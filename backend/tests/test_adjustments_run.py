@@ -27,14 +27,14 @@ def _write_minimal_master(path: Path) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "Master_PL"
-    headers = list(CONSOLIDATION_META_COLS) + ["L5", "FY24A", "FY25A"]
+    headers = list(CONSOLIDATION_META_COLS) + ["L5", "L6", "FY24A", "FY25A"]
     for c, h in enumerate(headers, start=1):
         ws.cell(1, c, h)
     ws.cell(2, 1, "Entity A")
     ws.cell(2, 5, "PL")
-    ws.cell(2, 8, "Reported")
-    ws.cell(2, 9, 100)
-    ws.cell(2, 10, 200)
+    ws.cell(2, 9, "Reported")
+    ws.cell(2, 10, 100)
+    ws.cell(2, 11, 200)
     ws.cell(3, 1, "Total PL")
     wb.save(path)
 

@@ -1,31 +1,33 @@
 /**
- * FddChatPanel — fullscreen FDD Bot (below Finssentials navbar) with project sidebar.
+ * FddChatPanel — FDD Bot with project sidebar (fixed below app chrome).
  */
 
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronUp, Undo2 } from 'lucide-react'
+import { Undo2 } from 'lucide-react'
 import type { FddBotApi } from './useFddBot'
 import BotConversation from './BotConversation'
 import FddProjectSidebar from './FddProjectSidebar'
 
-const NAVBAR_OFFSET_PX = 64
+const DEFAULT_TOP_OFFSET_PX = 64
 
-export type FddPanelMode = 'closed' | 'expanded' | 'minimized'
+export type FddPanelMode = 'closed' | 'expanded'
 
 export type FddChatPanelProps = {
   mode: FddPanelMode
-  onMinimize: () => void
-  onExpand: () => void
   preloadedFile?: File | null
   bot: FddBotApi
+  /** Distance from viewport top — leave room for e.g. “Modus wechseln” above the panel */
+  topOffsetPx?: number
+  /** Gap from viewport bottom so the panel does not fill the full screen height */
+  bottomOffsetPx?: number
 }
 
 function FddChatPanelView({
   mode,
-  onMinimize,
-  onExpand,
   preloadedFile,
   bot,
+  topOffsetPx = DEFAULT_TOP_OFFSET_PX,
+  bottomOffsetPx = 0,
 }: FddChatPanelProps) {
   const {
     loading,
@@ -58,73 +60,15 @@ function FddChatPanelView({
       >
         <Undo2 size={16} />
       </button>
-      {mode === 'expanded' ? (
-        <button
-          type="button"
-          onClick={onMinimize}
-          title="Minimieren"
-          className="p-1.5 rounded-lg transition-colors"
-          style={{ color: 'rgba(255,255,255,0.85)' }}
-          aria-label="Minimieren"
-        >
-          <ChevronDown size={18} />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={onExpand}
-          title="Erweitern"
-          className="p-1.5 rounded-lg transition-colors"
-          style={{ color: 'rgba(255,255,255,0.85)' }}
-          aria-label="Erweitern"
-        >
-          <ChevronUp size={18} />
-        </button>
-      )}
     </div>
   )
 
-  const panel = mode === 'minimized' ? (
-    <div
-      className="fixed left-0 right-0 z-40 flex items-center justify-between px-4 cursor-pointer"
-      style={{
-        bottom: 0,
-        height: 48,
-        background: '#1E3A5F',
-        boxShadow: '0 -2px 12px rgba(0,0,0,0.12)',
-      }}
-      onClick={onExpand}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onExpand()
-        }
-      }}
-    >
-      <div className="flex items-center gap-2.5 min-w-0" onClick={(e) => e.stopPropagation()}>
-        <div
-          className="flex items-center justify-center rounded-full text-xs font-bold shrink-0"
-          style={{ width: 28, height: 28, background: 'rgba(255,255,255,0.15)', color: '#fff' }}
-        >
-          FDD
-        </div>
-        <p className="text-sm font-semibold truncate" style={{ color: '#FFFFFF' }}>
-          {projectName}
-        </p>
-        <span className="text-xs shrink-0" style={{ color: 'rgba(255,255,255,0.6)' }}>
-          {busy ? 'Thinking…' : 'Ready'}
-        </span>
-      </div>
-      <div onClick={(e) => e.stopPropagation()}>{headerActions}</div>
-    </div>
-  ) : (
+  const panel = (
     <div
       className="fixed left-0 right-0 z-40 flex"
       style={{
-        top: NAVBAR_OFFSET_PX,
-        bottom: 0,
+        top: topOffsetPx,
+        bottom: bottomOffsetPx,
         background: '#F8FAFC',
       }}
     >

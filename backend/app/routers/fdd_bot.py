@@ -72,7 +72,10 @@ SCRIPTS: dict[str, Path] = {
     "pdf_adjusted": PROJECT_ROOT / "PDF_Extraction_adjustments.py",
     "pdf_checked": PROJECT_ROOT / "PDF_Extraction_checked.py",
     "lead_is": PROJECT_ROOT / "Lead_IS.py",
+    "lead_bs": PROJECT_ROOT / "Lead_BS.py",
     "recon_pl": PROJECT_ROOT / "Recon_tables_PL_MM.py",
+    "recon_bs": PROJECT_ROOT / "Recon_tables_BS.py",
+    "bs_bucket": PROJECT_ROOT / "BS_Bucket.py",
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1495,6 +1498,15 @@ class DatabookReconPlRequest(BaseModel):
     show_fs_check: bool = False
 
 
+class DatabookReconPipelineRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    project_name: str = "Project"
+    company_name: str = "Group"
+    entity_order: list[str] = Field(default_factory=list)
+
+
 # ─── Run: Databook — post-SuSa steps ─────────────────────────────────────────
 
 
@@ -1740,7 +1752,6 @@ def run_databook_pdf_extraction(req: DatabookPdfExtractionRequest):
 @router.post("/run/databook/recon-pl")
 def run_databook_recon_pl(req: DatabookReconPlRequest):
     from databook_helpers import (
-        ensure_pl_mapping_file,
         extract_fs_check_values,
         master_workbook_path,
         prepare_master_pl_for_recon,
@@ -1758,7 +1769,6 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
     prepare_master_pl_for_recon(master)
-    mapping_file = ensure_pl_mapping_file()
     recon_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
 
     titles = {
@@ -1793,7 +1803,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
             "target_file": str(recon_target),
             "report_sheet": "PL_Reconciliation",
             "audit_master_sheet": "Master_PL",
-            "mapping_file": str(mapping_file),
+            "mapping_source": "db",
             "append_to_master": True,
             "master_file": str(master),
         },
@@ -1805,6 +1815,132 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
     result["output_filename"] = master.name
     result["master_path"] = str(master)
     return result
+
+
+@router.post("/run/databook/recon-pipeline")
+def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
+    """Run PL/BS recon, BS bucket, Lead_IS, Lead_BS on session master (no FS)."""
+    from databook_helpers import master_workbook_path, prepare_master_pl_for_recon
+
+    run_id = _make_run_id("db_recon_pipe_")
+    run_d = _run_dir(req.session_id, run_id)
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = Path(req.master_path) if req.master_path else master_workbook_path(
+        req.session_id, output_folder
+    )
+    if not master.is_file():
+        raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
+
+    prepare_master_pl_for_recon(master)
+    master_str = str(master)
+    entity_order = list(req.entity_order)
+    base = {
+        "project_name": req.project_name,
+        "company_name": req.company_name,
+        "entity_order": entity_order,
+        "paths": {"mapping_source": "db", "master_file": master_str},
+    }
+
+    recon_pl_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
+    recon_bs_target = master.parent / f"{req.session_id}_recon_bs.xlsx"
+
+    steps: list[tuple[str, dict]] = [
+        (
+            "recon_pl",
+            {
+                **base,
+                "sort_by": "custom",
+                "show_fs_check": False,
+                "fs_check_values": {"entities": [], "consolidation": []},
+                "display": {
+                    "titles": {
+                        "ic_display_name": "IC eliminations",
+                    }
+                },
+                "pl_config": {"display_label_map": {}},
+                "paths": {
+                    **base["paths"],
+                    "source_file": master_str,
+                    "source_sheet": "Master_PL",
+                    "source_engine": "openpyxl",
+                    "target_file": str(recon_pl_target),
+                    "report_sheet": "PL_Reconciliation",
+                    "audit_master_sheet": "Master_PL",
+                    "append_to_master": True,
+                },
+            },
+        ),
+        (
+            "recon_bs",
+            {
+                **base,
+                "display": {"titles": {"ic_display_name": "IC eliminations"}},
+                "paths": {
+                    **base["paths"],
+                    "source_file": master_str,
+                    "target_file": str(recon_bs_target),
+                    "report_sheet": "BS_Reconciliation",
+                    "append_to_master": True,
+                },
+            },
+        ),
+        (
+            "bs_bucket",
+            {
+                **base,
+                "paths": {
+                    **base["paths"],
+                    "input_file": master_str,
+                },
+            },
+        ),
+        (
+            "lead_is",
+            {
+                **base,
+                "paths": {
+                    **base["paths"],
+                    "input_file": master_str,
+                },
+            },
+        ),
+        (
+            "lead_bs",
+            {
+                **base,
+                "paths": {
+                    **base["paths"],
+                    "input_file": master_str,
+                    "pl_master_file": master_str,
+                },
+            },
+        ),
+    ]
+
+    messages: list[str] = []
+    for script_key, config in steps:
+        script = SCRIPTS.get(script_key)
+        if not script or not script.is_file():
+            raise HTTPException(status_code=500, detail=f"Script not found: {script_key}")
+        config_path = run_d / f"{script_key}_config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        result = _run_script(script, config_path)
+        if not result.get("success"):
+            result["failed_step"] = script_key
+            result["master_path"] = master_str
+            return result
+        if result.get("message"):
+            messages.append(str(result["message"]))
+
+    return {
+        "success": True,
+        "message": "\n".join(messages) if messages else "Recon pipeline completed.",
+        "output_file": master_str,
+        "output_filename": master.name,
+        "master_path": master_str,
+        "run_id": run_id,
+        "session_id": req.session_id,
+    }
 
 
 # ─── Templates ───────────────────────────────────────────────────────────────

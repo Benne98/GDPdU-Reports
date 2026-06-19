@@ -567,9 +567,8 @@ CHECK_ROW_LABEL = "Check"
 CHECK_TOLERANCE = 0.001
 CANVAS_EXTRA_COLS = 20
 CANVAS_EXTRA_ROWS_BELOW_CHECK = 200
-TEXT_OUTPUT_COLS = 8  # Entity … L5 (left-aligned text columns)
 
-META_COLS = [
+_META_COLS_BASE = [
     "Entity",
     "Account",
     "Account description",
@@ -578,10 +577,16 @@ META_COLS = [
     "L3",
     "L4",
     "L5",
-    "Comments",
-    "Q&A",
-    "Answer of Target",
+    "L6",
 ]
+META_COLS_PL = _META_COLS_BASE + ["Comments", "Q&A", "Answer of Target"]
+META_COLS_BS = _META_COLS_BASE + ["NA", "Comments", "Q&A", "Answer of Target"]
+
+TEXT_OUTPUT_COLS_PL = len(_META_COLS_BASE)  # Entity … L6
+TEXT_OUTPUT_COLS_BS = len(_META_COLS_BASE) + 1  # Entity … NA
+
+INDEX_COLS_PL = _META_COLS_BASE
+INDEX_COLS_BS = _META_COLS_BASE + ["NA"]
 
 NET_INCOME_ACCOUNT = "2869"
 NET_INCOME_DESCRIPTION = "Jahresüberschuss/Jahresfehlbetrag"
@@ -679,11 +684,14 @@ def _normalize_mapping_frame(raw: pd.DataFrame) -> pd.DataFrame:
             rename[col] = "L3"
         elif c.startswith("L4"):
             rename[col] = "L4"
+        elif c.upper() == "NA" or c.strip().lower() in ("l6 na mapping", "na mapping"):
+            rename[col] = "NA"
     df = raw.rename(columns=rename)
     # Mapping files come as BS_Kontenmapping / PL_Kontenmapping and typically contain
     # Account description + L1..L4. We map based on description (not account number).
     required = ["Account description", "L1 - BS/PL", "L2", "L3", "L4", "Account Type"]
-    for col in required:
+    optional = ["NA"]
+    for col in required + optional:
         if col not in df.columns:
             df[col] = None
     # If mapping uses plain L1 (BS/PL), align it to the expected columns.
@@ -692,7 +700,8 @@ def _normalize_mapping_frame(raw: pd.DataFrame) -> pd.DataFrame:
     df["Account Type"] = df["Account Type"].where(df["Account Type"].notna(), df["L1 - BS/PL"])
 
     df["Account description"] = df["Account description"].astype(str).str.strip()
-    return df[required].drop_duplicates(subset=["Account description"], keep="first")
+    out_cols = required + [c for c in optional if c in df.columns]
+    return df[out_cols].drop_duplicates(subset=["Account description"], keep="first")
 
 
 def resolve_mapping_paths(config: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -704,17 +713,21 @@ def resolve_mapping_paths(config: dict) -> Tuple[Optional[str], Optional[str]]:
 def load_account_type_mapping(config: dict) -> pd.DataFrame:
     bs_path, pl_path = resolve_mapping_paths(config)
     frames: List[pd.DataFrame] = []
-    for path in (bs_path, pl_path):
+    for path, account_type in ((bs_path, "BS"), (pl_path, "PL")):
         if path and Path(path).is_file():
             try:
                 raw = pd.read_excel(path, engine="openpyxl")
-                frames.append(_normalize_mapping_frame(raw))
+                frame = _normalize_mapping_frame(raw)
+                frame["Account Type"] = account_type
+                frames.append(frame)
             except Exception as exc:
                 print(f"[WARN] Could not load mapping file {path}: {exc}")
     if not frames:
         print("[WARN] No BS/PL mapping files found; L1–L4 columns will be empty.")
-        return pd.DataFrame(columns=["Account", "L1 - BS/PL", "L2", "L3", "L4", "Account Type"])
-    return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(
+            columns=["Account description", "L1 - BS/PL", "L2", "L3", "L4", "Account Type", "NA"]
+        )
+    return pd.concat(frames, ignore_index=True, sort=False)
 
 
 def build_account_type_lookup(df_mapping: pd.DataFrame) -> Dict[str, str]:
@@ -734,7 +747,8 @@ def _attach_mapping(df_long: pd.DataFrame, df_mapping_all: pd.DataFrame) -> pd.D
         out["L2"] = None
         out["L3"] = None
         out["L4"] = None
-        out["L5"] = "Reported"
+        out["L5"] = ""
+        out["L6"] = "Reported"
         out["Account Type"] = "UNKNOWN"
         return out
 
@@ -750,10 +764,13 @@ def _attach_mapping(df_long: pd.DataFrame, df_mapping_all: pd.DataFrame) -> pd.D
     base["__desc_key"] = base.get("Account description", "").astype(str).str.strip()
     base["__desc_norm"] = base["__desc_key"].map(_norm_desc)
 
+    map_cols = ["__desc_key", "__desc_norm", "L1 - BS/PL", "L2", "L3", "L4", "Account Type"]
+    if "NA" in df_mapping_all.columns:
+        map_cols.append("NA")
     m = df_mapping_all.copy()
     m["__desc_key"] = m.get("Account description", "").astype(str).str.strip()
     m["__desc_norm"] = m["__desc_key"].map(_norm_desc)
-    m = m[["__desc_key", "__desc_norm", "L1 - BS/PL", "L2", "L3", "L4", "Account Type"]].copy()
+    m = m[map_cols].copy()
 
     # 1) Hard exact match on description
     merged = base.merge(
@@ -774,11 +791,16 @@ def _attach_mapping(df_long: pd.DataFrame, df_mapping_all: pd.DataFrame) -> pd.D
                 how="left",
             )
         )
-        for col in ["L1 - BS/PL", "L2", "L3", "L4", "Account Type"]:
+        for col in ["L1 - BS/PL", "L2", "L3", "L4", "Account Type"] + (
+            ["NA"] if "NA" in m.columns else []
+        ):
             merged.loc[need_second, col] = merged.loc[need_second, col].combine_first(second[col])
 
     merged["Account Type"] = merged["Account Type"].fillna("UNKNOWN")
-    merged["L5"] = "Reported"
+    merged["L5"] = ""
+    merged["L6"] = "Reported"
+    if "NA" in merged.columns:
+        merged.loc[merged["Account Type"] != "BS", "NA"] = None
     merged.drop(columns=["__desc_key", "__desc_norm"], inplace=True, errors="ignore")
     return merged
 
@@ -896,7 +918,9 @@ def build_net_income_bs_rows(
             "L2": "Equity",
             "L3": "Net retained profits",
             "L4": "Net income",
-            "L5": "Reported",
+            "L5": "",
+            "L6": "Reported",
+            "NA": "Equity",
             "Comments": None,
             "Q&A": None,
             "Answer of Target": None,
@@ -926,7 +950,7 @@ def build_net_income_bs_rows(
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.reindex(columns=META_COLS + fy_cols + period_order)
+    return out.reindex(columns=META_COLS_BS + fy_cols + period_order)
 
 
 def validate_df_long(df_long: pd.DataFrame, strict_mapping: bool = False) -> List[str]:
@@ -949,6 +973,9 @@ def build_final_output(
     fy_end_month: int = 12,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = finalize_periods(df_long, fiscal_start_month)
+    for col, default in (("L5", ""), ("L6", "Reported"), ("NA", None)):
+        if col not in df.columns:
+            df[col] = default
     value_type = str(value_type or "balances").strip()
     if value_type == "balances":
         df = pl_movements_from_balances(df, fiscal_start_month=fiscal_start_month)
@@ -992,16 +1019,8 @@ def build_final_output(
         fy_rename[fy] = new_name
         fy_cols.append(new_name)
 
-    index_cols = [
-        "Entity",
-        "Account",
-        "Account description",
-        "L1 - BS/PL",
-        "L2",
-        "L3",
-        "L4",
-        "L5",
-    ]
+    index_cols_pl = INDEX_COLS_PL
+    index_cols_bs = INDEX_COLS_BS
 
     pl_long = df[df["Account Type"] == "PL"].copy()
 
@@ -1012,7 +1031,7 @@ def build_final_output(
 
     pl_pivot = (
         pl_long.pivot_table(
-            index=index_cols,
+            index=index_cols_pl,
             columns="Period",
             values="Balance",
             aggfunc="sum",
@@ -1024,7 +1043,7 @@ def build_final_output(
 
     pl_fy_pivot = (
         pl_long.pivot_table(
-            index=index_cols,
+            index=index_cols_pl,
             columns="Reporting FY",
             values="Balance",
             aggfunc="sum",
@@ -1035,19 +1054,19 @@ def build_final_output(
     if fy_values:
         pl_fy_pivot = pl_fy_pivot.rename(columns=fy_rename)
 
-    master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols, how="outer")
+    master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
 
     bs_long = df[df["Account Type"] == "BS"].copy()
     if not bs_long.empty and fy_values:
         bs_fy_end = select_bs_fy_end_rows(
             bs_long,
-            index_cols,
+            index_cols_bs,
             fiscal_start_month=fiscal_start_month,
             fy_end_month=fy_end_month,
         )
         bs_fy_pivot = (
             bs_fy_end.pivot_table(
-                index=index_cols,
+                index=index_cols_bs,
                 columns="Reporting FY",
                 values="Balance",
                 aggfunc="sum",
@@ -1058,7 +1077,7 @@ def build_final_output(
         bs_fy_pivot = bs_fy_pivot.rename(columns=fy_rename)
         bs_period_pivot = (
             bs_long.pivot_table(
-                index=index_cols,
+                index=index_cols_bs,
                 columns="Period",
                 values="Balance",
                 aggfunc="sum",
@@ -1066,9 +1085,9 @@ def build_final_output(
             .reindex(columns=period_order)
             .reset_index()
         )
-        master_bs = bs_period_pivot.merge(bs_fy_pivot, on=index_cols, how="outer")
+        master_bs = bs_period_pivot.merge(bs_fy_pivot, on=index_cols_bs, how="outer")
     else:
-        master_bs = pd.DataFrame(columns=META_COLS + fy_cols + period_order)
+        master_bs = pd.DataFrame(columns=META_COLS_BS + fy_cols + period_order)
 
     net_income = build_net_income_bs_rows(
         df,
@@ -1082,18 +1101,21 @@ def build_final_output(
     if not net_income.empty:
         master_bs = pd.concat([master_bs, net_income], ignore_index=True)
 
-    for col in META_COLS:
+    for col in META_COLS_PL:
         if col not in master_pl.columns:
             master_pl[col] = None
+    for col in META_COLS_BS:
         if col not in master_bs.columns:
             master_bs[col] = None
 
-    desired_cols = META_COLS + fy_cols + period_order
-    master_pl = master_pl.reindex(columns=desired_cols)
-    master_bs = master_bs.reindex(columns=desired_cols)
+    desired_cols_pl = META_COLS_PL + fy_cols + period_order
+    desired_cols_bs = META_COLS_BS + fy_cols + period_order
+    master_pl = master_pl.reindex(columns=desired_cols_pl)
+    master_bs = master_bs.reindex(columns=desired_cols_bs)
 
     for master in (master_pl, master_bs):
-        master["L5"] = "Reported"
+        master["L5"] = ""
+        master["L6"] = "Reported"
         master["__sort"] = pd.to_numeric(master["Account"], errors="coerce")
         master.sort_values(["Entity", "__sort", "Account"], inplace=True)
         master.drop(columns=["__sort"], inplace=True)
@@ -1128,14 +1150,14 @@ def set_row_heights(ws, max_row: int, height: float = 12):
         ws.row_dimensions[r].height = height
 
 
-def format_header(ws, table_cols: int):
+def format_header(ws, table_cols: int, n_text_cols: int):
     for c in range(1, table_cols + 1):
         cell = ws.cell(row=1, column=c)
         cell.font = THEME.font_header
         cell.fill = THEME.fill_header
         cell.border = THEME.border_header_bottom
         cell.alignment = Alignment(
-            horizontal="left" if c <= TEXT_OUTPUT_COLS else "right",
+            horizontal="left" if c <= n_text_cols else "right",
             vertical="center",
         )
 
@@ -1162,7 +1184,7 @@ def format_data_cells(ws, n_rows: int, n_cols: int, n_text_cols: int):
             cell.alignment = Alignment(horizontal="right")
 
 
-def add_total_pl_row(ws, df_shape: Tuple[int, int], label: str) -> int:
+def add_total_pl_row(ws, df_shape: Tuple[int, int], label: str, n_text_cols: int) -> int:
     n_rows, n_cols = df_shape
     first_data_row = 2
     last_data_row = n_rows + 1
@@ -1171,9 +1193,9 @@ def add_total_pl_row(ws, df_shape: Tuple[int, int], label: str) -> int:
         cell = ws.cell(row=total_row, column=c)
         cell.fill = CHECK_FILL
         cell.font = THEME.font_bold
-        cell.alignment = Alignment(horizontal="left" if c <= TEXT_OUTPUT_COLS else "right")
+        cell.alignment = Alignment(horizontal="left" if c <= n_text_cols else "right")
     ws.cell(row=total_row, column=1).value = label
-    for c in range(TEXT_OUTPUT_COLS + 1, n_cols + 1):
+    for c in range(n_text_cols + 1, n_cols + 1):
         col = get_column_letter(c)
         ws.cell(
             row=total_row,
@@ -1194,6 +1216,7 @@ def _write_master_sheet(
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
     ws = wb.create_sheet(sheet_name)
+    n_text_cols = TEXT_OUTPUT_COLS_BS if sheet_name == SHEET_BS else TEXT_OUTPUT_COLS_PL
     for row in dataframe_to_rows(master, index=False, header=True):
         ws.append(row)
     n_rows, n_cols = master.shape
@@ -1201,18 +1224,18 @@ def _write_master_sheet(
     canvas_right = n_cols + int(config.get("canvas_extra_cols", CANVAS_EXTRA_COLS))
     paint_canvas_white(ws, canvas_right, canvas_bottom)
     set_row_heights(ws, canvas_bottom, height=12)
-    format_header(ws, n_cols)
-    format_data_cells(ws, n_rows, n_cols, TEXT_OUTPUT_COLS)
-    auto_size_account_columns(ws, TEXT_OUTPUT_COLS)
+    format_header(ws, n_cols, n_text_cols)
+    format_data_cells(ws, n_rows, n_cols, n_text_cols)
+    auto_size_account_columns(ws, n_text_cols)
     add_check_row(
         ws,
         master.shape,
         float(config.get("check_tolerance", CHECK_TOLERANCE)),
         str(config.get("check_row_label") or CHECK_ROW_LABEL),
-        TEXT_OUTPUT_COLS + 1,
+        n_text_cols + 1,
     )
     if add_total:
-        add_total_pl_row(ws, master.shape, "Total PL")
+        add_total_pl_row(ws, master.shape, "Total PL", n_text_cols)
 
 
 def write_output(

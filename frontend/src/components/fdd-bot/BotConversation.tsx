@@ -28,7 +28,7 @@ export default function BotConversation({
   active,
   autoHello = true,
   preloadedFile,
-  footerNote = 'FDD Bot · Powered by Rasa',
+  footerNote,
   inputPlaceholder = 'Type a message or use the cards above…',
   wide = false,
 }: BotConversationProps) {

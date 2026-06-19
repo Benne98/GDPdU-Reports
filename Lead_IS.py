@@ -26,6 +26,26 @@ SHEET_MASTER = "Master_PL"
 SHEET_OUT = "Lead_IS"
 SHEET_RECON = "PL_Reconciliation"
 
+_RUNTIME_CFG: dict = {}
+
+
+def _apply_runtime_config() -> None:
+    global INPUT_FILE, MAPPING_FILE, PROJECT_NAME, GROUP_NAME, _RUNTIME_CFG
+    from databook_runtime import load_argv_config, path_value
+
+    cfg = load_argv_config()
+    if not cfg:
+        return
+    _RUNTIME_CFG.update(cfg)
+    INPUT_FILE = path_value(cfg, "master_file", path_value(cfg, "input_file", INPUT_FILE))
+    if cfg.get("project_name"):
+        PROJECT_NAME = str(cfg["project_name"])
+    if cfg.get("company_name"):
+        GROUP_NAME = str(cfg["company_name"])
+
+
+_apply_runtime_config()
+
 PROJECT_NAME = "Desktop Test"
 GROUP_NAME = "Group"
 UNIT_LABEL = "kEUR"
@@ -335,7 +355,9 @@ l4_rng = master_range("L4")
 l5_rng = master_range(l5_col)
 year_rng = {y: master_range(y) for y in YEARS}
 
-map_df = pd.read_excel(MAPPING_FILE, sheet_name=0, engine="openpyxl")
+from recon_mapping_loader import load_pl_recon_mapping_df
+
+map_df = load_pl_recon_mapping_df(_RUNTIME_CFG)
 if not {"L3", "L4"}.issubset(map_df.columns):
     raise ValueError("Mapping-Datei muss Spalten 'L3' und 'L4' enthalten.")
 

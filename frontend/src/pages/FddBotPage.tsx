@@ -299,10 +299,10 @@ export default function FddBotPage() {
         )}
         <FddChatPanel
           mode={panelMode}
-          onMinimize={() => setPanelMode('minimized')}
-          onExpand={() => setPanelMode('expanded')}
           preloadedFile={preloadedFile}
           bot={bot}
+          topOffsetPx={112}
+          bottomOffsetPx={20}
         />
       </>
     ) : null

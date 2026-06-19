@@ -16,7 +16,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
+from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
 # =============================================
 # HARD-CODED DEFAULTS / STABLE SETTINGS
 # =============================================
@@ -979,9 +979,10 @@ def main():
                 end_column=b["year_endcol"],
             )
             t           = ws.cell(BLOCK_TITLE_ROW, b["year_startcol"], b["title"])
-            t.font      = FONT_HEADER
+            t.font      = FONT_BASE_BOLD
             t.alignment = ALIGN_CENTER
             ws.cell(BLOCK_TITLE_ROW, b["poscol"]).value = None
+            ws.cell(BLOCK_TITLE_ROW, b["poscol"]).fill = FILL_WHITE
         else:
             ws.merge_cells(
                 start_row=BLOCK_TITLE_ROW,
@@ -990,7 +991,7 @@ def main():
                 end_column=b["year_endcol"],
             )
             t           = ws.cell(BLOCK_TITLE_ROW, b["startcol"], b["title"])
-            t.font      = FONT_HEADER
+            t.font      = FONT_BASE_BOLD
             t.alignment = ALIGN_CENTER
 
         if b.get("has_plpos"):
@@ -1024,10 +1025,6 @@ def main():
             h.alignment = ALIGN_CENTER
 
         ws.column_dimensions[col_letter(b["spacer_col"])].width = SPACER_WIDTH
-
-    ws.row_dimensions[ENTITY_CODE_ROW].outlineLevel = 2
-    ws.row_dimensions[ENTITY_CODE_ROW].hidden       = True
-    ws.sheet_view.showOutlineSymbols = True
 
     # ---------------------------------------------------
     # WRITE ROWS
@@ -1074,9 +1071,6 @@ def main():
         else:
             ws.row_dimensions[excel_row].outlineLevel = 0
             ws.row_dimensions[excel_row].hidden       = False
-
-    ws.sheet_properties.outlinePr.summaryBelow = True
-    ws.sheet_properties.outlinePr.applyStyles  = True
 
     LAST_TABLE_ROW = DATA_START_ROW + len(row_structure) - 1
 
@@ -1300,14 +1294,6 @@ def main():
     ws.cell(HEADER_ROW, POS_COL).font = FONT_HEADER
 
     spacer_cols = {b["spacer_col"] for b in blocks}
-    for r in (BLOCK_TITLE_ROW, HEADER_ROW):
-        for c in range(1, LAST_USED_COL + 1):
-            if c in spacer_cols:
-                continue
-            cell = ws.cell(r, c)
-            cell.fill = FILL_HEADER
-            if r == HEADER_ROW:
-                cell.border = BORDER_HEADER_BOTTOM
 
     for r in row_structure:
         if r["type"] not in ("subtotal", "total"):
@@ -1363,52 +1349,20 @@ def main():
             for y_idx in range(len(YEARS)):
                 ws.cell(excel_row, b["year_startcol"] + y_idx).border = border_to_set
 
-    # ---------------------------------------------------
-    # OUTLINE / COLLAPSE FOR COLUMNS
-    # ---------------------------------------------------
-    for cc in range(1, 10):
-        col = col_letter(cc)
-        ws.column_dimensions[col].outlineLevel = 2
-        ws.column_dimensions[col].hidden       = True
+    apply_recon_portfolio_layout(
+        ws,
+        blocks=blocks,
+        pos_col=POS_COL,
+        header_row=HEADER_ROW,
+        block_title_row=BLOCK_TITLE_ROW,
+        entity_code_row=ENTITY_CODE_ROW,
+        last_used_col=LAST_USED_COL,
+        spacer_cols=spacer_cols,
+    )
 
-    for b in blocks:
-        c_first = b["startcol"]
-        c_last  = b["spacer_col"]
+    ws.row_dimensions[HEADER_ROW].height = ROW_HEIGHT
+    ws.row_dimensions[BLOCK_TITLE_ROW].height = ROW_HEIGHT
 
-        if b["kind"] in {"consolidation", "difference", "fs"}:
-            for cc in range(c_first, c_last + 1):
-                col = col_letter(cc)
-                ws.column_dimensions[col].outlineLevel = 0
-                ws.column_dimensions[col].hidden       = False
-            continue
-
-        for cc in range(c_first, c_last + 1):
-            col = col_letter(cc)
-            ws.column_dimensions[col].outlineLevel = 1
-            ws.column_dimensions[col].hidden       = False
-        ws.column_dimensions[col_letter(c_last)].collapsed = True
-
-    ws.column_dimensions[col_letter(POS_COL)].outlineLevel = 0
-    ws.column_dimensions[col_letter(POS_COL)].hidden       = False
-
-    for key in ("Difference", "Financial statements"):
-        b      = next(bb for bb in blocks if bb["key"] == key)
-        poscol = b["poscol"]
-        if poscol is None:
-            continue
-        col_l = col_letter(poscol)
-        ws.column_dimensions[col_l].outlineLevel = 1
-        ws.column_dimensions[col_l].hidden       = True
-        ws.column_dimensions[col_l].collapsed    = True
-
-        for c in range(b["year_startcol"], b["year_endcol"] + 1):
-            c_l = col_letter(c)
-            ws.column_dimensions[c_l].outlineLevel = 0
-            ws.column_dimensions[c_l].hidden       = False
-
-    # ---------------------------------------------------
-    # ZERO ROWS (all FY values = 0)
-    # ---------------------------------------------------
     recon_year_cf_cols = []
     for b in blocks:
         for y_idx in range(len(YEARS)):
@@ -1421,6 +1375,7 @@ def main():
         year_col_indices=recon_year_cf_cols,
         style_start_col=POS_COL,
         style_end_col=LAST_USED_COL,
+        exclude_cols=spacer_cols,
     )
 
     # ---------------------------------------------------

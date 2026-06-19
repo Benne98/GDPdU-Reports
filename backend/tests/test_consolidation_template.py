@@ -35,6 +35,7 @@ from gst_excel_theme import THEME  # noqa: E402
 def _write_sample_master(path: Path) -> None:
     cols = list(CONSOLIDATION_META_COLS) + [
         "L5",
+        "L6",
         "FY24A",
         "FY25A",
         "Jan-2024",

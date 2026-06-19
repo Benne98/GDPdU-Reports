@@ -3,8 +3,8 @@ Append consolidation block to Master_BS / Master_PL in the SuSa master workbook.
 Driven by JSON config (first CLI argument) from the FDD backend.
 
 Changes vs. previous version:
-- The consolidation input template does NOT need an L5 column anymore.
-- The generated consolidation rows always receive L5 = "Reported".
+- The consolidation input template does NOT need L5/L6 columns anymore.
+- Generated consolidation rows receive L5 empty and L6 = "Reported".
 - FY columns are detected robustly, e.g. FY23A, FY24A, FY2024A.
 - Month columns are detected robustly, e.g. Jan-2024, Feb-2024, Dec-2024.
 - The input template may contain either FY columns or month columns, but not both.
@@ -45,7 +45,7 @@ CHECK_FILL = PatternFill("solid", fgColor="FFFEF3C7")
 HEADER_BORDER = Border(bottom=Side(style="thin", color="FFE2E8F0"))
 
 CANVAS_EXTRA_COLS = 20
-L5_CONSOLIDATION_VALUE = "Reported"
+L6_CONSOLIDATION_VALUE = "Reported"
 
 TEXT_COLS = {
     "Entity",
@@ -56,6 +56,8 @@ TEXT_COLS = {
     "L3",
     "L4",
     "L5",
+    "L6",
+    "NA",
     "Comments",
     "Q&A",
     "Answer of Target",
@@ -96,15 +98,15 @@ def get_table_col_limit(ws) -> int:
     return last
 
 
-def get_format_limit_col(ws, l5_col: int | None = None) -> int:
+def get_format_limit_col(ws, l6_col: int | None = None) -> int:
     """
     Rightmost column to paint white / purple / check backgrounds.
     Covers FY columns, period columns and SuSa canvas extension.
     """
     table = get_table_col_limit(ws)
     limit = min(max(ws.max_column, table), table + CANVAS_EXTRA_COLS)
-    if l5_col is not None:
-        limit = max(limit, l5_col)
+    if l6_col is not None:
+        limit = max(limit, l6_col)
     return limit
 
 
@@ -115,12 +117,27 @@ def get_l5_col(ws) -> int | None:
     return None
 
 
+def get_l6_col(ws) -> int | None:
+    for c in range(1, ws.max_column + 1):
+        if ws.cell(1, c).value == "L6":
+            return c
+    return None
+
+
 def require_l5_col(ws) -> int:
-    """The master generator is expected to create L5. Fail loudly if it is missing."""
+    """The master generator is expected to create L5 (may be empty). Fail if missing."""
     l5_col = get_l5_col(ws)
     if l5_col is None:
         raise ValueError(f"Sheet '{ws.title}' must contain an 'L5' column in row 1.")
     return l5_col
+
+
+def require_l6_col(ws) -> int:
+    """The master generator is expected to create L6. Fail loudly if it is missing."""
+    l6_col = get_l6_col(ws)
+    if l6_col is None:
+        raise ValueError(f"Sheet '{ws.title}' must contain an 'L6' column in row 1.")
+    return l6_col
 
 
 def normalize_header(header) -> str:
@@ -278,8 +295,8 @@ def derive_fy_values_from_months(
     return derived_fy_cols
 
 
-def apply_header_style(ws, l5_col: int | None = None) -> None:
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+def apply_header_style(ws, l6_col: int | None = None) -> None:
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         cell = ws.cell(1, c)
         cell.fill = HEADER_FILL
@@ -303,13 +320,13 @@ def style_cell(cell, *, header=None, fill=WHITE_FILL, bold: bool = False):
         cell.number_format = FMT_AMOUNT
 
 
-def write_df(ws, start_row, df, l5_col: int | None = None):
+def write_df(ws, start_row, df, l6_col: int | None = None):
     header_map = {
         ws.cell(1, c).value: c
         for c in range(1, ws.max_column + 1)
         if ws.cell(1, c).value is not None
     }
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
 
     for r_offset, (_, row) in enumerate(df.iterrows()):
         r = start_row + r_offset
@@ -328,23 +345,23 @@ def write_df(ws, start_row, df, l5_col: int | None = None):
                 style_cell(cell, header=header)
 
 
-def fill_row(ws, row, *, fill=WHITE_FILL, bold: bool = False, l5_col: int | None = None):
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+def fill_row(ws, row, *, fill=WHITE_FILL, bold: bool = False, l6_col: int | None = None):
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         header = ws.cell(1, c).value
         cell = ws.cell(row, c)
         style_cell(cell, header=header, fill=fill, bold=bold)
 
 
-def fill_block(ws, start_row, end_row, *, fill=WHITE_FILL, l5_col: int | None = None):
+def fill_block(ws, start_row, end_row, *, fill=WHITE_FILL, l6_col: int | None = None):
     if end_row < start_row:
         return
     for r in range(start_row, end_row + 1):
-        fill_row(ws, r, fill=fill, l5_col=l5_col)
+        fill_row(ws, r, fill=fill, l6_col=l6_col)
 
 
-def add_consolidation_header(ws, row, l5_col: int | None = None):
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+def add_consolidation_header(ws, row, l6_col: int | None = None):
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         cell = ws.cell(row, c)
         cell.fill = PURPLE_FILL
@@ -358,11 +375,11 @@ def subtotal(col, r1, r2):
     return f"SUBTOTAL(9,{col}{r1}:{col}{r2})"
 
 
-def add_check_row(ws, row, bspl_start, bspl_end, cons_start, cons_end, l5_col: int | None = None):
+def add_check_row(ws, row, bspl_start, bspl_end, cons_start, cons_end, l6_col: int | None = None):
     ws.cell(row, 1, "Check")
-    fill_row(ws, row, fill=CHECK_FILL, bold=True, l5_col=l5_col)
+    fill_row(ws, row, fill=CHECK_FILL, bold=True, l6_col=l6_col)
 
-    for c in range(1, get_format_limit_col(ws, l5_col=l5_col) + 1):
+    for c in range(1, get_format_limit_col(ws, l6_col=l6_col) + 1):
         header = ws.cell(1, c).value
         cell = ws.cell(row, c)
         if not is_amount_header(header):
@@ -375,11 +392,11 @@ def add_check_row(ws, row, bspl_start, bspl_end, cons_start, cons_end, l5_col: i
         cell.alignment = Alignment(horizontal="right", vertical="center")
 
 
-def add_total_pl_row(ws, row, pl_start, pl_end, cons_start, cons_end, l5_col: int | None = None):
+def add_total_pl_row(ws, row, pl_start, pl_end, cons_start, cons_end, l6_col: int | None = None):
     ws.cell(row, 1, "Total PL")
-    fill_row(ws, row, fill=CHECK_FILL, bold=True, l5_col=l5_col)
+    fill_row(ws, row, fill=CHECK_FILL, bold=True, l6_col=l6_col)
 
-    for c in range(1, get_format_limit_col(ws, l5_col=l5_col) + 1):
+    for c in range(1, get_format_limit_col(ws, l6_col=l6_col) + 1):
         header = ws.cell(1, c).value
         cell = ws.cell(row, c)
         if not is_amount_header(header):
@@ -413,7 +430,8 @@ def _prepare_cons_df(
         raise ValueError("Consolidation input must contain 'L1' or 'L1 - BS/PL'.")
 
     part["L1 - BS/PL"] = l1_value
-    part["L5"] = L5_CONSOLIDATION_VALUE
+    part["L5"] = ""
+    part["L6"] = L6_CONSOLIDATION_VALUE
 
     fy_cols, month_cols = get_value_cols_from_input(cons)
     if fy_cols:
@@ -440,6 +458,7 @@ def _prepare_cons_df(
         "L3",
         "L4",
         "L5",
+        "L6",
     ]
     result = part.reindex(columns=base_cols + value_cols)
     return scale_to_keur(result, value_cols, enabled=scale_to_keur_enabled)
@@ -471,8 +490,9 @@ def run(config: dict) -> None:
 
     # Master_BS
     ws_bs = wb["Master_BS"]
-    l5_col_bs = require_l5_col(ws_bs)
-    apply_header_style(ws_bs, l5_col=l5_col_bs)
+    require_l5_col(ws_bs)
+    l6_col_bs = require_l6_col(ws_bs)
+    apply_header_style(ws_bs, l6_col=l6_col_bs)
     bspl_start = 2
     old_check = find_row_optional(ws_bs, "Check")
 
@@ -493,21 +513,22 @@ def run(config: dict) -> None:
         scale_to_keur_enabled=scale_to_keur_enabled,
     )
     ws_bs.insert_rows(insert_row, amount=len(cons_bs) + 5)
-    fill_row(ws_bs, insert_row, l5_col=l5_col_bs)
-    add_consolidation_header(ws_bs, insert_row + 1, l5_col=l5_col_bs)
-    fill_row(ws_bs, insert_row + 2, l5_col=l5_col_bs)
+    fill_row(ws_bs, insert_row, l6_col=l6_col_bs)
+    add_consolidation_header(ws_bs, insert_row + 1, l6_col=l6_col_bs)
+    fill_row(ws_bs, insert_row + 2, l6_col=l6_col_bs)
     cons_start = insert_row + 3
-    write_df(ws_bs, cons_start, cons_bs, l5_col=l5_col_bs)
+    write_df(ws_bs, cons_start, cons_bs, l6_col=l6_col_bs)
     cons_end = cons_start + len(cons_bs) - 1
-    fill_block(ws_bs, cons_start, cons_end, l5_col=l5_col_bs)
-    fill_row(ws_bs, cons_end + 1, l5_col=l5_col_bs)
+    fill_block(ws_bs, cons_start, cons_end, l6_col=l6_col_bs)
+    fill_row(ws_bs, cons_end + 1, l6_col=l6_col_bs)
     check_row = cons_end + 2
-    add_check_row(ws_bs, check_row, bspl_start, bspl_end, cons_start, cons_end, l5_col=l5_col_bs)
+    add_check_row(ws_bs, check_row, bspl_start, bspl_end, cons_start, cons_end, l6_col=l6_col_bs)
 
     # Master_PL
     ws_pl = wb["Master_PL"]
-    l5_col_pl = require_l5_col(ws_pl)
-    apply_header_style(ws_pl, l5_col=l5_col_pl)
+    require_l5_col(ws_pl)
+    l6_col_pl = require_l6_col(ws_pl)
+    apply_header_style(ws_pl, l6_col=l6_col_pl)
     pl_start = 2
     old_total = find_row_optional(ws_pl, "Total PL")
 
@@ -528,16 +549,16 @@ def run(config: dict) -> None:
         scale_to_keur_enabled=scale_to_keur_enabled,
     )
     ws_pl.insert_rows(insert_row, amount=len(cons_pl) + 5)
-    fill_row(ws_pl, insert_row, l5_col=l5_col_pl)
-    add_consolidation_header(ws_pl, insert_row + 1, l5_col=l5_col_pl)
-    fill_row(ws_pl, insert_row + 2, l5_col=l5_col_pl)
+    fill_row(ws_pl, insert_row, l6_col=l6_col_pl)
+    add_consolidation_header(ws_pl, insert_row + 1, l6_col=l6_col_pl)
+    fill_row(ws_pl, insert_row + 2, l6_col=l6_col_pl)
     cons_start = insert_row + 3
-    write_df(ws_pl, cons_start, cons_pl, l5_col=l5_col_pl)
+    write_df(ws_pl, cons_start, cons_pl, l6_col=l6_col_pl)
     cons_end = cons_start + len(cons_pl) - 1
-    fill_block(ws_pl, cons_start, cons_end, l5_col=l5_col_pl)
-    fill_row(ws_pl, cons_end + 1, l5_col=l5_col_pl)
+    fill_block(ws_pl, cons_start, cons_end, l6_col=l6_col_pl)
+    fill_row(ws_pl, cons_end + 1, l6_col=l6_col_pl)
     total_row = cons_end + 2
-    add_total_pl_row(ws_pl, total_row, pl_start, pl_end, cons_start, cons_end, l5_col=l5_col_pl)
+    add_total_pl_row(ws_pl, total_row, pl_start, pl_end, cons_start, cons_end, l6_col=l6_col_pl)
 
     wb.save(master_path)
     print(f"Consolidation applied to {master_path}")

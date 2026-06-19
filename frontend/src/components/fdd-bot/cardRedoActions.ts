@@ -55,8 +55,10 @@ export const CARD_REDO_ACTION: Record<string, string> = {
   databook_consolidation_upload: 'action_process_databook_consolidation_upload',
   databook_adjustments: 'action_process_databook_adjustments',
   databook_adjustments_upload: 'action_process_databook_adjustments_upload',
+  databook_fs_gate: 'action_process_databook_fs_gate',
   databook_fs_upload: 'action_process_databook_fs_upload',
   databook_fs_review_upload: 'action_process_databook_fs_review_upload',
   databook_recon_order: 'action_process_databook_recon_order',
   databook_recon_labels: 'action_process_databook_recon_labels',
+  databook_next_step: 'action_process_databook_next_step',
 }

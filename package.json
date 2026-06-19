@@ -1,0 +1,16 @@
+{
+  "name": "gdpdu-reports",
+  "private": true,
+  "description": "GDPdU Reports dev stack (PM2)",
+  "scripts": {
+    "stack:start": "npx pm2 start ecosystem.gdpdu.config.cjs",
+    "stack:stop": "npx pm2 stop gdpdu-api gdpdu-rasa-actions gdpdu-rasa gdpdu-vite",
+    "stack:restart": "npx pm2 restart gdpdu-api gdpdu-rasa-actions gdpdu-rasa gdpdu-vite",
+    "stack:delete": "npx pm2 delete gdpdu-api gdpdu-rasa-actions gdpdu-rasa gdpdu-vite",
+    "stack:logs": "npx pm2 logs",
+    "stack:status": "npx pm2 status"
+  },
+  "devDependencies": {
+    "pm2": "^5.4.3"
+  }
+}

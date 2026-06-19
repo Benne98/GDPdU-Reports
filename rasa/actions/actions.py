@@ -1687,10 +1687,12 @@ class ActionDispatchCard(Action):
             "databook_consolidation_upload": ActionProcessDatabookConsolidationUpload(),
             "databook_adjustments": ActionProcessDatabookAdjustments(),
             "databook_adjustments_upload": ActionProcessDatabookAdjustmentsUpload(),
+            "databook_fs_gate": ActionProcessDatabookFsGate(),
             "databook_fs_upload": ActionProcessDatabookFsUpload(),
             "databook_fs_review_upload": ActionProcessDatabookFsReviewUpload(),
             "databook_recon_order": ActionProcessDatabookReconOrder(),
             "databook_recon_labels": ActionProcessDatabookReconLabels(),
+            "databook_next_step": ActionProcessDatabookNextStep(),
             "databook_sort": ActionProcessDatabookSort(),
             "databook_proceed": ActionRunDatabookFinal(),
         }
@@ -5552,6 +5554,57 @@ def _utter_databook_adjustments_card(dispatcher: CollectingDispatcher) -> None:
     )
 
 
+def _utter_databook_fs_gate_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_fs_gate",
+            "title": "Financial statements",
+            "subtitle": "Do you want to ingest the financial statements now?",
+            "inputs": [
+                {
+                    "id": "db_fs_ingest_now",
+                    "type": "radio",
+                    "label": "Ingest financial statements",
+                    "options": [
+                        {"label": "Yes", "value": "yes"},
+                        {"label": "No", "value": "no"},
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _utter_databook_next_step_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_next_step",
+            "title": "Next step",
+            "subtitle": "What would you like to do now?",
+            "inputs": [
+                {
+                    "id": "db_next_step",
+                    "type": "radio",
+                    "label": "Choose next action",
+                    "options": [
+                        {"label": "1. Apply adjustments", "value": "apply_adjustments"},
+                        {"label": "2. Ingest financial statements", "value": "ingest_fs"},
+                        {"label": "3. Generate further databook tables", "value": "more_tables"},
+                        {
+                            "label": "4. Interrupt databook and create Revenue Databook instead",
+                            "value": "revenue_databook",
+                        },
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
 def _utter_databook_fs_upload_card(dispatcher: CollectingDispatcher) -> None:
     dispatcher.utter_message(
         json_message={
@@ -5990,7 +6043,7 @@ class ActionProcessDatabookAdjustments(Action):
         apply_adj = str(payload.get("db_apply_adjustments") or "no").strip().lower()
         events = [SlotSet("db_apply_adjustments", apply_adj)]
         if apply_adj == "no":
-            _utter_databook_fs_upload_card(dispatcher)
+            _utter_databook_fs_gate_card(dispatcher)
         else:
             fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
             fiscal_start_month = (fy_end_m % 12) + 1
@@ -6053,12 +6106,79 @@ class ActionProcessDatabookAdjustmentsUpload(Action):
             master_path = _master_path_from_result(result, tracker)
             if master_path:
                 events.append(SlotSet("db_master_workbook_path", master_path))
-            _utter_databook_fs_upload_card(dispatcher)
+            _utter_databook_fs_gate_card(dispatcher)
         else:
             dispatcher.utter_message(
                 text=f"Adjustments error: {result.get('message', 'Unknown error')}"
             )
             _utter_databook_adjustments_upload_card(dispatcher, tracker)
+        return events
+
+
+class ActionProcessDatabookFsGate(Action):
+    def name(self) -> str:
+        return "action_process_databook_fs_gate"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("db_fs_ingest_now") or "no").strip().lower()
+        events = [SlotSet("db_fs_ingest_now", choice)]
+        if choice == "yes":
+            _utter_databook_fs_upload_card(dispatcher)
+            return events
+
+        entity_names = list(tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker))
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "master_path": tracker.get_slot("db_master_workbook_path")
+            or _abs_master_path_from_tracker(tracker),
+            "project_name": tracker.get_slot("project_name") or "Project",
+            "company_name": tracker.get_slot("group_name") or "Group",
+            "entity_order": entity_names,
+        }
+        result = _fdd_post("/api/v1/fdd/run/databook/recon-pipeline", body, timeout=1200)
+        if result.get("success"):
+            if not _utter_output_file_attachment(
+                dispatcher,
+                result,
+                title="Master databook (reconciliation tables)",
+                tracker=tracker,
+            ):
+                dispatcher.utter_message(
+                    text="Reconciliation tables have been added to the master databook."
+                )
+            master_path = _master_path_from_result(result, tracker)
+            if master_path:
+                events.append(SlotSet("db_master_workbook_path", master_path))
+            _utter_databook_next_step_card(dispatcher)
+        else:
+            dispatcher.utter_message(
+                text=f"Reconciliation pipeline error: {result.get('message', 'Unknown error')}"
+            )
+            _utter_databook_fs_gate_card(dispatcher)
+        return events
+
+
+class ActionProcessDatabookNextStep(Action):
+    def name(self) -> str:
+        return "action_process_databook_next_step"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("db_next_step") or "").strip().lower()
+        events = [SlotSet("db_next_step", choice)]
+        if choice == "apply_adjustments":
+            dispatcher.utter_message(text="Apply adjustments — coming soon.")
+        elif choice == "ingest_fs":
+            dispatcher.utter_message(text="Ingest financial statements — coming soon.")
+        elif choice == "more_tables":
+            dispatcher.utter_message(text="Generate further databook tables — coming soon.")
+        elif choice == "revenue_databook":
+            dispatcher.utter_message(response="utter_ask_build_databook")
+        else:
+            dispatcher.utter_message(text="Please choose one of the listed options.")
+            _utter_databook_next_step_card(dispatcher)
         return events
 
 

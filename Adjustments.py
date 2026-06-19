@@ -6,7 +6,7 @@ Expects:
 - master_path: existing SuSa master after consolidation (in-place update)
 - adjustments_path: uploaded template (sheet 'Adjustments', meta + FY columns)
 
-The master must already contain L5; this script does not add columns.
+The master must already contain L5 and L6; this script does not add columns.
 """
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ TEXT_COLS = {
     "L3",
     "L4",
     "L5",
+    "L6",
 }
 
 MONTH_RE = re.compile(
@@ -96,8 +97,8 @@ def get_table_col_limit(ws) -> int:
 def get_required_col(ws, header_name: str) -> int:
     """
     Return the column index of an existing header.
-    This script no longer inserts L5 itself. The master creation logic must
-    already provide the L5 column.
+    This script no longer inserts L5/L6 itself. The master creation logic must
+    already provide the L5 and L6 columns.
     """
     for c in range(1, ws.max_column + 1):
         if ws.cell(1, c).value == header_name:
@@ -108,15 +109,15 @@ def get_required_col(ws, header_name: str) -> int:
     )
 
 
-def get_format_limit_col(ws, l5_col=None) -> int:
+def get_format_limit_col(ws, l6_col=None) -> int:
     """
     Rightmost column to paint white / purple backgrounds.
     Matches Consolidation.py and the SuSa master canvas extension.
     """
     table = get_table_col_limit(ws)
     limit = min(max(ws.max_column, table), table + CANVAS_EXTRA_COLS)
-    if l5_col is not None:
-        limit = max(limit, l5_col)
+    if l6_col is not None:
+        limit = max(limit, l6_col)
     return limit
 
 
@@ -142,11 +143,11 @@ def fy_columns_from_df(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if isinstance(c, str) and FY_RE.fullmatch(c.strip())]
 
 
-def apply_header_style(ws, l5_col=None):
+def apply_header_style(ws, l6_col=None):
     """
     Header format: #F2F2F2, bold, bottom border, GT Walsheim LC Light 8.
     """
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         cell = ws.cell(1, c)
         cell.fill = HEADER_FILL
@@ -169,13 +170,13 @@ def _style_data_cell(cell, header):
             cell.number_format = FMT_AMOUNT
 
 
-def write_df(ws, start_row, df, l5_col=None):
+def write_df(ws, start_row, df, l6_col=None):
     header_map = {
         ws.cell(1, c).value: c
         for c in range(1, ws.max_column + 1)
         if ws.cell(1, c).value is not None
     }
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
 
     for i, (_, row) in enumerate(df.iterrows()):
         r = start_row + i
@@ -195,18 +196,18 @@ def write_df(ws, start_row, df, l5_col=None):
                 _style_data_cell(cell, header)
 
 
-def fill_single_white_row_to_limit(ws, row, l5_col=None):
+def fill_single_white_row_to_limit(ws, row, l6_col=None):
     """
     Fill one row white across the relevant table area, including L5.
     """
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         cell = ws.cell(row, c)
         cell.fill = WHITE_FILL
         cell.font = BASE_FONT
 
 
-def fill_block_white_to_limit(ws, start_row, end_row, l5_col=None):
+def fill_block_white_to_limit(ws, start_row, end_row, l6_col=None):
     """
     Fill the complete adjustment block white across the relevant table area,
     not only cells with values.
@@ -214,7 +215,7 @@ def fill_block_white_to_limit(ws, start_row, end_row, l5_col=None):
     if end_row < start_row:
         return
 
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for r in range(start_row, end_row + 1):
         for c in range(1, limit + 1):
             cell = ws.cell(r, c)
@@ -222,8 +223,8 @@ def fill_block_white_to_limit(ws, start_row, end_row, l5_col=None):
             cell.font = BASE_FONT
 
 
-def add_adjustment_header(ws, row, l5_col=None):
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+def add_adjustment_header(ws, row, l6_col=None):
+    limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):
         cell = ws.cell(row, c)
         cell.fill = PURPLE_FILL
@@ -308,7 +309,8 @@ def _prepare_adj_pl(
         raise ValueError("Adjustment input must contain 'L1' or 'L1 - BS/PL'.")
 
     adj_pl["L1 - BS/PL"] = "PL"
-    adj_pl["L5"] = "Adjusted"
+    adj_pl["L5"] = ""
+    adj_pl["L6"] = "Adjusted"
 
     result = adj_pl.reindex(columns=[
         "Entity",
@@ -319,6 +321,7 @@ def _prepare_adj_pl(
         "L3",
         "L4",
         "L5",
+        "L6",
     ] + fy_cols)
     return scale_to_keur(result, fy_cols, enabled=scale_to_keur_enabled)
 
@@ -351,8 +354,9 @@ def run(config: dict) -> None:
 
     cons_header_row, cons_start, cons_end = find_consolidation_block(ws, old_total)
 
-    l5_col = get_required_col(ws, "L5")
-    apply_header_style(ws, l5_col=l5_col)
+    get_required_col(ws, "L5")
+    l6_col = get_required_col(ws, "L6")
+    apply_header_style(ws, l6_col=l6_col)
 
     reported_end = pl_end
     if cons_header_row is not None:
@@ -361,7 +365,7 @@ def run(config: dict) -> None:
             reported_end = pl_end
 
     for r in range(pl_start, reported_end + 1):
-        cell = ws.cell(r, l5_col)
+        cell = ws.cell(r, l6_col)
         if cell.value in (None, ""):
             cell.value = "Reported"
         cell.font = BASE_FONT
@@ -371,7 +375,7 @@ def run(config: dict) -> None:
     ws.delete_rows(old_total, 1)
     insert_row = old_total
 
-    fill_single_white_row_to_limit(ws, insert_row - 1, l5_col=l5_col)
+    fill_single_white_row_to_limit(ws, insert_row - 1, l6_col=l6_col)
 
     adj_pl = _prepare_adj_pl(adj, fy_cols, scale_to_keur_enabled=scale_to_keur_enabled)
     if adj_pl.empty:
@@ -379,18 +383,18 @@ def run(config: dict) -> None:
 
     ws.insert_rows(insert_row, amount=len(adj_pl) + 4)
 
-    add_adjustment_header(ws, insert_row, l5_col=l5_col)
-    fill_single_white_row_to_limit(ws, insert_row + 1, l5_col=l5_col)
+    add_adjustment_header(ws, insert_row, l6_col=l6_col)
+    fill_single_white_row_to_limit(ws, insert_row + 1, l6_col=l6_col)
 
     adj_start = insert_row + 2
-    write_df(ws, adj_start, adj_pl, l5_col=l5_col)
+    write_df(ws, adj_start, adj_pl, l6_col=l6_col)
     adj_end = adj_start + len(adj_pl) - 1
 
-    fill_single_white_row_to_limit(ws, adj_end + 1, l5_col=l5_col)
-    fill_block_white_to_limit(ws, adj_start, adj_end, l5_col=l5_col)
+    fill_single_white_row_to_limit(ws, adj_end + 1, l6_col=l6_col)
+    fill_block_white_to_limit(ws, adj_start, adj_end, l6_col=l6_col)
 
     for r in range(adj_start, adj_end + 1):
-        cell = ws.cell(r, l5_col, "Adjusted")
+        cell = ws.cell(r, l6_col, "Adjusted")
         cell.font = BASE_FONT
         cell.fill = WHITE_FILL
         cell.alignment = Alignment(horizontal="left", vertical="center")
@@ -398,7 +402,7 @@ def run(config: dict) -> None:
     total_row = adj_end + 2
     ws.cell(total_row, 1, "Total PL").font = BASE_FONT
 
-    limit = get_format_limit_col(ws, l5_col=l5_col)
+    limit = get_format_limit_col(ws, l6_col=l6_col)
 
     for c in range(1, limit + 1):
         cell = ws.cell(total_row, c)

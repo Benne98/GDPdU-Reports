@@ -186,3 +186,104 @@ def apply_zero_row_conditional_formatting(
         start_cell = f"{get_column_letter(start_c)}{first_row}"
         end_cell = f"{get_column_letter(end_c)}{last_row}"
         ws.conditional_formatting.add(f"{start_cell}:{end_cell}", rule)
+
+
+def apply_recon_portfolio_layout(
+    ws,
+    *,
+    blocks: list[dict],
+    pos_col: int,
+    header_row: int,
+    block_title_row: int,
+    entity_code_row: int,
+    last_used_col: int,
+    spacer_cols: set[int],
+    visible_block_kinds: frozenset[str] | None = None,
+    collapsed_poscol_keys: tuple[str, ...] = ("Difference", "Financial statements"),
+) -> None:
+    """
+    Column grouping, header bands and entity block titles — aligned with BS_Bucket.py.
+
+    Presentation only: collapsed helper columns (E–I), entity portfolios grouped with
+    white spacer separators, Consolidation/Difference/FS blocks always expanded.
+    """
+    from openpyxl.utils import get_column_letter
+
+    visible = visible_block_kinds or frozenset({"consolidation", "difference", "fs"})
+
+    ws.sheet_view.showOutlineSymbols = True
+    ws.sheet_properties.outlinePr.summaryBelow = True
+    ws.sheet_properties.outlinePr.applyStyles = True
+
+    left_group_end = pos_col - 1
+    for cc in range(1, left_group_end + 1):
+        col = get_column_letter(cc)
+        ws.column_dimensions[col].outlineLevel = 2
+        ws.column_dimensions[col].hidden = True
+    if left_group_end >= 1:
+        ws.column_dimensions[get_column_letter(left_group_end)].collapsed = True
+
+    pos_letter = get_column_letter(pos_col)
+    ws.column_dimensions[pos_letter].outlineLevel = 0
+    ws.column_dimensions[pos_letter].hidden = False
+
+    ws.row_dimensions[entity_code_row].outlineLevel = 2
+    ws.row_dimensions[entity_code_row].hidden = True
+
+    for b in blocks:
+        c_first = b["startcol"]
+        c_last = b["spacer_col"]
+        kind = str(b.get("kind") or "")
+
+        if kind in visible:
+            for cc in range(c_first, c_last + 1):
+                col = get_column_letter(cc)
+                ws.column_dimensions[col].outlineLevel = 0
+                ws.column_dimensions[col].hidden = False
+            continue
+
+        for cc in range(c_first, c_last + 1):
+            col = get_column_letter(cc)
+            ws.column_dimensions[col].outlineLevel = 1
+            ws.column_dimensions[col].hidden = False
+        ws.column_dimensions[get_column_letter(c_last)].collapsed = True
+
+    for b in blocks:
+        key = str(b.get("key") or "")
+        if key not in collapsed_poscol_keys:
+            continue
+        poscol = b.get("poscol")
+        if poscol is None:
+            continue
+        col_l = get_column_letter(poscol)
+        ws.column_dimensions[col_l].outlineLevel = 1
+        ws.column_dimensions[col_l].hidden = True
+        ws.column_dimensions[col_l].collapsed = True
+        for c in range(b["year_startcol"], b["year_endcol"] + 1):
+            c_l = get_column_letter(c)
+            ws.column_dimensions[c_l].outlineLevel = 0
+            ws.column_dimensions[c_l].hidden = False
+
+    for r in (block_title_row, header_row):
+        for cc in range(1, last_used_col + 1):
+            cell = ws.cell(r, cc)
+            if cc in spacer_cols:
+                cell.fill = THEME.fill_white
+            else:
+                cell.fill = THEME.fill_header
+
+    for cc in range(1, last_used_col + 1):
+        if cc in spacer_cols:
+            continue
+        ws.cell(header_row, cc).border = THEME.border_header_bottom
+
+    for b in blocks:
+        if b.get("has_plpos"):
+            title_col = b["year_startcol"]
+            if b.get("poscol"):
+                ws.cell(block_title_row, b["poscol"]).fill = THEME.fill_white
+        else:
+            title_col = b["startcol"]
+        title_cell = ws.cell(block_title_row, title_col)
+        title_cell.font = THEME.font_bold
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")

@@ -34,6 +34,11 @@ def default_pl_mapping_path() -> Path:
     return default_mapping_dir() / PL_FILENAME
 
 
+def finssentials_sibling_mapping_dir() -> Path:
+    """Local dev fallback: ../finssentials/Desktop next to GDPdU-Reports."""
+    return PROJECT_ROOT.parent / "finssentials" / "Desktop"
+
+
 def resolve_susa_kontenmapping_paths(
     config: dict[str, Any] | None = None,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -44,7 +49,8 @@ def resolve_susa_kontenmapping_paths(
       1. config['bs_mapping_path'] / config['pl_mapping_path']
       2. SUSA_BS_MAPPING_PATH / SUSA_PL_MAPPING_PATH env vars
       3. <repo>/Desktop/BS_Kontenmapping.xlsx and PL_Kontenmapping.xlsx
-      4. {output}/mappings/… (legacy)
+      4. ../finssentials/Desktop/ (sibling repo, local dev)
+      5. {output}/mappings/… (legacy)
     """
     cfg = config or {}
     bs = str(cfg.get("bs_mapping_path") or os.environ.get("SUSA_BS_MAPPING_PATH") or "").strip()
@@ -58,6 +64,14 @@ def resolve_susa_kontenmapping_paths(
         candidate = default_pl_mapping_path()
         if candidate.is_file():
             pl = str(candidate)
+
+    sibling = finssentials_sibling_mapping_dir()
+    if not bs and (sibling / BS_FILENAME).is_file():
+        bs = str(sibling / BS_FILENAME)
+        print(f"[INFO] Using BS Kontenmapping from {bs}")
+    if not pl and (sibling / PL_FILENAME).is_file():
+        pl = str(sibling / PL_FILENAME)
+        print(f"[INFO] Using PL Kontenmapping from {pl}")
 
     if not bs or not pl:
         search_dirs: list[Path] = []

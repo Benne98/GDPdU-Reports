@@ -53,6 +53,9 @@ _DEFAULT_META_WIDTHS: dict[str, float] = {
     "L2": 16.0,
     "L3": 36.0,
     "L4": 49.0,
+    "L5": 8.0,
+    "L6": 12.0,
+    "NA": 10.0,
 }
 _DEFAULT_AMOUNT_COL_WIDTH = 13.0
 
@@ -237,10 +240,62 @@ def build_adjustments_template_from_config(config: dict) -> Path:
     )
 
 
+def append_sheet_to_master(
+    master_path: Path,
+    source_path: Path,
+    sheet_name: str,
+) -> None:
+    """Copy a sheet from source workbook into master (replace if exists)."""
+    from copy import copy
+
+    master_wb = load_workbook(master_path)
+    source_wb = load_workbook(source_path)
+    if sheet_name in master_wb.sheetnames:
+        del master_wb[sheet_name]
+    src = source_wb[sheet_name]
+    dest = master_wb.create_sheet(sheet_name)
+    for row in src.iter_rows():
+        for cell in row:
+            dest[cell.coordinate].value = cell.value
+            if cell.has_style:
+                dest[cell.coordinate].font = copy(cell.font)
+                dest[cell.coordinate].fill = copy(cell.fill)
+                dest[cell.coordinate].border = copy(cell.border)
+                dest[cell.coordinate].alignment = copy(cell.alignment)
+                dest[cell.coordinate].number_format = cell.number_format
+    for col, dim in src.column_dimensions.items():
+        dest.column_dimensions[col].width = dim.width
+    master_wb.save(master_path)
+
+
+def load_pl_recon_mapping_df_from_db() -> "pd.DataFrame":
+    """Backend helper: PL recon mapping as DataFrame."""
+    import pandas as pd
+    from recon_mapping_loader import load_pl_recon_mapping_df
+
+    return load_pl_recon_mapping_df({"paths": {"mapping_source": "db"}})
+
+
+def load_bs_recon_mapping_df_from_db() -> "pd.DataFrame":
+    """Backend helper: BS recon mapping as DataFrame."""
+    import pandas as pd
+    from recon_mapping_loader import load_bs_recon_mapping_df
+
+    return load_bs_recon_mapping_df({"paths": {"mapping_source": "db"}})
+
+
 def ensure_pl_mapping_file() -> Path:
-    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-    if PL_MAPPING_TEMPLATE.is_file():
-        return PL_MAPPING_TEMPLATE
+    """Deprecated file fallback; recon pipeline uses DB. Kept for API compatibility."""
+    try:
+        df = load_pl_recon_mapping_df_from_db()
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        out = TEMPLATES_DIR / "pl_recon_mapping_from_db.xlsx"
+        df.to_excel(out, index=False, sheet_name="Mapping")
+        return out
+    except Exception:
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        if PL_MAPPING_TEMPLATE.is_file():
+            return PL_MAPPING_TEMPLATE
     rows = [
         ("Net sales", "Net sales"),
         ("Own work capitalised", "Own work capitalised"),
@@ -291,24 +346,24 @@ def build_consolidation_template(
 
 
 def prepare_master_pl_for_recon(master_path: Path) -> None:
-    """Ensure Master_PL has L5=Reported for rows without section headers."""
+    """Ensure Master_PL has L6=Reported for rows without section headers."""
     wb = load_workbook(master_path)
     if "Master_PL" not in wb.sheetnames:
         return
     ws = wb["Master_PL"]
     headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-    if "L5" not in headers:
-        l5_col = ws.max_column + 1
-        ws.cell(1, l5_col, "L5")
+    if "L6" not in headers:
+        l6_col = ws.max_column + 1
+        ws.cell(1, l6_col, "L6")
     else:
-        l5_col = headers["L5"]
+        l6_col = headers["L6"]
     skip_labels = {"Consolidation", "Total PL", "Adjustments", "Check"}
     for r in range(2, ws.max_row + 1):
         label = ws.cell(r, 1).value
         if label in skip_labels:
             continue
-        if ws.cell(r, l5_col).value in (None, ""):
-            ws.cell(r, l5_col, "Reported")
+        if ws.cell(r, l6_col).value in (None, ""):
+            ws.cell(r, l6_col, "Reported")
     wb.save(master_path)
 
 

@@ -729,6 +729,16 @@ slots:
     mappings:
       - type: custom
 
+  db_fs_ingest_now:
+    type: text
+    mappings:
+      - type: custom
+
+  db_next_step:
+    type: text
+    mappings:
+      - type: custom
+
 # ─── Responses ────────────────────────────────────────────────────────────────
 
 responses:
