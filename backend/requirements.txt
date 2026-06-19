@@ -1,0 +1,24 @@
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+SQLAlchemy==2.0.*
+psycopg2-binary==2.9.*
+alembic==1.14.*
+pydantic==2.*
+pydantic-settings==2.*
+passlib==1.7.*
+bcrypt==4.0.1        # pinned: passlib 1.7.x is incompatible with bcrypt >= 4.1
+python-jose[cryptography]==3.3.*
+python-multipart==0.0.*
+
+# Data / ETL (P1)
+pandas==2.2.*
+numpy>=1.26,<3
+openpyxl==3.1.*
+
+# Tests
+pytest==8.*
+httpx==0.28.*       # required by FastAPI TestClient (smoke_ingest.py + DF5 tests)
+
+# FDD script runtime (Mathis stack at repo root)
+matplotlib>=3.8,<4
+requests>=2.31,<3

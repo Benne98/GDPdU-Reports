@@ -1,0 +1,76 @@
+{
+  "title": "Project Apollo",
+  "table": "Sales by product groups",
+  "company": "Sonoro GmbH",
+  "subtitle_suffix": "Product sales (gross), GP and GM by product groups",
+
+  "file_path": "C:\\Users\\mmarx\\Grant Thornton Germany\\Data Operations - Dokumente\\Chatbot technischer Ordner\\Work\\20260323-204055_73577357\\Database_Sonoro.xlsx",
+  "output_file_path": "C:\\Users\\mmarx\\Grant Thornton Germany\\Data Operations - Dokumente\\Projekt Mathis\\Test-Daten\\Auswertungen\\GST",
+  "case_id": "20260323-172356_83b31867-cf07-40f5-a364-9988772a5d10",
+  "run_id": "20260323-172356_83b31867-cf07-40f5-a364-9988772a5d10",
+  "base_sheet_name": "General sales table",
+  "total_label": "Gross sales / GP / GM",
+
+  "invoice_mapping_mode": "date",
+  "calc_mode": "invoice",
+  "profit_mode": "cost",
+  "invoice_col": "Invoice date",
+  "start_col": "Contract Start",
+  "end_col": "Contract End",
+
+  "value_cols": {
+    "revenue": "Revenue",
+    "cost": "Einstandspreis Gesamt",
+    "profit": "Gross profit FY25A"
+  },
+
+  "group_cols": ["Segment", "Core products IM", "Product group new"],
+
+  "first_fy": 2020,
+  "current_year": 2025,
+  "current_month": 3,
+  "fiscal_year_end_month": 7,
+  "fiscal_year_end_day": 31,
+
+  "show_ytd": true,
+  "show_ltm": true,
+  "show_ytd_delta": true,
+  "show_ltm_delta": true,
+  "show_ytd_cagr": true,
+  "show_ltm_cagr": true,
+
+  "show_revenue": true,
+  "show_gp": true,
+  "show_gm": true,
+
+  "sort_mode": "FY_LAST",
+
+  "reported_numbers": {
+    "sales": {
+      "fy": [20364042.31, 21952051.8, 24204822.95]
+    },
+    "profit": {
+      "fy": [10300605.95, 11403744.89, 13443363.07]
+    }
+  },
+
+  "hierarchy_limits": {
+    "level_1": {
+      "max_items": 13,
+      "other_label": "Miscellaneous"
+    },
+    "level_2": {
+      "max_items": 8,
+      "other_label": "Miscellaneous"
+    },
+    "level_3": {
+      "max_items": 5,
+      "other_label": "Miscellaneous"
+    }
+  },
+
+  "filters": {
+    "enabled": false,
+    "rules": []
+  }
+}

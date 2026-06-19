@@ -1,0 +1,42 @@
+version: "3.1"
+
+rules:
+
+  # ─── Greeting ──────────────────────────────────────────────────────────────
+
+  - rule: Start conversation on greet
+    steps:
+      - intent: greet
+      - action: action_set_session_id
+      - action: utter_greet
+      - action: utter_main_welcome
+
+  # ─── Reset ─────────────────────────────────────────────────────────────────
+
+  - rule: Reset all slots and restart
+    steps:
+      - intent: reset
+      - action: action_reset_all_slots
+      - action: action_set_session_id
+      - action: utter_reset_confirm
+      - action: utter_main_welcome
+
+  # ─── All card submissions → single dispatcher ──────────────────────────────
+  # The dispatcher action reads payload.card and routes internally.
+
+  - rule: Handle any card submission
+    steps:
+      - intent: submit_card
+      - action: action_dispatch_card
+
+  - rule: Undo to checkpoint
+    steps:
+      - intent: undo_to_checkpoint
+      - action: action_undo_to_checkpoint
+
+  # ─── Fallback ───────────────────────────────────────────────────────────────
+
+  - rule: Fallback to default
+    steps:
+      - intent: nlu_fallback
+      - action: action_nlu_fallback_dispatch

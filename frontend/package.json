@@ -1,0 +1,41 @@
+{
+  "name": "finssentials-gdpdu-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:test": "vite --mode test",
+    "dev:fdd-merge": "vite --mode fdd-merge",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@types/leaflet": "^1.9.21",
+    "exceljs": "^4.4.0",
+    "framer-motion": "^11.18.2",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.400.0",
+    "pptxgenjs": "^4.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-leaflet": "^4.2.1",
+    "react-router-dom": "^6.26.2",
+    "recharts": "^2.15.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.13",
+    "@types/node": "^25.9.3",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "playwright": "^1.60.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.8"
+  }
+}

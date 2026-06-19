@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+!**/.env.fdd-merge.example
+frontend/scripts/.parity-token
+
+# Data / uploads
+uploads/
+*.xlsx
+*.csv
+*.parquet
+!etl/source_data/partner_masters/*.csv
+!**/templates/**/*.xlsx
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Rasa trained models (local only)
+rasa/models/
+.rasa/

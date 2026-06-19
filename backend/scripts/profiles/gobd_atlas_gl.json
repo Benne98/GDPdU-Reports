@@ -1,0 +1,24 @@
+{
+  "entity": {"mode": "column", "value": "Entity No"},
+  "fiscal_year": {"mode": "from_date", "value": null},
+  "sign": {"mode": "signed", "amount": "Amount"},
+  "decimal": ".",
+  "thousands": null,
+  "date_dayfirst": true,
+  "columns": {
+    "journal_entry_number": "Transaction number",
+    "account_number": "Account number",
+    "vat_amount": "VAT amount",
+    "line_note": "Booking text",
+    "posting_type": "Posting type",
+    "posting_date": "Posting date",
+    "document_date": "Document date",
+    "document_type": "Document type",
+    "reference_document_number": "Document number",
+    "source_type": "Source type",
+    "source_no": "Source No."
+  },
+  "linking_strategy": "txn",
+  "entry_type": "actual",
+  "source_system": "decidra_gobd"
+}

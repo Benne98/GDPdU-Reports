@@ -1,0 +1,89 @@
+version: "3.1"
+
+nlu:
+  - intent: greet
+    examples: |
+      - /greet
+      - hello
+      - hi
+      - hey
+      - good morning
+      - good afternoon
+      - start
+      - begin
+      - let's start
+
+  - intent: affirm
+    examples: |
+      - yes
+      - yeah
+      - yep
+      - sure
+      - correct
+      - that's right
+      - absolutely
+      - proceed
+      - ok
+      - okay
+      - confirm
+
+  - intent: deny
+    examples: |
+      - no
+      - nope
+      - not really
+      - don't think so
+      - negative
+      - cancel
+      - skip
+
+  - intent: reset
+    examples: |
+      - reset
+      - start over
+      - restart
+      - begin again
+      - clear everything
+      - reset all
+      - new session
+      - I want to start fresh
+      - reset the bot
+      - clear conversation
+
+  - intent: undo_to_checkpoint
+    examples: |
+      - /undo_to_checkpoint{"slots": {}, "next_action": "action_navigate_folders"}
+      - /undo_to_checkpoint{"slots": {"first_fy": 2020}, "next_action": "action_ask_sheet_name"}
+
+  - intent: submit_card
+    examples: |
+      - /submit_card[{"card_payload": "{}"}]
+      - __card_submit__
+      - /submit_card{"card_payload": {"card": "folder_select", "base_path": "/tmp", "output_folder": "/tmp"}}
+      - /submit_card{"card_payload": {"card": "dates", "ltm_month": "2025-06", "fy_end_month": "12", "fy_end_day": 31, "first_fy": 2020}}
+      - /submit_card{"card_payload": {"card": "main_welcome", "project_name": "X", "group_name": "Y"}}
+      - /submit_card{"card_payload": {"card": "gst_proceed"}}
+      - /submit_card{"card_payload": {"card": "file_upload", "sheet_name": "Sales"}}
+      - /submit_card{"card_payload": {"card": "reuse_sales_file", "reuse": true}}
+      - /submit_card{"card_payload": {"card": "desired_output", "desired_output": "general_sales_table"}}
+      - /submit_card{"card_payload": {"card": "gst_invoice_mode", "gst_invoice_mapping_mode": "date"}}
+      - /submit_card{"card_payload": {"card": "gst_calc_mode", "gst_calc_mode": "accrual"}}
+      - /submit_card{"card_payload": {"card": "gst_columns", "gst_revenue_col": "Amount", "gst_invoice_col": "Date"}}
+      - /submit_card{"card_payload": {"card": "gst_groups", "gst_group_col_1": "Product"}}
+      - /submit_card{"card_payload": {"card": "gst_limits", "gst_max_items_l1": 10}}
+      - /submit_card{"card_payload": {"card": "gst_periods", "gst_show_ytd": true}}
+      - /submit_card{"card_payload": {"card": "gst_metrics", "gst_show_gp": true}}
+      - /submit_card{"card_payload": {"card": "gst_sort", "gst_sort_mode": "FY_LAST"}}
+      - /submit_card{"card_payload": {"card": "gst_filter_checkpoint", "gst_filter_manage_choice": "keep"}}
+      - /submit_card{"card_payload": {"card": "pvm_filter_checkpoint", "pvm_filter_manage_choice": "keep"}}
+      - /submit_card{"card_payload": {"card": "pvm_filter_checkpoint", "pvm_filter_manage_choice": "add_rule"}}
+      - /submit_card{"card_payload": {"card": "top_filter_checkpoint", "top_filter_manage_choice": "add_rule"}}
+      - /submit_card{"card_payload": {"card": "filter_rule", "col": "Region", "op": "eq", "value": "EU"}}
+      - /submit_card{"card_payload": {"card": "filter_rule", "col": "Amount", "op": "gte", "value": "1000"}}
+      - /submit_card{"card_payload": {"card": "fx_col_select", "fx_col": "EUR"}}
+      - /submit_card{"card_payload": {"card": "pvm_labels", "pvm_total_label_revenue": "Gross sales", "pvm_total_label_cost": "Cost of materials", "pvm_total_label_gp": "Gross profit", "pvm_sort_by_bridge": "revenue", "pvm_first_fy_override": 2021}}
+      - /submit_card{"card_payload": {"card": "pvm_proceed", "project_name": "P", "group_name": "G", "pvm_period_mode": "FY", "pvm_first_fy_override": 2021}}
+      - /submit_card{"card_payload": {"card": "top_proceed"}}
+      - /submit_card{"card_payload": {"card": "next_action", "next_action": "change_filters"}}
+      - /submit_card{"card_payload": {"card": "gst_proceed", "project_name": "P", "group_name": "G", "gst_calc_mode": "invoice"}}
+      - /submit_card{"card_payload": {"card": "gst_proceed", "gst_revenue_col": "Net", "gst_invoice_col": "InvoiceDate", "gst_group_col_1": "SKU"}}

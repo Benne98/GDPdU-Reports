@@ -1,0 +1,1927 @@
+"""
+FDD Bot FastAPI router.
+
+Endpoints:
+  POST /api/v1/fdd/upload             — receive XLSX, save to disk, return file_id + headers
+  GET  /api/v1/fdd/headers/{file_id}  — extract column headers from an uploaded XLSX
+  GET  /api/v1/fdd/folders            — list immediate subdirectories at a given path
+  POST /api/v1/fdd/run/gst            — execute general_sales_table_MM_verformelt.py (sync)
+  POST /api/v1/fdd/run/gst/async      — start GST in background; poll GET /run/status
+  POST /api/v1/fdd/run/pvm            — execute pvm_verformelt.py
+  POST /api/v1/fdd/run/pvm/async      — start PVM in background
+  POST /api/v1/fdd/run/top            — execute top-report script
+  POST /api/v1/fdd/run/top/async      — start TOP in background
+  POST /api/v1/fdd/run/bubble/async   — start bubble scatter in background
+  GET  /api/v1/fdd/run/status         — poll async job status (running | done | failed)
+  POST /api/v1/fdd/run/databook       — orchestrate Databook scripts
+  POST /api/v1/fdd/run/databook/susa  — execute SuSabyYear.py
+  GET  /api/v1/fdd/templates/{name}   — return a template XLSX for download
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+import pandas as pd
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, field_validator
+
+router = APIRouter(prefix="/api/v1/fdd", tags=["fdd-bot"])
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+# Repo root (backend/app/routers → four levels up)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+BACKEND_ROOT = PROJECT_ROOT / "backend"
+
+# SuSabyYear + susa_column_mapping live at repo root (same as script cwd).
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+# Uploaded files live here: uploads/{session_id}/{file_id}_{filename}
+UPLOAD_DIR = PROJECT_ROOT / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Python interpreter used to run analytical scripts (see _script_python())
+
+# Script paths relative to PROJECT_ROOT
+SCRIPTS: dict[str, Path] = {
+    "gst": PROJECT_ROOT / "general_sales_table_MM_verformelt.py",
+    "pvm": PROJECT_ROOT / "pvm_verformelt.py",
+    "top": PROJECT_ROOT / "top_report.py",
+    "bubble": PROJECT_ROOT / "bubblescatterplot.py",
+    "susa": PROJECT_ROOT / "SuSabyYear.py",
+    "consolidation": PROJECT_ROOT / "Consolidation.py",
+    "consolidation_template": PROJECT_ROOT / "consolidation_template.py",
+    "adjustments": PROJECT_ROOT / "Adjustments.py",
+    "adjustments_template": PROJECT_ROOT / "adjustments_template.py",
+    "pdf_recon": PROJECT_ROOT / "PDF_Extraction_recon.py",
+    "pdf_adjusted": PROJECT_ROOT / "PDF_Extraction_adjustments.py",
+    "pdf_checked": PROJECT_ROOT / "PDF_Extraction_checked.py",
+    "lead_is": PROJECT_ROOT / "Lead_IS.py",
+    "recon_pl": PROJECT_ROOT / "Recon_tables_PL_MM.py",
+}
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+SCRIPT_RUN_TIMEOUT_SEC = 900
+SCRIPT_ASYNC_TIMEOUT_SEC = 7200
+
+
+def _resolve_output_folder(raw: str | None, session_id: str) -> str:
+    """Normalize output folder from bot slot/config to an absolute writable path."""
+    if not raw or not str(raw).strip():
+        out = _session_dir(session_id) / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        return str(out.resolve())
+    text = str(raw).strip()
+    p = Path(text).expanduser()
+    if not p.is_absolute():
+        # Bare names like "Desktop" must not resolve against the repo cwd.
+        if text.lower() in ("desktop", "documents", "downloads"):
+            p = Path.home() / text
+        else:
+            p = (PROJECT_ROOT / p).resolve()
+    else:
+        p = p.resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p)
+
+
+def _script_python() -> str:
+    """Prefer backend/.venv for repo scripts (PDF extraction deps live there)."""
+    candidates = [
+        BACKEND_ROOT / ".venv" / "bin" / "python",
+        BACKEND_ROOT / ".venv" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
+PYTHON = _script_python()
+
+
+def _check_module(python_exe: str, module: str) -> bool:
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", f"import {module}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _script_subprocess_env() -> dict:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(BACKEND_ROOT / ".env")
+    except ImportError:
+        pass
+
+    env = os.environ.copy()
+    scripts_dir = str(PROJECT_ROOT / "scripts")
+    existing_path = env.get("PYTHONPATH", "")
+    if scripts_dir not in existing_path.split(os.pathsep):
+        env["PYTHONPATH"] = (
+            f"{scripts_dir}{os.pathsep}{existing_path}" if existing_path else scripts_dir
+        )
+    return env
+
+
+def _run_status_path(session_id: str, run_id: str) -> Path:
+    return _run_dir(session_id, run_id) / "status.json"
+
+
+def _write_run_status(session_id: str, run_id: str, data: dict) -> None:
+    path = _run_status_path(session_id, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_run_status(session_id: str, run_id: str) -> dict | None:
+    path = _run_status_path(session_id, run_id)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _resolve_output_files(session_id: str, config: dict, output_folder: str) -> tuple[str | None, str | None]:
+    explicit_out = str(config.get("output_path") or "").strip()
+    if explicit_out and os.path.isfile(explicit_out):
+        return explicit_out, os.path.basename(explicit_out)
+    output_file = os.path.join(output_folder, f"{session_id}_Output.xlsx")
+    if os.path.isfile(output_file):
+        return output_file, os.path.basename(output_file)
+    return None, None
+
+
+def _run_script(script: Path, config_path: Path, timeout: int = SCRIPT_RUN_TIMEOUT_SEC) -> dict:
+    """Run a Python analytical script with a JSON config path as first argument."""
+    if not script.exists():
+        return {"success": False, "message": f"Script not found: {script}"}
+
+    env = _script_subprocess_env()
+    script_python = _script_python()
+
+    if script.name.startswith("PDF_Extraction") and not _check_module(script_python, "anthropic"):
+        msg = (
+            f"Missing Python package 'anthropic' for {script_python}. "
+            f"Install with: {script_python} -m pip install -r scripts/requirements_pdf_extraction.txt"
+        )
+        return {"success": False, "message": msg}
+
+    try:
+        result = subprocess.run(
+            [script_python, str(script), str(config_path)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "message": f"Script timed out after {timeout}s ({script.name}). "
+            "Try fewer periods/metrics or a smaller file.",
+            "timed_out": True,
+        }
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        message = _clean_script_error_message(stderr, stdout)
+        return {
+            "success": False,
+            "message": message,
+        }
+    return {"success": True, "message": result.stdout.strip()}
+
+
+def _clean_script_error_message(stderr: str, stdout: str) -> str:
+    """Prefer concise user-facing errors over noisy subprocess output."""
+    combined = "\n".join(part for part in (stderr, stdout) if part).strip()
+    for line in reversed(combined.splitlines()):
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("Anthropic API"):
+            return text
+        if "ValueError:" in text:
+            return text.split("ValueError:", 1)[-1].strip()
+    # Drop pymupdf progress-bar backspace noise
+    cleaned = re.sub(r".\x08", "", combined)
+    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", cleaned)
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if line.startswith("Traceback"):
+            break
+        if "Error" in line or "error" in line.lower():
+            return line
+    return lines[-1] if lines else "Script exited with non-zero code"
+
+
+def _make_run_id(prefix: str = "") -> str:
+    now = datetime.now().strftime("%Y%m%d-%H%M%S")
+    short = str(uuid.uuid4())[:8]
+    return f"{prefix}{now}_{short}" if prefix else f"{now}_{short}"
+
+
+def _session_dir(session_id: str) -> Path:
+    d = UPLOAD_DIR / session_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _run_dir(session_id: str, run_id: str) -> Path:
+    d = _session_dir(session_id) / "runs" / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _file_path_for_id(session_id: str, file_id: str) -> Optional[Path]:
+    sess = _session_dir(session_id)
+    for f in sess.iterdir():
+        if f.is_file() and f.stem.startswith(file_id):
+            return f
+    # Legacy trackers may still pass an old session_id slot while uploads use REST sender_id.
+    for sub in UPLOAD_DIR.iterdir():
+        if not sub.is_dir() or sub.name == session_id:
+            continue
+        for f in sub.iterdir():
+            if f.is_file() and f.stem.startswith(file_id):
+                logger.warning(
+                    "fdd: file_id=%s found under session %s (requested %s)",
+                    file_id,
+                    sub.name,
+                    session_id,
+                )
+                return f
+    return None
+
+
+def _resolve_entity_file_paths(session_id: str, entity_files: list[Any]) -> list[str]:
+    """
+    Build absolute paths for Databook scripts.
+    Accepts plain paths (str) and Rasa /submit_card dicts: {name, file_id, year, ...}.
+    """
+    out: list[str] = []
+    for item in entity_files or []:
+        if isinstance(item, str):
+            p = Path(item)
+            if p.is_file():
+                out.append(str(p.resolve()))
+                continue
+            resolved = _file_path_for_id(session_id, item)
+            if resolved:
+                out.append(str(resolved))
+        elif isinstance(item, dict):
+            fids = item.get("file_ids")
+            if isinstance(fids, list) and fids:
+                for fid in fids:
+                    resolved = _file_path_for_id(session_id, str(fid))
+                    if resolved:
+                        out.append(str(resolved))
+                continue
+            fid = item.get("file_id")
+            if not fid:
+                continue
+            resolved = _file_path_for_id(session_id, str(fid))
+            if resolved:
+                out.append(str(resolved))
+    return out
+
+
+class EntityYearFileGroup(BaseModel):
+    """One grid cell: one entity × one fiscal year × one or many uploaded workbooks."""
+
+    entity_index: int = 0
+    entity_name: str = ""
+    fy_label: str = ""
+    file_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("entity_index", mode="before")
+    @classmethod
+    def _coerce_entity_index(cls, v: Any) -> int:
+        if v is None or v == "":
+            return 0
+        return int(float(v))
+
+
+def _fy_calendar_year_from_label(fy_label: str) -> int:
+    m = re.search(r"(19|20)\d{2}", str(fy_label))
+    if not m:
+        raise ValueError(f"Cannot parse calendar year from fy_label: {fy_label!r}")
+    return int(m.group(0))
+
+
+def _resolve_entity_year_files_for_susa(session_id: str, groups: list[EntityYearFileGroup]) -> list[dict[str, Any]]:
+    """Resolve upload file_ids to absolute paths per grid cell."""
+    resolved: list[dict[str, Any]] = []
+    for g in groups:
+        paths: list[str] = []
+        for fid in g.file_ids:
+            p = _file_path_for_id(session_id, str(fid))
+            if p:
+                paths.append(str(p.resolve()))
+        if not paths:
+            continue
+        try:
+            year = _fy_calendar_year_from_label(g.fy_label)
+        except ValueError:
+            year = 0
+        resolved.append(
+            {
+                "entity_index": g.entity_index,
+                "entity_name": g.entity_name,
+                "fy_label": g.fy_label,
+                "year": year,
+                "paths": paths,
+                "file_ids": list(g.file_ids),
+            }
+        )
+    return resolved
+
+
+def _default_susa_workbook_config() -> dict[str, Any]:
+    return {
+        "columns": {
+            "Account": "A",
+            "Account description": "B",
+            "Balance": "P",
+            "S": "G",
+            "H": "H",
+            "Month": "C",
+        },
+        "output_sheet_name": "Master",
+        "extensions": [".xlsx", ".xlsm"],
+        "check_tolerance": 0.001,
+        "check_row_label": "Check",
+        "scale_to_keur": True,
+        "canvas_extra_cols": 20,
+        "canvas_extra_rows_below_check": 200,
+    }
+
+
+def _list_workbook_sheets(path: Path) -> list[str]:
+    """Return visible sheet names using openpyxl (read-only)."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(filename=str(path), read_only=True, data_only=True)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
+def _normalize_header_cells(raw: list[str]) -> list[str]:
+    """Drop blank / default Unnamed columns from pandas header row."""
+    out: list[str] = []
+    for cell in raw:
+        s = str(cell).strip()
+        if not s:
+            continue
+        if s.lower().startswith("unnamed"):
+            continue
+        out.append(s)
+    return out
+
+
+def _resolve_sheet_name(requested: Optional[str], sheets: list[str]) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """
+    Pick the worksheet to read. Returns (resolved_name, error_detail).
+    error_detail matches the JSON shape used in HTTP 422 responses.
+    """
+    if not sheets:
+        return None, {
+            "step": "NO_SHEETS",
+            "user_message": "The workbook has no readable worksheets.",
+            "available_sheets": [],
+        }
+    if requested is None or not str(requested).strip():
+        logger.info("fdd.headers: no sheet_name provided; using first sheet %r", sheets[0])
+        return sheets[0], None
+    req = str(requested).strip()
+    if req in sheets:
+        return req, None
+    req_lower = req.lower().replace("\u00a0", " ")
+    for s in sheets:
+        if s.lower().replace("\u00a0", " ") == req_lower:
+            logger.info("fdd.headers: matched sheet case-insensitively %r -> %r", req, s)
+            return s, None
+    logger.warning("fdd.headers: sheet not found requested=%r available=%s", req, sheets)
+    return None, {
+        "step": "SHEET_NOT_FOUND",
+        "user_message": (
+            f"The sheet «{req}» was not found. Use one of the tab names listed under "
+            f"available_sheets (check spaces and special characters)."
+        ),
+        "requested": req,
+        "available_sheets": sheets,
+    }
+
+
+def _read_excel_headers(path: Path, resolved_sheet: str) -> tuple[list[str], Optional[dict[str, Any]]]:
+    """Read the first row as column headers via pandas + openpyxl."""
+    try:
+        df = pd.read_excel(
+            path,
+            sheet_name=resolved_sheet,
+            nrows=0,
+            engine="openpyxl",
+        )
+        raw = [str(c) for c in df.columns.astype(str)]
+    except Exception as exc:
+        logger.exception("fdd.headers: pandas read failed path=%s sheet=%s", path, resolved_sheet)
+        return [], {
+            "step": "READ_HEADERS_FAILED",
+            "user_message": f"Pandas could not read the header row: {exc}",
+            "resolved_sheet": resolved_sheet,
+        }
+
+    headers = _normalize_header_cells(raw)
+    if not headers:
+        logger.warning(
+            "fdd.headers: empty header row after normalisation raw=%r sheet=%s",
+            raw[:20],
+            resolved_sheet,
+        )
+        return [], {
+            "step": "EMPTY_HEADER_ROW",
+            "user_message": (
+                "The first row of that sheet has no usable column names "
+                "(blank cells or only default «Unnamed» columns). "
+                "Put headers in row 1 or choose another sheet."
+            ),
+            "resolved_sheet": resolved_sheet,
+            "raw_preview": raw[:40],
+        }
+    return headers, None
+
+
+# ─── File upload ──────────────────────────────────────────────────────────────
+
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+):
+    """
+    Receive an XLSX file, save it to uploads/{session_id}/, and return:
+      - file_id  — short identifier for subsequent calls
+      - file_path — absolute path on disk
+      - headers  — column names from the first sheet (empty list if unreadable)
+      - sheet_names — tab names discovered in the workbook (best-effort)
+      - upload_debug — optional hints when preview read fails
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
+    file_id = str(uuid.uuid4())[:8]
+    dest = _session_dir(session_id) / f"{file_id}_{file.filename}"
+
+    content = await file.read()
+    dest.write_bytes(content)
+
+    sheet_names: list[str] = []
+    upload_debug: dict[str, Any] = {}
+    try:
+        sheet_names = _list_workbook_sheets(dest)
+        logger.info("fdd.upload: file_id=%s sheets=%s", file_id, sheet_names)
+    except Exception as exc:
+        upload_debug["list_sheets_error"] = str(exc)
+        logger.warning("fdd.upload: could not list sheets: %s", exc)
+
+    suffix = dest.suffix.lower()
+    allowed = (".xlsx", ".xlsm", ".xltx", ".xltm", ".pdf")
+    if suffix not in allowed:
+        upload_debug["format_hint"] = (
+            f"File extension is {suffix!r}; allowed: {', '.join(allowed)}."
+        )
+
+    headers: list[str] = []
+    if sheet_names:
+        try:
+            first = sheet_names[0]
+            headers, err = _read_excel_headers(dest, first)
+            if err:
+                upload_debug["preview_headers"] = err.get("step")
+        except Exception as exc:
+            upload_debug["preview_read_error"] = str(exc)
+            logger.warning("fdd.upload: preview header read failed: %s", exc)
+    else:
+        upload_debug["preview_headers"] = "NO_SHEETS"
+
+    return {
+        "file_id": file_id,
+        "file_path": str(dest),
+        "headers": headers,
+        "sheet_names": sheet_names,
+        "upload_debug": upload_debug or None,
+    }
+
+
+# ─── Header extraction ────────────────────────────────────────────────────────
+
+
+@router.get("/headers/{file_id}")
+def get_headers(
+    file_id: str,
+    session_id: str = Query(...),
+    sheet_name: Optional[str] = Query(None),
+):
+    """
+    Extract column headers from a previously uploaded XLSX.
+    If sheet_name is omitted or blank, the first worksheet is used.
+    On failure, returns HTTP 422 with a JSON detail object (step, user_message, …).
+    """
+    matched = _file_path_for_id(session_id, file_id)
+
+    if not matched:
+        logger.warning("fdd.headers: file not found file_id=%s session_id=%s", file_id, session_id)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "step": "FILE_NOT_FOUND",
+                "user_message": (
+                    f"No file matching id «{file_id}» was found for this chat session. "
+                    "Upload the workbook again (session ids must match between upload and header read)."
+                ),
+                "file_id": file_id,
+                "session_id": session_id,
+            },
+        )
+
+    suffix = matched.suffix.lower()
+    if suffix not in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        logger.warning("fdd.headers: unexpected extension %s path=%s", suffix, matched)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "step": "UNSUPPORTED_FORMAT",
+                "user_message": (
+                    f"This endpoint expects a modern Excel file (.xlsx); got {suffix!r}. "
+                    "Re-save as .xlsx or upload a compatible file."
+                ),
+                "path_suffix": suffix,
+            },
+        )
+
+    try:
+        sheets = _list_workbook_sheets(matched)
+    except Exception as exc:
+        logger.exception("fdd.headers: failed to open workbook %s", matched)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "step": "OPEN_WORKBOOK_FAILED",
+                "user_message": f"Could not open the Excel file: {exc}",
+            },
+        )
+
+    resolved, err = _resolve_sheet_name(sheet_name, sheets)
+    if err:
+        raise HTTPException(status_code=422, detail=err)
+    if not resolved:
+        raise HTTPException(
+            status_code=422,
+            detail={"step": "INTERNAL", "user_message": "Could not determine which worksheet to read."},
+        )
+    headers, read_err = _read_excel_headers(matched, resolved)
+    if read_err:
+        read_err["available_sheets"] = sheets
+        raise HTTPException(status_code=422, detail=read_err)
+
+    logger.info("fdd.headers: ok file_id=%s sheet=%s ncols=%s", file_id, resolved, len(headers))
+    return {
+        "headers": headers,
+        "file_path": str(matched),
+        "resolved_sheet": resolved,
+    }
+
+
+# ─── Folder navigation ────────────────────────────────────────────────────────
+
+
+@router.get("/folders")
+def list_folders(path: str = Query(default="")):
+    """
+    List immediate subdirectories at the given path.
+    Returns {"path": ..., "subfolders": [...]} or an error message.
+    """
+    base = Path(path) if path else Path.home()
+
+    if not base.exists():
+        return {"path": str(base), "subfolders": [], "error": "Path does not exist"}
+
+    try:
+        subfolders = sorted(
+            [d.name for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        )
+    except PermissionError:
+        return {"path": str(base), "subfolders": [], "error": "Permission denied"}
+
+    return {"path": str(base), "subfolders": subfolders}
+
+
+def _is_local_fdd_enabled() -> bool:
+    return os.environ.get("FDD_LOCAL", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _pick_folder_native() -> tuple[str, bool]:
+    """Open OS folder picker in a subprocess (tkinter). Returns (path, cancelled)."""
+    code = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "try:\n"
+        "    root.attributes('-topmost', True)\n"
+        "except tk.TclError:\n"
+        "    pass\n"
+        "p = filedialog.askdirectory(title='Select output folder')\n"
+        "print(p or '')\n"
+    )
+    try:
+        proc = subprocess.run(
+            [PYTHON, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(PROJECT_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        return "", True
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "folder picker failed").strip()
+        raise HTTPException(status_code=500, detail=err)
+    chosen = (proc.stdout or "").strip()
+    if not chosen:
+        return "", True
+    return chosen, False
+
+
+def _resolve_download_path(raw_path: str) -> Path:
+    """Allow downloads only under uploads/ or an existing parent directory tree."""
+    if not raw_path or not str(raw_path).strip():
+        raise HTTPException(status_code=400, detail="path is required")
+    try:
+        candidate = Path(raw_path).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Not a file")
+
+    upload_root = UPLOAD_DIR.resolve()
+    try:
+        candidate.relative_to(upload_root)
+        return candidate
+    except ValueError:
+        pass
+
+    # Allow outputs saved to user-selected folders (must exist on disk).
+    parent = candidate.parent.resolve()
+    if parent.exists() and parent.is_dir():
+        return candidate
+
+    raise HTTPException(status_code=403, detail="Path not allowed")
+
+
+@router.post("/pick-folder")
+def pick_folder():
+    """
+    Open a native folder picker (macOS / Windows) via tkinter in a subprocess.
+    Only available when FDD_LOCAL is enabled (default on local dev).
+    """
+    if not _is_local_fdd_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Native folder picker is only available in local FDD mode (FDD_LOCAL=1).",
+        )
+    path, cancelled = _pick_folder_native()
+    return {"path": path, "cancelled": cancelled}
+
+
+@router.get("/download")
+def download_output_file(path: str = Query(..., description="Absolute path to output file")):
+    """Download a generated output workbook (path must be under uploads or an allowed folder)."""
+    resolved = _resolve_download_path(path)
+    return FileResponse(
+        path=str(resolved),
+        filename=resolved.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ─── Pydantic models ──────────────────────────────────────────────────────────
+
+
+class RunRequest(BaseModel):
+    session_id: str
+    file_id: str
+    config: dict
+
+
+class DatabookRequest(BaseModel):
+    session_id: str
+    entity_files: list[Any] = Field(default_factory=list)
+    entity_year_files: list[EntityYearFileGroup] = Field(default_factory=list)
+    entity_names: list[str] = Field(default_factory=list)
+    output_folder: str
+    sort_mode: str = "total_assets_desc"
+    entity_order: list[Any] = Field(default_factory=list)
+    layout_format: str = ""
+    value_type: str = ""
+    sign_mode: str = ""
+    ap_ar_included: Optional[bool] = None
+    ap_ar_remove_account_length: Optional[int] = None
+    column_mapping: Optional[dict[str, Any]] = None
+
+
+class DatabookSusaRequest(BaseModel):
+    session_id: str
+    entity_names: list[str] = Field(default_factory=list)
+    entity_year_files: list[EntityYearFileGroup] = Field(default_factory=list)
+    entity_files: list[Any] = Field(default_factory=list)
+    output_folder: str = ""
+    layout_format: str = ""
+    value_type: str = ""
+    sign_mode: str = ""
+    ap_ar_included: bool = True
+    ap_ar_remove_account_length: Optional[int] = None
+    column_mapping: Optional[dict[str, Any]] = None
+    fy_end_month: Optional[int] = None
+    fy_end_day: Optional[int] = None
+    fiscal_start_month: Optional[int] = None
+    bs_mapping_path: Optional[str] = None
+    pl_mapping_path: Optional[str] = None
+    strict_mapping: bool = False
+
+
+# ─── Script execution helpers ──────────────────────────────────────────────────
+
+
+def _prepare_run_artifacts(
+    session_id: str,
+    file_id: str,
+    config: dict,
+    script_key: str,
+) -> dict:
+    """Write config JSON for a run; return paths or an error dict."""
+    matched = _file_path_for_id(session_id, file_id)
+    if not matched:
+        return {"success": False, "message": f"File {file_id} not found for session {session_id}"}
+
+    run_id = _make_run_id()
+    run_d = _run_dir(session_id, run_id)
+
+    output_folder = _resolve_output_folder(config.get("output_file_path"), session_id)
+
+    config = dict(config)
+    config["file_path"] = str(matched)
+    config["output_file_path"] = output_folder
+    config["case_id"] = session_id
+    config["run_id"] = run_id
+
+    if script_key == "bubble" and not str(config.get("output_path") or "").strip():
+        config["output_path"] = os.path.join(output_folder, f"{session_id}_Bubble_Output.xlsx")
+
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = datetime.now().year
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = datetime.now().month
+    if "fiscal_year_end_month" not in config or not config["fiscal_year_end_month"]:
+        config["fiscal_year_end_month"] = 12
+    if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
+        config["fiscal_year_end_day"] = 31
+
+    config_path = run_d / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    script = SCRIPTS.get(script_key)
+    if not script:
+        return {"success": False, "message": f"Unknown script key: {script_key}"}
+
+    return {
+        "success": True,
+        "run_id": run_id,
+        "config_path": config_path,
+        "config": config,
+        "output_folder": output_folder,
+        "script": script,
+        "script_key": script_key,
+    }
+
+
+def _monitor_script_job(
+    session_id: str,
+    run_id: str,
+    proc: subprocess.Popen,
+    script: Path,
+    config: dict,
+    output_folder: str,
+    script_key: str,
+) -> None:
+    """Background thread: wait for subprocess and write final status.json."""
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        stdout, stderr = proc.communicate(timeout=SCRIPT_ASYNC_TIMEOUT_SEC)
+        finished = datetime.now(timezone.utc).isoformat()
+        if proc.returncode != 0:
+            message = _clean_script_error_message((stderr or "").strip(), (stdout or "").strip())
+            _write_run_status(
+                session_id,
+                run_id,
+                {
+                    "status": "failed",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "script_key": script_key,
+                    "started_at": started,
+                    "finished_at": finished,
+                    "message": message,
+                    "output_path": output_folder,
+                },
+            )
+            return
+
+        output_file, output_filename = _resolve_output_files(session_id, config, output_folder)
+        if not output_file:
+            _write_run_status(
+                session_id,
+                run_id,
+                {
+                    "status": "failed",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "script_key": script_key,
+                    "started_at": started,
+                    "finished_at": finished,
+                    "message": "Script finished but output file was not found.",
+                    "output_path": output_folder,
+                },
+            )
+            return
+
+        _write_run_status(
+            session_id,
+            run_id,
+            {
+                "status": "done",
+                "session_id": session_id,
+                "run_id": run_id,
+                "script_key": script_key,
+                "started_at": started,
+                "finished_at": finished,
+                "message": (stdout or "").strip(),
+                "output_path": output_folder,
+                "output_file": output_file,
+                "output_filename": output_filename,
+            },
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        _write_run_status(
+            session_id,
+            run_id,
+            {
+                "status": "failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "script_key": script_key,
+                "started_at": started,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "message": f"Script timed out after {SCRIPT_ASYNC_TIMEOUT_SEC}s ({script.name}).",
+                "output_path": output_folder,
+            },
+        )
+    except Exception as exc:
+        logger.exception("async script monitor failed for %s/%s", session_id, run_id)
+        _write_run_status(
+            session_id,
+            run_id,
+            {
+                "status": "failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "script_key": script_key,
+                "started_at": started,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "message": str(exc),
+                "output_path": output_folder,
+            },
+        )
+
+
+def _start_async_script_job(
+    session_id: str,
+    file_id: str,
+    config: dict,
+    script_key: str,
+) -> dict:
+    """Start script in background; return immediately with run_id."""
+    prep = _prepare_run_artifacts(session_id, file_id, config, script_key)
+    if not prep.get("success"):
+        return prep
+
+    run_id = prep["run_id"]
+    script: Path = prep["script"]
+    config_path: Path = prep["config_path"]
+    output_folder: str = prep["output_folder"]
+    cfg: dict = prep["config"]
+
+    if not script.exists():
+        return {"success": False, "message": f"Script not found: {script}"}
+
+    env = _script_subprocess_env()
+    script_python = _script_python()
+
+    if script.name.startswith("PDF_Extraction") and not _check_module(script_python, "anthropic"):
+        return {
+            "success": False,
+            "message": (
+                f"Missing Python package 'anthropic' for {script_python}. "
+                f"Install with: {script_python} -m pip install -r scripts/requirements_pdf_extraction.txt"
+            ),
+        }
+
+    started = datetime.now(timezone.utc).isoformat()
+    _write_run_status(
+        session_id,
+        run_id,
+        {
+            "status": "running",
+            "session_id": session_id,
+            "run_id": run_id,
+            "script_key": script_key,
+            "started_at": started,
+            "output_path": output_folder,
+        },
+    )
+
+    proc = subprocess.Popen(
+        [script_python, str(script), str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+
+    thread = threading.Thread(
+        target=_monitor_script_job,
+        args=(session_id, run_id, proc, script, cfg, output_folder, script_key),
+        daemon=True,
+    )
+    thread.start()
+
+    return {
+        "success": True,
+        "status": "running",
+        "session_id": session_id,
+        "run_id": run_id,
+        "script_key": script_key,
+        "output_path": output_folder,
+    }
+
+
+def _prepare_and_run(
+    session_id: str,
+    file_id: str,
+    config: dict,
+    script_key: str,
+) -> dict:
+    """
+    1. Locate the uploaded file for file_id in session.
+    2. Inject file_path, output_file_path, case_id, run_id into config.
+    3. Write config JSON to a run directory.
+    4. Call the script.
+    5. Return {success, message, output_path, run_id}.
+    """
+    prep = _prepare_run_artifacts(session_id, file_id, config, script_key)
+    if not prep.get("success"):
+        return prep
+
+    run_id = prep["run_id"]
+    config_path = prep["config_path"]
+    output_folder = prep["output_folder"]
+    script = prep["script"]
+    cfg = prep["config"]
+
+    result = _run_script(script, config_path)
+    result["output_path"] = output_folder
+    result["run_id"] = run_id
+    output_file, output_filename = _resolve_output_files(session_id, cfg, output_folder)
+    if output_file:
+        result["output_file"] = output_file
+        result["output_filename"] = output_filename
+    return result
+
+
+# ─── Run: General Sales Table ─────────────────────────────────────────────────
+
+
+@router.post("/run/gst")
+def run_gst(req: RunRequest):
+    """Execute general_sales_table_MM_verformelt.py with the provided config."""
+    return _prepare_and_run(req.session_id, req.file_id, req.config, "gst")
+
+
+@router.post("/run/gst/async")
+def run_gst_async(req: RunRequest):
+    """Start GST script in background; poll GET /run/status for completion."""
+    return _start_async_script_job(req.session_id, req.file_id, req.config, "gst")
+
+
+# ─── Run: PVM Analysis ────────────────────────────────────────────────────────
+
+
+@router.post("/run/pvm")
+def run_pvm(req: RunRequest):
+    """Execute pvm_verformelt.py with the provided config."""
+    config = req.config
+
+    # Map field names expected by pvm_verformelt.py
+    if "fy_end_month" not in config or not config["fy_end_month"]:
+        config["fy_end_month"] = 12
+    if "fy_end_day" not in config or not config["fy_end_day"]:
+        config["fy_end_day"] = 31
+    if "as_of_year" not in config or not config["as_of_year"]:
+        config["as_of_year"] = datetime.now().year
+    if "as_of_month" not in config or not config["as_of_month"]:
+        config["as_of_month"] = datetime.now().month
+
+    return _prepare_and_run(req.session_id, req.file_id, config, "pvm")
+
+
+@router.post("/run/pvm/async")
+def run_pvm_async(req: RunRequest):
+    config = req.config
+    if "fy_end_month" not in config or not config["fy_end_month"]:
+        config["fy_end_month"] = 12
+    if "fy_end_day" not in config or not config["fy_end_day"]:
+        config["fy_end_day"] = 31
+    if "as_of_year" not in config or not config["as_of_year"]:
+        config["as_of_year"] = datetime.now().year
+    if "as_of_month" not in config or not config["as_of_month"]:
+        config["as_of_month"] = datetime.now().month
+    return _start_async_script_job(req.session_id, req.file_id, config, "pvm")
+
+
+# ─── Run: TOP Report ──────────────────────────────────────────────────────────
+
+
+@router.post("/run/top")
+def run_top(req: RunRequest):
+    """Execute horizontal_bars_hierachy.py (TOP report) with the provided config."""
+    config = req.config
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = datetime.now().year
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = datetime.now().month
+    if "fiscal_year_end_month" not in config or not config["fiscal_year_end_month"]:
+        config["fiscal_year_end_month"] = 12
+    if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
+        config["fiscal_year_end_day"] = 31
+
+    return _prepare_and_run(req.session_id, req.file_id, config, "top")
+
+
+@router.post("/run/top/async")
+def run_top_async(req: RunRequest):
+    config = req.config
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = datetime.now().year
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = datetime.now().month
+    if "fiscal_year_end_month" not in config or not config["fiscal_year_end_month"]:
+        config["fiscal_year_end_month"] = 12
+    if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
+        config["fiscal_year_end_day"] = 31
+    return _start_async_script_job(req.session_id, req.file_id, config, "top")
+
+
+# ─── Run: Bubble Scatter Plot ─────────────────────────────────────────────────
+
+
+@router.post("/run/bubble")
+def run_bubble(req: RunRequest):
+    """Execute bubblescatterplot.py with the provided config."""
+    config = req.config
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = datetime.now().year
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = datetime.now().month
+    if "fiscal_year_end_month" not in config or not config["fiscal_year_end_month"]:
+        config["fiscal_year_end_month"] = 12
+    if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
+        config["fiscal_year_end_day"] = 31
+
+    return _prepare_and_run(req.session_id, req.file_id, config, "bubble")
+
+
+@router.post("/run/bubble/async")
+def run_bubble_async(req: RunRequest):
+    config = req.config
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = datetime.now().year
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = datetime.now().month
+    if "fiscal_year_end_month" not in config or not config["fiscal_year_end_month"]:
+        config["fiscal_year_end_month"] = 12
+    if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
+        config["fiscal_year_end_day"] = 31
+    return _start_async_script_job(req.session_id, req.file_id, config, "bubble")
+
+
+@router.get("/run/status")
+def run_status(
+    session_id: str = Query(...),
+    run_id: str = Query(...),
+):
+    """Poll async script job status (running | done | failed)."""
+    status = _read_run_status(session_id, run_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return status
+
+
+# ─── SuSa preview (column mapper) ─────────────────────────────────────────────
+
+
+@router.get("/susa/preview")
+def susa_preview(
+    session_id: str = Query(...),
+    file_id: str = Query(...),
+    sheet_index: int = Query(0, ge=0),
+):
+    """
+    Raw matrix from first uploaded trial balance (header row + letter columns + sample rows).
+    Used by the interactive column-mapping wizard in the FDD bot UI.
+    """
+    if not (file_id or "").strip():
+        raise HTTPException(status_code=400, detail="file_id is required for preview.")
+
+    path = _file_path_for_id(session_id, file_id)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found for session_id / file_id.")
+
+    from susa_column_mapping import build_preview
+
+    try:
+        raw = pd.read_excel(path, sheet_name=sheet_index, header=None, engine="openpyxl")
+        preview = build_preview(raw)
+        preview["file_id"] = file_id
+        preview["sheet_index"] = sheet_index
+        return preview
+    except Exception as exc:
+        logger.exception("susa preview failed")
+        raise HTTPException(status_code=400, detail=f"Could not read workbook: {exc}") from exc
+
+
+# ─── Run: Databook — SuSa step ────────────────────────────────────────────────
+
+
+@router.post("/run/databook/susa")
+def run_databook_susa(req: DatabookSusaRequest):
+    """
+    Execute SuSabyYear.py to create the Master Sheet from structured entity × FY uploads.
+    """
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    groups = list(req.entity_year_files)
+    if not groups and req.entity_files:
+        for it in req.entity_files:
+            if isinstance(it, dict) and isinstance(it.get("file_ids"), list):
+                try:
+                    groups.append(EntityYearFileGroup.model_validate(it))
+                except Exception:
+                    logger.warning("Skipping invalid entity_year_files entry: %s", it)
+
+    layout = (req.layout_format or "").strip()
+    if layout not in ("monthly_workbooks", "monthly_sheets", "single_sheet"):
+        raise HTTPException(
+            status_code=400,
+            detail="layout_format must be monthly_workbooks, monthly_sheets, or single_sheet.",
+        )
+
+    resolved_cells = _resolve_entity_year_files_for_susa(req.session_id, groups)
+    if not resolved_cells:
+        raise HTTPException(
+            status_code=400,
+            detail="No uploaded files could be resolved for Databook (check file_id and session_id).",
+        )
+
+    from databook_helpers import master_workbook_path
+
+    master = master_workbook_path(req.session_id, output_folder)
+    out_xlsx = str(master)
+    flat_paths = [p for cell in resolved_cells for p in cell["paths"]]
+
+    column_mapping = req.column_mapping
+    if not column_mapping:
+        logger.warning("Databook SuSa run without column_mapping; using legacy default letters.")
+
+    fy_end_month = int(req.fy_end_month or 12)
+    fiscal_start_month = int(req.fiscal_start_month or ((fy_end_month % 12) + 1))
+    from susa_mapping_paths import resolve_susa_kontenmapping_paths
+
+    bs_mapping_path, pl_mapping_path = resolve_susa_kontenmapping_paths(
+        {
+            "bs_mapping_path": (req.bs_mapping_path or "").strip() or None,
+            "pl_mapping_path": (req.pl_mapping_path or "").strip() or None,
+            "output_file_path": output_folder,
+        }
+    )
+
+    config: dict[str, Any] = {
+        **_default_susa_workbook_config(),
+        "entity_year_files": resolved_cells,
+        "entity_names": list(req.entity_names),
+        "entity_files": flat_paths,
+        "layout_format": layout,
+        "value_type": (req.value_type or "balances").strip(),
+        "sign_mode": (req.sign_mode or "sh_column").strip(),
+        "ap_ar_included": bool(req.ap_ar_included),
+        "ap_ar_remove_account_length": req.ap_ar_remove_account_length,
+        "column_mapping": column_mapping,
+        "fy_end_month": fy_end_month,
+        "fy_end_day": int(req.fy_end_day or 31),
+        "fiscal_start_month": fiscal_start_month,
+        "bs_mapping_path": bs_mapping_path,
+        "pl_mapping_path": pl_mapping_path,
+        "strict_mapping": bool(req.strict_mapping),
+        "output_file_path": output_folder,
+        "output_path": out_xlsx,
+        "run_id": run_id,
+        "session_id": req.session_id,
+        "case_id": req.session_id,
+    }
+
+    config_path = run_d / "susa_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = _run_script(SCRIPTS["susa"], config_path)
+    result["output_path"] = output_folder
+    result["run_id"] = run_id
+    result["session_id"] = req.session_id
+    result["master_path"] = out_xlsx
+    if master.is_file():
+        result["output_file"] = out_xlsx
+        result["output_filename"] = master.name
+    return result
+
+
+# ─── Run: Databook — full orchestration ─────────────────────────────────────
+
+
+@router.post("/run/databook")
+def run_databook(req: DatabookRequest):
+    """
+    Orchestrate the full Databook pipeline:
+      1. SuSabyYear.py   → Master Sheet
+      2. Consolidation.py
+      3. Adjustments.py
+      4. Lead_IS.py
+    Each step runs sequentially; stops on first failure.
+    """
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_full_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    groups = list(req.entity_year_files)
+    if not groups and req.entity_files:
+        for it in req.entity_files:
+            if isinstance(it, dict) and isinstance(it.get("file_ids"), list):
+                try:
+                    groups.append(EntityYearFileGroup.model_validate(it))
+                except Exception:
+                    logger.warning("Skipping invalid entity_year_files entry: %s", it)
+
+    path_items: list[Any] = [g.model_dump() for g in groups] if groups else list(req.entity_files)
+    paths = _resolve_entity_file_paths(req.session_id, path_items)
+    if not paths:
+        raise HTTPException(
+            status_code=400,
+            detail="No uploaded files could be resolved for Databook (check file_id and session_id).",
+        )
+
+    layout = (req.layout_format or "").strip() or "monthly_sheets"
+    value_type = (req.value_type or "balances").strip()
+    sign_mode = (req.sign_mode or "sh_column").strip()
+    ap_ar = True if req.ap_ar_included is None else bool(req.ap_ar_included)
+
+    resolved_cells = _resolve_entity_year_files_for_susa(req.session_id, groups)
+    if not resolved_cells:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolvable entity_year_files for Databook. Upload files via the trial balance grid and interpretation steps.",
+        )
+    from databook_helpers import master_workbook_path
+
+    master = master_workbook_path(req.session_id, output_folder)
+    out_xlsx = str(master)
+    fy_end_month = int(getattr(req, "fy_end_month", None) or 12)
+    fiscal_start_month = int(getattr(req, "fiscal_start_month", None) or ((fy_end_month % 12) + 1))
+
+    from susa_mapping_paths import resolve_susa_kontenmapping_paths
+
+    bs_mapping_path, pl_mapping_path = resolve_susa_kontenmapping_paths(
+        {"output_file_path": output_folder}
+    )
+
+    base_config: dict[str, Any] = {
+        "entity_files": paths,
+        "entity_names": req.entity_names,
+        "entity_year_files": resolved_cells,
+        "layout_format": layout,
+        "value_type": value_type,
+        "sign_mode": sign_mode,
+        "ap_ar_included": ap_ar,
+        "ap_ar_remove_account_length": req.ap_ar_remove_account_length,
+        "column_mapping": req.column_mapping,
+        "fy_end_month": fy_end_month,
+        "fiscal_start_month": fiscal_start_month,
+        "bs_mapping_path": bs_mapping_path,
+        "pl_mapping_path": pl_mapping_path,
+        "strict_mapping": bool(getattr(req, "strict_mapping", False)),
+        "output_file_path": output_folder,
+        "output_path": out_xlsx,
+        "run_id": run_id,
+        "session_id": req.session_id,
+        "case_id": req.session_id,
+        "sort_mode": req.sort_mode,
+        "entity_order": req.entity_order,
+    }
+
+    steps = [
+        ("susa", "Trial balance master sheet"),
+        ("consolidation", "Consolidation"),
+        ("adjustments", "Adjustments"),
+        ("lead_is", "Lead IS"),
+    ]
+
+    messages: list[str] = []
+    for step_key, step_label in steps:
+        script = SCRIPTS.get(step_key)
+        if not script or not script.exists():
+            messages.append(f"[SKIP] {step_label}: script not found at {script}")
+            continue
+
+        config_path = run_d / f"{step_key}_config.json"
+        if step_key == "susa":
+            cfg = {**_default_susa_workbook_config(), **base_config}
+        else:
+            cfg = dict(base_config)
+        config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        result = _run_script(script, config_path)
+        if result["success"]:
+            messages.append(f"[OK] {step_label}")
+        else:
+            messages.append(f"[ERROR] {step_label}: {result['message']}")
+            return {
+                "success": False,
+                "message": "\n".join(messages),
+                "output_path": output_folder,
+                "run_id": run_id,
+            }
+
+    result: dict[str, Any] = {
+        "success": True,
+        "message": "\n".join(messages),
+        "output_path": output_folder,
+        "run_id": run_id,
+        "session_id": req.session_id,
+        "master_path": out_xlsx,
+    }
+    if master.is_file():
+        result["output_file"] = out_xlsx
+        result["output_filename"] = master.name
+    else:
+        output_file = os.path.join(output_folder, f"{req.session_id}_Output.xlsx")
+        if os.path.isfile(output_file):
+            result["output_file"] = output_file
+            result["output_filename"] = os.path.basename(output_file)
+    return result
+
+
+class DatabookConsolidationRequest(BaseModel):
+    session_id: str
+    consolidation_file_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    fy_end_month: Optional[int] = None
+    fy_end_day: Optional[int] = None
+    fiscal_start_month: Optional[int] = None
+
+
+class DatabookConsolidationTemplateRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    period_level: str = "yearly"
+    first_fy: Optional[int] = None
+    ltm_month: Optional[str] = None
+    fy_end_month: Optional[int] = None
+    fy_end_day: Optional[int] = None
+    fiscal_start_month: Optional[int] = None
+
+
+class DatabookAdjustmentsTemplateRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    first_fy: Optional[int] = None
+    ltm_month: Optional[str] = None
+    fy_end_month: Optional[int] = None
+    fy_end_day: Optional[int] = None
+    fiscal_start_month: Optional[int] = None
+
+
+class DatabookAdjustmentsRequest(BaseModel):
+    session_id: str
+    adjustments_file_id: str
+    output_folder: str = ""
+    master_path: str = ""
+
+
+class DatabookPdfExtractionRequest(BaseModel):
+    session_id: str
+    pdf_file_ids: list[str] = Field(default_factory=list)
+    output_folder: str = ""
+    fy_end_month: int = 12
+
+
+class DatabookReconPlRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    project_name: str = "Project"
+    company_name: str = "Group"
+    entity_order: list[str] = Field(default_factory=list)
+    display_titles: dict[str, str] = Field(default_factory=dict)
+    display_label_map: dict[str, str] = Field(default_factory=dict)
+    fs_review_file_id: str = ""
+    show_fs_check: bool = False
+
+
+# ─── Run: Databook — post-SuSa steps ─────────────────────────────────────────
+
+
+@router.post("/run/databook/consolidation-template")
+def run_databook_consolidation_template(req: DatabookConsolidationTemplateRequest):
+    from databook_helpers import consolidation_template_path, master_workbook_path
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_cons_tpl_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    if req.master_path:
+        master = Path(req.master_path).expanduser()
+        if master.is_file():
+            master = master.resolve()
+    else:
+        master = master_workbook_path(req.session_id, output_folder)
+        if master.is_file():
+            master = master.resolve()
+    template_out = consolidation_template_path(req.session_id, output_folder)
+    period_level = str(req.period_level or "yearly").strip().lower()
+    if period_level not in ("yearly", "monthly"):
+        raise HTTPException(
+            status_code=400,
+            detail="period_level must be 'yearly' or 'monthly'.",
+        )
+
+    fy_end_month = int(req.fy_end_month or 12)
+    fiscal_start_month = int(
+        req.fiscal_start_month or ((fy_end_month % 12) + 1)
+    )
+
+    config: dict[str, Any] = {
+        "session_id": req.session_id,
+        "output_folder": output_folder,
+        "master_path": str(master),
+        "period_level": period_level,
+        "output_path": str(template_out),
+        "first_fy": req.first_fy,
+        "ltm_month": req.ltm_month,
+        "fy_end_month": fy_end_month,
+        "fy_end_day": int(req.fy_end_day or 31),
+        "fiscal_start_month": fiscal_start_month,
+    }
+    config_path = run_d / "consolidation_template_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = _run_script(SCRIPTS["consolidation_template"], config_path)
+    result["run_id"] = run_id
+    result["period_level"] = period_level
+    result["template_path"] = str(template_out)
+    if template_out.is_file():
+        result["output_file"] = str(template_out)
+        result["output_filename"] = template_out.name
+    return result
+
+
+@router.post("/run/databook/adjustments-template")
+def run_databook_adjustments_template(req: DatabookAdjustmentsTemplateRequest):
+    from databook_helpers import adjustments_template_path, master_workbook_path
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_adj_tpl_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    if req.master_path:
+        master = Path(req.master_path).expanduser()
+        if master.is_file():
+            master = master.resolve()
+    else:
+        master = master_workbook_path(req.session_id, output_folder)
+        if master.is_file():
+            master = master.resolve()
+    template_out = adjustments_template_path(req.session_id, output_folder)
+
+    fy_end_month = int(req.fy_end_month or 12)
+    fiscal_start_month = int(
+        req.fiscal_start_month or ((fy_end_month % 12) + 1)
+    )
+
+    config: dict[str, Any] = {
+        "session_id": req.session_id,
+        "output_folder": output_folder,
+        "master_path": str(master),
+        "output_path": str(template_out),
+        "first_fy": req.first_fy,
+        "ltm_month": req.ltm_month,
+        "fy_end_month": fy_end_month,
+        "fy_end_day": int(req.fy_end_day or 31),
+        "fiscal_start_month": fiscal_start_month,
+    }
+    config_path = run_d / "adjustments_template_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = _run_script(SCRIPTS["adjustments_template"], config_path)
+    result["run_id"] = run_id
+    result["template_path"] = str(template_out)
+    if template_out.is_file():
+        result["output_file"] = str(template_out)
+        result["output_filename"] = template_out.name
+    return result
+
+
+@router.post("/run/databook/adjustments")
+def run_databook_adjustments(req: DatabookAdjustmentsRequest):
+    from databook_helpers import master_workbook_path
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_adj_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    if req.master_path:
+        master = Path(req.master_path).expanduser()
+        if master.is_file():
+            master = master.resolve()
+    else:
+        master = master_workbook_path(req.session_id, output_folder)
+        if master.is_file():
+            master = master.resolve()
+
+    adj_path = _file_path_for_id(req.session_id, req.adjustments_file_id)
+    if not adj_path or not adj_path.is_file():
+        raise HTTPException(status_code=404, detail="Adjustments file not found.")
+
+    config = {
+        "master_path": str(master),
+        "adjustments_path": str(adj_path),
+        "session_id": req.session_id,
+    }
+    config_path = run_d / "adjustments_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["adjustments"], config_path)
+    result["output_file"] = str(master)
+    result["output_filename"] = master.name
+    result["master_path"] = str(master)
+    return result
+
+
+@router.post("/run/databook/consolidation")
+def run_databook_consolidation(req: DatabookConsolidationRequest):
+    from databook_helpers import master_workbook_path
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_cons_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = Path(req.master_path) if req.master_path else master_workbook_path(
+        req.session_id, output_folder
+    )
+    cons_path = _file_path_for_id(req.session_id, req.consolidation_file_id)
+    if not cons_path or not cons_path.is_file():
+        raise HTTPException(status_code=404, detail="Consolidation file not found.")
+
+    fy_end_month = int(req.fy_end_month or 12)
+    fiscal_start_month = int(
+        req.fiscal_start_month or ((fy_end_month % 12) + 1)
+    )
+    config = {
+        "master_path": str(master),
+        "consolidation_path": str(cons_path),
+        "session_id": req.session_id,
+        "fy_end_month": fy_end_month,
+        "fy_end_day": int(req.fy_end_day or 31),
+        "fiscal_start_month": fiscal_start_month,
+    }
+    config_path = run_d / "consolidation_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["consolidation"], config_path)
+    result["output_file"] = str(master)
+    result["output_filename"] = master.name
+    result["master_path"] = str(master)
+    return result
+
+
+@router.post("/run/databook/pdf-extraction")
+def run_databook_pdf_extraction(req: DatabookPdfExtractionRequest):
+    from databook_helpers import FS_EXTRACTION_TEMPLATE, TEMPLATES_DIR
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_pdf_")
+    run_d = _run_dir(req.session_id, run_id)
+    output_folder = Path(_resolve_output_folder(req.output_folder, req.session_id))
+
+    pdf_dir = run_d / "pdfs"
+    pdf_dir.mkdir(exist_ok=True)
+    for fid in req.pdf_file_ids:
+        src = _file_path_for_id(req.session_id, fid)
+        if src and src.is_file():
+            dest = pdf_dir / src.name.split("_", 1)[-1]
+            dest.write_bytes(src.read_bytes())
+
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    template_path = FS_EXTRACTION_TEMPLATE
+    if not template_path.is_file():
+        from PDF_Extraction_recon import ensure_template
+        ensure_template(template_path)
+
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    fy_month_bs = month_names[min(max(int(req.fy_end_month), 1), 12) - 1]
+
+    out_recon = output_folder / f"{req.session_id}_FS_extracted.xlsx"
+    out_adj = output_folder / f"{req.session_id}_FS_adjusted.xlsx"
+    out_checked = output_folder / f"{req.session_id}_FS_checked.xlsx"
+
+    md_dir = output_folder / "md"
+    recon_cfg = {
+        "pdf_input_dir": str(pdf_dir),
+        "template_path": str(template_path),
+        "output_excel": str(out_recon),
+        "fy_month_bs": fy_month_bs,
+        "pdf_md_cache_dir": str(output_folder / ".pdf-md-cache"),
+        "md_output_dir": str(md_dir),
+    }
+    recon_path = run_d / "pdf_recon_config.json"
+    recon_path.write_text(json.dumps(recon_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["pdf_recon"], recon_path)
+    if not result.get("success"):
+        return result
+
+    adj_cfg = {"input_file": str(out_recon), "output_file": str(out_adj)}
+    adj_path = run_d / "pdf_adj_config.json"
+    adj_path.write_text(json.dumps(adj_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["pdf_adjusted"], adj_path)
+    if not result.get("success"):
+        return result
+
+    chk_cfg = {"input_file": str(out_adj), "output_file": str(out_checked)}
+    chk_path = run_d / "pdf_chk_config.json"
+    chk_path.write_text(json.dumps(chk_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["pdf_checked"], chk_path)
+    result["output_file"] = str(out_checked)
+    result["output_filename"] = out_checked.name
+    result["review_file"] = str(out_checked)
+    return result
+
+
+@router.post("/run/databook/recon-pl")
+def run_databook_recon_pl(req: DatabookReconPlRequest):
+    from databook_helpers import (
+        ensure_pl_mapping_file,
+        extract_fs_check_values,
+        master_workbook_path,
+        prepare_master_pl_for_recon,
+    )
+
+    sess = _session_dir(req.session_id)
+    run_id = _make_run_id("db_recon_")
+    run_d = _run_dir(req.session_id, run_id)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = Path(req.master_path) if req.master_path else master_workbook_path(
+        req.session_id, output_folder
+    )
+    if not master.is_file():
+        raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
+
+    prepare_master_pl_for_recon(master)
+    mapping_file = ensure_pl_mapping_file()
+    recon_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
+
+    titles = {
+        "aggregated_title": req.display_titles.get("aggregated_title", "Aggregated"),
+        "consolidation_title": req.display_titles.get("consolidation_title", "Consolidation"),
+        "difference_title": req.display_titles.get("difference_title", "Difference"),
+        "financial_statements_title": req.display_titles.get(
+            "financial_statements_title", "Financial statements"
+        ),
+        "ic_display_name": req.display_titles.get("ic_display_name", "IC eliminations"),
+    }
+
+    fs_check = {"entities": [], "consolidation": []}
+    if req.fs_review_file_id:
+        fs_path = _file_path_for_id(req.session_id, req.fs_review_file_id)
+        if fs_path and fs_path.is_file():
+            fs_check = extract_fs_check_values(fs_path)
+
+    config = {
+        "project_name": req.project_name,
+        "company_name": req.company_name,
+        "sort_by": "custom",
+        "entity_order": list(req.entity_order),
+        "show_fs_check": bool(req.show_fs_check),
+        "fs_check_values": fs_check,
+        "display": {"titles": titles},
+        "pl_config": {"display_label_map": dict(req.display_label_map)},
+        "paths": {
+            "source_file": str(master),
+            "source_sheet": "Master_PL",
+            "source_engine": "openpyxl",
+            "target_file": str(recon_target),
+            "report_sheet": "PL_Reconciliation",
+            "audit_master_sheet": "Master_PL",
+            "mapping_file": str(mapping_file),
+            "append_to_master": True,
+            "master_file": str(master),
+        },
+    }
+    config_path = run_d / "recon_pl_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    result = _run_script(SCRIPTS["recon_pl"], config_path)
+    result["output_file"] = str(master)
+    result["output_filename"] = master.name
+    result["master_path"] = str(master)
+    return result
+
+
+# ─── Templates ───────────────────────────────────────────────────────────────
+
+
+@router.get("/templates/{name}")
+def download_template(
+    name: str,
+    session_id: str = Query(""),
+    output_folder: str = Query(""),
+    period_level: str = Query("yearly"),
+    first_fy: Optional[int] = Query(None),
+    ltm_month: str = Query(""),
+    fy_end_month: Optional[int] = Query(None),
+    fy_end_day: Optional[int] = Query(None),
+    fiscal_start_month: Optional[int] = Query(None),
+):
+    """
+    Serve an XLSX template for the given name.
+    For consolidation: prefer session-generated template; fallback to on-the-fly build.
+    """
+    if name == "consolidation" and session_id:
+        from databook_helpers import (
+            build_consolidation_template_from_config,
+            consolidation_template_path,
+            master_workbook_path,
+        )
+
+        resolved_folder = _resolve_output_folder(output_folder or None, session_id)
+        session_template = consolidation_template_path(session_id, resolved_folder)
+        if session_template.is_file():
+            return FileResponse(
+                path=str(session_template),
+                filename="consolidation_template.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        master = master_workbook_path(session_id, resolved_folder)
+        if master.is_file():
+            master = master.resolve()
+        level = str(period_level or "yearly").strip().lower()
+        if level not in ("yearly", "monthly"):
+            level = "yearly"
+        fy_end_m = int(fy_end_month or 12)
+        fiscal_start = int(fiscal_start_month or ((fy_end_m % 12) + 1))
+        fallback_config: dict[str, Any] = {
+            "session_id": session_id,
+            "output_folder": resolved_folder,
+            "master_path": str(master) if master.is_file() else "",
+            "period_level": level,
+            "output_path": str(session_template),
+            "first_fy": first_fy,
+            "ltm_month": ltm_month or None,
+            "fy_end_month": fy_end_m,
+            "fy_end_day": int(fy_end_day or 31),
+            "fiscal_start_month": fiscal_start,
+        }
+        try:
+            template_file = build_consolidation_template_from_config(fallback_config)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(
+            path=str(template_file),
+            filename="consolidation_template.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if name == "adjustments" and session_id:
+        from databook_helpers import (
+            adjustments_template_path,
+            build_adjustments_template_from_config,
+            master_workbook_path,
+        )
+
+        resolved_folder = _resolve_output_folder(output_folder or None, session_id)
+        session_template = adjustments_template_path(session_id, resolved_folder)
+        if session_template.is_file():
+            return FileResponse(
+                path=str(session_template),
+                filename="adjustments_template.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        master = master_workbook_path(session_id, resolved_folder)
+        if master.is_file():
+            master = master.resolve()
+        fy_end_m = int(fy_end_month or 12)
+        fiscal_start = int(fiscal_start_month or ((fy_end_m % 12) + 1))
+        fallback_config: dict[str, Any] = {
+            "session_id": session_id,
+            "output_folder": resolved_folder,
+            "master_path": str(master) if master.is_file() else "",
+            "output_path": str(session_template),
+            "first_fy": first_fy,
+            "ltm_month": ltm_month or None,
+            "fy_end_month": fy_end_m,
+            "fy_end_day": int(fy_end_day or 31),
+            "fiscal_start_month": fiscal_start,
+        }
+        try:
+            template_file = build_adjustments_template_from_config(fallback_config)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(
+            path=str(template_file),
+            filename="adjustments_template.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    templates_dir = Path(__file__).parent.parent / "templates" / "fdd"
+    template_file = templates_dir / f"{name}.xlsx"
+
+    if not template_file.exists():
+        raise HTTPException(status_code=404, detail=f"Template '{name}' not found")
+
+    return FileResponse(
+        path=str(template_file),
+        filename=f"{name}_template.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )

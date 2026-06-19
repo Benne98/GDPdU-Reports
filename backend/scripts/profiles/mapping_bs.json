@@ -1,0 +1,19 @@
+{
+  "entity": {"mode": "column", "value": "Entity number"},
+  "fiscal_year": {"mode": "fixed", "value": 2024},
+  "columns": {
+    "account_number": "Account number",
+    "account_name": "Account",
+    "level_0": "L0",
+    "level_1": "L1",
+    "level_2": "L2",
+    "level_3": "L3",
+    "level_4": "L4",
+    "level_2_sort": "L2 sort",
+    "level_3_sort": "L3 sort",
+    "is_ic": "L10 IC",
+    "l6_na_mapping": "L6 NA Mapping",
+    "l7_na_description": "L7 NA description"
+  },
+  "source_system": "decidra_gobd"
+}

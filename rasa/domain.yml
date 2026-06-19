@@ -1,0 +1,1090 @@
+version: "3.1"
+
+intents:
+  - greet
+  - affirm
+  - deny
+  - reset
+  - submit_card
+  - undo_to_checkpoint
+  - inform
+
+entities:
+  - card_payload
+
+# ─── Slots ────────────────────────────────────────────────────────────────────
+
+slots:
+  # ── Session ──
+  session_id:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── Main topic ──
+  project_name:
+    type: text
+    mappings:
+      - type: from_text
+        conditions:
+          - active_loop: main_form
+            requested_slot: project_name
+
+  group_name:
+    type: text
+    mappings:
+      - type: from_text
+        conditions:
+          - active_loop: main_form
+            requested_slot: group_name
+
+  ltm_month:
+    type: text
+    mappings:
+      - type: custom
+
+  ytd_month:
+    type: text
+    mappings:
+      - type: custom
+
+  fy_end_month:
+    type: text
+    mappings:
+      - type: custom
+
+  fy_end_day:
+    type: float
+    mappings:
+      - type: custom
+
+  first_fy:
+    type: float
+    mappings:
+      - type: custom
+
+  base_path:
+    type: text
+    mappings:
+      - type: custom
+
+  output_folder:
+    type: text
+    mappings:
+      - type: custom
+
+  file_id:
+    type: text
+    mappings:
+      - type: custom
+
+  file_path:
+    type: text
+    mappings:
+      - type: custom
+
+  sheet_name:
+    type: text
+    mappings:
+      - type: custom
+
+  sheet_names:
+    type: text
+    mappings:
+      - type: custom
+
+  apply_fx:
+    type: bool
+    mappings:
+      - type: custom
+
+  fx_col:
+    type: text
+    mappings:
+      - type: custom
+
+  desired_output:
+    type: text
+    mappings:
+      - type: custom
+
+  headers:
+    type: list
+    mappings:
+      - type: custom
+
+  build_databook_first:
+    type: bool
+    mappings:
+      - type: custom
+
+  output_type:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── General Sales Table ──
+  gst_invoice_mapping_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_calc_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_profit_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_revenue_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_cost_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_profit_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_invoice_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_start_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_end_col:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_group_col_1:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_group_col_2:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_group_col_3:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_max_items_l1:
+    type: float
+    mappings:
+      - type: custom
+
+  gst_max_items_l2:
+    type: float
+    mappings:
+      - type: custom
+
+  gst_max_items_l3:
+    type: float
+    mappings:
+      - type: custom
+
+  gst_other_label_l1:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_other_label_l2:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_other_label_l3:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_show_ytd:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_show_ltm:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_ytd_delta:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_ltm_delta:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_ytd_cagr:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_ltm_cagr:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_show_gp:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_show_gm:
+    type: bool
+    mappings:
+      - type: custom
+
+  gst_sort_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_first_fy_override:
+    type: float
+    mappings:
+      - type: custom
+
+  gst_table_name:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_total_label:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  gst_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── PVM Analysis ──
+  pvm_group_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_period_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_method:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_invoice_mapping_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_profit_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_revenue_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_invoice_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_quantity_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_cost_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_profit_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_start_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_end_col:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_total_label_revenue:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_total_label_cost:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_total_label_gp:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_sort_by_bridge:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_first_fy_override:
+    type: float
+    mappings:
+      - type: custom
+
+  pvm_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  pvm_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── TOP Report ──
+  top_calc_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  top_col:
+    type: text
+    mappings:
+      - type: custom
+
+  top_value_col:
+    type: text
+    mappings:
+      - type: custom
+
+  top_invoice_col:
+    type: text
+    mappings:
+      - type: custom
+
+  top_start_col:
+    type: text
+    mappings:
+      - type: custom
+
+  top_end_col:
+    type: text
+    mappings:
+      - type: custom
+
+  top_first_fy_override:
+    type: float
+    influence_conversation: false
+    mappings:
+      - type: custom
+  top_subtitle:
+    type: text
+    mappings:
+      - type: custom
+
+  top_total_label:
+    type: text
+    mappings:
+      - type: custom
+
+  top_abc_thresholds:
+    type: text
+    mappings:
+      - type: custom
+
+  top_bucket_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  top_bucket_thresholds:
+    type: text
+    mappings:
+      - type: custom
+
+  top_bucket_numbers:
+    type: text
+    mappings:
+      - type: custom
+
+  top_other_bucket:
+    type: text
+    mappings:
+      - type: custom
+
+  top_other_bucket_enabled:
+    type: bool
+    mappings:
+      - type: custom
+
+  top_other_bucket_label:
+    type: text
+    mappings:
+      - type: custom
+
+  top_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  top_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── Bubble Scatter Plot ──
+  bs_period_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_calc_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_invoice_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_start_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_end_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_profit_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_revenue_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_cogs_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_profit_col:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_group_col_1:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_group_col_2:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_max_items_parent:
+    type: float
+    mappings:
+      - type: custom
+
+  bs_max_items_child:
+    type: float
+    mappings:
+      - type: custom
+
+  bs_table_name:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_subtitle_suffix:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_other_bucket_parent:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_other_bucket_child:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_other_bucket_label:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_y_unit:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  bs_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── Apply Filters (shared state) ──
+  active_filter_context:
+    type: text
+    mappings:
+      - type: custom
+
+  filter_col:
+    type: text
+    mappings:
+      - type: custom
+
+  filter_op:
+    type: text
+    mappings:
+      - type: custom
+
+  filter_value:
+    type: text
+    mappings:
+      - type: custom
+
+  filter_add_another:
+    type: bool
+    mappings:
+      - type: custom
+
+  # ── Databook ──
+  db_susa_layout_format:
+    type: text
+    mappings:
+      - type: custom
+
+  db_susa_value_type:
+    type: text
+    mappings:
+      - type: custom
+
+  db_susa_sign_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  db_susa_ap_ar_included:
+    type: bool
+    mappings:
+      - type: custom
+
+  db_ap_ar_account_digits:
+    type: float
+    mappings:
+      - type: custom
+
+  db_susa_column_mapping:
+    type: any
+    mappings:
+      - type: custom
+
+  db_susa_mapping_confirmed:
+    type: bool
+    mappings:
+      - type: custom
+
+  db_entity_year_files:
+    type: any
+    mappings:
+      - type: custom
+
+  db_entity_year_files_json:
+    type: text
+    mappings:
+      - type: custom
+
+  db_entity_files:
+    type: any
+    mappings:
+      - type: custom
+
+  db_entity_names:
+    type: list
+    mappings:
+      - type: custom
+
+  db_entity_count:
+    type: float
+    mappings:
+      - type: custom
+
+  db_output_folder:
+    type: text
+    mappings:
+      - type: custom
+
+  db_consolidation_available:
+    type: bool
+    mappings:
+      - type: custom
+
+  db_sort_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  db_entity_order:
+    type: list
+    mappings:
+      - type: custom
+
+  db_pl_rename_map:
+    type: text
+    mappings:
+      - type: custom
+
+  db_consolidation_account_level:
+    type: text
+    mappings:
+      - type: custom
+
+  db_consolidation_period_level:
+    type: text
+    mappings:
+      - type: custom
+
+  db_apply_adjustments:
+    type: text
+    mappings:
+      - type: custom
+
+  db_fs_folder_file_ids:
+    type: list
+    mappings:
+      - type: custom
+
+  db_fs_review_file_id:
+    type: text
+    mappings:
+      - type: custom
+
+  db_recon_entity_order:
+    type: list
+    mappings:
+      - type: custom
+
+  db_recon_display_titles:
+    type: text
+    mappings:
+      - type: custom
+
+  db_master_workbook_path:
+    type: text
+    mappings:
+      - type: custom
+
+# ─── Responses ────────────────────────────────────────────────────────────────
+
+responses:
+  utter_greet:
+    - text: "Hello! I'm the FDD Bot. I'll guide you through building your due diligence output. Let's start."
+
+  utter_reset_confirm:
+    - text: "All settings have been reset. You can start a new conversation."
+
+  utter_default:
+    - text: "I didn't quite understand that. Please use the buttons or form inputs to respond."
+
+  utter_main_welcome:
+    - custom:
+        type: adaptive_card
+        card: "main_welcome"
+        title: "Project Setup"
+        subtitle: "Let's set up the basic project information."
+        inputs:
+          - id: project_name
+            type: text
+            label: "What is the project's name?"
+            placeholder: "e.g. Project COOP"
+            required: true
+          - id: group_name
+            type: text
+            label: "What is the group's name?"
+            placeholder: "e.g. WorkwithUs Group"
+            required: true
+        submit_label: "Continue"
+
+  utter_ask_dates:
+    - custom:
+        type: adaptive_card
+        card: "dates"
+        compact: true
+        title: "Date Settings"
+        inputs:
+          - id: ltm_month
+            type: month_picker
+            span: 2
+            label: "Last month to include (as-of timestamp for LTM and YTD calculations)"
+            required: true
+          - id: fy_end_month
+            type: dropdown
+            label: "FY end — month"
+            rowGroup: fy_end
+            required: true
+            default: "12"
+            options:
+              - label: "January"
+                value: "1"
+              - label: "February"
+                value: "2"
+              - label: "March"
+                value: "3"
+              - label: "April"
+                value: "4"
+              - label: "May"
+                value: "5"
+              - label: "June"
+                value: "6"
+              - label: "July"
+                value: "7"
+              - label: "August"
+                value: "8"
+              - label: "September"
+                value: "9"
+              - label: "October"
+                value: "10"
+              - label: "November"
+                value: "11"
+              - label: "December"
+                value: "12"
+          - id: fy_end_day
+            type: number
+            label: "FY end — day"
+            rowGroup: fy_end
+            placeholder: "31"
+            default: "31"
+            required: true
+          - id: first_fy
+            type: number
+            label: "Please provide the first financial year included in your data source"
+            placeholder: "e.g. 2020"
+            required: true
+        submit_label: "Submit"
+
+  utter_ask_base_path:
+    - custom:
+        type: adaptive_card
+        card: "base_path"
+        title: "Output Folder"
+        subtitle: "Please enter the base folder path where outputs should be saved."
+        inputs:
+          - id: base_path
+            type: text
+            label: "Base output folder path"
+            placeholder: "C:\\Users\\..."
+            required: true
+        submit_label: "Navigate"
+
+  utter_ask_upload_file:
+    - custom:
+        type: adaptive_card
+        card: "file_upload"
+        title: "Upload Sales Data"
+        subtitle: "Please upload the Excel file containing the sales data."
+        inputs:
+          - id: file_upload
+            type: file_drop
+            label: "Drop your XLSX file here or click to browse"
+            accept: ".xlsx"
+            required: true
+        submit_label: "Upload"
+
+  utter_ask_sheet_name:
+    - custom:
+        type: adaptive_card
+        card: "sheet_name"
+        title: "Sheet Name"
+        subtitle: "Please enter the name of the data sheet in your Excel file."
+        inputs:
+          - id: sheet_name
+            type: text
+            label: "What is the data sheet's name?"
+            placeholder: "e.g. Database"
+            required: true
+        submit_label: "Continue"
+
+  utter_ask_fx_rate:
+    - custom:
+        type: adaptive_card
+        card: "fx_rate"
+        title: "FX Rate"
+        subtitle: "Apply an FX rate column to normalise currencies?"
+        inputs:
+          - id: apply_fx
+            type: radio
+            label: "Apply FX rate?"
+            options:
+              - label: "Yes"
+                value: "yes"
+              - label: "No"
+                value: "no"
+        submit_label: "Continue"
+
+  utter_ask_desired_output:
+    - custom:
+        type: adaptive_card
+        card: "desired_output"
+        title: "Output Selection"
+        subtitle: "What kind of output would you like to create?"
+        inputs:
+          - id: desired_output
+            type: radio
+            label: "Select output type"
+            options:
+              - label: "TOP Report"
+                value: "top_report"
+              - label: "PVM Analysis"
+                value: "pvm_analysis"
+              - label: "General Sales Table"
+                value: "general_sales_table"
+              - label: "Bubble Scatter Plot"
+                value: "bubble_scatter"
+        submit_label: "Continue"
+
+  utter_ask_build_databook:
+    - custom:
+        type: adaptive_card
+        card: "build_databook"
+        title: "Select Output"
+        subtitle: "What would you like to build?"
+        inputs:
+          - id: output_type
+            type: radio
+            label: "Choose output"
+            options:
+              - label: "Databook"
+                value: "databook"
+              - label: "Revenue Databook"
+                value: "revenue_databook"
+              - label: "Creditor / Debitor Aging"
+                value: "creditor_debitor_aging"
+              - label: "FTE Development"
+                value: "fte_development"
+        submit_label: "Continue"
+
+  utter_processing:
+    - text: "Please wait while your data files are being processed... ⏳"
+
+  utter_gst_intro:
+    - text: "Great! Let's configure the General Sales Table."
+
+  utter_pvm_intro:
+    - text: "Great! Let's configure the PVM Analysis."
+
+  utter_top_intro:
+    - text: "Great! Let's configure the TOP Report."
+
+  utter_databook_intro:
+    - text: "Let's set up the Databook. You'll choose how your trial balances are organised, upload files, then confirm how they should be read."
+
+  utter_output_next_steps:
+    - custom:
+        type: adaptive_card
+        card: "next_action"
+        title: "Output Complete"
+        subtitle: "Your output has been generated successfully. What would you like to do next?"
+        inputs:
+          - id: next_action
+            type: radio
+            label: "Next action"
+            options:
+              - label: "Create another output"
+                value: "create_another"
+              - label: "Change settings and regenerate"
+                value: "change_settings"
+              - label: "Restart the full guided conversation"
+                value: "restart"
+              - label: "Change only the filters"
+                value: "change_filters"
+        submit_label: "Continue"
+
+# ─── Actions ──────────────────────────────────────────────────────────────────
+
+actions:
+  - action_dispatch_card
+  - action_nlu_fallback_dispatch
+  - action_reset_all_slots
+  - action_set_session_id
+  - action_show_main_welcome
+  - action_ask_dates_card
+  - action_process_main_card
+  - action_process_dates_card
+  - action_navigate_folders
+  - action_process_folder_selection
+  - action_upload_file
+  - action_ask_upload_file
+  - action_ask_sheet_name
+  - action_undo_to_checkpoint
+  - action_get_headers
+  - action_process_fx_card
+  - action_process_desired_output
+  - action_process_build_databook
+  - action_process_reuse_sales_file
+  - action_run_gst
+  - action_process_gst_invoice_mode
+  - action_process_gst_calc_mode
+  - action_process_gst_columns
+  - action_reshow_gst_columns
+  - action_reshow_gst_invoice_mode
+  - action_reshow_gst_calc_mode
+  - action_reshow_gst_groups
+  - action_reshow_gst_limits
+  - action_reshow_gst_periods
+  - action_reshow_gst_metrics
+  - action_reshow_gst_sort
+  - action_process_gst_groups
+  - action_process_gst_limits
+  - action_process_gst_periods
+  - action_process_gst_metrics
+  - action_process_gst_sort
+  - action_enter_gst_filter_checkpoint
+  - action_process_gst_filter_checkpoint
+  - action_show_gst_review
+  - action_run_pvm
+  - action_process_pvm_group
+  - action_process_pvm_period
+  - action_process_pvm_method
+  - action_process_pvm_columns
+  - action_reshow_pvm_columns
+  - action_process_pvm_labels
+  - action_enter_pvm_filter_checkpoint
+  - action_process_pvm_filter_checkpoint
+  - action_show_pvm_review
+  - action_run_top
+  - action_process_top_calc_mode
+  - action_process_top_columns
+  - action_reshow_top_columns
+  - action_process_top_labels
+  - action_process_top_abc
+  - action_process_top_bucket
+  - action_enter_top_filter_checkpoint
+  - action_process_top_filter_checkpoint
+  - action_show_top_review
+  - action_process_bs_period_calc
+  - action_process_bs_value_columns
+  - action_process_bs_groups
+  - action_process_bs_labels
+  - action_process_bs_display_options
+  - action_enter_bs_filter_checkpoint
+  - action_process_bs_filter_checkpoint
+  - action_show_bs_review
+  - action_run_bubble
+  - action_start_filter
+  - action_process_filter_rule
+  - action_finish_filters
+  - action_run_databook
+  - action_process_databook_susa_format
+  - action_process_databook_entity_count
+  - action_show_databook_entity_count
+  - action_process_databook_entities
+  - action_process_databook_susa_interpretation
+  - action_process_databook_ap_ar_digits
+  - action_process_databook_column_mapping
+  - action_show_databook_column_mapper
+  - action_process_databook_consolidation_account
+  - action_process_databook_consolidation_level
+  - action_process_databook_consolidation_upload
+  - action_process_databook_adjustments
+  - action_process_databook_adjustments_upload
+  - action_process_databook_fs_upload
+  - action_process_databook_fs_review_upload
+  - action_process_databook_recon_order
+  - action_process_databook_recon_labels
+  - action_process_databook_sort
+  - action_process_next_action
+
+# ─── Forms ────────────────────────────────────────────────────────────────────
+
+forms:
+  main_form:
+    required_slots:
+      - project_name
+      - group_name
+
+  gst_form:
+    required_slots:
+      - gst_table_name
+      - gst_invoice_mapping_mode
+      - gst_calc_mode
+      - gst_profit_mode
+      - gst_revenue_col
+      - gst_invoice_col
+      - gst_group_col_1
+      - gst_max_items_l1
+      - gst_other_label_l1
+      - gst_sort_mode
+
+  pvm_form:
+    required_slots:
+      - pvm_group_col
+      - pvm_period_mode
+      - pvm_method
+      - pvm_invoice_mapping_mode
+      - pvm_profit_mode
+      - pvm_revenue_col
+      - pvm_invoice_col
+      - pvm_quantity_col
+
+  top_form:
+    required_slots:
+      - top_calc_mode
+      - top_col
+      - top_value_col
+      - top_invoice_col
+      - top_total_label

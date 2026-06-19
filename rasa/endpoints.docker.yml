@@ -1,0 +1,4 @@
+# Used in Docker Compose: action server hostname = service name on the Docker network.
+action_endpoint:
+  url: "http://fdd-actions:5055/webhook"
+  request_timeout: 960

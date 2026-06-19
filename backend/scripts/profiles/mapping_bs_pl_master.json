@@ -1,0 +1,14 @@
+{
+  "entity": {"mode": "resolved_column", "value": "_entity_prefix"},
+  "fiscal_year": {"mode": "fixed", "value": 2024},
+  "columns": {
+    "account_number": "Account",
+    "account_name": "Account description",
+    "level_0": "L1",
+    "level_1": "L2",
+    "level_2": "L3",
+    "level_3": "L4",
+    "level_4": "L5"
+  },
+  "source_system": "bs_pl_master"
+}

@@ -1,0 +1,15 @@
+version: "3.1"
+
+stories:
+  - story: Full GST workflow example
+    steps:
+      - intent: greet
+      - action: action_set_session_id
+      - action: utter_greet
+      - action: utter_main_welcome
+      - intent: submit_card
+      - action: action_dispatch_card
+      - intent: submit_card
+      - action: action_dispatch_card
+      - intent: submit_card
+      - action: action_dispatch_card

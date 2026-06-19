@@ -1,0 +1,177 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-surface:        #F4F6F9;
+    --color-primary:        #1E3A5F;
+    --color-primary-light:  #2E5280;
+    --color-border:         #CBD5E1;
+    --color-text-primary:   #111827;
+    --color-text-secondary: #475569;
+    --color-text-muted:     #94A3B8;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  @media (min-width: 1280px) {
+    html {
+      font-size: 17px;
+    }
+  }
+
+  body {
+    background-color: #F4F6F9;
+    color: #111827;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background-color: rgba(30, 58, 95, 0.15);
+    color: #111827;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #EEF1F6;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #CBD5E1;
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #1E3A5F;
+  }
+}
+
+@layer utilities {
+  /* Slight global readability uplift across dashboards and landing content. */
+  .text-xs {
+    font-size: 0.8rem;
+    line-height: 1.35;
+  }
+
+  .text-sm {
+    font-size: 0.94rem;
+    line-height: 1.45;
+  }
+}
+
+@layer components {
+  /* Keep OpenStreetMap / Leaflet layers inside the map card (avoid covering page tabs). */
+  .delivery-route-map {
+    isolation: isolate;
+    position: relative;
+    z-index: 0;
+  }
+
+  .delivery-route-map .leaflet-container {
+    position: relative;
+    z-index: 0;
+  }
+
+  /* Primary filled button */
+  .btn-gold {
+    @apply inline-flex items-center gap-2 px-6 py-3 rounded-lg font-semibold text-sm
+           transition-all duration-200 cursor-pointer select-none;
+    background: #1E3A5F;
+    color: #FFFFFF;
+    box-shadow: 0 1px 3px rgba(30, 58, 95, 0.25);
+  }
+
+  .btn-gold:hover {
+    background: #17304F;
+    box-shadow: 0 4px 16px rgba(30, 58, 95, 0.3);
+    transform: translateY(-1px);
+  }
+
+  .btn-gold:active {
+    transform: translateY(0);
+  }
+
+  /* Outline button */
+  .btn-outline {
+    @apply inline-flex items-center gap-2 px-6 py-3 rounded-lg font-semibold text-sm
+           border transition-all duration-200 cursor-pointer select-none;
+    border-color: #CBD5E1;
+    color: #1E3A5F;
+    background: #FFFFFF;
+  }
+
+  .btn-outline:hover {
+    border-color: #1E3A5F;
+    background: #EEF3FA;
+    box-shadow: 0 2px 8px rgba(30, 58, 95, 0.1);
+    transform: translateY(-1px);
+  }
+
+  /* Marketing hero — audience pills (matches top badge / outline language) */
+  .marketing-audience-pill {
+    @apply inline-flex items-center shrink-0 whitespace-nowrap px-4 py-1.5 rounded-full
+           text-xs font-semibold transition-colors duration-200 select-none;
+    color: #1E3A5F;
+    background: rgba(30, 58, 95, 0.06);
+    border: 1px solid rgba(30, 58, 95, 0.2);
+  }
+
+  .marketing-audience-pill:hover {
+    background: rgba(30, 58, 95, 0.1);
+    border-color: rgba(30, 58, 95, 0.28);
+  }
+
+  /* Section label (e.g. "Platform Modules") */
+  .section-label {
+    @apply inline-flex items-center gap-2 text-xs font-semibold tracking-widest uppercase;
+    color: #1E3A5F;
+  }
+
+  .section-label::before {
+    content: '';
+    display: block;
+    width: 24px;
+    height: 2px;
+    background: #1E3A5F;
+    border-radius: 1px;
+  }
+
+  /* Gradient text (headline accent) */
+  .gradient-text {
+    background: linear-gradient(135deg, #1E3A5F 0%, #2E6AAD 50%, #1E3A5F 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Card surface */
+  .card-surface {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.06);
+  }
+}
+
+/* FDD Bot typing animation */
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+  40%           { transform: translateY(-5px); opacity: 1; }
+}
+
+/* Skeleton/shimmer for AI summary loading state */
+@keyframes finssentialsShimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
