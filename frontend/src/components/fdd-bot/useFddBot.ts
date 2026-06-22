@@ -60,8 +60,10 @@ export interface AdaptiveCardInput {
   max?: number
   label: string
   placeholder?: string
+  /** Muted helper line shown between label and control */
+  hint?: string
   default?: string
-  options?: { label: string; value: string }[]
+  options?: { label: string; value: string; optional?: boolean }[]
   required?: boolean
   accept?: string
   entity_count?: number
@@ -71,8 +73,8 @@ export interface AdaptiveCardInput {
   rowGroup?: string
   /** For type radio: label left, options right */
   layout?: 'default' | 'split'
-  /** Show this input only when another field equals `value` (client-side, e.g. review cards). */
-  showWhen?: { field: string; value: string }
+  /** Show this input only when condition(s) match (client-side). One object or all must match. */
+  showWhen?: { field: string; value: string } | { field: string; value: string }[]
   /** Omit from UI but still submit default with the card (e.g. ltm_month on review). */
   hidden?: boolean
 }
@@ -98,6 +100,8 @@ export interface AdaptiveCardPayload {
   next_card?: string
   /** Tighter layout (2-column grid where inputs set span) */
   compact?: boolean
+  /** Full width of chat column (uses compact grid without narrow max-width) */
+  wide?: boolean
   /** file_attachment card: downloadable output workbook */
   filename?: string
   download_url?: string
@@ -600,6 +604,7 @@ export function useFddBot() {
           sheet_names: row.sheet_names,
           headers: row.headers?.length ? row.headers : undefined,
         }
+        addMessage({ role: 'bot', text: `✓ ${file.name} hochgeladen — bereit für den nächsten Schritt.` })
         return row
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Upload error'

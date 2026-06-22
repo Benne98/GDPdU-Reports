@@ -710,6 +710,8 @@ def _is_source_helper_header(name) -> bool:
         return True
     if s.startswith("_PVM_FX_"):
         return True
+    if s.startswith("_churn_arr_"):
+        return True
     return False
 
 
@@ -865,6 +867,21 @@ def _normalize_header_name(name: str) -> str:
     s = str(name).strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def resolve_column_names_to_df(df: pd.DataFrame, names: list[str]) -> list[str]:
+    """Map config column labels to exact DataFrame header strings (nbsp/case tolerant)."""
+    col_map = {
+        _normalize_header_name(str(c)): str(c).replace("\u00a0", " ").strip()
+        for c in df.columns
+    }
+    resolved: list[str] = []
+    for raw in names:
+        key = _normalize_header_name(str(raw).replace("\u00a0", " "))
+        if key not in col_map:
+            raise ValueError(f"Spalte '{raw}' nicht in Quelldaten gefunden.")
+        resolved.append(col_map[key])
+    return resolved
 
 
 def _get_sheet_header_map(ws) -> dict[str, int]:

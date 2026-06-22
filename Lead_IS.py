@@ -10,10 +10,15 @@ from openpyxl.styles import Border, Side
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+BACKEND_DIR = PROJECT_ROOT / "backend"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
+from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from report_row_layout import build_lead_is_row_structure, l3_order_from_mapping  # noqa: E402
 
 # ==================================================
 # DESKTOP DEFAULTS
@@ -26,32 +31,13 @@ SHEET_MASTER = "Master_PL"
 SHEET_OUT = "Lead_IS"
 SHEET_RECON = "PL_Reconciliation"
 
-_RUNTIME_CFG: dict = {}
-
-
-def _apply_runtime_config() -> None:
-    global INPUT_FILE, MAPPING_FILE, PROJECT_NAME, GROUP_NAME, _RUNTIME_CFG
-    from databook_runtime import load_argv_config, path_value
-
-    cfg = load_argv_config()
-    if not cfg:
-        return
-    _RUNTIME_CFG.update(cfg)
-    INPUT_FILE = path_value(cfg, "master_file", path_value(cfg, "input_file", INPUT_FILE))
-    if cfg.get("project_name"):
-        PROJECT_NAME = str(cfg["project_name"])
-    if cfg.get("company_name"):
-        GROUP_NAME = str(cfg["company_name"])
-
-
-_apply_runtime_config()
-
 PROJECT_NAME = "Desktop Test"
 GROUP_NAME = "Group"
 UNIT_LABEL = "kEUR"
 
 SOURCE_COL_CANDIDATES = ("L5", "L6")
 REPORTED_FILTER_VALUE = "reported"
+L4_SORT_BASIS = "latest_fy"
 
 PL_POSITION_RENAME_MAP = {
     "Other Expenses": "Other operating expenses",
@@ -193,16 +179,18 @@ def col_letter(i: int) -> str:
 
 
 def detect_year_columns(df_: pd.DataFrame) -> list[str]:
-    pattern = re.compile(r"^FY(\d{2}|\d{4})A$", re.IGNORECASE)
-    years = [str(c).strip() for c in df_.columns if pattern.match(str(c).strip())]
-    if not years:
+    """FY columns only (for recon cross-checks)."""
+    fy, _ = split_fy_and_ytd(ordered_reporting_columns_from_df(df_))
+    if not fy:
         raise ValueError("Keine FY-Spalten gefunden (erwartet z. B. FY22A, FY23A).")
+    return fy
 
-    def year_sort_key(x: str):
-        m = pattern.match(x)
-        return int(m.group(1))
 
-    return sorted(dict.fromkeys(years), key=year_sort_key)
+def detect_reporting_period_columns(df_: pd.DataFrame) -> list[str]:
+    periods = ordered_reporting_columns_from_df(df_)
+    if not periods:
+        raise ValueError("Keine FY/YTD-Spalten gefunden (erwartet z. B. FY22A, YTD25A).")
+    return periods
 
 
 def resolve_source_section_column(df_: pd.DataFrame) -> str:
@@ -326,18 +314,19 @@ if SHEET_OUT in wb.sheetnames:
 ws = wb.create_sheet(SHEET_OUT)
 
 df_master = pd.read_excel(INPUT_FILE, sheet_name=SHEET_MASTER, engine="openpyxl")
-YEARS = detect_year_columns(df_master)
-CAGR_N = len(YEARS) - 1
+PERIODS = detect_reporting_period_columns(df_master)
+FY_COLS, YTD_COLS = split_fy_and_ytd(PERIODS)
+CAGR_N = len(FY_COLS) - 1
 
-required_cols = {"L3", "L4"} | set(YEARS)
+required_cols = {"L3", "L4"} | set(PERIODS)
 missing = required_cols - set(df_master.columns)
 if missing:
     raise ValueError(f"Master_PL fehlt Spalten: {missing}")
 
 l5_col = resolve_source_section_column(df_master)
-POS1_COL, Y1_COLS, CAGR1_COL, SPACER_COL, POS2_COL, Y2_COLS, CAGR2_COL = compute_lead_is_layout(len(YEARS))
+POS1_COL, Y1_COLS, CAGR1_COL, SPACER_COL, POS2_COL, Y2_COLS, CAGR2_COL = compute_lead_is_layout(len(PERIODS))
 
-year_range_txt = f"{YEARS[0]} - {YEARS[-1]}"
+year_range_txt = f"{FY_COLS[0]} - {FY_COLS[-1]}"
 TITLE_REPORTED = f"{GROUP_NAME} | Reported income statement {year_range_txt}"
 TITLE_PROFORMA = f"{GROUP_NAME} | Pro forma income statement {year_range_txt}"
 
@@ -353,30 +342,23 @@ def master_range(colname):
 l3_rng = master_range("L3")
 l4_rng = master_range("L4")
 l5_rng = master_range(l5_col)
-year_rng = {y: master_range(y) for y in YEARS}
+year_rng = {y: master_range(y) for y in PERIODS}
 
-from recon_mapping_loader import load_pl_recon_mapping_df
-
-map_df = load_pl_recon_mapping_df(_RUNTIME_CFG)
-if not {"L3", "L4"}.issubset(map_df.columns):
-    raise ValueError("Mapping-Datei muss Spalten 'L3' und 'L4' enthalten.")
+map_df = pd.read_excel(MAPPING_FILE, sheet_name=0, engine="openpyxl")
+if "L3" not in map_df.columns:
+    raise ValueError("Mapping-Datei muss Spalte 'L3' enthalten.")
 
 map_df = map_df.copy()
 map_df["L3"] = map_df["L3"].astype(str).apply(norm_pl)
-map_df["L4"] = map_df["L4"].where(map_df["L4"].notna(), "").astype(str).apply(norm_pl)
 
-row_structure = []
-l3_order = []
-for v in map_df["L3"].tolist():
-    if v not in l3_order:
-        l3_order.append(v)
-
-for l3 in l3_order:
-    block = map_df[map_df["L3"] == l3]
-    details = block[block["L4"].astype(str).str.strip().ne(l3)]
-    for r in details.itertuples(index=False):
-        row_structure.append({"type": "detail", "label": r.L4, "L3": r.L3, "L4": r.L4})
-    row_structure.append({"type": "subtotal", "label": l3, "L3": l3, "L4": l3})
+l3_order = l3_order_from_mapping(map_df)
+row_structure = build_lead_is_row_structure(
+    df_master,
+    l3_order,
+    {"l4_sort_basis": L4_SORT_BASIS},
+    source_col=l5_col,
+    label_fn=norm_pl,
+)
 
 existing_labels = {r["label"] for r in row_structure}
 
@@ -424,7 +406,7 @@ for cc in range(POS2_COL, CAGR2_COL + 1):
     ws.cell(HEADER_ROW_7, cc).fill = FILL_HEADER7
     ws.cell(HEADER_ROW_7, cc).font = FONT_BASE_BOLD
 
-cagr_range_txt = f"{year_short(YEARS[0])} - {year_short(YEARS[-1])}"
+cagr_range_txt = f"{year_short(FY_COLS[0])} - {year_short(FY_COLS[-1])}"
 for cagr_col in (CAGR1_COL, CAGR2_COL):
     ws.cell(HEADER_ROW_7, cagr_col, "CAGR").alignment = ALIGN_RIGHT
     ws.cell(HEADER_ROW_7, cagr_col).font = FONT_BASE_BOLD
@@ -447,7 +429,7 @@ ws.cell(HEADER_ROW, POS1_COL, UNIT_LABEL).font = FONT_HEADER
 ws.cell(HEADER_ROW, POS1_COL).alignment = ALIGN_LEFT
 ws.cell(HEADER_ROW, POS1_COL).fill = FILL_HEADER
 
-for idx, y in enumerate(YEARS):
+for idx, y in enumerate(PERIODS):
     cc = Y1_COLS[idx]
     h = ws.cell(HEADER_ROW, cc, y)
     h.font = FONT_HEADER
@@ -462,7 +444,7 @@ ws.cell(HEADER_ROW, POS2_COL, UNIT_LABEL).font = FONT_HEADER
 ws.cell(HEADER_ROW, POS2_COL).alignment = ALIGN_LEFT
 ws.cell(HEADER_ROW, POS2_COL).fill = FILL_HEADER
 
-for idx, y in enumerate(YEARS):
+for idx, y in enumerate(PERIODS):
     cc = Y2_COLS[idx]
     h = ws.cell(HEADER_ROW, cc, y)
     h.font = FONT_HEADER
@@ -536,7 +518,7 @@ for i, r in enumerate(row_structure):
     l4_crit = f"${col_letter(MAP_START_COL + 3)}${excel_row}"
     rep_crit = f"${col_letter(MAP_START_COL + 0)}${excel_row}"
 
-    for y_idx, year in enumerate(YEARS):
+    for y_idx, year in enumerate(PERIODS):
         c = ws.cell(excel_row, Y1_COLS[y_idx])
         c.number_format = NUM_FMT_INT
         c.alignment = ALIGN_RIGHT
@@ -575,9 +557,9 @@ for i, r in enumerate(row_structure):
     cagr1.font = FONT_CAGR_BOLD if is_total else FONT_CAGR
     cagr1.fill = FILL_KPI
     cagr1.border = NO_BORDER
-    cagr1.value = cagr_formula(Y1_COLS[0], Y1_COLS[-1], excel_row, CAGR_N)
+    cagr1.value = cagr_formula(Y1_COLS[0], Y1_COLS[len(FY_COLS) - 1], excel_row, CAGR_N)
 
-    for y_idx, year in enumerate(YEARS):
+    for y_idx, year in enumerate(PERIODS):
         c = ws.cell(excel_row, Y2_COLS[y_idx])
         c.number_format = NUM_FMT_INT
         c.alignment = ALIGN_RIGHT
@@ -615,7 +597,7 @@ for i, r in enumerate(row_structure):
     cagr2.font = FONT_CAGR_BOLD if is_total else FONT_CAGR
     cagr2.fill = FILL_KPI
     cagr2.border = NO_BORDER
-    cagr2.value = cagr_formula(Y2_COLS[0], Y2_COLS[-1], excel_row, CAGR_N)
+    cagr2.value = cagr_formula(Y2_COLS[0], Y2_COLS[len(FY_COLS) - 1], excel_row, CAGR_N)
 
 for r in row_structure:
     if r["type"] == "detail":
@@ -722,7 +704,7 @@ NET_RESULT_ROW = row_index[NET_RESULT_LABEL]
 if SHEET_RECON not in wb.sheetnames:
     raise RuntimeError("Sheet 'PL_Reconciliation' not found for check.")
 ws_recon = wb[SHEET_RECON]
-recon_year_col = find_recon_consolidation_year_cols(ws_recon, YEARS)
+recon_year_col = find_recon_consolidation_year_cols(ws_recon, FY_COLS)
 
 recon_net_row = None
 for rr in range(1, ws_recon.max_row + 1):
@@ -744,7 +726,7 @@ ws.cell(CHECK_DELTA_ROW, POS2_COL).font = FONT_BASE
 
 DELTA_RED_FONT = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.delta_negative)
 
-for i, y in enumerate(YEARS):
+for i, y in enumerate(FY_COLS):
     src1 = ws.cell(CHECK_SRC_ROW, Y1_COLS[i])
     src1.value = f"={SHEET_RECON}!{col_letter(recon_year_col[y])}{recon_net_row}"
     src1.number_format = NUM_FMT_INT
@@ -857,5 +839,5 @@ apply_zero_row_conditional_formatting(
 wb.save(INPUT_FILE)
 print(f"Fertig. Reiter '{SHEET_OUT}' gespeichert in: {INPUT_FILE}")
 print(f"Master_PL Source-Spalte: {l5_col}")
-print(f"Verwendete Jahre: {YEARS} (CAGR_N={CAGR_N})")
+print(f"Verwendete Perioden: {PERIODS} (FY={FY_COLS}, CAGR_N={CAGR_N})")
 print("Check rows linked to PL_Reconciliation / Consolidation / Net result.")

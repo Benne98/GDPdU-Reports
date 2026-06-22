@@ -87,6 +87,50 @@ class TestSusaMasterColumns(unittest.TestCase):
         self.assertTrue(pd.isna(out.loc[out["Account"] == "4000", "NA"].iloc[0]))
         self.assertEqual(out.loc[out["Account"] == "1000", "NA"].iloc[0], "Current assets")
 
+    def test_attach_mapping_bs_sign_dependent_duplicate_description(self):
+        desc = "Darl. Bet. GmbH an BU BR"
+        mapping = pd.DataFrame(
+            {
+                "Account description": [desc, desc],
+                "L1 - BS/PL": ["BS", "BS"],
+                "L2": ["Assets", "Liabilities"],
+                "L3": ["Receivables", "Financial liabilities"],
+                "L4": ["Receivables from affiliates", "Liabilities due to affiliates"],
+                "Account Type": ["BS", "BS"],
+                "NA": ["TWC", "ND"],
+            }
+        )
+        long_neg = pd.DataFrame(
+            {
+                "Account description": [desc, desc],
+                "Entity": ["E1", "E1"],
+                "Account": ["1200", "1200"],
+                "Month": [11, 12],
+                "Year": [2024, 2024],
+                "Balance": [1000.0, -500.0],
+            }
+        )
+        out_neg = _attach_mapping(long_neg, mapping)
+        self.assertEqual(out_neg.loc[out_neg["Month"] == 12, "NA"].iloc[0], "ND")
+        self.assertEqual(
+            out_neg.loc[out_neg["Month"] == 12, "L3"].iloc[0],
+            "Financial liabilities",
+        )
+
+        long_pos = pd.DataFrame(
+            {
+                "Account description": [desc, desc],
+                "Entity": ["E1", "E1"],
+                "Account": ["1200", "1200"],
+                "Month": [11, 12],
+                "Year": [2024, 2024],
+                "Balance": [-100.0, 800.0],
+            }
+        )
+        out_pos = _attach_mapping(long_pos, mapping)
+        self.assertEqual(out_pos.loc[out_pos["Month"] == 12, "NA"].iloc[0], "TWC")
+        self.assertEqual(out_pos.loc[out_pos["Month"] == 12, "L3"].iloc[0], "Receivables")
+
     def test_build_final_output_column_layout(self):
         rows = []
         for desc, acct, atype, na in (

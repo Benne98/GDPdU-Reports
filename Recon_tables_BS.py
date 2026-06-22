@@ -15,6 +15,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
+from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
 
 # =============================================
 # CONFIG (BS) — Desktop work defaults
@@ -69,6 +70,7 @@ SOURCE_SHEET_BS = "Master_BS"
 SOURCE_HEADER_ROW = 0
 SOURCE_COL_CANDIDATES = ("L5", "L6")
 REPORTED_FILTER_VALUE = "reported"
+L4_SORT_BASIS = "latest_fy"
 
 # =============================================
 # LAYOUT (same general geometry as PL)
@@ -211,121 +213,17 @@ def ic_sign(block):
     return 1 if block["kind"] == "ic" else 1
 
 # =============================================
-# LOAD BS MAPPING (L2/L3/L4)
+# LOAD BS MAPPING (L2/L3 hierarchy order; L4 ignored)
 # =============================================
 bs_map_df = pd.read_excel(MAPPING_FILE_BS, sheet_name=0, engine="openpyxl")
 bs_map_df = bs_map_df.loc[:, [c for c in bs_map_df.columns if not str(c).startswith("Unnamed")]]
-if not {"L2", "L3", "L4"}.issubset(bs_map_df.columns):
-    raise ValueError("Sortierung_BS_Datenbank muss Spalten 'L2', 'L3', 'L4' enthalten.")
+if not {"L2", "L3"}.issubset(bs_map_df.columns):
+    raise ValueError("Sortierung_BS_Datenbank muss Spalten 'L2' und 'L3' enthalten.")
 
 bs_map_df = bs_map_df.copy()
 bs_map_df["L2"] = bs_map_df["L2"].astype(str)
 bs_map_df["L3"] = bs_map_df["L3"].astype(str)
-bs_map_df["L4"] = bs_map_df["L4"].astype(str)
-
-# =============================================
-# BUILD BS ROW STRUCTURE with "single underposition => show only one L3 row"
-# =============================================
-bs_row_structure = []
-
-l2_order = []
-for v in bs_map_df["L2"].tolist():
-    if v not in l2_order:
-        l2_order.append(v)
-
-for l2 in l2_order:
-    sub_l2 = bs_map_df[bs_map_df["L2"] == l2]
-
-    l3_order = []
-    for v in sub_l2["L3"].tolist():
-        if v not in l3_order:
-            l3_order.append(v)
-
-    for l3 in l3_order:
-        sub_l3 = sub_l2[sub_l2["L3"] == l3]
-        l4_list = [str(x).strip() for x in sub_l3["L4"].tolist()]
-        l4_unique = list(dict.fromkeys(l4_list))
-        l3_label = str(l3).strip()
-
-        if len(l4_unique) == 1:
-            only_l4 = l4_unique[0]
-            if only_l4 == l3_label:
-                bs_row_structure.append({
-                    "type":  "detail_single",
-                    "label": l3_label,
-                    "L2":    l2,
-                    "L3":    l3_label,
-                    "L4":    only_l4,
-                })
-            else:
-                bs_row_structure.append({
-                    "type":  "detail",
-                    "label": only_l4,
-                    "L2":    l2,
-                    "L3":    l3_label,
-                    "L4":    only_l4,
-                })
-                bs_row_structure.append({
-                    "type":  "subtotal_l3",
-                    "label": l3_label,
-                    "L2":    l2,
-                    "L3":    l3_label,
-                    "L4":    "",
-                })
-        else:
-            for l4 in l4_unique:
-                bs_row_structure.append({
-                    "type":  "detail",
-                    "label": l4,
-                    "L2":    l2,
-                    "L3":    l3_label,
-                    "L4":    l4,
-                })
-
-            bs_row_structure.append({
-                "type":  "subtotal_l3",
-                "label": l3_label,
-                "L2":    l2,
-                "L3":    l3_label,
-                "L4":    "",
-            })
-
-    bs_row_structure.append({
-        "type":  "subtotal_l2",
-        "label": l2,
-        "L2":    l2,
-        "L3":    "",
-        "L4":    ""
-    })
-
-# =============================================
-# INSERT BS TOTALS (after L2 subtotals)
-# =============================================
-def insert_after_anchor_bs(struct, anchor_label, new_row):
-    for i, row in enumerate(struct):
-        if row["type"] == "subtotal_l2" and row["label"] == anchor_label:
-            struct.insert(i + 1, new_row)
-            return True
-    return False
-
-existing_labels = {r["label"] for r in bs_row_structure}
-
-for t in BS_TOTALS_CONFIG:
-    comps = [c for c in t["components"] if c in existing_labels]
-    if not comps:
-        continue
-
-    total_row = {
-        "type":       "total",
-        "label":      t["label"],
-        "components": comps,
-        "L2":         "",
-        "L3":         "",
-        "L4":         "",
-    }
-
-    if not insert_after_anchor_bs(bs_row_structure, t["insert_after"], total_row):
-        raise RuntimeError(f"Anchor '{t['insert_after']}' for BS total '{t['label']}' not found.")
+bs_l2_l3_order = l2_l3_order_from_mapping(bs_map_df)
 
 # =============================================
 # LOAD MASTER_BS + NORMALIZE ENTITY
@@ -342,6 +240,36 @@ REC_PERIOD_TO = YEARS[-1]
 
 source_col_bs = resolve_source_section_column(df_bs)
 print(f"Verwende Source-Spalte für Reported/Adjusted: {source_col_bs}")
+
+bs_row_structure = build_bs_row_structure(
+    df_bs,
+    bs_l2_l3_order,
+    {"l4_sort_basis": L4_SORT_BASIS},
+    source_col=source_col_bs or SOURCE_COL_CANDIDATES[0],
+)
+
+def insert_after_anchor_bs(struct, anchor_label, new_row):
+    for i, row in enumerate(struct):
+        if row["type"] == "subtotal_l2" and row["label"] == anchor_label:
+            struct.insert(i + 1, new_row)
+            return True
+    return False
+
+existing_labels = {r["label"] for r in bs_row_structure}
+for t in BS_TOTALS_CONFIG:
+    comps = [c for c in t["components"] if c in existing_labels]
+    if not comps:
+        continue
+    total_row = {
+        "type": "total",
+        "label": t["label"],
+        "components": comps,
+        "L2": "",
+        "L3": "",
+        "L4": "",
+    }
+    if not insert_after_anchor_bs(bs_row_structure, t["insert_after"], total_row):
+        raise RuntimeError(f"Anchor '{t['insert_after']}' for BS total '{t['label']}' not found.")
 
 required_bs = {"Entity", "L2", "L3", "L4"} | set(YEARS)
 missing_bs  = required_bs - set(df_bs.columns)

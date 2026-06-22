@@ -21,6 +21,19 @@ from rasa_sdk.executor import CollectingDispatcher
 import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_BACKEND_DIR = os.path.abspath(os.path.join(_REPO_ROOT, "backend"))
+
+for _p in (_REPO_ROOT, _BACKEND_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from databook_periods import (  # noqa: E402
+    as_of_is_fy_end,
+    compute_databook_grid_labels,
+    current_fy_end_year_containing_as_of,
+    is_ytd_grid_label,
+    ytd_reporting_fy_end_year,
+)
 from urllib.parse import quote
 
 from config import FASTAPI_BASE_URL, FILTER_OPERATORS, MONTH_NAMES
@@ -427,6 +440,7 @@ def _cached_session_ltm_month(tracker: Tracker) -> str | None:
 
 _SESSION_HEADERS: dict[str, list[str]] = {}
 _SESSION_COLUMN_ROLES: dict[str, dict[str, str]] = {}
+_SESSION_CHURN_FLOW: dict[str, dict[str, Any]] = {}
 
 _SESSION_DB_LAYOUT: dict[str, str] = {}
 _SESSION_DB_ENTITY_YEAR_FILES: dict[str, list[dict[str, Any]]] = {}
@@ -577,6 +591,216 @@ def _first_fy_for_top_review_card(tracker: Tracker, default: int = 2020) -> int:
     )
 
 
+def _first_fy_for_churn_labels_card(tracker: Tracker, default: int = 2020) -> int:
+    return _slot_int_first_hit(
+        tracker,
+        ("first_fy", "churn_first_fy_override", "top_first_fy_override", "gst_first_fy_override"),
+        default,
+    )
+
+
+def _fy_end_month_dropdown_opts() -> list[dict[str, str]]:
+    return [{"label": name, "value": str(i + 1)} for i, name in enumerate(MONTH_NAMES)]
+
+
+def _remember_churn_flow(tracker: Tracker, updates: dict[str, Any]) -> None:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return
+    bucket = _SESSION_CHURN_FLOW.setdefault(key, {})
+    for k, v in updates.items():
+        if v is None:
+            continue
+        bucket[k] = v
+
+
+def _churn_flow(tracker: Tracker) -> dict[str, Any]:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return {}
+    return dict(_SESSION_CHURN_FLOW.get(key, {}))
+
+
+def _churn_flow_val(tracker: Tracker, key: str, default: Any = "") -> Any:
+    raw = tracker.get_slot(key)
+    if raw not in (None, ""):
+        return raw
+    cached = _churn_flow(tracker).get(key)
+    if cached not in (None, ""):
+        return cached
+    if key.startswith("churn_group_col_"):
+        try:
+            idx = int(key.rsplit("_", 1)[-1]) - 1
+            group_cols = _churn_flow(tracker).get("group_cols")
+            if isinstance(group_cols, list) and 0 <= idx < len(group_cols):
+                text = str(group_cols[idx] or "").strip()
+                if text:
+                    return text
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
+def _churn_flow_group_cols(tracker: Tracker) -> list[str]:
+    flow = _churn_flow(tracker)
+    cached = flow.get("group_cols")
+    if isinstance(cached, list) and cached:
+        cols = [str(c).strip() for c in cached if str(c).strip()]
+        if cols:
+            return cols
+    cols: list[str] = []
+    for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+        text = str(_churn_flow_val(tracker, f"churn_group_col_{i}", "") or "").strip()
+        if text:
+            cols.append(text)
+    if cols:
+        return cols
+    for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+        raw = tracker.get_slot(f"churn_group_col_{i}")
+        text = str(raw or "").strip()
+        if text:
+            cols.append(text)
+    return cols
+
+
+def _churn_slot_col(tracker: Tracker, slot: str) -> str:
+    raw = tracker.get_slot(slot)
+    if raw not in (None, ""):
+        return str(raw).strip()
+    role = _SLOT_COLUMN_ROLE.get(slot)
+    if role:
+        cached = _cached_session_column_role(tracker, role)
+        if cached:
+            return str(cached).strip()
+    flow_val = _churn_flow_val(tracker, slot, "")
+    if flow_val not in (None, ""):
+        return str(flow_val).strip()
+    return str(_column_default(tracker, slot) or "").strip()
+
+
+def _churn_review_group_level_count(tracker: Tracker) -> int:
+    raw = _churn_flow_val(tracker, "churn_group_level_count", None)
+    if raw not in (None, ""):
+        try:
+            n = int(float(raw))
+            return max(1, min(CHURN_MAX_GROUP_LEVELS, n))
+        except (TypeError, ValueError):
+            pass
+    cols = _churn_flow_group_cols(tracker)
+    if cols:
+        return len(cols)
+    return 1
+
+
+def _churn_bucket_inputs_for_card(tracker: Tracker) -> list[dict[str, Any]]:
+    bucket_mode_default = str(_churn_flow_val(tracker, "churn_bucket_mode", "threshold") or "threshold").strip().lower()
+    if bucket_mode_default in ("custom_threshold", "threshold"):
+        bucket_mode_default = "threshold"
+    elif bucket_mode_default != "custom_numbers":
+        bucket_mode_default = "threshold"
+    return [
+        {
+            "id": "churn_top_bucket_enabled",
+            "type": "radio",
+            "label": "Enable top buckets",
+            "layout": "split",
+            "span": 2,
+            "default": "on" if _slot_bool(_churn_flow_val(tracker, "churn_top_bucket_enabled", False)) else "off",
+            "options": [
+                {"label": "Off", "value": "off"},
+                {"label": "On", "value": "on"},
+            ],
+        },
+        {
+            "id": "churn_bucket_mode",
+            "type": "radio",
+            "label": "Bucket mode",
+            "layout": "split",
+            "span": 2,
+            "default": bucket_mode_default,
+            "showWhen": {"field": "churn_top_bucket_enabled", "value": "on"},
+            "options": [
+                {"label": "Cumulative share thresholds", "value": "threshold"},
+                {"label": "Items per bucket", "value": "custom_numbers"},
+            ],
+        },
+        {
+            "id": "churn_bucket_thresholds",
+            "type": "text",
+            "label": "Thresholds e.g. [0.2, 0.5, 0.8]",
+            "hint": "You can create as many buckets as you want",
+            "span": 2,
+            "default": _churn_flow_val(tracker, "churn_bucket_thresholds", "[0.2, 0.5, 0.8]") or "[0.2, 0.5, 0.8]",
+            "showWhen": [
+                {"field": "churn_top_bucket_enabled", "value": "on"},
+                {"field": "churn_bucket_mode", "value": "threshold"},
+            ],
+        },
+        {
+            "id": "churn_bucket_numbers",
+            "type": "text",
+            "label": "Items per bucket e.g. [3, 5, 10]",
+            "hint": "You can create as many buckets as you want",
+            "span": 2,
+            "default": _churn_flow_val(tracker, "churn_bucket_numbers", "") or "",
+            "showWhen": [
+                {"field": "churn_top_bucket_enabled", "value": "on"},
+                {"field": "churn_bucket_mode", "value": "custom_numbers"},
+            ],
+        },
+        {
+            "id": "churn_other_bucket",
+            "type": "radio",
+            "label": "'Other' bucket",
+            "layout": "split",
+            "span": 2,
+            "default": str(_churn_flow_val(tracker, "churn_other_bucket", "include") or "include"),
+            "showWhen": {"field": "churn_top_bucket_enabled", "value": "on"},
+            "options": [
+                {"label": "Include", "value": "include"},
+                {"label": "Disable", "value": "disable"},
+            ],
+        },
+        {
+            "id": "churn_other_bucket_label",
+            "type": "text",
+            "label": "Label for the 'Other' bucket",
+            "span": 2,
+            "default": _churn_flow_val(tracker, "churn_other_bucket_label", "Other") or "Other",
+            "showWhen": [
+                {"field": "churn_top_bucket_enabled", "value": "on"},
+                {"field": "churn_other_bucket", "value": "include"},
+            ],
+        },
+    ]
+
+
+def _churn_review_summary(tracker: Tracker) -> str:
+    grp = " / ".join(_churn_group_cols_from_tracker(tracker))
+    return "\n".join([
+        f"Value: {_churn_slot_col(tracker, 'churn_value_col') or '—'}",
+        f"Customer: {_churn_slot_col(tracker, 'churn_customer_col') or '—'}",
+        f"Product: {_churn_slot_col(tracker, 'churn_product_col') or '—'}",
+        f"Grouping: {grp or '—'}",
+    ])
+
+
+def _fdd_latest_closed_fy_end_year(cy: int, cm: int, fy_end_m: int, fy_end_d: int) -> int:
+    """Latest closed FY-end calendar year for as-of month (no funktionssammlung import)."""
+    cur = current_fy_end_year_containing_as_of(cy, cm, fy_end_m, fy_end_d)
+    return cur if as_of_is_fy_end(cy, cm, fy_end_m, fy_end_d) else cur - 1
+
+
+def _churn_sort_config_from_payload(tracker: Tracker, payload: dict | None) -> dict[str, Any]:
+    p = payload or {}
+    sort: dict[str, Any] = {"top_level_desc": True, "leaf_desc": True}
+    s1 = str(p.get("churn_sort_by_1", tracker.get_slot("churn_sort_by_1") or "arr")).strip().lower()
+    sort["top_level_by"] = "name" if s1 == "name" else "ARR2"
+    s2 = str(p.get("churn_sort_by_2", tracker.get_slot("churn_sort_by_2") or "arr")).strip().lower()
+    sort["leaf_within_parent"] = "name" if s2 == "name" else "ARR2"
+    return sort
+
+
 def _resolve_filter_context(tracker: Tracker) -> str:
     """
     Which output's filter rules are being edited (gst / pvm / top).
@@ -585,7 +809,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
     chain (Rasa tracker persistence); `desired_output` stays set — use it as fallback.
     """
     raw = tracker.get_slot("active_filter_context")
-    if raw in ("gst", "pvm", "top", "bs"):
+    if raw in ("gst", "pvm", "top", "bs", "churn"):
         return str(raw)
     desired = str(tracker.get_slot("desired_output") or "").strip()
     return {
@@ -593,6 +817,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
         "pvm_analysis": "pvm",
         "top_report": "top",
         "bubble_scatter": "bs",
+        "churn": "churn",
     }.get(desired, "gst")
 
 
@@ -776,14 +1001,16 @@ def _revenue_slot(tracker: Tracker, key: str, payload: dict | None = None, defau
 # slots in every other strand. The "dimension" role is the primary analysis
 # grouping column (products / customers / ...).
 _COLUMN_ROLE_SLOTS: dict[str, list[str]] = {
-    "revenue": ["gst_revenue_col", "pvm_revenue_col", "top_value_col", "bs_revenue_col"],
-    "invoice": ["gst_invoice_col", "pvm_invoice_col", "top_invoice_col", "bs_invoice_col"],
-    "start": ["gst_start_col", "top_start_col", "bs_start_col"],
-    "end": ["gst_end_col", "top_end_col", "bs_end_col"],
+    "revenue": ["gst_revenue_col", "pvm_revenue_col", "top_value_col", "bs_revenue_col", "churn_value_col"],
+    "invoice": ["gst_invoice_col", "pvm_invoice_col", "top_invoice_col", "bs_invoice_col", "churn_invoice_col"],
+    "start": ["gst_start_col", "top_start_col", "bs_start_col", "churn_start_col"],
+    "end": ["gst_end_col", "top_end_col", "bs_end_col", "churn_end_col"],
     "cost": ["gst_cost_col", "pvm_cost_col", "bs_cogs_col"],
     "profit": ["gst_profit_col", "pvm_profit_col", "bs_profit_col"],
     "quantity": ["pvm_quantity_col"],
     "dimension": ["top_col", "pvm_group_col", "gst_group_col_1", "bs_group_col_1"],
+    "customer": ["churn_customer_col"],
+    "product": ["churn_product_col"],
 }
 
 _SLOT_COLUMN_ROLE: dict[str, str] = {
@@ -1658,6 +1885,13 @@ class ActionDispatchCard(Action):
             "top_filter_checkpoint": ActionProcessTopFilterCheckpoint(),
             "top_review": ActionShowTopReview(),
             "top_proceed": ActionRunTop(),
+            # Churn
+            "churn_columns": ActionProcessChurnColumns(),
+            "churn_groups": ActionProcessChurnGroups(),
+            "churn_labels": ActionProcessChurnLabels(),
+            "churn_filter_checkpoint": ActionProcessChurnFilterCheckpoint(),
+            "churn_review": ActionShowChurnReview(),
+            "churn_proceed": ActionRunChurn(),
             # Bubble Scatter
             "bs_period_calc": ActionProcessBsPeriodCalc(),
             "bs_value_columns": ActionProcessBsValueColumns(),
@@ -1687,12 +1921,11 @@ class ActionDispatchCard(Action):
             "databook_consolidation_upload": ActionProcessDatabookConsolidationUpload(),
             "databook_adjustments": ActionProcessDatabookAdjustments(),
             "databook_adjustments_upload": ActionProcessDatabookAdjustmentsUpload(),
-            "databook_fs_gate": ActionProcessDatabookFsGate(),
+            "databook_l4_sort": ActionProcessDatabookL4Sort(),
             "databook_fs_upload": ActionProcessDatabookFsUpload(),
             "databook_fs_review_upload": ActionProcessDatabookFsReviewUpload(),
             "databook_recon_order": ActionProcessDatabookReconOrder(),
             "databook_recon_labels": ActionProcessDatabookReconLabels(),
-            "databook_next_step": ActionProcessDatabookNextStep(),
             "databook_sort": ActionProcessDatabookSort(),
             "databook_proceed": ActionRunDatabookFinal(),
         }
@@ -1814,6 +2047,9 @@ def _undo_redo_handlers() -> dict[str, Any]:
         "action_reshow_top_columns": ActionReshowTopColumns(),
         "action_show_top_review": ActionShowTopReview(),
         "action_enter_top_filter_checkpoint": ActionEnterTopFilterCheckpoint(),
+        "action_reshow_churn_columns": ActionReshowChurnColumns(),
+        "action_show_churn_review": ActionShowChurnReview(),
+        "action_enter_churn_filter_checkpoint": ActionEnterChurnFilterCheckpoint(),
         "action_show_bs_review": ActionShowBsReview(),
         "action_enter_bs_filter_checkpoint": ActionEnterBsFilterCheckpoint(),
     }
@@ -1980,119 +2216,31 @@ class ActionProcessDatesCard(Action):
             events.append(SlotSet("first_fy", fy_val))
             events.append(SlotSet("gst_first_fy_override", fy_val))
             events.append(SlotSet("pvm_first_fy_override", fy_val))
-        # Advance directly to folder navigation (combined card)
-        events.append(FollowupAction("action_navigate_folders"))
+        # Outputs go to session upload folder; user downloads via file_attachment cards.
+        dispatcher.utter_message(response="utter_ask_build_databook")
         return events
 
 
 class ActionNavigateFolders(Action):
+    """Legacy undo target — folder selection removed; go straight to output type."""
+
     def name(self) -> str:
         return "action_navigate_folders"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        payload = _parse_payload(tracker)
-        # Accept path from payload text field or previously stored slot
-        base_path = payload.get("base_path", tracker.get_slot("base_path") or "")
-        result = _fdd_get("/api/v1/fdd/folders", {"path": base_path})
-
-        subfolders = result.get("subfolders", [])
-        subfolder_options = [
-            {"label": f"📁 {f}", "value": f"{base_path}/{f}".replace("\\", "/") if base_path else f}
-            for f in subfolders
-        ]
-        subfolder_options.insert(0, {"label": "✓ Use current folder", "value": base_path or ""})
-
-        inputs = [
-            {
-                "id": "base_path",
-                "type": "folder_picker",
-                "label": "Output folder path",
-                "placeholder": "C:\\Users\\...",
-                "default": base_path or "",
-            },
-        ]
-        if subfolder_options:
-            inputs.append({
-                "id": "output_folder",
-                "type": "dropdown",
-                "label": "Or navigate into a subfolder",
-                "options": subfolder_options,
-                "default": base_path or "",
-            })
-
-        dispatcher.utter_message(
-            json_message={
-                "type": "adaptive_card",
-                "card": "folder_select",
-                "title": "Select Output Folder",
-                "subtitle": f"Current path: {base_path or '(root)'}",
-                "inputs": inputs,
-                "submit_label": "Confirm",
-            }
-        )
-        events_out: list[Any] = [SlotSet("base_path", base_path)]
-        fy = tracker.get_slot("first_fy")
-        if fy not in (None, ""):
-            try:
-                fv = float(fy)
-                events_out.extend(
-                    [
-                        SlotSet("first_fy", fv),
-                        SlotSet("gst_first_fy_override", fv),
-                        SlotSet("pvm_first_fy_override", fv),
-                    ]
-                )
-            except (TypeError, ValueError):
-                pass
-        return events_out
+        dispatcher.utter_message(response="utter_ask_build_databook")
+        return []
 
 
 class ActionProcessFolderSelection(Action):
+    """Legacy dispatch handler — folder selection removed."""
+
     def name(self) -> str:
         return "action_process_folder_selection"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        payload = _parse_payload(tracker)
-        # Prefer the subfolder dropdown selection; fall back to the typed path
-        output_folder = payload.get("output_folder") or payload.get("base_path") or tracker.get_slot("base_path") or ""
-        # If the user navigated into a subfolder (output_folder differs from base_path), re-show nav card
-        selected_path = payload.get("base_path", tracker.get_slot("base_path") or "")
-        chosen = payload.get("output_folder", "")
-        if chosen and chosen != selected_path:
-            # User picked a subfolder — navigate deeper
-            result = _fdd_get("/api/v1/fdd/folders", {"path": chosen})
-            subfolders = result.get("subfolders", [])
-            subfolder_options = [
-                {"label": f"📁 {f}", "value": f"{chosen}/{f}".replace("\\", "/")}
-                for f in subfolders
-            ]
-            subfolder_options.insert(0, {"label": "✓ Use current folder", "value": chosen})
-            inputs = [
-                {"id": "base_path", "type": "folder_picker", "label": "Output folder path",
-                 "placeholder": "C:\\Users\\...", "default": chosen},
-            ]
-            if subfolder_options:
-                inputs.append({
-                    "id": "output_folder",
-                    "type": "dropdown",
-                    "label": "Or navigate into a subfolder",
-                    "options": subfolder_options,
-                    "default": chosen,
-                })
-            dispatcher.utter_message(
-                json_message={
-                    "type": "adaptive_card",
-                    "card": "folder_select",
-                    "title": "Select Output Folder",
-                    "subtitle": f"Current path: {chosen}",
-                    "inputs": inputs,
-                    "submit_label": "Confirm",
-                }
-            )
-            return [SlotSet("base_path", chosen)]
-        # User confirmed the current folder
         dispatcher.utter_message(response="utter_ask_build_databook")
-        return [SlotSet("output_folder", output_folder)]
+        return []
 
 
 class ActionProcessBuildDatabook(Action):
@@ -2408,6 +2556,7 @@ class ActionProcessFxCard(Action):
                                 {"label": "TOP Report", "value": "top_report"},
                                 {"label": "PVM Analysis", "value": "pvm_analysis"},
                                 {"label": "General Sales Table", "value": "general_sales_table"},
+                                {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
                             ],
                         }
@@ -2452,6 +2601,9 @@ class ActionProcessDesiredOutput(Action):
             dispatcher.utter_message(
                 json_message=_build_top_calc_mode_card()
             )
+        elif desired == "churn":
+            dispatcher.utter_message(text="Great! Let's configure the Churn / ARR Bridge.")
+            _emit_churn_columns_card(dispatcher, tracker, payload)
         elif desired == "bubble_scatter":
             dispatcher.utter_message(text="Great! Let's configure the Bubble Scatter Plot.")
             dispatcher.utter_message(
@@ -3619,6 +3771,19 @@ def _top_bucket_mode_for_script(mode: str) -> str:
     return "threshold"
 
 
+def _parse_list(val: Any, fallback: list) -> list:
+    if val in (None, ""):
+        return fallback
+    if isinstance(val, list):
+        return val
+    try:
+        import ast
+        parsed = ast.literal_eval(str(val))
+        return parsed if isinstance(parsed, list) else fallback
+    except Exception:
+        return fallback
+
+
 def _top_filters_payload(rules_json: str | None) -> dict:
     return _fdd_filters_payload(rules_json)
 
@@ -3909,15 +4074,6 @@ class ActionRunTop(Action):
             v = payload.get(key, None)
             return default if v is None or v == "" else v
 
-        def _parse_list(val: str | None, fallback: list) -> list:
-            if not val:
-                return fallback
-            try:
-                import ast
-                return ast.literal_eval(val)
-            except Exception:
-                return fallback
-
         bucket_mode_raw = pick("top_bucket_mode", s.get("top_bucket_mode", "threshold"))
         bucket_mode = _top_bucket_mode_for_script(bucket_mode_raw)
         thresholds = _parse_list(pick("top_bucket_thresholds", s.get("top_bucket_thresholds")), [0.2, 0.5, 0.8])
@@ -4028,6 +4184,677 @@ class ActionRunTop(Action):
         )
 
         return slot_events
+
+
+# ─── Churn / ARR Bridge flow ───────────────────────────────────────────────────
+
+CHURN_MAX_GROUP_LEVELS = 3
+
+
+def _churn_group_level_count(tracker: Tracker) -> int:
+    raw = tracker.get_slot("churn_group_level_count")
+    try:
+        n = int(float(raw)) if raw not in (None, "") else 1
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(CHURN_MAX_GROUP_LEVELS, n))
+
+
+def _churn_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
+    disp = (tracker.get_slot("churn_filter_rules_display") or "").strip()
+    if not disp:
+        disp = "No active filter rules."
+    return {
+        "type": "adaptive_card",
+        "card": "churn_filter_checkpoint",
+        "title": "Churn — Filter rules",
+        "subtitle": "Review your current filter rules, then choose an action.",
+        "review_text": disp,
+        "inputs": [
+            {
+                "id": "churn_filter_manage_choice",
+                "type": "radio",
+                "label": "What would you like to do?",
+                "options": [
+                    {"label": "1. Delete current rules", "value": "delete_all"},
+                    {"label": "2. Add a rule", "value": "add_rule"},
+                    {"label": "3. Keep rules as they are", "value": "keep"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+def _emit_churn_columns_card(dispatcher: CollectingDispatcher, tracker: Tracker, payload: dict | None = None) -> None:
+    header_opts = _header_opts_for_review(
+        tracker,
+        payload,
+        _column_default(tracker, "churn_value_col", payload),
+        _column_default(tracker, "churn_invoice_col", payload),
+        _column_default(tracker, "churn_start_col", payload),
+        _column_default(tracker, "churn_end_col", payload),
+    )
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "churn_columns",
+            "title": "Churn — Core columns",
+            "subtitle": "Map the contract and customer fields required for the ARR bridge.",
+            "inputs": [
+                {"id": "churn_value_col", "type": "dropdown", "label": "Contract value column",
+                 "options": header_opts, "default": _column_default(tracker, "churn_value_col", payload)},
+                {"id": "churn_customer_col", "type": "dropdown", "label": "Customer ID column",
+                 "options": header_opts, "default": _column_default(tracker, "churn_customer_col", payload)},
+                {"id": "churn_product_col", "type": "dropdown", "label": "Product column",
+                 "options": header_opts, "default": _column_default(tracker, "churn_product_col", payload)},
+                {"id": "churn_start_col", "type": "dropdown", "label": "Contract start date",
+                 "options": header_opts, "default": _column_default(tracker, "churn_start_col", payload)},
+                {"id": "churn_end_col", "type": "dropdown", "label": "Contract end date",
+                 "options": header_opts, "default": _column_default(tracker, "churn_end_col", payload)},
+                {"id": "churn_invoice_col", "type": "dropdown", "label": "Invoice date column",
+                 "options": header_opts, "default": _column_default(tracker, "churn_invoice_col", payload)},
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _emit_churn_groups_card(dispatcher: CollectingDispatcher, tracker: Tracker, level_count: int) -> None:
+    headers = _headers_from_sources(tracker)
+    opts = [{"label": h, "value": h} for h in headers]
+    inputs: list[dict[str, Any]] = []
+    for i in range(1, level_count + 1):
+        slot = f"churn_group_col_{i}"
+        default = str(_column_default(tracker, slot) or "")
+        if default and not any(o["value"] == default for o in opts):
+            col_opts = [{"label": default, "value": default}] + opts
+        else:
+            col_opts = opts
+        inputs.append({
+            "id": slot,
+            "type": "dropdown",
+            "label": f"Grouping column — level {i}",
+            "options": col_opts,
+            "default": default,
+        })
+        sort_default = tracker.get_slot(f"churn_sort_by_{i}") or "arr"
+        inputs.append({
+            "id": f"churn_sort_by_{i}",
+            "type": "radio",
+            "label": f"Sort level {i} by (descending)",
+            "default": str(sort_default),
+            "options": [
+                {"label": "ARR (largest first)", "value": "arr"},
+                {"label": "Alphabetical", "value": "name"},
+            ],
+        })
+    card: dict[str, Any] = {
+        "type": "adaptive_card",
+        "card": "churn_groups",
+        "title": "Churn — Grouping",
+        "subtitle": (
+            "Hierarchy: level 1 is the outer group; deeper levels nest inside. "
+            "Sorting is always descending."
+        ),
+        "inputs": inputs,
+        "submit_label": "Continue",
+    }
+    if level_count < CHURN_MAX_GROUP_LEVELS:
+        card["secondary_submit_label"] = "Add another grouping column"
+        card["secondary_submit_id"] = "churn_add_group_col"
+    dispatcher.utter_message(json_message=card)
+
+
+def _emit_churn_labels_card(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+    group_cols_override: list[str] | None = None,
+) -> None:
+    group_cols = group_cols_override if group_cols_override is not None else _churn_group_cols_from_tracker(tracker)
+    single_group = len(group_cols) == 1
+    fy_default = int(_first_fy_for_churn_labels_card(tracker))
+    inputs: list[dict[str, Any]] = [
+        {"id": "churn_table", "type": "text", "label": "Table name",
+         "default": tracker.get_slot("churn_table") or "ARR Bridge", "placeholder": "ARR Bridge"},
+        {"id": "churn_total_label", "type": "text", "label": "Total row label",
+         "default": tracker.get_slot("churn_total_label") or "Total", "placeholder": "Total"},
+        {
+            "id": "churn_first_fy_override",
+            "type": "number",
+            "label": "First fiscal year to include in the data source",
+            "default": str(fy_default),
+            "placeholder": str(fy_default),
+        },
+    ]
+    if single_group:
+        bucket_mode_default = str(tracker.get_slot("churn_bucket_mode") or "threshold").strip().lower()
+        if bucket_mode_default in ("custom_threshold", "threshold"):
+            bucket_mode_default = "threshold"
+        elif bucket_mode_default != "custom_numbers":
+            bucket_mode_default = "threshold"
+        inputs.append({
+            "id": "churn_top_bucket_enabled",
+            "type": "radio",
+            "label": "Enable top buckets",
+            "default": "off" if not _slot_bool(tracker.get_slot("churn_top_bucket_enabled")) else "on",
+            "options": [
+                {"label": "Off", "value": "off"},
+                {"label": "On", "value": "on"},
+            ],
+        })
+        inputs += [
+            {
+                "id": "churn_bucket_mode",
+                "type": "radio",
+                "label": "Bucket mode",
+                "default": bucket_mode_default,
+                "showWhen": {"field": "churn_top_bucket_enabled", "value": "on"},
+                "options": [
+                    {"label": "Cumulative share thresholds", "value": "threshold"},
+                    {"label": "Items per bucket", "value": "custom_numbers"},
+                ],
+            },
+            {
+                "id": "churn_bucket_thresholds",
+                "type": "text",
+                "label": "Thresholds e.g. [0.2, 0.5, 0.8]",
+                "hint": "You can create as many buckets as you want",
+                "default": _churn_flow_val(tracker, "churn_bucket_thresholds", "[0.2, 0.5, 0.8]") or "[0.2, 0.5, 0.8]",
+                "showWhen": [
+                    {"field": "churn_top_bucket_enabled", "value": "on"},
+                    {"field": "churn_bucket_mode", "value": "threshold"},
+                ],
+            },
+            {
+                "id": "churn_bucket_numbers",
+                "type": "text",
+                "label": "Items per bucket e.g. [3, 5, 10]",
+                "hint": "You can create as many buckets as you want",
+                "default": _churn_flow_val(tracker, "churn_bucket_numbers", "") or "",
+                "showWhen": [
+                    {"field": "churn_top_bucket_enabled", "value": "on"},
+                    {"field": "churn_bucket_mode", "value": "custom_numbers"},
+                ],
+            },
+            {
+                "id": "churn_other_bucket",
+                "type": "radio",
+                "label": "'Other' bucket",
+                "default": "include",
+                "showWhen": {"field": "churn_top_bucket_enabled", "value": "on"},
+                "options": [
+                    {"label": "Include", "value": "include"},
+                    {"label": "Disable", "value": "disable"},
+                ],
+            },
+            {
+                "id": "churn_other_bucket_label",
+                "type": "text",
+                "label": "Label for the 'Other' bucket",
+                "default": _churn_flow_val(tracker, "churn_other_bucket_label", "Other") or "Other",
+                "showWhen": [
+                    {"field": "churn_top_bucket_enabled", "value": "on"},
+                    {"field": "churn_other_bucket", "value": "include"},
+                ],
+            },
+        ]
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "churn_labels",
+            "title": "Churn — Labels & periods",
+            "inputs": inputs,
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _churn_group_cols_from_tracker(tracker: Tracker) -> list[str]:
+    return _churn_flow_group_cols(tracker)
+
+
+def _churn_group_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    p = payload or {}
+    cols: list[str] = []
+    for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+        raw = p.get(f"churn_group_col_{i}")
+        if raw in (None, ""):
+            raw = _churn_flow_val(tracker, f"churn_group_col_{i}", "")
+        text = str(raw or "").strip()
+        if text:
+            cols.append(text)
+    if cols:
+        return cols
+    return _churn_flow_group_cols(tracker)
+
+
+def _churn_sort_config_from_tracker(tracker: Tracker) -> dict[str, Any]:
+    sort: dict[str, Any] = {"top_level_desc": True, "leaf_desc": True}
+    s1 = str(tracker.get_slot("churn_sort_by_1") or "arr").strip().lower()
+    sort["top_level_by"] = "name" if s1 == "name" else "ARR2"
+    if _churn_group_level_count(tracker) >= 2:
+        s2 = str(tracker.get_slot("churn_sort_by_2") or "arr").strip().lower()
+        sort["leaf_within_parent"] = "name" if s2 == "name" else "ARR2"
+    return sort
+
+
+def _churn_top_bucket_config(tracker: Tracker, payload: dict | None = None) -> dict[str, Any]:
+    p = payload or {}
+    enabled = str(
+        p.get("churn_top_bucket_enabled", _churn_flow_val(tracker, "churn_top_bucket_enabled", "off") or "off")
+    ).lower() == "on"
+    if not enabled or len(_churn_group_cols_from_sources(tracker, p)) != 1:
+        return {"enabled": False}
+    mode_raw = str(p.get("churn_bucket_mode", _churn_flow_val(tracker, "churn_bucket_mode", "threshold") or "threshold")).lower()
+    bucket_mode = _top_bucket_mode_for_script(mode_raw)
+    thresholds = _parse_list(
+        p.get("churn_bucket_thresholds", _churn_flow_val(tracker, "churn_bucket_thresholds", "[0.2, 0.5, 0.8]")),
+        [0.2, 0.5, 0.8],
+    )
+    numbers = _parse_list(p.get("churn_bucket_numbers", _churn_flow_val(tracker, "churn_bucket_numbers", "")), [])
+    other = str(p.get("churn_other_bucket", _churn_flow_val(tracker, "churn_other_bucket", "include") or "include"))
+    other_label = str(
+        p.get("churn_other_bucket_label", _churn_flow_val(tracker, "churn_other_bucket_label", "Other") or "Other")
+    ).strip() or "Other"
+    return {
+        "enabled": True,
+        "bucket_mode": bucket_mode,
+        "thresholds": thresholds,
+        "numbers": numbers,
+        "create_other_bucket": other != "disable",
+        "other_bucket_label": other_label if other != "disable" else "Other",
+        "based_on": "current",
+    }
+
+
+class ActionProcessChurnColumns(Action):
+    def name(self) -> str:
+        return "action_process_churn_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        events: list[Any] = []
+        flow_updates: dict[str, Any] = {}
+        for k in (
+            "churn_value_col", "churn_customer_col", "churn_product_col",
+            "churn_start_col", "churn_end_col", "churn_invoice_col",
+        ):
+            if k in payload:
+                events.extend(_sync_column_role_slots(tracker, k, payload.get(k)))
+                flow_updates[k] = payload.get(k)
+        _remember_churn_flow(tracker, flow_updates)
+        _emit_churn_groups_card(dispatcher, tracker, 1)
+        return events + [SlotSet("churn_group_level_count", 1)]
+
+
+class ActionReshowChurnColumns(Action):
+    def name(self) -> str:
+        return "action_reshow_churn_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_churn_columns_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessChurnGroups(Action):
+    def name(self) -> str:
+        return "action_process_churn_groups"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        events: list[Any] = []
+        for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+            gk = f"churn_group_col_{i}"
+            sk = f"churn_sort_by_{i}"
+            if gk in payload:
+                events.append(SlotSet(gk, payload.get(gk)))
+            if sk in payload:
+                events.append(SlotSet(sk, payload.get(sk)))
+
+        flow_partial: dict[str, Any] = {}
+        for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+            gk = f"churn_group_col_{i}"
+            sk = f"churn_sort_by_{i}"
+            if gk in payload:
+                flow_partial[gk] = payload.get(gk)
+            if sk in payload:
+                flow_partial[sk] = payload.get(sk)
+        if flow_partial:
+            _remember_churn_flow(tracker, flow_partial)
+
+        if payload.get("churn_add_group_col"):
+            level = min(CHURN_MAX_GROUP_LEVELS, _churn_group_level_count(tracker) + 1)
+            events.append(SlotSet("churn_group_level_count", level))
+            _remember_churn_flow(tracker, {"churn_group_level_count": level})
+            _emit_churn_groups_card(dispatcher, tracker, level)
+            return events
+
+        payload_cols = [
+            str(payload.get(f"churn_group_col_{i}") or "").strip()
+            for i in range(1, CHURN_MAX_GROUP_LEVELS + 1)
+            if str(payload.get(f"churn_group_col_{i}") or "").strip()
+        ]
+        level = max(1, min(CHURN_MAX_GROUP_LEVELS, len(payload_cols) if payload_cols else _churn_group_level_count(tracker)))
+        events.append(SlotSet("churn_group_level_count", level))
+        flow_updates: dict[str, Any] = {"group_cols": payload_cols, "churn_group_level_count": level}
+        for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+            col = payload_cols[i - 1] if i <= len(payload_cols) else ""
+            events.append(SlotSet(f"churn_group_col_{i}", col))
+            flow_updates[f"churn_group_col_{i}"] = col
+            sk = f"churn_sort_by_{i}"
+            if sk in payload:
+                events.append(SlotSet(sk, payload.get(sk)))
+                flow_updates[sk] = payload.get(sk)
+        _remember_churn_flow(tracker, flow_updates)
+        _emit_churn_labels_card(dispatcher, tracker, group_cols_override=payload_cols or None)
+        return events
+
+
+class ActionProcessChurnLabels(Action):
+    def name(self) -> str:
+        return "action_process_churn_labels"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        fy_raw = payload.get("churn_first_fy_override")
+        if fy_raw in (None, ""):
+            fy_val = float(_first_fy_for_churn_labels_card(tracker))
+        else:
+            fy_val = float(str(fy_raw).strip().replace(",", "."))
+        _remember_session_first_fy(tracker, fy_val)
+        bucket_on = str(payload.get("churn_top_bucket_enabled", "off")).lower() == "on"
+        events = [
+            SlotSet("churn_table", payload.get("churn_table", "ARR Bridge")),
+            SlotSet("churn_total_label", payload.get("churn_total_label", "Total")),
+            SlotSet("churn_first_fy_override", fy_val),
+            SlotSet("churn_top_bucket_enabled", bucket_on),
+            SlotSet("churn_bucket_mode", payload.get("churn_bucket_mode", "threshold")),
+            SlotSet("churn_bucket_thresholds", payload.get("churn_bucket_thresholds", "[0.2, 0.5, 0.8]")),
+            SlotSet("churn_bucket_numbers", payload.get("churn_bucket_numbers", "")),
+            SlotSet("churn_other_bucket", payload.get("churn_other_bucket", "include")),
+            SlotSet("churn_other_bucket_label", payload.get("churn_other_bucket_label", "Other")),
+        ]
+        _remember_churn_flow(tracker, {
+            "churn_table": payload.get("churn_table", "ARR Bridge"),
+            "churn_total_label": payload.get("churn_total_label", "Total"),
+            "churn_first_fy_override": fy_val,
+            "churn_top_bucket_enabled": bucket_on,
+            "churn_bucket_mode": payload.get("churn_bucket_mode", "threshold"),
+            "churn_bucket_thresholds": payload.get("churn_bucket_thresholds", "[0.2, 0.5, 0.8]"),
+            "churn_bucket_numbers": payload.get("churn_bucket_numbers", ""),
+            "churn_other_bucket": payload.get("churn_other_bucket", "include"),
+            "churn_other_bucket_label": payload.get("churn_other_bucket_label", "Other"),
+            "group_cols": _churn_flow_group_cols(tracker),
+        })
+        dispatcher.utter_message(json_message=_churn_filter_checkpoint_card(tracker))
+        return events
+
+
+class ActionEnterChurnFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_enter_churn_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_churn_filter_checkpoint_card(tracker))
+        return []
+
+
+class ActionProcessChurnFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_process_churn_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("churn_filter_manage_choice", "")).lower()
+        if choice == "delete_all":
+            events = [
+                SlotSet("churn_filter_rules_json", "[]"),
+                SlotSet("churn_filter_rules_display", ""),
+            ]
+            dispatcher.utter_message(json_message=_churn_filter_checkpoint_card(tracker))
+            return events
+        if choice == "add_rule":
+            events = [SlotSet("active_filter_context", "churn")]
+            events += ActionStartFilter().run(dispatcher, tracker, domain)
+            return events
+        if choice == "keep":
+            events = _hydrate_column_roles_from_session_cache(tracker)
+            _emit_churn_review_card(dispatcher, tracker)
+            return events
+        dispatcher.utter_message(text="Please choose option 1, 2, or 3.")
+        dispatcher.utter_message(json_message=_churn_filter_checkpoint_card(tracker))
+        return []
+
+
+def _emit_churn_review_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    headers = _headers_from_sources(tracker)
+    header_opts_base = [{"label": h, "value": h} for h in headers]
+    selected_cols = [
+        _churn_slot_col(tracker, s) for s in (
+            "churn_value_col", "churn_customer_col", "churn_product_col",
+            "churn_start_col", "churn_end_col", "churn_invoice_col",
+            "churn_group_col_1", "churn_group_col_2", "churn_group_col_3",
+        )
+    ]
+    header_opts = _header_opts_for_review(tracker, None, *selected_cols)
+    review_fy = int(_first_fy_for_churn_labels_card(tracker))
+    level_count = _churn_review_group_level_count(tracker)
+    group_cols = _churn_group_cols_from_tracker(tracker)
+    single_group = len(group_cols) == 1
+
+    inputs: list[dict[str, Any]] = [
+        {"id": "ltm_month", "type": "text", "hidden": True, "required": False, "label": "",
+         "default": _ltm_month_from_sources(tracker)},
+        {"id": "churn_table", "type": "text", "label": "Table name", "span": 2,
+         "default": _churn_flow_val(tracker, "churn_table", "ARR Bridge") or "ARR Bridge"},
+        {"id": "churn_total_label", "type": "text", "label": "Total row label", "span": 2,
+         "default": _churn_flow_val(tracker, "churn_total_label", "Total") or "Total"},
+        {"id": "churn_first_fy_override", "type": "number",
+         "label": "First fiscal year to include in the data source", "span": 2,
+         "default": str(review_fy)},
+        {"id": "churn_value_col", "type": "dropdown", "label": "Contract value column", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_value_col")},
+        {"id": "churn_customer_col", "type": "dropdown", "label": "Customer ID column", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_customer_col")},
+        {"id": "churn_product_col", "type": "dropdown", "label": "Product column", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_product_col")},
+        {"id": "churn_start_col", "type": "dropdown", "label": "Contract start date", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_start_col")},
+        {"id": "churn_end_col", "type": "dropdown", "label": "Contract end date", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_end_col")},
+        {"id": "churn_invoice_col", "type": "dropdown", "label": "Invoice date column", "span": 2,
+         "options": header_opts, "default": _churn_slot_col(tracker, "churn_invoice_col")},
+    ]
+
+    for i in range(1, level_count + 1):
+        slot = f"churn_group_col_{i}"
+        default = (group_cols[i - 1] if i <= len(group_cols) else "") or _churn_slot_col(tracker, slot)
+        col_opts = header_opts_base
+        if default and not any(o["value"] == default for o in col_opts):
+            col_opts = [{"label": default, "value": default}] + col_opts
+        inputs.append({
+            "id": slot,
+            "type": "dropdown",
+            "label": f"Grouping column — level {i}",
+            "span": 2,
+            "options": col_opts,
+            "default": default,
+        })
+        inputs.append({
+            "id": f"churn_sort_by_{i}",
+            "type": "radio",
+            "label": f"Sort level {i} by (descending)",
+            "layout": "split",
+            "span": 2,
+            "default": str(_churn_flow_val(tracker, f"churn_sort_by_{i}", "arr") or "arr"),
+            "options": [
+                {"label": "ARR (largest first)", "value": "arr"},
+                {"label": "Alphabetical", "value": "name"},
+            ],
+        })
+
+    if single_group:
+        inputs += _churn_bucket_inputs_for_card(tracker)
+
+    if bool(tracker.get_slot("apply_fx")):
+        inputs.append({
+            "id": "fx_col", "type": "text", "label": "FX column", "span": 2,
+            "required": False,
+            "default": str(tracker.get_slot("fx_col") or ""),
+        })
+
+    filter_disp = (tracker.get_slot("churn_filter_rules_display") or "").strip()
+    card: dict[str, Any] = {
+        "type": "adaptive_card",
+        "card": "churn_proceed",
+        "wide": True,
+        "title": "Review — Churn / ARR Bridge",
+        "subtitle": (
+            f"{tracker.get_slot('project_name') or '—'}"
+            f" · {tracker.get_slot('group_name') or '—'}"
+        ),
+        "inputs": inputs,
+        "submit_label": "Proceed",
+    }
+    if filter_disp:
+        card["filter_info"] = {
+            "label": "Active filter rules",
+            "value": filter_disp,
+            "actions": [],
+        }
+    dispatcher.utter_message(json_message=card)
+
+
+class ActionShowChurnReview(Action):
+    def name(self) -> str:
+        return "action_show_churn_review"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        events = _hydrate_column_roles_from_session_cache(tracker)
+        _emit_churn_review_card(dispatcher, tracker)
+        return events
+
+
+class ActionRunChurn(Action):
+    def name(self) -> str:
+        return "action_run_churn"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        s = tracker.current_slot_values()
+
+        flow = _churn_flow(tracker)
+
+        def pick(key: str, default: Any = "") -> Any:
+            v = payload.get(key)
+            if v is None or v == "":
+                v = s.get(key)
+            if v is None or v == "":
+                v = flow.get(key, default)
+            return default if v in (None, "") else v
+
+        ltm_month = str(_ltm_month_from_sources(tracker, payload) or "").strip()
+        if not ltm_month:
+            dispatcher.utter_message(
+                text="Date settings are incomplete (last month to include is missing). "
+                "Please go back to Date Settings and select the as-of month."
+            )
+            return []
+
+        fy_m, fy_d = _fy_end_month_day_from_tracker({}, tracker)
+        cy, cm = _as_of_year_month_from_ltm(ltm_month)
+        fy_end_year = _fdd_latest_closed_fy_end_year(cy, cm, fy_m, fy_d)
+        churn_first_fy = int(float(pick("churn_first_fy_override", _first_fy_for_churn_labels_card(tracker))))
+
+        group_cols: list[str] = []
+        for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+            c = str(pick(f"churn_group_col_{i}", "") or "").strip()
+            if c:
+                group_cols.append(c)
+        if not group_cols:
+            cached = flow.get("group_cols")
+            if isinstance(cached, list):
+                group_cols = [str(c).strip() for c in cached if str(c).strip()]
+        if not group_cols:
+            dispatcher.utter_message(text="Please select at least one grouping column.")
+            _emit_churn_review_card(dispatcher, tracker)
+            return []
+
+        project_name = s.get("project_name", "")
+        group_name = s.get("group_name", "")
+        churn_table = pick("churn_table", s.get("churn_table") or "ARR Bridge")
+        churn_total_label = pick("churn_total_label", s.get("churn_total_label") or "Total")
+        value_col = pick("churn_value_col", s.get("churn_value_col", ""))
+        customer_col = pick("churn_customer_col", s.get("churn_customer_col", ""))
+        product_col = pick("churn_product_col", s.get("churn_product_col", ""))
+        start_col = pick("churn_start_col", s.get("churn_start_col", ""))
+        end_col = pick("churn_end_col", s.get("churn_end_col", ""))
+        invoice_col = pick("churn_invoice_col", s.get("churn_invoice_col", ""))
+        bucket_on = str(pick("churn_top_bucket_enabled", "off")).lower() == "on"
+
+        events: list[Any] = _hydrate_column_roles_from_session_cache(tracker)
+        events += [
+            SlotSet("churn_table", churn_table),
+            SlotSet("churn_total_label", churn_total_label),
+            SlotSet("churn_first_fy_override", float(churn_first_fy)),
+            SlotSet("churn_value_col", value_col),
+            SlotSet("churn_customer_col", customer_col),
+            SlotSet("churn_product_col", product_col),
+            SlotSet("churn_start_col", start_col),
+            SlotSet("churn_end_col", end_col),
+            SlotSet("churn_invoice_col", invoice_col),
+            SlotSet("churn_top_bucket_enabled", bucket_on),
+            SlotSet("churn_bucket_mode", pick("churn_bucket_mode", s.get("churn_bucket_mode") or "threshold")),
+            SlotSet("churn_bucket_thresholds", pick("churn_bucket_thresholds", "[0.2, 0.5, 0.8]")),
+            SlotSet("churn_bucket_numbers", pick("churn_bucket_numbers", "")),
+            SlotSet("churn_other_bucket", pick("churn_other_bucket", "include")),
+            SlotSet("churn_other_bucket_label", pick("churn_other_bucket_label", "Other")),
+            SlotSet("churn_group_level_count", len(group_cols)),
+        ]
+        for i in range(1, CHURN_MAX_GROUP_LEVELS + 1):
+            col = group_cols[i - 1] if i <= len(group_cols) else ""
+            events.append(SlotSet(f"churn_group_col_{i}", col))
+            events.append(SlotSet(f"churn_sort_by_{i}", pick(f"churn_sort_by_{i}", "arr")))
+        _remember_session_first_fy(tracker, float(churn_first_fy))
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "file_id": tracker.get_slot("file_id"),
+            "config": {
+                "title": project_name,
+                "company": group_name,
+                "table": churn_table,
+                "total_label": churn_total_label,
+                "first_fy": churn_first_fy,
+                "fy_end_year": fy_end_year,
+                "fy_end_month": fy_m,
+                "fy_end_day": fy_d,
+                "current_year": cy,
+                "current_month": cm,
+                "as_of_year": cy,
+                "as_of_month": cm,
+                "ltm_month": ltm_month,
+                "sheet_name": s.get("sheet_name", ""),
+                "base_sheet_name": "Churn",
+                "formula_mode": True,
+                "value_col": value_col,
+                "customer_col": customer_col,
+                "product_col": product_col,
+                "start_col": start_col,
+                "end_col": end_col,
+                "invoice_col": invoice_col,
+                "group_cols": group_cols,
+                "sort": _churn_sort_config_from_payload(tracker, payload),
+                "top_bucket": _churn_top_bucket_config(tracker, payload),
+                "apply_fx": bool(s.get("apply_fx")),
+                "fx_col": s.get("fx_col") or "",
+                "output_file_path": s.get("output_folder", ""),
+                "filters": _fdd_filters_payload(pick("churn_filter_rules_json", s.get("churn_filter_rules_json"))),
+            },
+        }
+        _start_async_revenue_script(dispatcher, body, "churn", "Churn / ARR Bridge")
+        return events
 
 
 # ─── Bubble Scatter Plot flow ─────────────────────────────────────────────────
@@ -4810,11 +5637,16 @@ class ActionFinishFilters(Action):
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         context = _resolve_filter_context(tracker)
 
+        if context == "churn":
+            dispatcher.utter_message(json_message=_churn_filter_checkpoint_card(tracker))
+            return []
+
         follow_map = {
             "gst": "action_enter_gst_filter_checkpoint",
             "pvm": "action_enter_pvm_filter_checkpoint",
             "top": "action_enter_top_filter_checkpoint",
             "bs": "action_enter_bs_filter_checkpoint",
+            "churn": "action_enter_churn_filter_checkpoint",
         }
         next_action = follow_map.get(context, "utter_default")
         return [FollowupAction(next_action)]
@@ -4852,6 +5684,7 @@ class ActionProcessNextAction(Action):
                                 {"label": "TOP Report", "value": "top_report"},
                                 {"label": "PVM Analysis", "value": "pvm_analysis"},
                                 {"label": "General Sales Table", "value": "general_sales_table"},
+                                {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
                             ],
                         }
@@ -4866,6 +5699,7 @@ class ActionProcessNextAction(Action):
                 "pvm_analysis": "pvm",
                 "top_report": "top",
                 "bubble_scatter": "bs",
+                "churn": "churn",
             }
             ctx = ctx_map.get(desired, "gst")
             checkpoint_map = {
@@ -4873,6 +5707,7 @@ class ActionProcessNextAction(Action):
                 "pvm": "action_enter_pvm_filter_checkpoint",
                 "top": "action_enter_top_filter_checkpoint",
                 "bs": "action_enter_bs_filter_checkpoint",
+                "churn": "action_enter_churn_filter_checkpoint",
             }
             return [
                 SlotSet("active_filter_context", ctx),
@@ -4886,6 +5721,7 @@ class ActionProcessNextAction(Action):
                 "pvm_analysis": "action_show_pvm_review",
                 "top_report": "action_show_top_review",
                 "bubble_scatter": "action_show_bs_review",
+                "churn": "action_show_churn_review",
             }
             next_act = rerun_map.get(desired, "utter_default")
             return [FollowupAction(next_act)]
@@ -4930,27 +5766,30 @@ def _last_completed_fy_end_calendar_year(
     return ltm_y if as_of_end >= fye_this_cal_year else ltm_y - 1
 
 
-def _compute_databook_fy_labels(tracker: Tracker) -> list[str]:
+def _compute_databook_period_labels(tracker: Tracker) -> list[str]:
     """
-    FY column headers for the Databook trial balance grid: FY{yyyy} where yyyy is the
-    fiscal year-end calendar year, from Date Settings first_fy through the last
-    completed FY implied by ltm_month (as-of) and FY end month/day.
+    Period column headers for the Databook trial balance grid: FY{yyyy}… and
+    optionally YTD{yyyy} when as-of is not the fiscal year-end (Stichtag).
     """
     start = _tracker_first_fy_int(tracker, default=2022)
-
     ltm_raw = _ltm_month_from_tracker(tracker)
-    if ltm_raw not in (None, ""):
-        ltm_y, ltm_m = _as_of_year_month_from_ltm(ltm_raw)
-    else:
-        # No as-of in session — do not default to today's year (would add spurious FY columns).
-        return [f"FY{start}"]
-
     fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
+    return compute_databook_grid_labels(start, ltm_raw, fy_end_m, fy_end_d)
 
-    last_fy_end_y = _last_completed_fy_end_calendar_year(ltm_y, ltm_m, fy_end_m, fy_end_d)
-    if last_fy_end_y < start:
-        return [f"FY{start}"]
-    return [f"FY{y}" for y in range(start, last_fy_end_y + 1)]
+
+def _compute_databook_fy_labels(tracker: Tracker) -> list[str]:
+    """FY-only grid labels (deprecated — prefer _compute_databook_period_labels)."""
+    return [y for y in _compute_databook_period_labels(tracker) if not is_ytd_grid_label(y)]
+
+
+def _databook_grid_options(tracker: Tracker) -> list[dict[str, Any]]:
+    opts: list[dict[str, Any]] = []
+    for label in _compute_databook_period_labels(tracker):
+        opt: dict[str, Any] = {"label": label, "value": label}
+        if is_ytd_grid_label(label):
+            opt["optional"] = True
+        opts.append(opt)
+    return opts
 
 
 def _compute_fy_years(tracker: Tracker) -> list[str]:
@@ -5038,7 +5877,9 @@ def _utter_databook_entities_grid(
     layout: str,
     entity_count: int,
 ) -> None:
-    years = _compute_databook_fy_labels(tracker)
+    years = _compute_databook_period_labels(tracker)
+    grid_options = _databook_grid_options(tracker)
+    has_ytd = any(is_ytd_grid_label(y) for y in years)
     grid_mode = "folder" if layout == "monthly_workbooks" else "single_file"
     n = max(1, min(50, int(entity_count)))
     if layout == "monthly_workbooks":
@@ -5050,6 +5891,8 @@ def _utter_databook_entities_grid(
     else:
         sub = "Enter each entity name and upload one .xlsx trial balance file per fiscal year."
         note = "One trial balance (.xlsx) per entity per fiscal year. Entity names are editable."
+    if has_ytd:
+        note += " YTD columns are optional (upload only where available per entity)."
 
     dispatcher.utter_message(
         json_message={
@@ -5062,7 +5905,7 @@ def _utter_databook_entities_grid(
                     "id": "susa_files",
                     "type": "susa_grid",
                     "label": "Entity files",
-                    "options": [{"label": y, "value": y} for y in years],
+                    "options": grid_options,
                     "entity_count": n,
                     "grid_mode": grid_mode,
                 }
@@ -5531,6 +6374,42 @@ def _utter_databook_adjustments_upload_card(
     )
 
 
+def _utter_databook_l4_sort_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
+    ltm = _ltm_month_from_tracker(tracker) or ""
+    show_ytd = ytd_reporting_fy_end_year(ltm, fy_end_m, fy_end_d) is not None
+
+    options = [
+        {"label": "Sum of all fiscal years", "value": "all_fy"},
+        {"label": "Latest fiscal year", "value": "latest_fy"},
+    ]
+    if show_ytd:
+        options.append({"label": "Year-to-date (YTD)", "value": "ytd"})
+
+    default = tracker.get_slot("db_l4_sort_basis") or "latest_fy"
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_l4_sort",
+            "title": "L4 line sorting",
+            "subtitle": (
+                "How should detail lines (L4) be ordered within each subtotal (L3)? "
+                "Lines are sorted by absolute amount, largest first."
+            ),
+            "inputs": [
+                {
+                    "id": "db_l4_sort_basis",
+                    "type": "radio",
+                    "label": "Sort L4 lines by amount based on",
+                    "options": options,
+                    "default": str(default),
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
 def _utter_databook_adjustments_card(dispatcher: CollectingDispatcher) -> None:
     dispatcher.utter_message(
         json_message={
@@ -5546,57 +6425,6 @@ def _utter_databook_adjustments_card(dispatcher: CollectingDispatcher) -> None:
                     "options": [
                         {"label": "Yes", "value": "yes"},
                         {"label": "No", "value": "no"},
-                    ],
-                }
-            ],
-            "submit_label": "Continue",
-        }
-    )
-
-
-def _utter_databook_fs_gate_card(dispatcher: CollectingDispatcher) -> None:
-    dispatcher.utter_message(
-        json_message={
-            "type": "adaptive_card",
-            "card": "databook_fs_gate",
-            "title": "Financial statements",
-            "subtitle": "Do you want to ingest the financial statements now?",
-            "inputs": [
-                {
-                    "id": "db_fs_ingest_now",
-                    "type": "radio",
-                    "label": "Ingest financial statements",
-                    "options": [
-                        {"label": "Yes", "value": "yes"},
-                        {"label": "No", "value": "no"},
-                    ],
-                }
-            ],
-            "submit_label": "Continue",
-        }
-    )
-
-
-def _utter_databook_next_step_card(dispatcher: CollectingDispatcher) -> None:
-    dispatcher.utter_message(
-        json_message={
-            "type": "adaptive_card",
-            "card": "databook_next_step",
-            "title": "Next step",
-            "subtitle": "What would you like to do now?",
-            "inputs": [
-                {
-                    "id": "db_next_step",
-                    "type": "radio",
-                    "label": "Choose next action",
-                    "options": [
-                        {"label": "1. Apply adjustments", "value": "apply_adjustments"},
-                        {"label": "2. Ingest financial statements", "value": "ingest_fs"},
-                        {"label": "3. Generate further databook tables", "value": "more_tables"},
-                        {
-                            "label": "4. Interrupt databook and create Revenue Databook instead",
-                            "value": "revenue_databook",
-                        },
                     ],
                 }
             ],
@@ -5736,6 +6564,33 @@ def _databook_after_susa_run(
     return events + [SlotSet("db_susa_mapping_confirmed", True)]
 
 
+def _missing_databook_grid_uploads(
+    entity_year_files: list[dict[str, Any]],
+    entity_count: int,
+    required_labels: list[str],
+    entity_names: list[Any],
+) -> list[str]:
+    uploaded: set[tuple[int, str]] = set()
+    for row in entity_year_files:
+        try:
+            ei = int(row.get("entity_index", 0))
+        except (TypeError, ValueError):
+            continue
+        uploaded.add((ei, str(row.get("fy_label") or "")))
+    missing: list[str] = []
+    for ei in range(max(1, entity_count)):
+        name_list = list(entity_names) if isinstance(entity_names, list) else []
+        label_name = (
+            str(name_list[ei])
+            if ei < len(name_list) and name_list[ei] not in (None, "")
+            else f"Entity {ei + 1}"
+        )
+        for period_label in required_labels:
+            if (ei, period_label) not in uploaded:
+                missing.append(f"{label_name}: {period_label}")
+    return missing
+
+
 class ActionProcessDatabookEntities(Action):
     def name(self) -> str:
         return "action_process_databook_entities"
@@ -5779,6 +6634,26 @@ class ActionProcessDatabookEntities(Action):
                     text="Please upload exactly one .xlsx file per filled grid cell."
                 )
                 return []
+
+        try:
+            entity_count = int(float(payload.get("db_entity_count", tracker.get_slot("db_entity_count") or 1)))
+        except (ValueError, TypeError):
+            entity_count = max(1, len(entity_names))
+        entity_count = max(1, min(50, entity_count or len(entity_names) or 1))
+
+        required_labels = [x for x in _compute_databook_period_labels(tracker) if not is_ytd_grid_label(x)]
+        missing = _missing_databook_grid_uploads(
+            entity_year_files, entity_count, required_labels, entity_names
+        )
+        if missing:
+            dispatcher.utter_message(
+                text=(
+                    "Please upload trial balances for every entity and required FY column in the grid. "
+                    f"Missing: {', '.join(missing)}."
+                )
+            )
+            _utter_databook_entities_grid(dispatcher, tracker, layout, entity_count)
+            return []
 
         consolidation_available = payload.get("consolidation_available") in (True, "yes", "true")
 
@@ -5903,6 +6778,7 @@ class ActionProcessDatabookColumnMapping(Action):
 
         fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
         fiscal_start_month = (fy_end_m % 12) + 1
+        ltm_month = _ltm_month_from_tracker(tracker) or ""
 
         body = {
             "session_id": session_id,
@@ -5918,6 +6794,8 @@ class ActionProcessDatabookColumnMapping(Action):
             "fy_end_month": fy_end_m,
             "fy_end_day": fy_end_d,
             "fiscal_start_month": fiscal_start_month,
+            "ltm_month": ltm_month,
+            "first_fy": _tracker_first_fy_int(tracker),
         }
         result = _fdd_post("/api/v1/fdd/run/databook/susa", body)
         events = [
@@ -6043,7 +6921,7 @@ class ActionProcessDatabookAdjustments(Action):
         apply_adj = str(payload.get("db_apply_adjustments") or "no").strip().lower()
         events = [SlotSet("db_apply_adjustments", apply_adj)]
         if apply_adj == "no":
-            _utter_databook_fs_gate_card(dispatcher)
+            _utter_databook_l4_sort_card(dispatcher, tracker)
         else:
             fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
             fiscal_start_month = (fy_end_m % 12) + 1
@@ -6106,7 +6984,7 @@ class ActionProcessDatabookAdjustmentsUpload(Action):
             master_path = _master_path_from_result(result, tracker)
             if master_path:
                 events.append(SlotSet("db_master_workbook_path", master_path))
-            _utter_databook_fs_gate_card(dispatcher)
+            _utter_databook_l4_sort_card(dispatcher, tracker)
         else:
             dispatcher.utter_message(
                 text=f"Adjustments error: {result.get('message', 'Unknown error')}"
@@ -6115,71 +6993,30 @@ class ActionProcessDatabookAdjustmentsUpload(Action):
         return events
 
 
-class ActionProcessDatabookFsGate(Action):
+class ActionProcessDatabookL4Sort(Action):
     def name(self) -> str:
-        return "action_process_databook_fs_gate"
+        return "action_process_databook_l4_sort"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
-        choice = str(payload.get("db_fs_ingest_now") or "no").strip().lower()
-        events = [SlotSet("db_fs_ingest_now", choice)]
-        if choice == "yes":
-            _utter_databook_fs_upload_card(dispatcher)
-            return events
+        basis = str(payload.get("db_l4_sort_basis") or "latest_fy").strip().lower()
+        if basis not in ("all_fy", "latest_fy", "ytd"):
+            dispatcher.utter_message(text="Please choose how L4 lines should be sorted.")
+            _utter_databook_l4_sort_card(dispatcher, tracker)
+            return []
 
-        entity_names = list(tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker))
-        body = {
-            "session_id": _fdd_session_id(tracker),
-            "output_folder": tracker.get_slot("output_folder") or "",
-            "master_path": tracker.get_slot("db_master_workbook_path")
-            or _abs_master_path_from_tracker(tracker),
-            "project_name": tracker.get_slot("project_name") or "Project",
-            "company_name": tracker.get_slot("group_name") or "Group",
-            "entity_order": entity_names,
-        }
-        result = _fdd_post("/api/v1/fdd/run/databook/recon-pipeline", body, timeout=1200)
-        if result.get("success"):
-            if not _utter_output_file_attachment(
-                dispatcher,
-                result,
-                title="Master databook (reconciliation tables)",
-                tracker=tracker,
-            ):
+        if basis == "ytd":
+            fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
+            ltm = _ltm_month_from_tracker(tracker) or ""
+            if ytd_reporting_fy_end_year(ltm, fy_end_m, fy_end_d) is None:
                 dispatcher.utter_message(
-                    text="Reconciliation tables have been added to the master databook."
+                    text="YTD sorting is only available when the as-of month is not the fiscal year-end."
                 )
-            master_path = _master_path_from_result(result, tracker)
-            if master_path:
-                events.append(SlotSet("db_master_workbook_path", master_path))
-            _utter_databook_next_step_card(dispatcher)
-        else:
-            dispatcher.utter_message(
-                text=f"Reconciliation pipeline error: {result.get('message', 'Unknown error')}"
-            )
-            _utter_databook_fs_gate_card(dispatcher)
-        return events
+                _utter_databook_l4_sort_card(dispatcher, tracker)
+                return []
 
-
-class ActionProcessDatabookNextStep(Action):
-    def name(self) -> str:
-        return "action_process_databook_next_step"
-
-    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        payload = _parse_payload(tracker)
-        choice = str(payload.get("db_next_step") or "").strip().lower()
-        events = [SlotSet("db_next_step", choice)]
-        if choice == "apply_adjustments":
-            dispatcher.utter_message(text="Apply adjustments — coming soon.")
-        elif choice == "ingest_fs":
-            dispatcher.utter_message(text="Ingest financial statements — coming soon.")
-        elif choice == "more_tables":
-            dispatcher.utter_message(text="Generate further databook tables — coming soon.")
-        elif choice == "revenue_databook":
-            dispatcher.utter_message(response="utter_ask_build_databook")
-        else:
-            dispatcher.utter_message(text="Please choose one of the listed options.")
-            _utter_databook_next_step_card(dispatcher)
-        return events
+        _utter_databook_fs_upload_card(dispatcher)
+        return [SlotSet("db_l4_sort_basis", basis)]
 
 
 class ActionProcessDatabookFsUpload(Action):
@@ -6282,6 +7119,7 @@ class ActionProcessDatabookReconLabels(Action):
             "display_titles": display_titles,
             "fs_review_file_id": tracker.get_slot("db_fs_review_file_id") or "",
             "show_fs_check": False,
+            "l4_sort_basis": tracker.get_slot("db_l4_sort_basis") or "latest_fy",
         }
         result = _fdd_post("/api/v1/fdd/run/databook/recon-pl", body, timeout=600)
         events = [SlotSet("db_recon_display_titles", json.dumps(display_titles))]
@@ -6378,10 +7216,7 @@ class ActionRunDatabookFinal(Action):
                 tracker=tracker,
             ):
                 dispatcher.utter_message(
-                    text=(
-                        "Databook outputs created successfully.\n\n"
-                        f"Outputs:\n{result.get('output_path', '(see output folder)')}"
-                    )
+                    text="Databook outputs created successfully. Use the download button below."
                 )
         else:
             dispatcher.utter_message(

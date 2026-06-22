@@ -8,7 +8,7 @@
  * On submit, calls onSubmit(cardName, values) which the parent hook posts to Rasa.
  */
 
-import { useState, useRef, type DragEvent } from 'react'
+import { useState, useRef, useId, useEffect, type DragEvent } from 'react'
 import { Upload, ChevronDown, Check, FileSpreadsheet, Download } from 'lucide-react'
 import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
@@ -37,6 +37,50 @@ const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
 ]
+
+/** Reliable drag-over / drop handling (Safari + nested scroll areas). */
+function bindFileDragHandlers(
+  setDragging: (v: boolean) => void,
+  onFiles: (files: FileList) => void,
+  opts?: { disabled?: boolean },
+) {
+  return {
+    onDragEnter: (e: DragEvent) => {
+      if (opts?.disabled) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (e.dataTransfer.types.includes('Files')) setDragging(true)
+    },
+    onDragOver: (e: DragEvent) => {
+      if (opts?.disabled) return
+      e.preventDefault()
+      e.stopPropagation()
+      e.dataTransfer.dropEffect = 'copy'
+      setDragging(true)
+    },
+    onDragLeave: (e: DragEvent) => {
+      if (opts?.disabled) return
+      e.preventDefault()
+      e.stopPropagation()
+      if (e.currentTarget.contains(e.relatedTarget as Node)) return
+      setDragging(false)
+    },
+    onDrop: (e: DragEvent) => {
+      if (opts?.disabled) return
+      e.preventDefault()
+      e.stopPropagation()
+      setDragging(false)
+      if (e.dataTransfer.files?.length) onFiles(e.dataTransfer.files)
+    },
+  }
+}
+
+function enableFolderPicker(input: HTMLInputElement | null) {
+  if (!input) return
+  input.setAttribute('webkitdirectory', '')
+  input.setAttribute('directory', '')
+  input.multiple = true
+}
 
 /** Consecutive inputs sharing `rowGroup` render on one horizontal row. */
 function chunkInputRows(inputs: AdaptiveCardInput[]): AdaptiveCardInput[][] {
@@ -249,6 +293,11 @@ function TextInput({ input, value, onChange, dense }: {
         {input.label}
         {input.required !== false && <span style={{ color: '#EF4444' }}> *</span>}
       </label>
+      {input.hint ? (
+        <p className={dense ? 'text-[10px] leading-snug' : 'text-[11px] leading-snug'} style={{ color: '#64748B' }}>
+          {input.hint}
+        </p>
+      ) : null}
       <input
         type={input.type === 'number' ? 'number' : 'text'}
         value={value}
@@ -505,11 +554,12 @@ function MonthPickerInput({ input, value, onChange, dense }: {
   )
 }
 
-function FileDropInput({ input, onFileSelect }: {
+function FileDropInput({ input, onFileSelect, disabled }: {
   input: AdaptiveCardInput
   onFileSelect: (f: File) => void
+  disabled?: boolean
 }) {
-  const ref = useRef<HTMLInputElement>(null)
+  const inputId = useId()
   const [dragging, setDragging] = useState(false)
   const [fileName, setFileName] = useState<string | null>(null)
 
@@ -518,24 +568,27 @@ function FileDropInput({ input, onFileSelect }: {
     onFileSelect(file)
   }
 
+  const dragHandlers = bindFileDragHandlers(setDragging, (files) => {
+    const f = files[0]
+    if (f) handle(f)
+  }, { disabled })
+
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs font-medium" style={{ color: '#475569' }}>{input.label}</label>
-      <div
-        className="rounded-lg flex flex-col items-center justify-center gap-2 py-5 cursor-pointer transition-colors"
+      <label htmlFor={inputId} className="text-xs font-medium" style={{ color: '#475569' }}>
+        {input.label}
+      </label>
+      <label
+        htmlFor={disabled ? undefined : inputId}
+        className="rounded-lg flex flex-col items-center justify-center gap-2 py-5 transition-colors"
         style={{
           border: `1.5px dashed ${dragging ? '#1E3A5F' : '#CBD5E1'}`,
           background: dragging ? 'rgba(30,58,95,0.04)' : '#F8FAFC',
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          opacity: disabled ? 0.55 : 1,
+          pointerEvents: disabled ? 'none' : 'auto',
         }}
-        onDragOver={e => { e.preventDefault(); setDragging(true) }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={e => {
-          e.preventDefault()
-          setDragging(false)
-          const f = e.dataTransfer.files[0]
-          if (f) handle(f)
-        }}
-        onClick={() => ref.current?.click()}
+        {...dragHandlers}
       >
         <Upload size={18} style={{ color: fileName ? '#10B981' : '#94A3B8' }} />
         <p className="text-xs" style={{ color: '#64748B' }}>
@@ -544,28 +597,36 @@ function FileDropInput({ input, onFileSelect }: {
         {input.accept && (
           <p className="text-xs" style={{ color: '#94A3B8' }}>{input.accept}</p>
         )}
-      </div>
+      </label>
       <input
-        ref={ref}
+        id={inputId}
         type="file"
-        accept={input.accept}
-        className="hidden"
+        accept={input.accept ?? '.xlsx,.xls'}
+        disabled={disabled}
+        className="sr-only"
         onChange={e => {
           const f = e.target.files?.[0]
           if (f) handle(f)
+          e.target.value = ''
         }}
       />
     </div>
   )
 }
 
-function FolderDropInput({ input, onFilesSelect }: {
+function FolderDropInput({ input, onFilesSelect, disabled }: {
   input: AdaptiveCardInput
   onFilesSelect: (files: File[]) => void
+  disabled?: boolean
 }) {
-  const ref = useRef<HTMLInputElement>(null)
+  const inputId = useId()
+  const folderInputRef = useRef<HTMLInputElement>(null)
   const [dragging, setDragging] = useState(false)
   const [count, setCount] = useState(0)
+
+  useEffect(() => {
+    enableFolderPicker(folderInputRef.current)
+  }, [])
 
   const handleFiles = (list: FileList | null) => {
     if (!list?.length) return
@@ -575,23 +636,24 @@ function FolderDropInput({ input, onFilesSelect }: {
     onFilesSelect(pdfs)
   }
 
+  const dragHandlers = bindFileDragHandlers(setDragging, handleFiles, { disabled })
+
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs font-medium" style={{ color: '#475569' }}>{input.label}</label>
-      <div
-        className="rounded-lg flex flex-col items-center justify-center gap-2 py-5 cursor-pointer transition-colors"
+      <label htmlFor={inputId} className="text-xs font-medium" style={{ color: '#475569' }}>
+        {input.label}
+      </label>
+      <label
+        htmlFor={disabled ? undefined : inputId}
+        className="rounded-lg flex flex-col items-center justify-center gap-2 py-5 transition-colors"
         style={{
           border: `1.5px dashed ${dragging ? '#1E3A5F' : '#CBD5E1'}`,
           background: dragging ? 'rgba(30,58,95,0.04)' : '#F8FAFC',
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          opacity: disabled ? 0.55 : 1,
+          pointerEvents: disabled ? 'none' : 'auto',
         }}
-        onDragOver={e => { e.preventDefault(); setDragging(true) }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={e => {
-          e.preventDefault()
-          setDragging(false)
-          handleFiles(e.dataTransfer.files)
-        }}
-        onClick={() => ref.current?.click()}
+        {...dragHandlers}
       >
         <Upload size={18} style={{ color: count > 0 ? '#10B981' : '#94A3B8' }} />
         <p className="text-xs" style={{ color: '#64748B' }}>
@@ -600,14 +662,14 @@ function FolderDropInput({ input, onFilesSelect }: {
         {input.accept && (
           <p className="text-xs" style={{ color: '#94A3B8' }}>{input.accept}</p>
         )}
-      </div>
+      </label>
       <input
-        ref={ref}
+        id={inputId}
+        ref={folderInputRef}
         type="file"
         accept={input.accept ?? '.pdf'}
-        multiple
-        {...({ webkitDirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
-        className="hidden"
+        disabled={disabled}
+        className="sr-only"
         onChange={e => handleFiles(e.target.files)}
       />
     </div>
@@ -688,14 +750,17 @@ function DatePickerInput({ input, value, onChange }: {
   )
 }
 
-function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }: {
+function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange, disabled }: {
   input: AdaptiveCardInput
   onCellFiles: (entityIdx: number, year: string, files: File[]) => void
   fileStatuses: Record<string, string | null>
   onEntityNameChange: (entityIdx: number, name: string) => void
+  disabled?: boolean
 }) {
   const entityCount = input.entity_count ?? 5
-  const years = input.options?.map(o => o.value) ?? []
+  const yearOptions = input.options ?? []
+  const years = yearOptions.map(o => o.value)
+  const optionalYears = new Set(yearOptions.filter(o => o.optional).map(o => o.value))
   const gridMode = input.grid_mode ?? 'single_file'
   const fileRefs = useRef<Record<string, HTMLInputElement | null>>({})
   const [entityNames, setEntityNames] = useState<string[]>(() =>
@@ -705,10 +770,16 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
   const cellKey = (entityIdx: number, year: string) => `entity_${entityIdx + 1}_${year}`
 
   const pickXlsx = (files: FileList | File[]) =>
-    Array.from(files).filter(f => /\.xlsx$/i.test(f.name) && !f.name.startsWith('~$'))
+    Array.from(files).filter(f => /\.xlsx?$/i.test(f.name) && !f.name.startsWith('~$'))
 
-  const triggerBrowse = (key: string) => {
-    fileRefs.current[key]?.click()
+  const applyCellFiles = (ei: number, yr: string, files: FileList | File[]) => {
+    const raw = pickXlsx(files)
+    if (gridMode === 'folder') {
+      if (raw.length) onCellFiles(ei, yr, raw)
+    } else {
+      const f = raw[0]
+      if (f) onCellFiles(ei, yr, [f])
+    }
   }
 
   return (
@@ -724,6 +795,9 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
               {years.map(yr => (
                 <th key={yr} className="pb-2 px-2 text-center" style={{ color: '#64748B', fontWeight: 600, whiteSpace: 'nowrap' }}>
                   {yr}
+                  {optionalYears.has(yr) && (
+                    <span className="block text-[10px] font-normal" style={{ color: '#94A3B8' }}>optional</span>
+                  )}
                 </th>
               ))}
             </tr>
@@ -750,26 +824,23 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
                   const uploaded = fileStatuses[key]
                   return (
                     <td key={yr} className="px-2 py-2 text-center">
-                      <div
-                        className="rounded-lg flex flex-col items-center justify-center gap-1 cursor-pointer transition-colors"
+                      <label
+                        htmlFor={disabled ? undefined : `susa-${key}`}
+                        className="rounded-lg flex flex-col items-center justify-center gap-1 transition-colors"
                         style={{
                           border: `1.5px dashed ${uploaded ? '#10B981' : '#CBD5E1'}`,
                           background: uploaded ? 'rgba(16,185,129,0.04)' : '#F8FAFC',
                           padding: '6px 8px',
                           minWidth: 70,
+                          cursor: disabled ? 'not-allowed' : 'pointer',
+                          opacity: disabled ? 0.55 : 1,
+                          pointerEvents: disabled ? 'none' : 'auto',
                         }}
-                        onClick={() => triggerBrowse(key)}
-                        onDragOver={e => e.preventDefault()}
-                        onDrop={e => {
-                          e.preventDefault()
-                          const raw = pickXlsx(e.dataTransfer.files)
-                          if (gridMode === 'folder') {
-                            if (raw.length) onCellFiles(ei, yr, raw)
-                          } else {
-                            const f = raw[0]
-                            if (f) onCellFiles(ei, yr, [f])
-                          }
-                        }}
+                        {...bindFileDragHandlers(
+                          () => {},
+                          (files) => applyCellFiles(ei, yr, files),
+                          { disabled },
+                        )}
                       >
                         <Upload size={12} style={{ color: uploaded ? '#10B981' : '#94A3B8' }} />
                         <span
@@ -785,27 +856,22 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
                         >
                           {uploaded ?? (gridMode === 'folder' ? 'Drop folder / click' : 'Drop / click')}
                         </span>
-                      </div>
+                      </label>
                       <input
+                        id={`susa-${key}`}
                         ref={el => {
                           fileRefs.current[key] = el
+                          if (el && gridMode === 'folder') enableFolderPicker(el)
                         }}
                         type="file"
-                        className="hidden"
+                        disabled={disabled}
+                        className="sr-only"
+                        accept={gridMode === 'folder' ? undefined : '.xlsx,.xls'}
                         multiple={gridMode === 'folder'}
-                        {...(gridMode === 'folder'
-                          ? ({ webkitDirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)
-                          : { accept: '.xlsx' })}
                         onChange={e => {
                           const list = e.target.files
                           if (!list?.length) return
-                          const raw = pickXlsx(list)
-                          if (gridMode === 'folder') {
-                            if (raw.length) onCellFiles(ei, yr, raw)
-                          } else {
-                            const f = raw[0]
-                            if (f) onCellFiles(ei, yr, [f])
-                          }
+                          applyCellFiles(ei, yr, list)
                           e.target.value = ''
                         }}
                       />
@@ -825,7 +891,8 @@ function inputVisible(inp: AdaptiveCardInput, vals: Record<string, unknown>): bo
   if (inp.hidden) return false
   const w = inp.showWhen
   if (!w) return true
-  return String(vals[w.field] ?? '') === w.value
+  const rules = Array.isArray(w) ? w : [w]
+  return rules.every(rule => String(vals[rule.field] ?? '') === rule.value)
 }
 
 // ─── AdaptiveCard ─────────────────────────────────────────────────────────────
@@ -952,7 +1019,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             }
             continue
           }
-          if (String(raw ?? '').trim() === '') {
+          if (String(raw ?? inp.default ?? '').trim() === '') {
             setSubmitting(false)
             return
           }
@@ -963,6 +1030,18 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
       const visibleIds = new Set(visible.map(inp => inp.id))
 
       for (const inp of inputs) {
+        if (inp.hidden) {
+          const raw = values[inp.id] ?? inp.default
+          if (raw !== undefined && raw !== '') {
+            if (inp.type === 'number') {
+              const s = String(raw).trim().replace(',', '.')
+              out[inp.id] = s === '' ? '' : Number(s)
+            } else {
+              out[inp.id] = raw
+            }
+          }
+          continue
+        }
         if (!visibleIds.has(inp.id)) {
           continue
         }
@@ -1170,6 +1249,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
           <FileDropInput
             key={inp.id}
             input={inp}
+            disabled={disabled}
             onFileSelect={file => setFileCache(prev => ({ ...prev, [inp.id]: file }))}
           />
         )
@@ -1178,6 +1258,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
           <FolderDropInput
             key={inp.id}
             input={inp}
+            disabled={disabled}
             onFilesSelect={files => setFileCache(prev => ({ ...prev, [inp.id]: files }))}
           />
         )
@@ -1205,6 +1286,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
           <SusaGridInput
             key={inp.id}
             input={inp}
+            disabled={disabled}
             fileStatuses={susaFileNames}
             onCellFiles={(entityIdx, year, files) => handleSusaCellFiles(inp.id, entityIdx, year, files)}
             onEntityNameChange={(entityIdx, name) => handleSusaEntityName(inp.id, entityIdx, name)}
@@ -1216,9 +1298,10 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   }
 
   const hasSusaGrid = inputs.some(i => i.type === 'susa_grid')
-  const compact = Boolean(payload.compact)
+  const wide = Boolean(payload.wide)
+  const compact = Boolean(payload.compact) || wide
   const visibleInputs = inputs.filter(inp => inputVisible(inp, values))
-  const cardMax = hasSusaGrid ? 720 : compact ? 440 : 380
+  const cardMax = wide ? '100%' : hasSusaGrid ? 720 : compact ? 440 : 380
 
   return (
     <div

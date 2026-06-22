@@ -8,7 +8,7 @@ import {
   buildNextActionCard,
   scriptDisplayLabel,
 } from './nextActionCard'
-import type { ChatMessage } from './useFddBot'
+import type { AdaptiveCardPayload, ChatMessage } from './useFddBot'
 
 export interface ScriptJobPayload {
   run_id: string
@@ -52,10 +52,9 @@ export interface ScriptJobCallbacks {
   setScriptJobLoading: (loading: boolean) => void
 }
 
-function completionSubtitle(job: ScriptJobPayload, status: RunStatusResponse): string {
+function completionSubtitle(job: ScriptJobPayload, _status: RunStatusResponse): string {
   const label = job.title ?? scriptDisplayLabel(job.script_key)
-  const path = status.output_file ?? status.output_path ?? '(see output folder)'
-  return `${label} created successfully.\n\nOutput saved to:\n${path}`
+  return `${label} created successfully. Use the download button below to save your file.`
 }
 
 function longerRunningText(job: ScriptJobPayload): string {

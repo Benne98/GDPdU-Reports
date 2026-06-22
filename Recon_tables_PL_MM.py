@@ -17,6 +17,11 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
+from report_row_layout import (  # noqa: E402
+    build_pl_row_structure,
+    l3_order_from_mapping,
+    normalize_l4_sort_basis,
+)
 # =============================================
 # HARD-CODED DEFAULTS / STABLE SETTINGS
 # =============================================
@@ -38,7 +43,7 @@ SOURCE_COL_CANDIDATES = ("L5", "L6")
 SOURCE_COL_NAME = "L5"
 REPORTED_FILTER_VALUE = "reported"
 
-MAPPING_REQUIRED_COLUMNS = {"L3", "L4"}
+MAPPING_REQUIRED_COLUMNS = {"L3"}
 
 CHECK_TITLE_LABEL   = "Check - Financial statements"
 CHECK_DIFF_LABEL    = "Difference to trial balances"
@@ -253,6 +258,8 @@ def normalize_config(cfg: dict) -> dict:
     if out["sort_by"] not in {"assets", "revenue", "custom"}:
         raise ValueError("CONFIG['sort_by'] muss 'assets', 'revenue' oder 'custom' sein.")
 
+    out["l4_sort_basis"] = normalize_l4_sort_basis(out, default="latest_fy")
+
     entity_order = list(out.get("entity_order") or [])
     out["entity_order"] = [str(e).strip() for e in entity_order if str(e).strip()]
     if out["sort_by"] == "custom" and not out["entity_order"]:
@@ -372,6 +379,7 @@ def build_desktop_default_config() -> dict:
         "company_name": "Group",
         "sort_by": "custom",
         "entity_order": entities,
+        "l4_sort_basis": "latest_fy",
         "show_fs_check": False,
         "fs_check_values": {"entities": [], "consolidation": []},
         "display": {"unit_label": "kEUR"},
@@ -502,12 +510,10 @@ def load_mapping_df(cfg: dict) -> pd.DataFrame:
     )
 
     if not MAPPING_REQUIRED_COLUMNS.issubset(map_df.columns):
-        raise ValueError("Mapping-Datei muss Spalten 'L3' und 'L4' enthalten.")
+        raise ValueError("Mapping-Datei muss Spalte 'L3' enthalten.")
 
     map_df = map_df.copy()
-    map_df["L3"]          = map_df["L3"].astype(str).apply(normalize_technical_pl_key)
-    map_df["L4"]          = map_df["L4"].where(map_df["L4"].notna(), "").apply(normalize_technical_pl_key)
-    map_df["is_subtotal"] = map_df["L4"].eq(map_df["L3"])
+    map_df["L3"] = map_df["L3"].astype(str).apply(normalize_technical_pl_key)
 
     return map_df
 
@@ -539,43 +545,6 @@ def load_source_df(cfg: dict) -> pd.DataFrame:
     return df_norm
 
 
-def build_row_structure(map_df: pd.DataFrame, cfg: dict) -> list[dict]:
-    row_structure = []
-    l3_order      = []
-
-    for v in map_df["L3"].tolist():
-        if v not in l3_order:
-            l3_order.append(v)
-
-    for l3 in l3_order:
-        block   = map_df[map_df["L3"] == l3]
-        details = block[~block["is_subtotal"]]
-
-        for r in details.itertuples(index=False):
-            row_structure.append(
-                {
-                    "type":          "detail",
-                    "tech_label":    r.L4,
-                    "display_label": technical_to_display_label(r.L4, cfg),
-                    "L3":            r.L3,
-                    "L4":            r.L4,
-                }
-            )
-
-        row_structure.append(
-            {
-                "type":          "subtotal",
-                "tech_label":    l3,
-                "display_label": technical_to_display_label(l3, cfg),
-                "L3":            l3,
-                "L4":            l3,
-                "from_mapping":  True,
-            }
-        )
-
-    return row_structure
-
-
 def insert_after_anchor(struct: list[dict], anchor_label: str, new_row: dict) -> bool:
     for i, row in enumerate(struct):
         if row["tech_label"] == anchor_label:
@@ -596,9 +565,16 @@ def apply_totals_to_row_structure(row_structure: list[dict], cfg: dict) -> list[
             "L4":            "",
         }
 
-        if not insert_after_anchor(row_structure, t["insert_after"], new_row):
+        anchor = t["insert_after"]
+        inserted = insert_after_anchor(row_structure, anchor, new_row)
+        if not inserted:
+            for candidate in reversed(t["components"]):
+                if candidate != anchor and insert_after_anchor(row_structure, candidate, new_row):
+                    inserted = True
+                    break
+        if not inserted:
             raise RuntimeError(
-                f"Anchor '{t['insert_after']}' für Total '{t['label']}' nicht gefunden."
+                f"Anchor '{anchor}' für Total '{t['label']}' nicht gefunden."
             )
 
     return row_structure
@@ -887,7 +863,14 @@ def main():
     print(f"Verwende Source-Spalte für Reported/Adjusted: {SOURCE_COL_NAME}")
 
     map_df        = load_mapping_df(cfg)
-    row_structure = build_row_structure(map_df, cfg)
+    l3_order      = l3_order_from_mapping(map_df)
+    row_structure = build_pl_row_structure(
+        df,
+        l3_order,
+        cfg,
+        source_col=SOURCE_COL_NAME,
+        display_label_fn=lambda lbl: technical_to_display_label(lbl, cfg),
+    )
     row_structure = apply_totals_to_row_structure(row_structure, cfg)
     row_structure = prune_nan_zero_blocks(row_structure, df, YEARS, source_col=SOURCE_COL_NAME)
     row_structure = prune_row_structure(row_structure)

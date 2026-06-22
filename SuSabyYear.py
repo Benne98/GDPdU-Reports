@@ -701,7 +701,107 @@ def _normalize_mapping_frame(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["Account description"] = df["Account description"].astype(str).str.strip()
     out_cols = required + [c for c in optional if c in df.columns]
-    return df[out_cols].drop_duplicates(subset=["Account description"], keep="first")
+    return df[out_cols]
+
+
+def _norm_account_description(s: object) -> str:
+    txt = "" if s is None else str(s)
+    txt = " ".join(txt.strip().lower().split())
+    txt = txt.replace("\u00a0", " ")
+    return " ".join(txt.split())
+
+
+def _duplicate_bs_desc_norms(df_mapping: pd.DataFrame) -> set[str]:
+    bs = df_mapping[df_mapping["Account Type"].astype(str).str.upper() == "BS"].copy()
+    if bs.empty:
+        return set()
+    counts = bs.groupby("__desc_norm", dropna=False).size()
+    return set(counts[counts > 1].index.astype(str))
+
+
+def _latest_balance_by_entity_desc(df_long: pd.DataFrame) -> Dict[Tuple[str, str], float]:
+    """Balance in the last available month (Month>0) per Entity × normalized description."""
+    if df_long.empty:
+        return {}
+    work = df_long.copy()
+    work["__desc_norm"] = work.get("Account description", "").astype(str).map(_norm_account_description)
+    work["_month"] = pd.to_numeric(work.get("Month"), errors="coerce")
+    work = work[work["_month"].fillna(0) > 0]
+    if work.empty:
+        return {}
+    if "Calendar Year" in work.columns:
+        work["_year"] = pd.to_numeric(work["Calendar Year"], errors="coerce")
+    else:
+        work["_year"] = pd.to_numeric(work.get("Year"), errors="coerce")
+    work["_bal"] = pd.to_numeric(work.get("Balance"), errors="coerce").fillna(0.0)
+
+    out: Dict[Tuple[str, str], float] = {}
+    for (entity, desc_norm), grp in work.groupby(
+        [work["Entity"].astype(str), work["__desc_norm"]], dropna=False
+    ):
+        latest = grp.sort_values(["_year", "_month"], kind="stable").iloc[-1]
+        out[(str(entity), str(desc_norm))] = float(latest["_bal"])
+    return out
+
+
+def _resolve_sign_dependent_mapping(
+    df_mapping_all: pd.DataFrame,
+    df_long: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    When BS account descriptions appear more than once in the mapping file, pick the row
+    based on the sign of the balance in the last available month: negative → NA=ND,
+    otherwise the alternate row (e.g. cash/TWC).
+    """
+    m = df_mapping_all.copy()
+    m["__desc_key"] = m.get("Account description", "").astype(str).str.strip()
+    m["__desc_norm"] = m["__desc_key"].map(_norm_account_description)
+
+    base = df_long.copy()
+    base["__desc_norm"] = base.get("Account description", "").astype(str).map(_norm_account_description)
+
+    dup_norms = _duplicate_bs_desc_norms(m)
+    sign_bal = _latest_balance_by_entity_desc(base)
+
+    rows: List[dict] = []
+    for desc_norm, grp in m.groupby("__desc_norm", dropna=False):
+        desc_norm_s = str(desc_norm)
+        if desc_norm_s not in dup_norms:
+            row = grp.iloc[0].to_dict()
+            row["Entity"] = None
+            rows.append(row)
+            continue
+
+        if str(grp.iloc[0].get("Account Type", "")).upper() != "BS":
+            row = grp.iloc[0].to_dict()
+            row["Entity"] = None
+            rows.append(row)
+            continue
+
+        na_series = grp["NA"].astype(str).str.strip().str.upper() if "NA" in grp.columns else pd.Series(dtype=str)
+        nd_rows = grp[na_series == "ND"]
+        pos_rows = grp[na_series != "ND"]
+        if nd_rows.empty or pos_rows.empty:
+            row = grp.iloc[0].to_dict()
+            row["Entity"] = None
+            rows.append(row)
+            continue
+
+        entities = base.loc[base["__desc_norm"] == desc_norm_s, "Entity"].dropna().astype(str).unique()
+        if len(entities) == 0:
+            row = pos_rows.iloc[0].to_dict()
+            row["Entity"] = None
+            rows.append(row)
+            continue
+
+        for ent in entities:
+            bal = sign_bal.get((str(ent), desc_norm_s), 0.0)
+            pick = nd_rows.iloc[0] if bal < 0 else pos_rows.iloc[0]
+            row = pick.to_dict()
+            row["Entity"] = str(ent)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def resolve_mapping_paths(config: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -752,49 +852,69 @@ def _attach_mapping(df_long: pd.DataFrame, df_mapping_all: pd.DataFrame) -> pd.D
         out["Account Type"] = "UNKNOWN"
         return out
 
-    def _norm_desc(s: object) -> str:
-        txt = "" if s is None else str(s)
-        txt = " ".join(txt.strip().lower().split())
-        # Remove non-breaking spaces etc.
-        txt = txt.replace("\u00a0", " ")
-        txt = " ".join(txt.split())
-        return txt
-
     base = df_long.copy()
     base["__desc_key"] = base.get("Account description", "").astype(str).str.strip()
-    base["__desc_norm"] = base["__desc_key"].map(_norm_desc)
+    base["__desc_norm"] = base["__desc_key"].map(_norm_account_description)
 
-    map_cols = ["__desc_key", "__desc_norm", "L1 - BS/PL", "L2", "L3", "L4", "Account Type"]
-    if "NA" in df_mapping_all.columns:
+    mapping_for_dup = df_mapping_all.copy()
+    mapping_for_dup["__desc_norm"] = (
+        mapping_for_dup.get("Account description", "").astype(str).str.strip().map(_norm_account_description)
+    )
+    dup_norms = _duplicate_bs_desc_norms(mapping_for_dup)
+
+    m = _resolve_sign_dependent_mapping(df_mapping_all, base)
+    m["__desc_key"] = m.get("__desc_key", m.get("Account description", "")).astype(str).str.strip()
+    m["__desc_norm"] = m["__desc_key"].map(_norm_account_description)
+
+    map_cols = ["L1 - BS/PL", "L2", "L3", "L4", "Account Type"]
+    if "NA" in m.columns:
         map_cols.append("NA")
-    m = df_mapping_all.copy()
-    m["__desc_key"] = m.get("Account description", "").astype(str).str.strip()
-    m["__desc_norm"] = m["__desc_key"].map(_norm_desc)
-    m = m[map_cols].copy()
 
-    # 1) Hard exact match on description
+    m_global = m[m["Entity"].isna() | (m["Entity"].astype(str).str.strip() == "")].copy()
+    m_entity = m[m["Entity"].notna() & (m["Entity"].astype(str).str.strip() != "")].copy()
+
     merged = base.merge(
-        m.drop(columns=["__desc_norm"]).rename(columns={"__desc_key": "__desc_key"}),
+        m_global[["__desc_key"] + map_cols],
         on="__desc_key",
         how="left",
         suffixes=("", "_map"),
     )
 
-    # 2) Second pass: normalized match for still-unmapped rows
-    need_second = merged["L1 - BS/PL"].isna()
-    if need_second.any():
-        second = (
-            base.loc[need_second, ["__desc_norm"]]
-            .merge(
-                m.drop(columns=["__desc_key"]).rename(columns={"__desc_norm": "__desc_norm"}),
-                on="__desc_norm",
+    if not m_entity.empty and dup_norms:
+        dup_mask = merged["__desc_norm"].isin(dup_norms)
+        if dup_mask.any():
+            entity_merge = base.loc[dup_mask, ["Entity", "__desc_key"]].merge(
+                m_entity[["Entity", "__desc_key"] + map_cols],
+                on=["Entity", "__desc_key"],
                 how="left",
             )
+            for col in map_cols:
+                merged.loc[dup_mask, col] = entity_merge[col].to_numpy()
+
+    # Second pass: normalized match for still-unmapped rows
+    need_second = merged["L1 - BS/PL"].isna()
+    if need_second.any():
+        m_norm_global = m_global.drop(columns=["__desc_key"]).rename(columns={"__desc_norm": "__desc_norm"})
+        second = base.loc[need_second, ["__desc_norm"]].merge(
+            m_norm_global[["__desc_norm"] + map_cols],
+            on="__desc_norm",
+            how="left",
         )
-        for col in ["L1 - BS/PL", "L2", "L3", "L4", "Account Type"] + (
-            ["NA"] if "NA" in m.columns else []
-        ):
+        for col in map_cols:
             merged.loc[need_second, col] = merged.loc[need_second, col].combine_first(second[col])
+
+        still_unmapped = merged["L1 - BS/PL"].isna() & merged["__desc_norm"].isin(dup_norms)
+        if still_unmapped.any() and not m_entity.empty:
+            m_norm_entity = m_entity.drop(columns=["__desc_key"]).rename(columns={"__desc_norm": "__desc_norm"})
+            second_entity = base.loc[still_unmapped, ["Entity", "__desc_norm"]].merge(
+                m_norm_entity[["Entity", "__desc_norm"] + map_cols],
+                on=["Entity", "__desc_norm"],
+                how="left",
+            )
+            for col in map_cols:
+                merged.loc[still_unmapped, col] = merged.loc[still_unmapped, col].combine_first(
+                    second_entity[col]
+                )
 
     merged["Account Type"] = merged["Account Type"].fillna("UNKNOWN")
     merged["L5"] = ""
@@ -864,15 +984,73 @@ def select_bs_fy_end_rows(
     return pd.DataFrame(parts)
 
 
+def select_bs_ytd_rows(
+    bs_long: pd.DataFrame,
+    index_cols: List[str],
+    *,
+    fiscal_start_month: int,
+    ytd_reporting_fy: int,
+    ltm_year: int,
+    ltm_month: int,
+) -> pd.DataFrame:
+    """BS balance at the as-of month within the open reporting FY."""
+    mov = bs_long[
+        (bs_long["Month"] > 0) & (bs_long["Reporting FY"] == ytd_reporting_fy)
+    ].copy()
+    if mov.empty:
+        return mov.iloc[0:0]
+
+    parts: List[pd.Series] = []
+    for _, grp in mov.groupby(index_cols, dropna=False):
+        exact = grp[(grp["Calendar Year"] == ltm_year) & (grp["Month"] == ltm_month)]
+        if not exact.empty:
+            parts.append(exact.sort_values(["Calendar Year", "Month"], kind="stable").iloc[-1])
+            continue
+        eligible = grp[
+            (grp["Calendar Year"] < ltm_year)
+            | ((grp["Calendar Year"] == ltm_year) & (grp["Month"] <= ltm_month))
+        ]
+        if eligible.empty:
+            continue
+        ordered = eligible.assign(
+            FY_MONTH_ORDER=lambda d: ((d["Month"] - fiscal_start_month) % 12),
+        ).sort_values(["Calendar Year", "FY_MONTH_ORDER", "Month"], kind="stable")
+        parts.append(ordered.iloc[-1])
+
+    if not parts:
+        return mov.iloc[0:0]
+    return pd.DataFrame(parts)
+
+
+def _pl_ytd_mask(
+    df: pd.DataFrame,
+    ytd_reporting_fy: int,
+    ltm_year: int,
+    ltm_month: int,
+) -> pd.Series:
+    return (
+        (df["Reporting FY"] == ytd_reporting_fy)
+        & (df["Month"] > 0)
+        & (
+            (df["Calendar Year"] < ltm_year)
+            | ((df["Calendar Year"] == ltm_year) & (df["Month"] <= ltm_month))
+        )
+    )
+
+
 def build_net_income_bs_rows(
     df: pd.DataFrame,
     period_order: List[str],
     fy_values: List[int],
     fy_rename: Dict[int, str],
-    fy_cols: List[str],
+    period_cols: List[str],
     *,
     fiscal_start_month: int = 1,
     fy_end_month: int = 12,
+    ytd_col: Optional[str] = None,
+    ytd_reporting_fy: Optional[int] = None,
+    ytd_ltm_year: Optional[int] = None,
+    ytd_ltm_month: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     One BS row per entity: cumulative sum of all PL monthly movements (Soll+/Haben-).
@@ -945,12 +1123,22 @@ def build_net_income_bs_rows(
                 fy_mask = (pl["Entity"] == entity) & (pl["Reporting FY"] == fy) & (pl["Month"] > 0)
                 row[fy_col] = float(pl.loc[fy_mask, "Balance"].sum())
 
+        if ytd_col and ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
+            ltm_period = make_period_str(ytd_ltm_year, ytd_ltm_month)
+            if ltm_period in row:
+                row[ytd_col] = row[ltm_period]
+            else:
+                mask = (pl["Entity"] == entity) & _pl_ytd_mask(
+                    pl, ytd_reporting_fy, ytd_ltm_year, ytd_ltm_month
+                )
+                row[ytd_col] = float(pl.loc[mask, "Balance"].sum())
+
         rows.append(row)
 
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.reindex(columns=META_COLS_BS + fy_cols + period_order)
+    return out.reindex(columns=META_COLS_BS + period_cols + period_order)
 
 
 def validate_df_long(df_long: pd.DataFrame, strict_mapping: bool = False) -> List[str]:
@@ -971,6 +1159,9 @@ def build_final_output(
     *,
     value_type: str = "balances",
     fy_end_month: int = 12,
+    ytd_reporting_fy: Optional[int] = None,
+    ytd_ltm_year: Optional[int] = None,
+    ytd_ltm_month: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = finalize_periods(df_long, fiscal_start_month)
     for col, default in (("L5", ""), ("L6", "Reported"), ("NA", None)):
@@ -1014,10 +1205,16 @@ def build_final_output(
     fy_rename: Dict[int, str] = {}
     fy_cols: List[str] = []
     for fy in fy_values:
-        # Always export full FY columns (no YTD naming here); the as-of logic lives in the bot date settings.
         new_name = f"FY{str(fy)[-2:]}A"
         fy_rename[fy] = new_name
         fy_cols.append(new_name)
+
+    ytd_col: Optional[str] = None
+    if ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
+        ytd_col = f"YTD{str(int(ytd_reporting_fy))[-2:]}A"
+    period_cols = list(fy_cols)
+    if ytd_col:
+        period_cols.append(ytd_col)
 
     index_cols_pl = INDEX_COLS_PL
     index_cols_bs = INDEX_COLS_BS
@@ -1054,7 +1251,19 @@ def build_final_output(
     if fy_values:
         pl_fy_pivot = pl_fy_pivot.rename(columns=fy_rename)
 
-    master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
+    if ytd_col and ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
+        pl_ytd = (
+            pl_long.loc[
+                _pl_ytd_mask(pl_long, int(ytd_reporting_fy), int(ytd_ltm_year), int(ytd_ltm_month))
+            ]
+            .groupby(index_cols_pl, as_index=False)["Balance"]
+            .sum()
+            .rename(columns={"Balance": ytd_col})
+        )
+        master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
+        master_pl = master_pl.merge(pl_ytd, on=index_cols_pl, how="left")
+    else:
+        master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
 
     bs_long = df[df["Account Type"] == "BS"].copy()
     if not bs_long.empty and fy_values:
@@ -1086,17 +1295,37 @@ def build_final_output(
             .reset_index()
         )
         master_bs = bs_period_pivot.merge(bs_fy_pivot, on=index_cols_bs, how="outer")
+        if ytd_col and ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
+            bs_ytd = select_bs_ytd_rows(
+                bs_long,
+                index_cols_bs,
+                fiscal_start_month=fiscal_start_month,
+                ytd_reporting_fy=int(ytd_reporting_fy),
+                ltm_year=int(ytd_ltm_year),
+                ltm_month=int(ytd_ltm_month),
+            )
+            if not bs_ytd.empty:
+                bs_ytd_pivot = (
+                    bs_ytd.groupby(index_cols_bs, as_index=False)["Balance"]
+                    .sum()
+                    .rename(columns={"Balance": ytd_col})
+                )
+                master_bs = master_bs.merge(bs_ytd_pivot, on=index_cols_bs, how="left")
     else:
-        master_bs = pd.DataFrame(columns=META_COLS_BS + fy_cols + period_order)
+        master_bs = pd.DataFrame(columns=META_COLS_BS + period_cols + period_order)
 
     net_income = build_net_income_bs_rows(
         df,
         period_order,
         fy_values,
         fy_rename,
-        fy_cols,
+        period_cols,
         fiscal_start_month=fiscal_start_month,
         fy_end_month=fy_end_month,
+        ytd_col=ytd_col,
+        ytd_reporting_fy=ytd_reporting_fy,
+        ytd_ltm_year=ytd_ltm_year,
+        ytd_ltm_month=ytd_ltm_month,
     )
     if not net_income.empty:
         master_bs = pd.concat([master_bs, net_income], ignore_index=True)
@@ -1108,8 +1337,8 @@ def build_final_output(
         if col not in master_bs.columns:
             master_bs[col] = None
 
-    desired_cols_pl = META_COLS_PL + fy_cols + period_order
-    desired_cols_bs = META_COLS_BS + fy_cols + period_order
+    desired_cols_pl = META_COLS_PL + period_cols + period_order
+    desired_cols_bs = META_COLS_BS + period_cols + period_order
     master_pl = master_pl.reindex(columns=desired_cols_pl)
     master_bs = master_bs.reindex(columns=desired_cols_bs)
 
@@ -1308,8 +1537,13 @@ def main(config: dict) -> None:
     all_long: List[pd.DataFrame] = []
     value_type = str(config.get("value_type") or "balances").strip()
     # Only include Eröffnungsbilanz for the first FY in the configured timeframe.
+    fy_cells = [
+        c
+        for c in cells
+        if not str(c.get("fy_label") or "").strip().upper().startswith("YTD")
+    ]
     try:
-        first_fy = min(int(c.get("year") or 0) for c in cells if int(c.get("year") or 0) > 0)
+        first_fy = min(int(c.get("year") or 0) for c in fy_cells if int(c.get("year") or 0) > 0)
     except ValueError:
         first_fy = None
 
@@ -1320,8 +1554,11 @@ def main(config: dict) -> None:
             raise SystemExit(f"Invalid year in cell: {cell!r}")
         entity_name = str(cell.get("entity_name") or "")
         source_file = paths[0] if paths else ""
+        is_ytd_cell = str(cell.get("fy_label") or "").strip().upper().startswith("YTD")
 
-        include_opening = bool(first_fy is not None and year == first_fy)
+        include_opening = bool(
+            not is_ytd_cell and first_fy is not None and year == first_fy
+        )
         if layout == "monthly_workbooks":
             df = process_monthly_workbooks_cell(
                 paths, year, config, entity_name, include_opening_balance=include_opening
@@ -1367,11 +1604,18 @@ def main(config: dict) -> None:
         if combined["L1 - BS/PL"].isna().any():
             raise SystemExit("strict_mapping: unmapped accounts remain.")
 
+    ytd_reporting_fy = config.get("ytd_reporting_fy_end_year")
+    ytd_ltm_year = config.get("ytd_ltm_year")
+    ytd_ltm_month = config.get("ytd_ltm_month")
+
     master_bs, master_pl = build_final_output(
         combined,
         fiscal_start_month=fiscal_start_month,
         value_type=value_type,
         fy_end_month=fy_end_month,
+        ytd_reporting_fy=int(ytd_reporting_fy) if ytd_reporting_fy else None,
+        ytd_ltm_year=int(ytd_ltm_year) if ytd_ltm_year else None,
+        ytd_ltm_month=int(ytd_ltm_month) if ytd_ltm_month else None,
     )
 
     output_path = config.get("output_path")

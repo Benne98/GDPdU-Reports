@@ -9,6 +9,8 @@ from pathlib import Path
 from susa_column_mapping import EN_MONTH_ABBR
 
 _FY_COL_RE = re.compile(r"^FY\d{2}A$", re.IGNORECASE)
+_YTD_COL_RE = re.compile(r"^YTD\d{2}A$", re.IGNORECASE)
+_YTD_GRID_RE = re.compile(r"^YTD(19|20)\d{2}$", re.IGNORECASE)
 _MONTH_COL_RE = re.compile(r"^[A-Za-z]{3}-\d{4}$")
 
 
@@ -18,6 +20,14 @@ def make_period_str(year: int, month: int) -> str:
 
 def is_fy_period_column(header: str) -> bool:
     return bool(_FY_COL_RE.match(str(header or "").strip()))
+
+
+def is_ytd_period_column(header: str) -> bool:
+    return bool(_YTD_COL_RE.match(str(header or "").strip()))
+
+
+def is_ytd_grid_label(label: str) -> bool:
+    return bool(_YTD_GRID_RE.match(str(label or "").strip()))
 
 
 def is_month_period_column(header: str) -> bool:
@@ -36,7 +46,7 @@ def filter_master_period_columns(headers: list, period_level: str) -> list[str]:
         s = str(h or "").strip()
         if not s:
             continue
-        if level == "yearly" and is_fy_period_column(s):
+        if level == "yearly" and (is_fy_period_column(s) or is_ytd_period_column(s)):
             out.append(s)
         elif level == "monthly" and is_month_period_column(s):
             out.append(s)
@@ -79,6 +89,85 @@ def _last_completed_fy_end_calendar_year(
     as_of_end = _eom_date(ltm_y, ltm_m)
     fye_this_cal_year = _safe_fy_end_date(ltm_y, fy_end_m, fy_end_d)
     return ltm_y if as_of_end >= fye_this_cal_year else ltm_y - 1
+
+
+def current_fy_end_year_containing_as_of(
+    ltm_y: int, ltm_m: int, fy_end_m: int, fy_end_d: int
+) -> int:
+    """Calendar year of the FY-end for the fiscal year that contains the as-of month-end."""
+    as_of_end = _eom_date(ltm_y, ltm_m)
+    fye_this_cal_year = _safe_fy_end_date(ltm_y, fy_end_m, fy_end_d)
+    return ltm_y if as_of_end <= fye_this_cal_year else ltm_y + 1
+
+
+def as_of_is_fy_end(ltm_y: int, ltm_m: int, fy_end_m: int, fy_end_d: int) -> bool:
+    """True when the as-of month-end lands exactly on a fiscal year-end (Stichtag)."""
+    as_of_end = _eom_date(ltm_y, ltm_m)
+    cur = current_fy_end_year_containing_as_of(ltm_y, ltm_m, fy_end_m, fy_end_d)
+    return as_of_end == _safe_fy_end_date(cur, fy_end_m, fy_end_d)
+
+
+def grid_ytd_label(reporting_fy_end_year: int) -> str:
+    return f"YTD{int(reporting_fy_end_year)}"
+
+
+def master_ytd_label(reporting_fy_end_year: int) -> str:
+    return f"YTD{str(int(reporting_fy_end_year))[-2:]}A"
+
+
+def ytd_reporting_fy_end_year(
+    ltm_month: str | None, fy_end_m: int, fy_end_d: int
+) -> int | None:
+    """Reporting FY-end calendar year for the open YTD column, or None when as-of is FY-end."""
+    ltm = _parse_ltm_month(ltm_month)
+    if not ltm:
+        return None
+    ltm_y, ltm_m = ltm
+    if as_of_is_fy_end(ltm_y, ltm_m, fy_end_m, fy_end_d):
+        return None
+    return current_fy_end_year_containing_as_of(ltm_y, ltm_m, fy_end_m, fy_end_d)
+
+
+def compute_databook_grid_labels(
+    first_fy: int,
+    ltm_month: str | None,
+    fy_end_m: int,
+    fy_end_d: int,
+) -> list[str]:
+    """Upload-grid period labels: FY{yyyy}… plus YTD{yyyy} when as-of is not FY-end."""
+    ltm = _parse_ltm_month(ltm_month)
+    if not ltm:
+        return [f"FY{first_fy}"]
+    ltm_y, ltm_m = ltm
+    last_fy = _last_completed_fy_end_calendar_year(ltm_y, ltm_m, fy_end_m, fy_end_d)
+    if last_fy < first_fy:
+        labels: list[str] = [f"FY{first_fy}"]
+    else:
+        labels = [f"FY{y}" for y in range(first_fy, last_fy + 1)]
+    ytd_fy = ytd_reporting_fy_end_year(ltm_month, fy_end_m, fy_end_d)
+    if ytd_fy is not None:
+        labels.append(grid_ytd_label(ytd_fy))
+    return labels
+
+
+def ordered_reporting_columns_from_headers(headers: list) -> list[str]:
+    """FY and YTD master columns in header order."""
+    out: list[str] = []
+    for h in headers:
+        s = str(h or "").strip()
+        if is_fy_period_column(s) or is_ytd_period_column(s):
+            out.append(s)
+    return out
+
+
+def ordered_reporting_columns_from_df(df) -> list[str]:
+    return ordered_reporting_columns_from_headers(list(df.columns))
+
+
+def split_fy_and_ytd(columns: list[str]) -> tuple[list[str], list[str]]:
+    fy = [c for c in columns if is_fy_period_column(c)]
+    ytd = [c for c in columns if is_ytd_period_column(c)]
+    return fy, ytd
 
 
 def _parse_ltm_month(ltm_month: str | None) -> tuple[int, int] | None:
@@ -126,7 +215,11 @@ def fallback_yearly_columns(config: dict) -> list[str]:
     last_fy = _last_completed_fy_end_calendar_year(ltm_y, ltm_m, fy_end_m, fy_end_d)
     if last_fy < first_fy:
         return [f"FY{str(first_fy)[-2:]}A"]
-    return [f"FY{str(y)[-2:]}A" for y in range(first_fy, last_fy + 1)]
+    cols = [f"FY{str(y)[-2:]}A" for y in range(first_fy, last_fy + 1)]
+    ytd_fy = ytd_reporting_fy_end_year(config.get("ltm_month"), fy_end_m, fy_end_d)
+    if ytd_fy is not None:
+        cols.append(master_ytd_label(ytd_fy))
+    return cols
 
 
 def fallback_monthly_columns(config: dict) -> list[str]:

@@ -1,6 +1,5 @@
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -11,10 +10,15 @@ from openpyxl.styles import Border, Side
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+BACKEND_DIR = PROJECT_ROOT / "backend"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
+from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from report_row_layout import build_lead_bs_row_structure, l3_order_from_mapping  # noqa: E402
 
 # ================================================
 # DESKTOP DEFAULTS
@@ -25,30 +29,6 @@ INPUT_FILE = str(DESKTOP_DIR / "BS_Reconciliation_output.xlsx")
 MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
 PL_LEAD_FILE = DESKTOP_DIR / "PL_Reconciliation_output.xlsx"
 PL_LEAD_FILENAME = PL_LEAD_FILE.name
-
-_RUNTIME_CFG: dict = {}
-
-
-def _apply_runtime_config() -> None:
-    global INPUT_FILE, PL_LEAD_FILE, PL_LEAD_FILENAME, PROJECT_NAME, GROUP_NAME, _RUNTIME_CFG
-    from databook_runtime import load_argv_config, path_value
-
-    cfg = load_argv_config()
-    if not cfg:
-        return
-    _RUNTIME_CFG.update(cfg)
-    master = path_value(cfg, "master_file", path_value(cfg, "input_file", INPUT_FILE))
-    INPUT_FILE = master
-    pl_master = path_value(cfg, "pl_master_file", master)
-    PL_LEAD_FILE = Path(pl_master)
-    PL_LEAD_FILENAME = PL_LEAD_FILE.name
-    if cfg.get("project_name"):
-        PROJECT_NAME = str(cfg["project_name"])
-    if cfg.get("company_name"):
-        GROUP_NAME = str(cfg["company_name"])
-
-
-_apply_runtime_config()
 
 SHEET_MASTER = "Master_BS"
 SHEET_OUT = "Lead_BS"
@@ -61,6 +41,7 @@ UNIT_LABEL = "kEUR"
 
 SOURCE_COL_CANDIDATES = ("L5", "L6")
 REPORTED_FILTER_VALUE = "reported"
+L4_SORT_BASIS = "latest_fy"
 
 L5_ORDER = ["FA", "TWC", "OWC", "ND", "Other", "Equity"]
 L5_TOTAL_LABEL = {
@@ -155,11 +136,17 @@ def col_letter(idx: int) -> str:
 
 
 def detect_year_columns(df_: pd.DataFrame) -> list[str]:
-    pattern = re.compile(r"^FY(\d{2}|\d{4})A$", re.IGNORECASE)
-    years = [str(c).strip() for c in df_.columns if pattern.match(str(c).strip())]
-    if not years:
+    fy, _ = split_fy_and_ytd(ordered_reporting_columns_from_df(df_))
+    if not fy:
         raise ValueError("Keine FY-Spalten im Master_BS gefunden.")
-    return sorted(dict.fromkeys(years), key=lambda x: int(pattern.match(x).group(1)))
+    return fy
+
+
+def detect_reporting_period_columns(df_: pd.DataFrame) -> list[str]:
+    periods = ordered_reporting_columns_from_df(df_)
+    if not periods:
+        raise ValueError("Keine FY/YTD-Spalten im Master_BS gefunden.")
+    return periods
 
 
 def detect_source_col(df_):
@@ -353,43 +340,27 @@ if SHEET_OUT in wb.sheetnames:
 ws = wb.create_sheet(SHEET_OUT)
 
 df_bs = pd.read_excel(INPUT_FILE, sheet_name=SHEET_MASTER, engine="openpyxl")
-YEARS = detect_year_columns(df_bs)
-Y_COLS = list(range(POS_COL + 1, POS_COL + 1 + len(YEARS)))
-IS_YEAR_COLS = detect_lead_is_proforma_year_cols(ws_is, YEARS)
+PERIODS = detect_reporting_period_columns(df_bs)
+FY_COLS, YTD_COLS = split_fy_and_ytd(PERIODS)
+Y_COLS = list(range(POS_COL + 1, POS_COL + 1 + len(PERIODS)))
+IS_YEAR_COLS = detect_lead_is_proforma_year_cols(ws_is, PERIODS)
 wb_pl.close()
 
 source_col = resolve_source_section_column(df_bs)
 l5_col = detect_l5_col(df_bs)
 
-required = {"Entity", "L3", "L4", l5_col} | set(YEARS)
+required = {"Entity", "L3", "L4", l5_col} | set(PERIODS)
 missing = required - set(df_bs.columns)
 if missing:
     raise ValueError(f"Master_BS fehlt Spalten: {missing}")
 
-from recon_mapping_loader import load_bs_recon_mapping_df
-
-map_df = load_bs_recon_mapping_df(_RUNTIME_CFG)
-if not {"L3", "L4"}.issubset(map_df.columns):
-    raise ValueError("BS-Mapping muss Spalten 'L3' und 'L4' enthalten.")
+map_df = pd.read_excel(MAPPING_FILE_BS, sheet_name=0, engine="openpyxl")
+if "L3" not in map_df.columns:
+    raise ValueError("BS-Mapping muss Spalte 'L3' enthalten.")
 
 map_df = map_df.copy()
 map_df["L3"] = map_df["L3"].astype(str).str.strip()
-map_df["L4"] = map_df["L4"].astype(str).str.strip()
-
-mapping_pairs = []
-seen = set()
-for l3, l4 in zip(map_df["L3"].tolist(), map_df["L4"].tolist()):
-    key = (l3, l4)
-    if key not in seen:
-        seen.add(key)
-        mapping_pairs.append(key)
-
-mapping_l3_order = []
-seen_l3 = set()
-for l3, _ in mapping_pairs:
-    if l3 not in seen_l3:
-        seen_l3.add(l3)
-        mapping_l3_order.append(l3)
+mapping_l3_order = l3_order_from_mapping(map_df)
 
 MASTER_START = 2
 MASTER_END = len(df_bs) + 1
@@ -404,95 +375,18 @@ l3_rng = master_range("L3")
 l4_rng = master_range("L4")
 l5_rng = master_range(l5_col)
 src_rng = master_range(source_col) if source_col is not None else None
-year_rng = {y: master_range(y) for y in YEARS}
+year_rng = {y: master_range(y) for y in PERIODS}
 
-df_entity = df_bs.copy()
-df_entity["L3"] = df_entity["L3"].astype(str).str.strip()
-df_entity["L4"] = df_entity["L4"].astype(str).str.strip()
-df_entity[l5_col] = df_entity[l5_col].astype(str).str.strip()
-
-tmp = defaultdict(list)
-for l3v, l4v, l5v in df_entity[["L3", "L4", l5_col]].itertuples(index=False, name=None):
-    tmp[(str(l3v).strip(), str(l4v).strip())].append(normalize_l5_bucket(l5v))
-
-pair_to_buckets = {pair: set(buckets) for pair, buckets in tmp.items()}
-pairs_by_bucket = defaultdict(list)
-
-for l3, l4 in mapping_pairs:
-    buckets = pair_to_buckets.get((l3, l4), {"Other"})
-    for b in L5_ORDER:
-        if b in buckets:
-            pairs_by_bucket[b].append((l3, l4))
-
-row_structure = []
-
-for bucket in L5_ORDER:
-    pairs = pairs_by_bucket.get(bucket, [])
-    if not pairs:
-        continue
-
-    l3_to_l4 = defaultdict(list)
-    for l3, l4 in pairs:
-        l3_to_l4[l3].append(l4)
-
-    for l3 in mapping_l3_order:
-        l4_list = l3_to_l4.get(l3, [])
-        if not l4_list:
-            continue
-
-        l4_unique = list(dict.fromkeys(l4_list))
-        l3_label = str(l3).strip()
-
-        if len(l4_unique) == 1:
-            only_l4 = l4_unique[0]
-            if only_l4 == l3_label:
-                row_structure.append({
-                    "type": "detail_single",
-                    "label": l3_label,
-                    "L5": bucket,
-                    "L3": l3_label,
-                    "L4": only_l4,
-                })
-            else:
-                row_structure.append({
-                    "type": "detail",
-                    "label": only_l4,
-                    "L5": bucket,
-                    "L3": l3_label,
-                    "L4": only_l4,
-                })
-                row_structure.append({
-                    "type": "subtotal_l3",
-                    "label": l3_label,
-                    "L5": bucket,
-                    "L3": l3_label,
-                    "L4": "",
-                })
-        else:
-            for l4 in l4_unique:
-                row_structure.append({
-                    "type": "detail",
-                    "label": l4,
-                    "L5": bucket,
-                    "L3": l3_label,
-                    "L4": l4,
-                })
-            row_structure.append({
-                "type": "subtotal_l3",
-                "label": l3_label,
-                "L5": bucket,
-                "L3": l3_label,
-                "L4": "",
-            })
-
-    row_structure.append({
-        "type": "total_l5",
-        "label": L5_TOTAL_LABEL[bucket],
-        "L5": bucket,
-        "L3": "",
-        "L4": "",
-        "bucket": bucket,
-    })
+row_structure = build_lead_bs_row_structure(
+    df_bs,
+    mapping_l3_order,
+    {"l4_sort_basis": L4_SORT_BASIS},
+    source_col=source_col or l5_col,
+    bucket_col=l5_col,
+    bucket_order=L5_ORDER,
+    normalize_bucket_fn=normalize_l5_bucket,
+    l5_total_labels=L5_TOTAL_LABEL,
+)
 
 existing_total_labels = [r["label"] for r in row_structure if r["type"] == "total_l5"]
 net_assets_components_existing = [x for x in NET_ASSETS_COMPONENT_TOTALS if x in existing_total_labels]
@@ -541,7 +435,7 @@ st = ws.cell(SUBTITLE_ROW, POS_COL, f"{GROUP_NAME} Lead balance sheet")
 st.font = FONT_SUBTITLE
 st.alignment = ALIGN_LEFT
 
-tt = ws.cell(TITLE_ROW, POS_COL, f"{GROUP_NAME} | Lead balance sheet {YEARS[0]} - {YEARS[-1]}")
+tt = ws.cell(TITLE_ROW, POS_COL, f"{GROUP_NAME} | Lead balance sheet {FY_COLS[0]} - {FY_COLS[-1]}")
 tt.font = FONT_TITLE
 tt.alignment = ALIGN_LEFT
 
@@ -563,7 +457,7 @@ ws.cell(HEADER_ROW, POS_COL, UNIT_LABEL).font = FONT_HEADER
 ws.cell(HEADER_ROW, POS_COL).alignment = ALIGN_LEFT
 ws.cell(HEADER_ROW, POS_COL).fill = FILL_HEADER
 
-for idx, y in enumerate(YEARS):
+for idx, y in enumerate(PERIODS):
     cc = Y_COLS[idx]
     h = ws.cell(HEADER_ROW, cc, y)
     h.font = FONT_HEADER
@@ -641,7 +535,7 @@ for i, r in enumerate(row_structure):
         ws.row_dimensions[excel_row].outlineLevel = 0
         ws.row_dimensions[excel_row].hidden = False
 
-    for y_idx, year in enumerate(YEARS):
+    for y_idx, year in enumerate(PERIODS):
         cell = ws.cell(excel_row, Y_COLS[y_idx])
         cell.alignment = ALIGN_RIGHT
         cell.number_format = NUM_FMT_INT
@@ -727,7 +621,7 @@ for i_kpi, label in enumerate(kpi_labels):
     lbl_cell = ws.cell(rr, POS_COL, label)
     lbl_cell.alignment = ALIGN_LEFT
     lbl_cell.font = FONT_KPI_ITALIC if is_italic_kpi else FONT_KPI
-    for y_idx in range(len(YEARS)):
+    for y_idx in range(len(PERIODS)):
         v = ws.cell(rr, Y_COLS[y_idx])
         v.number_format = NUM_FMT_KPI
         v.alignment = ALIGN_RIGHT
@@ -757,7 +651,7 @@ for rr, label in [(COGS_HELPER_ROW, "Cost of goods sold"), (NET_SALES_HELPER_ROW
         ws.cell(rr, cc).alignment = ALIGN_RIGHT
         ws.cell(rr, cc).number_format = NUM_FMT_INT
 
-for y_idx in range(len(YEARS)):
+for y_idx in range(len(PERIODS)):
     ws.cell(COGS_HELPER_ROW, Y_COLS[y_idx]).value = lead_is_external_ref(
         IS_YEAR_COLS[y_idx], is_row_cogs,
     )
@@ -765,7 +659,7 @@ for y_idx in range(len(YEARS)):
         IS_YEAR_COLS[y_idx], is_row_ns,
     )
 
-for y_idx in range(len(YEARS)):
+for y_idx in range(len(PERIODS)):
     colL = col_letter(Y_COLS[y_idx])
     ns_cell = f"{colL}{NET_SALES_HELPER_ROW}"
     cogs_cell = f"{colL}{COGS_HELPER_ROW}"
@@ -807,7 +701,7 @@ ws.cell(CHECK_ROW, POS_COL, "Check").font = FONT_CHECK_RED
 ws.cell(CHECK_ROW, POS_COL).alignment = ALIGN_LEFT
 
 if net_assets_rownum is not None and equity_rownum is not None:
-    for y_idx in range(len(YEARS)):
+    for y_idx in range(len(PERIODS)):
         colL = col_letter(Y_COLS[y_idx])
         na_cell = f"{colL}{net_assets_rownum}"
         eq_cell = f"{colL}{equity_rownum}"
@@ -846,7 +740,7 @@ else:
                 ws.cell(src_row, cc).fill = FILL_SOURCE
             source_rows_yellow.add(src_row)
 
-            for y_idx, year in enumerate(YEARS):
+            for y_idx, year in enumerate(PERIODS):
                 period = year
                 if period not in period_bucket_cols:
                     avail = sorted(period_bucket_cols.keys())
@@ -920,7 +814,7 @@ apply_zero_row_conditional_formatting(
 wb.save(INPUT_FILE)
 print(f"Fertig. Reiter '{SHEET_OUT}' gespeichert in:\n{INPUT_FILE}")
 print(f"NA-Bucket-Spalte: {l5_col}")
-print(f"Verwendete Jahre: {YEARS}")
+print(f"Verwendete Perioden: {PERIODS}")
 if source_col is None:
     print("Hinweis: Keine Reported/Adjusted-Spalte erkannt.")
 else:

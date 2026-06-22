@@ -11,6 +11,7 @@ const SCRIPT_LABELS: Record<string, string> = {
   gst: 'General Sales Table',
   pvm: 'PVM Analysis',
   top: 'TOP Report',
+  churn: 'Churn / ARR Bridge',
   bubble: 'Bubble Scatter Plot',
 }
 

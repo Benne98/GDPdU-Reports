@@ -471,6 +471,105 @@ slots:
     mappings:
       - type: custom
 
+  # ── Churn / ARR Bridge ──
+  churn_value_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_customer_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_product_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_start_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_end_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_invoice_col:
+    type: text
+    mappings:
+      - type: custom
+  churn_group_col_1:
+    type: text
+    mappings:
+      - type: custom
+  churn_group_col_2:
+    type: text
+    mappings:
+      - type: custom
+  churn_group_col_3:
+    type: text
+    mappings:
+      - type: custom
+  churn_sort_by_1:
+    type: text
+    mappings:
+      - type: custom
+  churn_sort_by_2:
+    type: text
+    mappings:
+      - type: custom
+  churn_sort_by_3:
+    type: text
+    mappings:
+      - type: custom
+  churn_group_level_count:
+    type: float
+    mappings:
+      - type: custom
+  churn_table:
+    type: text
+    mappings:
+      - type: custom
+  churn_total_label:
+    type: text
+    mappings:
+      - type: custom
+  churn_first_fy_override:
+    type: float
+    influence_conversation: false
+    mappings:
+      - type: custom
+  churn_top_bucket_enabled:
+    type: bool
+    mappings:
+      - type: custom
+  churn_bucket_mode:
+    type: text
+    mappings:
+      - type: custom
+  churn_bucket_thresholds:
+    type: text
+    mappings:
+      - type: custom
+  churn_bucket_numbers:
+    type: text
+    mappings:
+      - type: custom
+  churn_other_bucket:
+    type: text
+    mappings:
+      - type: custom
+  churn_other_bucket_label:
+    type: text
+    mappings:
+      - type: custom
+  churn_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+  churn_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
   # ── Bubble Scatter Plot ──
   bs_period_mode:
     type: text
@@ -704,6 +803,11 @@ slots:
     mappings:
       - type: custom
 
+  db_l4_sort_basis:
+    type: text
+    mappings:
+      - type: custom
+
   db_fs_folder_file_ids:
     type: list
     mappings:
@@ -725,16 +829,6 @@ slots:
       - type: custom
 
   db_master_workbook_path:
-    type: text
-    mappings:
-      - type: custom
-
-  db_fs_ingest_now:
-    type: text
-    mappings:
-      - type: custom
-
-  db_next_step:
     type: text
     mappings:
       - type: custom
@@ -826,20 +920,6 @@ responses:
             placeholder: "e.g. 2020"
             required: true
         submit_label: "Submit"
-
-  utter_ask_base_path:
-    - custom:
-        type: adaptive_card
-        card: "base_path"
-        title: "Output Folder"
-        subtitle: "Please enter the base folder path where outputs should be saved."
-        inputs:
-          - id: base_path
-            type: text
-            label: "Base output folder path"
-            placeholder: "C:\\Users\\..."
-            required: true
-        submit_label: "Navigate"
 
   utter_ask_upload_file:
     - custom:
@@ -1026,6 +1106,14 @@ actions:
   - action_enter_top_filter_checkpoint
   - action_process_top_filter_checkpoint
   - action_show_top_review
+  - action_process_churn_columns
+  - action_reshow_churn_columns
+  - action_process_churn_groups
+  - action_process_churn_labels
+  - action_enter_churn_filter_checkpoint
+  - action_process_churn_filter_checkpoint
+  - action_show_churn_review
+  - action_run_churn
   - action_process_bs_period_calc
   - action_process_bs_value_columns
   - action_process_bs_groups
@@ -1052,6 +1140,7 @@ actions:
   - action_process_databook_consolidation_upload
   - action_process_databook_adjustments
   - action_process_databook_adjustments_upload
+  - action_process_databook_l4_sort
   - action_process_databook_fs_upload
   - action_process_databook_fs_review_upload
   - action_process_databook_recon_order

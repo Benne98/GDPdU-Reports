@@ -26,6 +26,7 @@ class GstExcelTheme:
     gm_column_bg: str = "FFF8FAFC"
     tech_col_bg: str = "FFF1F5F9"
     white_bg: str = "FFFFFFFF"
+    period_column_bg: str = "FFF1F5F9"
 
     zero_row_bg: str = "FFF1F5F9"
 
@@ -73,6 +74,10 @@ class GstExcelTheme:
     @property
     def fill_white(self) -> PatternFill:
         return PatternFill(fill_type="solid", fgColor=self.white_bg)
+
+    @property
+    def fill_period(self) -> PatternFill:
+        return PatternFill(fill_type="solid", fgColor=self.period_column_bg)
 
     @property
     def fill_tech(self) -> PatternFill:

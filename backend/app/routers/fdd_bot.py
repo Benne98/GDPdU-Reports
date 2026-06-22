@@ -62,6 +62,7 @@ SCRIPTS: dict[str, Path] = {
     "gst": PROJECT_ROOT / "general_sales_table_MM_verformelt.py",
     "pvm": PROJECT_ROOT / "pvm_verformelt.py",
     "top": PROJECT_ROOT / "top_report.py",
+    "churn": PROJECT_ROOT / "churn_verformelt.py",
     "bubble": PROJECT_ROOT / "bubblescatterplot.py",
     "susa": PROJECT_ROOT / "SuSabyYear.py",
     "consolidation": PROJECT_ROOT / "Consolidation.py",
@@ -1126,6 +1127,47 @@ def run_top_async(req: RunRequest):
     if "fiscal_year_end_day" not in config or not config["fiscal_year_end_day"]:
         config["fiscal_year_end_day"] = 31
     return _start_async_script_job(req.session_id, req.file_id, config, "top")
+
+
+# ─── Run: Churn / ARR Bridge ──────────────────────────────────────────────────
+
+
+def _normalize_churn_config(config: dict) -> dict:
+    """Ensure Churn.py CONFIG keys (fy_end_*, as_of_*, fy_end_year) are present."""
+    if "fy_end_month" not in config or not config["fy_end_month"]:
+        config["fy_end_month"] = 12
+    if "fy_end_day" not in config or not config["fy_end_day"]:
+        config["fy_end_day"] = 31
+    if "as_of_year" not in config or not config["as_of_year"]:
+        config["as_of_year"] = config.get("current_year") or datetime.now().year
+    if "as_of_month" not in config or not config["as_of_month"]:
+        config["as_of_month"] = config.get("current_month") or datetime.now().month
+    if "current_year" not in config or not config["current_year"]:
+        config["current_year"] = config["as_of_year"]
+    if "current_month" not in config or not config["current_month"]:
+        config["current_month"] = config["as_of_month"]
+    if "fy_end_year" not in config or not config["fy_end_year"]:
+        cy = int(config["current_year"])
+        cm = int(config["current_month"])
+        fy_m = int(config["fy_end_month"])
+        fy_d = int(config["fy_end_day"])
+        from databook_periods import as_of_is_fy_end, current_fy_end_year_containing_as_of
+
+        cur = current_fy_end_year_containing_as_of(cy, cm, fy_m, fy_d)
+        config["fy_end_year"] = cur if as_of_is_fy_end(cy, cm, fy_m, fy_d) else cur - 1
+    return config
+
+
+@router.post("/run/churn")
+def run_churn(req: RunRequest):
+    config = _normalize_churn_config(dict(req.config))
+    return _prepare_and_run(req.session_id, req.file_id, config, "churn")
+
+
+@router.post("/run/churn/async")
+def run_churn_async(req: RunRequest):
+    config = _normalize_churn_config(dict(req.config))
+    return _start_async_script_job(req.session_id, req.file_id, config, "churn")
 
 
 # ─── Run: Bubble Scatter Plot ─────────────────────────────────────────────────

@@ -288,6 +288,11 @@ def ensure_pl_mapping_file() -> Path:
     """Deprecated file fallback; recon pipeline uses DB. Kept for API compatibility."""
     try:
         df = load_pl_recon_mapping_df_from_db()
+        if "L3" not in df.columns:
+            raise ValueError("PL mapping from DB must contain column 'L3'.")
+        df = df[["L3"]].copy()
+        df["L3"] = df["L3"].astype(str).str.strip()
+        df = df[df["L3"].ne("")].drop_duplicates(subset=["L3"], keep="first")
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         out = TEMPLATES_DIR / "pl_recon_mapping_from_db.xlsx"
         df.to_excel(out, index=False, sheet_name="Mapping")
@@ -297,31 +302,31 @@ def ensure_pl_mapping_file() -> Path:
         if PL_MAPPING_TEMPLATE.is_file():
             return PL_MAPPING_TEMPLATE
     rows = [
-        ("Net sales", "Net sales"),
-        ("Own work capitalised", "Own work capitalised"),
-        ("Total output", "Total output"),
-        ("Cost of goods sold", "Cost of goods sold"),
-        ("Gross profit", "Gross profit"),
-        ("Personnel expenses", "Personnel expenses"),
-        ("Wages & salaries", "Wages & salaries"),
-        ("Social security", "Social security"),
-        ("Other operating income", "Other income"),
-        ("Other operating expenses", "Other Expenses"),
-        ("Net operating expenses", "Net operating expenses"),
-        ("EBITDA", "EBITDA"),
-        ("Depreciation", "Depreciation"),
-        ("EBIT", "EBIT"),
-        ("Financial result", "Financial result"),
-        ("EBT", "EBT"),
-        ("Taxes on income", "Tax"),
-        ("Net result", "Net result"),
+        "Net sales",
+        "Own work capitalised",
+        "Total output",
+        "Cost of goods sold",
+        "Gross profit",
+        "Personnel expenses",
+        "Wages & salaries",
+        "Social security",
+        "Other operating income",
+        "Other operating expenses",
+        "Net operating expenses",
+        "EBITDA",
+        "Depreciation",
+        "EBIT",
+        "Financial result",
+        "EBT",
+        "Taxes on income",
+        "Net result",
     ]
     wb = Workbook()
     ws = wb.active
     ws.title = "Mapping"
-    ws.append(["L3", "L4"])
-    for l3, l4 in rows:
-        ws.append([l3, l4 if l4 != l3 else ""])
+    ws.append(["L3"])
+    for l3 in rows:
+        ws.append([l3])
     wb.save(PL_MAPPING_TEMPLATE)
     return PL_MAPPING_TEMPLATE
 
