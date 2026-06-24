@@ -38,6 +38,8 @@ export interface SerializedUndoFrame {
   userMessageId: string
 }
 
+export type FddProjectMode = 'upload' | 'pipeline'
+
 export interface FddProjectSnapshot {
   messages: StoredChatMessage[]
   datesContext: StoredDatesContext | null
@@ -46,6 +48,8 @@ export interface FddProjectSnapshot {
   firstFy: string | null
   submittedCardIds: string[]
   undoStack: SerializedUndoFrame[]
+  /** Which tile this chat was created in. Legacy records default to 'upload'. */
+  mode?: FddProjectMode
 }
 
 export interface FddProjectRecord {
@@ -54,9 +58,11 @@ export interface FddProjectRecord {
   senderId: string
   updatedAt: string
   snapshot: FddProjectSnapshot
+  /** Denormalised copy of snapshot.mode for easy filtering without loading snapshot. */
+  mode: FddProjectMode
 }
 
-export type FddProjectSummary = Pick<FddProjectRecord, 'id' | 'name' | 'updatedAt'>
+export type FddProjectSummary = Pick<FddProjectRecord, 'id' | 'name' | 'updatedAt' | 'mode'>
 
 function makeProjectId(): string {
   return crypto.randomUUID()
@@ -66,7 +72,7 @@ function makeSenderId(): string {
   return crypto.randomUUID().slice(0, 8)
 }
 
-function emptySnapshot(): FddProjectSnapshot {
+function emptySnapshot(mode: FddProjectMode = 'upload'): FddProjectSnapshot {
   return {
     messages: [],
     datesContext: null,
@@ -75,17 +81,22 @@ function emptySnapshot(): FddProjectSnapshot {
     firstFy: null,
     submittedCardIds: [],
     undoStack: [],
+    mode,
   }
 }
 
-export function createEmptyProject(name = DEFAULT_PROJECT_NAME): FddProjectRecord {
+export function createEmptyProject(
+  name = DEFAULT_PROJECT_NAME,
+  mode: FddProjectMode = 'upload',
+): FddProjectRecord {
   const now = new Date().toISOString()
   return {
     id: makeProjectId(),
     name,
     senderId: makeSenderId(),
     updatedAt: now,
-    snapshot: emptySnapshot(),
+    mode,
+    snapshot: emptySnapshot(mode),
   }
 }
 
@@ -105,10 +116,29 @@ function writeProjects(projects: FddProjectRecord[]): void {
   localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects))
 }
 
+/** Coerce a raw stored record so it always carries a valid `mode` field. */
+function migrateRecord(record: FddProjectRecord): FddProjectRecord {
+  const mode: FddProjectMode =
+    record.mode === 'pipeline' ? 'pipeline' : 'upload'
+  const snapshotMode: FddProjectMode =
+    record.snapshot?.mode === 'pipeline' ? 'pipeline' : 'upload'
+  if (record.mode === mode && record.snapshot?.mode === snapshotMode) return record
+  return {
+    ...record,
+    mode,
+    snapshot: { ...record.snapshot, mode: snapshotMode },
+  }
+}
+
 export function listProjectSummaries(): FddProjectSummary[] {
   return readProjectsRaw()
-    .map(({ id, name, updatedAt }) => ({ id, name, updatedAt }))
+    .map(migrateRecord)
+    .map(({ id, name, updatedAt, mode }) => ({ id, name, updatedAt, mode }))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+}
+
+export function listProjectSummariesByMode(mode: FddProjectMode): FddProjectSummary[] {
+  return listProjectSummaries().filter(p => p.mode === mode)
 }
 
 export function getProject(id: string): FddProjectRecord | null {
@@ -147,12 +177,13 @@ export function deleteProjectById(id: string): void {
   }
 }
 
-/** Migrate legacy single sender_id into first project entry. */
+/** Migrate legacy single sender_id into first project entry, and ensure all
+ *  records carry a valid `mode` field (legacy records default to 'upload'). */
 export function ensureMigratedProjects(): FddProjectRecord {
   let projects = readProjectsRaw()
   if (projects.length === 0) {
     const legacySender = localStorage.getItem(LEGACY_SENDER_KEY)
-    const project = createEmptyProject(legacySender ? 'Projekt' : DEFAULT_PROJECT_NAME)
+    const project = createEmptyProject(legacySender ? 'Projekt' : DEFAULT_PROJECT_NAME, 'upload')
     if (legacySender) {
       project.senderId = legacySender
     }
@@ -161,6 +192,12 @@ export function ensureMigratedProjects(): FddProjectRecord {
     setActiveProjectId(project.id)
     return project
   }
+
+  // Backfill mode on any existing records that predate this field.
+  const migrated = projects.map(migrateRecord)
+  const anyChanged = migrated.some((r, i) => r !== projects[i])
+  if (anyChanged) writeProjects(migrated)
+  projects = migrated
 
   const activeId = getActiveProjectId()
   const active = activeId ? projects.find(p => p.id === activeId) : null

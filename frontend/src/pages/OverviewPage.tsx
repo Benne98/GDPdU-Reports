@@ -28,6 +28,8 @@ import type { DrillDownRequest } from '../components/cockpit/EbitTable'
 import TopCustomerTable from '../components/cockpit/TopCustomerTable'
 import TopSupplierTable from '../components/cockpit/TopSupplierTable'
 import DrillDownTable from '../components/cockpit/DrillDownTable'
+import AnomaliesPanel from '../components/financials/AnomaliesPanel'
+import type { AnomalyPeriodParams } from '../lib/api'
 
 const ROUTE_BY_TAB: Record<FinTab, string> = {
   overview: '/overview',
@@ -128,6 +130,13 @@ export default function OverviewPage() {
 
   const periodParams = finParamsFromPeriod(period, ent)
 
+  const anomalyParams: AnomalyPeriodParams =
+    period.grain === 'week'
+      ? { period_grain: 'week', iso_year: period.isoYear, iso_week: period.isoWeek }
+      : period.grain === 'year'
+        ? { period_grain: 'year', year: period.year }
+        : { period_grain: 'month', year: period.year, month: period.month }
+
   return (
     <div className="min-h-screen" style={{ background: '#F4F6F9' }}>
       <AnalyticsPageShell
@@ -220,6 +229,16 @@ export default function OverviewPage() {
 
             {/* 6 — Top suppliers */}
             <TopSupplierTable period={cockpitPeriod} entity={ent} />
+
+            {/* 7 — Anomalies (compact panel, basis for narratives) */}
+            {periodReady && (
+              <AnomaliesPanel
+                key={`anomaly-overview-${resetKey}`}
+                periodParams={anomalyParams}
+                entity={ent}
+                mode="compact"
+              />
+            )}
           </div>
 
           <div className="mt-16" />

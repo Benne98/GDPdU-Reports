@@ -1269,7 +1269,7 @@ def _find_row_in_tree(rows: list[dict], line_code: str) -> Optional[dict]:
 
 def _wc_scope_fragment(
     session: Session, line_code: str, year: int, month: int, entity: Optional[str],
-    ent_frag: str,
+    ent_frag: str, *, prebuilt_rows: Optional[list[dict]] = None,
 ) -> tuple[str, dict[str, Any], str]:
     """Resolve a WC line_code to a GL WHERE fragment (level_0='BS', TWC/OWC).
 
@@ -1290,10 +1290,15 @@ def _wc_scope_fragment(
         label = _KPI_L3[up]
     else:
         # Resolve drill from the WC statement tree (clicked section / line / account).
+        # Reuse a prebuilt tree when the caller supplies one (anomaly engine) so we
+        # do not re-run the whole WC statement build per line — the dominant N+1 cost.
         try:
-            stmt = build_wc_statement_compat(session, period_grain="month",
-                                             year=year, month=month, entity=entity)
-            row = _find_row_in_tree(stmt.get("rows") or [], line_code)
+            if prebuilt_rows is not None:
+                row = _find_row_in_tree(prebuilt_rows, line_code)
+            else:
+                stmt = build_wc_statement_compat(session, period_grain="month",
+                                                 year=year, month=month, entity=entity)
+                row = _find_row_in_tree(stmt.get("rows") or [], line_code)
         except Exception:
             row = None
         drill = (row or {}).get("drill") or {}
@@ -1349,14 +1354,22 @@ def build_wc_line_detail(
     line_mom_keur: Optional[float] = None,
     anchor_year: Optional[int] = None,
     anchor_month: Optional[int] = None,
+    concentration_only: bool = False,
+    prebuilt_rows: Optional[list[dict]] = None,
 ) -> dict[str, Any]:
     """PlLineDetailResponse for a WC line — CUMULATIVE account balances (raw sign)
     at the cm/pm month-ends, top current-month bookings, and a 12-month balance
-    timeline.  Same response shape as the BS / P&L line detail."""
+    timeline.  Same response shape as the BS / P&L line detail.
+
+    ``prebuilt_rows`` lets a caller (the anomaly engine) hand in the already-built
+    WC statement tree so ``_wc_scope_fragment`` does not re-run
+    ``build_wc_statement_compat`` per line (the dominant N+1 cost).
+    """
     ep = resolve_entity_prefix(session, entity)
     ent_frag = entity_sql_fragment(ep)
     scope_sql, base_params, label = _wc_scope_fragment(
-        session, line_code, year, month, entity, ent_frag)
+        session, line_code, year, month, entity, ent_frag,
+        prebuilt_rows=prebuilt_rows)
 
     d_cm = last_day(year, month).isoformat()
     pm_y, pm_m = pm(year, month)
@@ -1421,6 +1434,12 @@ def build_wc_line_detail(
             "line_note": b[8] or "", "reference": b[9] or "",
             "counter_gl_account_id": None, "counter_account_name": None,
         })
+
+    # Concentration-only fast path (anomaly engine) — skip timeline/sub-lines/commentary.
+    if concentration_only:
+        from app.services.fin_compat_narrative_core import concentration_only_payload
+        return concentration_only_payload(
+            line_code, label, year, month, entity, accounts_out, top_bookings)
 
     periods = _last_12_periods(year, month)[-timeline_months:]
     period_defs = [

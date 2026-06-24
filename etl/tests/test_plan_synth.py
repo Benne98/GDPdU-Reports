@@ -210,7 +210,7 @@ def test_sales_plan_includes_forecast_when_current_year_given():
 # Orchestrator + edge cases
 # --------------------------------------------------------------------------- #
 def test_generate_plan_flags_synthetic_and_scenarios():
-    gl, sales = P.generate_plan(
+    gl, sales, _com = P.generate_plan(
         F.plan_gl_actuals(), F.plan_sales_actuals(),
         base_fy=2024, current_fy=2025, last_closed_period=2,
         horizon_years=4, growth_rate=0.05, group_col="pl_group",
@@ -226,10 +226,11 @@ def test_generate_plan_flags_synthetic_and_scenarios():
 def test_generate_plan_is_deterministic():
     args = dict(base_fy=2024, current_fy=2025, last_closed_period=2,
                 horizon_years=4, growth_rate=0.05, group_col="pl_group")
-    a_gl, a_s = P.generate_plan(F.plan_gl_actuals(), F.plan_sales_actuals(), **args)
-    b_gl, b_s = P.generate_plan(F.plan_gl_actuals(), F.plan_sales_actuals(), **args)
+    a_gl, a_s, a_c = P.generate_plan(F.plan_gl_actuals(), F.plan_sales_actuals(), **args)
+    b_gl, b_s, b_c = P.generate_plan(F.plan_gl_actuals(), F.plan_sales_actuals(), **args)
     pd.testing.assert_frame_equal(a_gl, b_gl)
     pd.testing.assert_frame_equal(a_s, b_s)
+    pd.testing.assert_frame_equal(a_c, b_c)
 
 
 def test_zero_base_yields_zero_plan_no_div_by_zero():

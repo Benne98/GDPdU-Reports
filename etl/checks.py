@@ -163,16 +163,32 @@ _OPENING_ENTRY_TYPES = frozenset(
     {"opening", "opening_balance", "eroeffnung", "eröffnung", "eroffnung"}
 )
 
+#: entry_type for synthetic net-profit equity bookings (etl.net_profit).  Like
+#: opening balances these are SINGLE-SIDED by design (one equity credit, no
+#: balancing counter-line), so they are exempt from the double-entry balance
+#: checks (B1/B2/B3) and the amount/posting-year structural checks (S1/S2).
+_NET_PROFIT_ENTRY_TYPES = frozenset({"net_profit"})
+
+#: All single-sided synthetic entry types exempt from per-booking / per-entity
+#: balance + amount/posting-year checks.
+_SINGLE_SIDED_ENTRY_TYPES = _OPENING_ENTRY_TYPES | _NET_PROFIT_ENTRY_TYPES
+
 
 def _opening_exempt_mask(lines: pd.DataFrame) -> pd.Series:
-    """Rows excluded from per-booking / per-entity balance checks (single-sided openings)."""
+    """Rows excluded from per-booking / per-entity balance checks (single-sided rows).
+
+    Covers BOTH opening balances (``fiscal_period=0`` / ``entry_type`` opening) and
+    synthetic net-profit equity bookings (``entry_type='net_profit'``).  Both are
+    single-sided by design, so they must not break B1/B2/B3 or S1/S2.  The name is
+    kept for backward compatibility (callers / tests reference it).
+    """
     exempt = pd.Series(False, index=lines.index)
     if "fiscal_period" in lines.columns:
         fp = pd.to_numeric(lines["fiscal_period"], errors="coerce")
         exempt |= fp.fillna(-1).eq(0)
     if "entry_type" in lines.columns:
         et = lines["entry_type"].astype(str).str.strip().str.lower()
-        exempt |= et.isin(_OPENING_ENTRY_TYPES)
+        exempt |= et.isin(_SINGLE_SIDED_ENTRY_TYPES)
     return exempt
 
 

@@ -30,7 +30,6 @@ import logging
 import re
 import sys
 import time
-import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,6 +87,43 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 MAX_UPLOAD_BYTES = settings.max_upload_mb * 1024 * 1024
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+
+# H2: OB / partner-master files are small (a Sachkontenstamm / opening-balance
+# extract is a few hundred rows). Cap them WELL below the large GL-ingest limit so
+# an oversized body for these staging endpoints cannot buffer the GL ceiling worth
+# of memory.  GL itself keeps MAX_UPLOAD_BYTES.
+OB_PARTNER_MAX_UPLOAD_BYTES = 32 * 1024 * 1024  # 32 MiB
+# Chunk size for the streamed, abort-early upload read (H2).
+_UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MiB
+# L1: TTL for abandoned staged uploads — swept on each upload so previewed-but-
+# never-committed files (real client data) do not accumulate on disk.
+_UPLOAD_TTL_SECONDS = 6 * 60 * 60  # 6h
+
+# H1: parse ceilings for the OB / partner upload+commit parse paths. GL/OB ledgers
+# can be larger than a budget template, so the row ceiling is generous; the column
+# ceiling bounds a dimension/zip bomb. Applied to the loaded frame BEFORE any
+# transform/write — a violation is a clean 422.
+MAX_PARSE_ROWS = 20_000
+MAX_PARSE_COLS = 120
+
+# Opening-balance tagging (matches etl.opening_balance / etl.gobd_gl_prepare /
+# etl.checks._OPENING_ENTRY_TYPES so the balance checks exempt these rows and the
+# BS layer reads them as opening stock).
+OB_ENTRY_TYPE = "opening_balance"
+OB_FISCAL_PERIOD = 0
+# M1: synthetic booking_line_id band for the FILE-OB commit path. This is
+# DELIBERATELY DISTINCT from the two other synthetic OB conventions so the three
+# can coexist without colliding:
+#   * load-path real lines       — 1-based source-row positions (far below any band)
+#   * file-OB (this router)       — 800_000_000_000 band, JEGN '<EE>9<acct>'
+#                                   (the leading-'9' file convention of
+#                                    etl.gobd_gl_prepare._synthetic_opening_txn,
+#                                    tagged by etl.opening_balance._mode_file)
+#   * carry-forward OB (synthesized) — 900_000_000_000 band
+#                                   (etl.opening_balance._SYNTHETIC_BID_BASE),
+#                                   JEGN '<EE>8<YY><acct>'
+# It does NOT mirror the carry-forward base; it is a separate reserved band.
+_OB_BID_BASE = 800_000_000_000
 
 router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
 
@@ -190,6 +226,14 @@ class CommitRequest(BaseModel):
     confirm_soft: bool = False
     exclude_line_ids: list[int] = Field(default_factory=list)
     commit_mode: str = "replace"  # replace | append
+    # Reporting-v2 Phase 7 — post-commit rebuild mode (only used when
+    # settings.rebuild_on_commit is ON; default OFF keeps the live stack unchanged).
+    #   'auto'        -> incremental for a pure append on already-mapped accounts,
+    #                    full otherwise (first-time / mapping changed / replace).
+    #   'incremental' -> force the mapping-free monthly-update path.
+    #   'full'        -> force the full deterministic rebuild.
+    rebuild_mode: str = "auto"
+    project_id: str = "default"
 
 
 class CommitResponse(BaseModel):
@@ -328,6 +372,56 @@ def _safe_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", Path(name).name)[:200]
 
 
+_VALID_REBUILD_MODES = {"auto", "full", "incremental"}
+
+
+def _select_rebuild_mode(
+    session: Session,
+    requested: str,
+    commit_mode: str,
+    scope: tuple[list[str], list[int]],
+) -> str:
+    """Choose the post-commit rebuild mode (reporting-v2 Phase 7).
+
+    'full' / 'incremental' are honoured verbatim.  'auto' (the default) picks:
+      * 'incremental' for a PURE APPEND (commit_mode='append') whose accounts are
+        ALREADY MAPPED in ``dim_gl_account`` for the scope — a routine monthly
+        update needs no mapping/structure recompute.
+      * 'full' otherwise (first-time load, replace, or any unmapped account) so
+        classification + structure are (re)built.
+
+    On any uncertainty (no scope, DB probe failure) we fall back to 'full' — the
+    safe, behaviour-preserving choice.
+    """
+    if requested in ("full", "incremental"):
+        return requested
+    if requested != "auto":
+        return "full"
+    if commit_mode != "append":
+        return "full"  # replace always rebuilds mapping/structure
+
+    prefixes, years = scope
+    if not prefixes or not years:
+        return "full"
+
+    # Incremental only when every (prefix, year) in scope already has mapped
+    # accounts — i.e. this is a routine append into an existing mapped scope.
+    try:
+        row = session.execute(
+            text(
+                "SELECT COUNT(*) FROM dim_gl_account "
+                "WHERE LEFT(account_number_group, 2) = ANY(:pfx) "
+                "AND fiscal_year = ANY(:fys)"
+            ),
+            {"pfx": prefixes, "fys": [int(y) for y in years]},
+        ).fetchone()
+        mapped = int(row[0]) if row else 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("commit: rebuild-mode probe failed (%s); defaulting to full", exc)
+        return "full"
+    return "incremental" if mapped > 0 else "full"
+
+
 def _detect_encoding(raw_bytes: bytes) -> str:
     """Best-effort encoding detection without external dependencies.
 
@@ -387,11 +481,56 @@ def _load_file(path: Path, sheet: str | None, dialect: dict, header: int | None 
     )
 
 
+def _assert_parse_bounds(df: pd.DataFrame, *, what: str = "file") -> None:
+    """H1: reject a parsed frame exceeding the OB/partner parse ceilings.
+
+    Checks the loaded DataFrame's row/column counts BEFORE any transform or DB
+    write so a crafted workbook (zip / dimension bomb) cannot blow up the parse.
+    Raises a clean 422 on violation.  Mirrors
+    ``app.services.budget_excel.assert_parse_bounds`` (which guards the openpyxl
+    Workbook directly); here the equivalent guard runs on the pandas frame the
+    OB/partner paths actually transform.
+    """
+    n_rows = int(len(df))
+    n_cols = int(df.shape[1])
+    if n_rows > MAX_PARSE_ROWS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{what} has too many rows ({n_rows} > {MAX_PARSE_ROWS}).",
+        )
+    if n_cols > MAX_PARSE_COLS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{what} has too many columns ({n_cols} > {MAX_PARSE_COLS}).",
+        )
+
+
+def _sweep_stale_uploads() -> None:
+    """L1: best-effort TTL sweep of abandoned staged uploads in UPLOAD_DIR.
+
+    Deletes files older than the TTL so previewed-but-never-committed files (which
+    may hold real client data) do not accumulate.  Runs on each staging upload.
+    Never raises — upload hygiene must not break the upload path itself.
+    """
+    cutoff = time.time() - _UPLOAD_TTL_SECONDS
+    try:
+        for p in UPLOAD_DIR.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ingest upload TTL sweep failed: %s", type(exc).__name__)
+
+
 def _get_sheets(path: Path) -> list[str]:
     if path.suffix.lower() in (".xlsx", ".xls"):
         try:
-            xf = pd.ExcelFile(path)
-            return list(xf.sheet_names)
+            # Close the handle (context manager) — on Windows a leaked ExcelFile
+            # handle blocks a later unlink() of the staged file (WinError 32).
+            with pd.ExcelFile(path) as xf:
+                return list(xf.sheet_names)
         except Exception:
             return []
     return []
@@ -1025,6 +1164,38 @@ def commit(
     except Exception as exc:
         logger.warning("commit: dim_customer/dim_supplier upsert failed (%s); GL load already committed", exc)
 
+    # Reporting-v2: deterministic post-load rebuild (flag-gated; default OFF).
+    # When settings.rebuild_on_commit is False (legacy/5176 default) this block is
+    # skipped entirely and the commit path is byte-identical to before.  When True
+    # (v2 stack), run the full idempotent rebuild so derived facts / partner links /
+    # structure reflect the new data without a manual derive_facts.py invocation.
+    if settings.rebuild_on_commit:
+        try:
+            from etl.rebuild import rebuild_project
+            from etl.versioning import derive_gl_scope
+
+            scope = derive_gl_scope(canonical)
+            # Phase 7: pick the rebuild mode (auto => incremental for a pure append
+            # on already-mapped accounts, full otherwise) and let the project config
+            # drive the rebuild flags so the persisted setup is reused every update.
+            rebuild_mode = _select_rebuild_mode(
+                session, body.rebuild_mode, commit_mode, scope
+            )
+            rebuild_summary = rebuild_project(
+                session, scope=scope, mode=rebuild_mode, project_id=body.project_id
+            )
+            logger.info(
+                "commit: rebuild_project(mode=%s, project=%s) completed: %s",
+                rebuild_mode, body.project_id, rebuild_summary,
+            )
+        except Exception as exc:
+            session.rollback()
+            logger.error("commit: rebuild_project failed: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="Post-commit rebuild failed; transaction rolled back. Check server logs.",
+            ) from exc
+
     # Pre-warm narrative snapshots in background (non-blocking).
     import os
     if os.getenv("NARRATIVE_WARM_ON_INGEST", "1").strip().lower() not in ("0", "false", "no"):
@@ -1362,6 +1533,548 @@ def mapping_commit(
 
 
 # --------------------------------------------------------------------------- #
+# Opening-balance separate-file path (Project Setup) + Partner master
+# --------------------------------------------------------------------------- #
+# These are the thin "collect-then-commit" endpoints for the Project Setup
+# wizard.  Upload = parse + preview (NO DB write); commit = admin-gated write
+# confined to the respective tables (OB -> fact_gl_entry/line with synthetic
+# tag; partner -> dim_customer / dim_supplier).  Upload security mirrors the
+# budget-Excel hardening: .xlsx/.csv only, size cap, finite, generic 500.
+
+
+class FileUploadPreviewResponse(BaseModel):
+    file_id: str
+    filename: str
+    sheets: list[str] = []
+    columns: list[str]
+    sample: list[dict]
+
+
+class OpeningBalanceCommitRequest(BaseModel):
+    file_id: str
+    sheet: str | None = None
+    profile: dict  # serialised GL MappingProfile dict (reused for column mapping)
+    scope: str = "first_year"  # 'first_year' | 'all'
+
+
+class OpeningBalanceCommitResponse(BaseModel):
+    load_id: int | None = None
+    entries: int
+    lines: int
+    fiscal_years: list[int] = Field(default_factory=list)
+    scope: str = "first_year"
+    loaded_at: str
+
+
+class PartnerMasterCommitRequest(BaseModel):
+    file_id: str
+    sheet: str | None = None
+    profile: dict  # serialised PartnerMappingProfile dict
+
+
+class PartnerMasterCommitResponse(BaseModel):
+    side: str
+    upserted: int
+    loaded_at: str
+
+
+def _visible_entity_prefixes_or_none(session: Session, user: User) -> set[str] | None:
+    """Resolve a user's allowed 2-char entity prefixes, or None for admin/unrestricted.
+
+    Mirrors ``budget._visible_entity_prefixes`` / ``_anomaly_entity_prefixes`` so
+    multi-tenant visibility cannot drift across write paths.
+    """
+    from app.services.entity_visibility import visible_entity_codes
+
+    allowed_codes = visible_entity_codes(session, user)
+    if allowed_codes is None:
+        return None  # admin / unrestricted
+    prefixes: set[str] = set()
+    if allowed_codes:
+        rows = session.execute(
+            text(
+                "SELECT DISTINCT entity_prefix FROM dim_legal_entity "
+                "WHERE legal_entity_code = ANY(:codes)"
+            ),
+            {"codes": sorted(allowed_codes)},
+        ).fetchall()
+        prefixes = {str(r[0]).strip()[:2] for r in rows if r and r[0] is not None}
+        prefixes.discard("")
+    return prefixes
+
+
+def _assert_prefixes_visible(
+    session: Session, user: User, prefixes: list[str]
+) -> None:
+    """Fail-closed: a restricted user may only commit data within their entities."""
+    allowed = _visible_entity_prefixes_or_none(session, user)
+    if allowed is None:
+        return  # admin / unrestricted
+    requested = {str(p).strip()[:2] for p in prefixes if str(p).strip()}
+    # M3: fail-closed for a RESTRICTED user when no prefix resolves. An empty
+    # `requested` is a subset of anything, so `issubset` would WRONGLY pass — a
+    # restricted user with no resolvable entity must be rejected, not waved through.
+    if not requested:
+        raise HTTPException(
+            status_code=403,
+            detail="No resolvable entity for this data; not permitted to write.",
+        )
+    if not requested.issubset(allowed):
+        raise HTTPException(
+            status_code=403,
+            detail="Not permitted to write data for one or more of these entities.",
+        )
+
+
+def _assert_finite_amounts(canonical: pd.DataFrame) -> None:
+    """Reject non-finite amounts (NaN / inf) before any DB write."""
+    import math
+
+    if "amount" not in canonical.columns:
+        return
+    amt = pd.to_numeric(canonical["amount"], errors="coerce")
+    if amt.isna().any() or not amt.map(lambda v: math.isfinite(float(v))).all():
+        raise HTTPException(
+            status_code=422,
+            detail="Opening-balance file contains non-finite or unparseable amounts.",
+        )
+
+
+def _staged_preview(file_id: str, sheet: str | None) -> FileUploadPreviewResponse:
+    """Re-parse a staged file (already saved by /upload) for a preview, no write."""
+    path = _file_path_from_id(file_id)
+    raw_bytes = path.read_bytes()
+    dialect = _detect_dialect(raw_bytes, path.suffix.lower())
+    sheets = _get_sheets(path)
+    try:
+        df = _load_file(path, sheet or (sheets[0] if sheets else None), dialect)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
+    _assert_parse_bounds(df, what="uploaded file")  # H1: zip/dimension-bomb guard
+    return FileUploadPreviewResponse(
+        file_id=file_id,
+        filename=path.name.split("_", 1)[-1],
+        sheets=sheets,
+        columns=list(df.columns),
+        sample=df.head(10).fillna("").to_dict(orient="records"),
+    )
+
+
+async def _save_upload(file: UploadFile, *, max_bytes: int | None = None) -> str:
+    """Save an uploaded file under UPLOAD_DIR with a UUID prefix; return file_id.
+
+    Applies the budget-Excel upload-security pattern: extension guard + sanitised
+    filename (no path traversal) + a size cap ENFORCED WHILE READING (H2).  The
+    body is read in chunks and the read is aborted (413) as soon as the running
+    total exceeds ``max_bytes`` so an oversized payload is never fully buffered.
+    OB / partner files are small, so the default cap is the OB/partner-specific
+    ``OB_PARTNER_MAX_UPLOAD_BYTES`` (well below the GL limit).  The cap is read at
+    call time (not bound as a default) so it stays monkeypatch-friendly in tests.
+    """
+    if max_bytes is None:
+        max_bytes = OB_PARTNER_MAX_UPLOAD_BYTES
+    # H2: reject early on a declared content-length / file.size hint when present.
+    declared = getattr(file, "size", None)
+    if isinstance(declared, int) and declared > max_bytes:
+        raise HTTPException(
+            status_code=413, detail=f"File exceeds {max_bytes // (1024 * 1024)} MB limit"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413, detail=f"File exceeds {max_bytes // (1024 * 1024)} MB limit"
+            )
+        chunks.append(chunk)
+    raw_bytes = b"".join(chunks)
+
+    safe_name = _safe_filename(file.filename or "upload")
+    ext = Path(safe_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type {ext!r}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
+    file_id = uuid.uuid4().hex[:16]
+    dest = UPLOAD_DIR / f"{file_id}_{safe_name}"
+    dest.write_bytes(raw_bytes)
+    return file_id
+
+
+# --------------------------------------------------------------------------- #
+# POST /opening-balance/upload  (auth — stage only, NO write)
+# --------------------------------------------------------------------------- #
+@router.post("/opening-balance/upload", response_model=FileUploadPreviewResponse)
+async def opening_balance_upload(
+    file: UploadFile = File(...),
+    sheet: str | None = Form(None),
+    _user: User = Depends(current_user),
+) -> FileUploadPreviewResponse:
+    """Stage an opening-balance file; return columns + sample preview.  NO DB write."""
+    _sweep_stale_uploads()  # L1: hygiene — drop abandoned staged files
+    file_id = await _save_upload(file)
+    try:
+        return _staged_preview(file_id, sheet)
+    except HTTPException:
+        _file_path_from_id(file_id).unlink(missing_ok=True)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# POST /opening-balance/commit  (admin — writes tagged OB rows)
+# --------------------------------------------------------------------------- #
+@router.post("/opening-balance/commit", response_model=OpeningBalanceCommitResponse)
+def opening_balance_commit(
+    body: OpeningBalanceCommitRequest,
+    session: Session = Depends(get_session),
+    _admin: User = Depends(require_admin),
+) -> OpeningBalanceCommitResponse:
+    """Load opening-balance rows into fact_gl_entry/line, tagged as opening balances.
+
+    Parses the OB file exactly like a GL file (reusing ``_load_and_apply`` + the GL
+    ``MappingProfile``), then tags every row ``entry_type='opening_balance'`` /
+    ``fiscal_period=0`` and re-mints a synthetic ``journal_entry_group_number`` with
+    a leading '9' (after the 2-char entity prefix), matching the 'file' OB-mode
+    convention (``etl.gobd_gl_prepare._synthetic_opening_txn`` /
+    ``etl.opening_balance._mode_file``).
+
+    ``scope='first_year'`` keeps only the earliest fiscal year in the file;
+    ``scope='all'`` keeps every year.  Idempotent per (entity, account, fiscal_year):
+    the synthetic group number + booking_line_id are deterministic in those keys, so
+    a re-commit is a no-op (ON CONFLICT DO NOTHING / replace within scope).
+    """
+    import re as _re
+
+    if body.scope not in ("first_year", "all"):
+        raise HTTPException(status_code=422, detail="scope must be 'first_year' or 'all'")
+
+    try:
+        canonical, _dialect, _raw = _load_and_apply(
+            body.file_id, body.sheet, body.profile, session
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("opening_balance_commit parse failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to parse opening-balance file.") from exc
+
+    if canonical.empty:
+        raise HTTPException(status_code=422, detail="Opening-balance file has no rows.")
+
+    # H1: bound the parsed frame BEFORE any transform/write (zip/dimension bomb).
+    _assert_parse_bounds(canonical, what="opening-balance file")
+    _assert_finite_amounts(canonical)
+
+    canonical = canonical.copy()
+    canonical["fiscal_year"] = pd.to_numeric(
+        canonical["fiscal_year"], errors="coerce"
+    ).astype("Int64")
+    canonical = canonical[canonical["fiscal_year"].notna()].copy()
+    if canonical.empty:
+        raise HTTPException(status_code=422, detail="No rows with a valid fiscal year.")
+
+    all_years = sorted({int(y) for y in canonical["fiscal_year"].dropna().tolist()})
+    if body.scope == "first_year":
+        keep_years = [all_years[0]]
+        canonical = canonical[canonical["fiscal_year"].astype(int) == keep_years[0]].copy()
+    else:
+        keep_years = all_years
+
+    # ---- entity-visibility guard (restricted users) ----
+    prefixes = sorted(
+        {
+            str(a)[:2]
+            for a in canonical["account_number_group"].dropna().tolist()
+            if str(a)[:2]
+        }
+    )
+    _assert_prefixes_visible(session, _admin, prefixes)
+
+    # ---- M2: ensure a usable posting_date per row ----
+    # The BS opening-stock read uses MIN(posting_date) per account, so every OB row
+    # needs a parseable posting_date.  Where it is present we keep it; where it is
+    # missing/unparseable we synthesize a deterministic Jan-1 of that row's
+    # fiscal_year (the in-data / carry-forward OB convention).  If neither a parsed
+    # date nor a fiscal_year is available for a row → 422 (cannot place the stock).
+    if "posting_date" not in canonical.columns:
+        canonical["posting_date"] = pd.NaT
+    _parsed_pd = pd.to_datetime(canonical["posting_date"], errors="coerce")
+    _fy_int = canonical["fiscal_year"].astype("Int64")
+    _jan1 = pd.to_datetime(
+        _fy_int.astype("float").astype("Int64").astype(str) + "-01-01",
+        errors="coerce",
+    )
+    # Synthesize Jan-1 where the parsed date is missing.
+    _final_pd = _parsed_pd.where(_parsed_pd.notna(), _jan1)
+    if _final_pd.isna().any():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Opening-balance rows lack a usable posting_date and a fiscal year "
+                "to synthesize one (Jan-1)."
+            ),
+        )
+    # Store as ISO date strings (the loader/_n passthrough accepts these).
+    canonical["posting_date"] = _final_pd.dt.strftime("%Y-%m-%d")
+
+    # ---- M1: file-OB vs in-data-OB exclusivity guard ----
+    # File-OB and in-data-OB are mutually exclusive: if real (non-synthetic)
+    # in-data opening_balance rows already exist for an (entity_prefix, account,
+    # fiscal_year) in scope, committing a second file-OB set would double-count the
+    # opening stock.  Detect such collisions and SKIP those rows (warn), so a file
+    # commit never creates a duplicate OB for an account that already carries one.
+    try:
+        # ``fact_gl_line`` carries no ``gl_account_id`` column; the account identity
+        # is the full ``account_number_group`` (entity prefix + account), so key the
+        # exclusivity on (account_number_group, fiscal_year).
+        existing = session.execute(
+            text(
+                "SELECT DISTINCT l.account_number_group AS ang, l.fiscal_year AS fy "
+                "FROM fact_gl_line l "
+                "JOIN fact_gl_entry e "
+                "  ON e.journal_entry_group_number = l.journal_entry_group_number "
+                " AND e.fiscal_year = l.fiscal_year "
+                "WHERE e.entry_type = :ot "
+                "  AND e.fiscal_period = :fp "
+                "  AND SUBSTR(l.journal_entry_group_number, 3, 1) <> '9' "
+                "  AND SUBSTR(l.account_number_group, 1, 2) = ANY(:pfx) "
+                "  AND l.fiscal_year = ANY(:fys)"
+            ),
+            {"ot": OB_ENTRY_TYPE, "fp": OB_FISCAL_PERIOD,
+             "pfx": prefixes or [""], "fys": keep_years},
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — guard must not crash the commit
+        # A failed probe poisons the psycopg2 transaction; roll back so the
+        # subsequent OB load can still proceed (the guard degrades to off).
+        session.rollback()
+        logger.warning("opening_balance_commit: in-data-OB probe failed (%s); skipping guard", exc)
+        existing = []
+
+    if existing:
+        # Key on (account_number_group, fiscal_year).
+        _existing_keys = {
+            (str(r[0]), int(r[1])) for r in existing if r[1] is not None
+        }
+        _row_keys = [
+            (str(a), int(fy))
+            for a, fy in zip(
+                canonical["account_number_group"].astype(str),
+                canonical["fiscal_year"].astype(int),
+            )
+        ]
+        _skip_mask = pd.Series(
+            [k in _existing_keys for k in _row_keys], index=canonical.index
+        )
+        if _skip_mask.any():
+            n_skip = int(_skip_mask.sum())
+            logger.warning(
+                "opening_balance_commit: %d row(s) skipped — in-data opening balances "
+                "already exist for those (entity, account, fiscal_year); file-OB and "
+                "in-data-OB are mutually exclusive.",
+                n_skip,
+            )
+            canonical = canonical[~_skip_mask].copy()
+        if canonical.empty:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "All opening-balance rows collide with existing in-data opening "
+                    "balances (file-OB and in-data-OB are mutually exclusive)."
+                ),
+            )
+
+    # ---- tag + re-mint synthetic OB journal_entry_group_number (prefix '9') ----
+    def _ob_jegn(ang: str, acct_id: str) -> str:
+        ee = _re.sub(r"\D", "", str(ang))[:2].zfill(2)
+        acct = _re.sub(r"\D", "", str(acct_id)).zfill(9)[-9:]
+        return f"{ee}9{acct}"[:12]
+
+    acct_for_jegn = (
+        canonical["gl_account_id"].astype(str)
+        if "gl_account_id" in canonical.columns
+        else canonical["account_number_group"].astype(str).str.slice(2)
+    )
+    canonical["journal_entry_group_number"] = [
+        _ob_jegn(ang, acct)
+        for ang, acct in zip(
+            canonical["account_number_group"].astype(str), acct_for_jegn
+        )
+    ]
+    # One line per synthetic entry (single-line OB bookings).
+    canonical["line_number"] = 1
+    canonical["fiscal_period"] = OB_FISCAL_PERIOD
+    canonical["entry_type"] = OB_ENTRY_TYPE
+    if "source_system" not in canonical.columns or canonical["source_system"].isna().all():
+        canonical["source_system"] = "opening_balance_upload"
+
+    # Deterministic, collision-free synthetic booking_line_id in the reserved band.
+    def _ob_bid(jegn: str, fy: int) -> int:
+        digits = _re.sub(r"\D", "", f"{jegn}{int(fy)}") or "0"
+        return _OB_BID_BASE + (int(digits) % 1_000_000_000_000)
+
+    canonical["booking_line_id"] = [
+        _ob_bid(j, fy)
+        for j, fy in zip(
+            canonical["journal_entry_group_number"],
+            canonical["fiscal_year"].astype(int),
+        )
+    ]
+
+    # ---- load: confine writes to fact_gl_entry / fact_gl_line (no facts/rebuild) ----
+    from etl.load import split_entry_line, _bulk_insert_entries, _bulk_insert_lines
+
+    loaded_at_dt = datetime.now(timezone.utc)
+    try:
+        # Idempotency: clear any prior OB rows for the exact synthetic keys in scope.
+        jegns = canonical["journal_entry_group_number"].astype(str).unique().tolist()
+        session.execute(
+            text(
+                "DELETE FROM fact_gl_line WHERE journal_entry_group_number = ANY(:j) "
+                "AND fiscal_year = ANY(:fys)"
+            ),
+            {"j": jegns, "fys": keep_years},
+        )
+        session.execute(
+            text(
+                "DELETE FROM fact_gl_entry WHERE journal_entry_group_number = ANY(:j) "
+                "AND fiscal_year = ANY(:fys)"
+            ),
+            {"j": jegns, "fys": keep_years},
+        )
+        entries, line_rows = split_entry_line(canonical)
+        if not entries.empty:
+            _bulk_insert_entries(session, entries)
+        if not line_rows.empty:
+            _bulk_insert_lines(session, line_rows)
+
+        load_row = session.execute(
+            text("""
+                INSERT INTO meta_dataset_load
+                  (dataset, legal_entity_code, fiscal_year, row_count, content_hash,
+                   loaded_at, loaded_by, scope_entity_prefixes, scope_fiscal_years,
+                   commit_mode, snapshot_captured)
+                VALUES (:ds, :le, :fy, :rc, :h, :la, :lb, :pfx, :fys, 'replace', FALSE)
+                RETURNING load_id
+            """),
+            {
+                "ds": "opening_balance",
+                "le": prefixes[0] if prefixes else None,
+                "fy": keep_years[0] if keep_years else None,
+                "rc": len(line_rows),
+                "h": content_hash(canonical),
+                "la": loaded_at_dt,
+                "lb": None,
+                "pfx": prefixes or None,
+                "fys": keep_years or None,
+            },
+        ).fetchone()
+        load_id = int(load_row[0]) if load_row else None
+        session.commit()
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        logger.error("opening_balance_commit load failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Opening-balance load failed; transaction rolled back. Check server logs.",
+        ) from exc
+
+    return OpeningBalanceCommitResponse(
+        load_id=load_id,
+        entries=len(entries),
+        lines=len(line_rows),
+        fiscal_years=keep_years,
+        scope=body.scope,
+        loaded_at=loaded_at_dt.isoformat(),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# POST /partner-master/upload  (auth — stage only, NO write)
+# --------------------------------------------------------------------------- #
+@router.post("/partner-master/upload", response_model=FileUploadPreviewResponse)
+async def partner_master_upload(
+    file: UploadFile = File(...),
+    sheet: str | None = Form(None),
+    _user: User = Depends(current_user),
+) -> FileUploadPreviewResponse:
+    """Stage a partner-master file; return columns + sample preview.  NO DB write."""
+    _sweep_stale_uploads()  # L1: hygiene — drop abandoned staged files
+    file_id = await _save_upload(file)
+    try:
+        return _staged_preview(file_id, sheet)
+    except HTTPException:
+        _file_path_from_id(file_id).unlink(missing_ok=True)
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# POST /partner-master/commit  (admin — UPSERT dim_customer / dim_supplier)
+# --------------------------------------------------------------------------- #
+@router.post("/partner-master/commit", response_model=PartnerMasterCommitResponse)
+def partner_master_commit(
+    body: PartnerMasterCommitRequest,
+    session: Session = Depends(get_session),
+    _admin: User = Depends(require_admin),
+) -> PartnerMasterCommitResponse:
+    """Column-mapped UPSERT of a partner-master file into dim_customer / dim_supplier.
+
+    The ``profile`` is a serialised ``PartnerMappingProfile`` describing the side
+    (customer/supplier), the entity, the join-key column (debtor / creditor number)
+    and the descriptive columns.  customer_id / supplier_id = entity_prefix(2) +
+    join-key value.  Writes are confined to the one partner table.
+    """
+    from etl.partner_master_mapping import (
+        apply_partner_profile,
+        load_partner_master,
+        partner_profile_from_dict,
+    )
+
+    path = _file_path_from_id(body.file_id)
+    raw_bytes = path.read_bytes()
+    dialect = _detect_dialect(raw_bytes, path.suffix.lower())
+    raw_df = _load_file(path, body.sheet, dialect)
+    # H1: bound the parsed frame BEFORE transform/write (zip/dimension bomb).
+    _assert_parse_bounds(raw_df, what="partner-master file")
+
+    try:
+        profile = partner_profile_from_dict(body.profile)
+        mapped = apply_partner_profile(raw_df, profile)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if mapped.empty:
+        raise HTTPException(status_code=422, detail="No partner rows with a valid join key.")
+
+    # ---- entity-visibility guard (restricted users) ----
+    id_col = "customer_id" if profile.side == "customer" else "supplier_id"
+    prefixes = sorted({str(v)[:2] for v in mapped[id_col].dropna().tolist() if str(v)[:2]})
+    _assert_prefixes_visible(session, _admin, prefixes)
+
+    try:
+        counts = load_partner_master(session, mapped, profile.side)
+        session.commit()
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        logger.error("partner_master_commit load failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Partner-master load failed; transaction rolled back. Check server logs.",
+        ) from exc
+
+    upserted = counts.get("customers", 0) + counts.get("suppliers", 0)
+    return PartnerMasterCommitResponse(
+        side=profile.side,
+        upserted=int(upserted),
+        loaded_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Version history + restore
 # --------------------------------------------------------------------------- #
 
@@ -1590,9 +2303,13 @@ def _json_dumps(obj: Any) -> str:
 
 
 def _raise_db_error(exc: Exception, ctx: str) -> None:
-    """Log full traceback, surface only a concise user-facing message."""
-    logger.error("%s DB error: %s\n%s", ctx, exc, traceback.format_exc())
-    msg = str(exc)
-    # Never leak internal details; trim at first newline
-    short = msg.split("\n")[0][:200]
-    raise HTTPException(status_code=500, detail=f"Database error: {short}") from exc
+    """Log the full traceback server-side; surface ONLY a generic message.
+
+    L2: the previous implementation echoed ``str(exc)`` (truncated) into the
+    response detail, which can leak DB schema / SQL / connection internals to the
+    client.  The full message stays in the logs; the client gets a generic string.
+    """
+    logger.exception("%s DB error", ctx)
+    raise HTTPException(
+        status_code=500, detail="Database error; check server logs."
+    ) from exc

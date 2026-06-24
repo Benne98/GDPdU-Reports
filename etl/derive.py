@@ -373,3 +373,119 @@ def _extract_one_side(
     first_cols = [id_col, number_col]
     rest = [c for c in grouped.columns if c not in first_cols]
     return grouped[first_cols + rest].reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Stored-partner backfill (DB-side method-A propagation)
+# --------------------------------------------------------------------------- #
+#
+# Moved here verbatim from backend/scripts/derive_facts.py so the reporting-v2
+# rebuild (etl/rebuild.py) and the legacy derive_facts.py CLI share one
+# implementation.  This is the on-DB equivalent of ``propagate_partners`` above:
+# it copies the (unambiguous) customer/supplier from the personal-account line
+# (receivable / payable) onto the matching P&L lines (revenue / material) within
+# the same journal entry, but operates on already-stored ``fact_gl_line`` rows
+# (used when the original GL load skipped classification before link_partners,
+# e.g. the Decidra reference path).
+
+
+def backfill_partner_links_on_gl_lines(session) -> dict[str, int]:
+    """Method-A backfill on stored fact_gl_line: receivable→revenue, payable→material.
+
+    Classification uses the same level-label sets as the derived-fact SQL
+    (``etl.derive_facts_sql``).  Returns the number of income/material lines linked.
+    Idempotent: re-running only fills lines that are still NULL/blank.
+    """
+    from sqlalchemy import text
+
+    from etl.derive_facts_sql import (
+        MATERIAL_L3,
+        PAYABLE_L3,
+        RECEIVABLE_L3,
+        REVENUE_L2,
+        REVENUE_L3,
+        _quote,
+    )
+
+    rev_l3 = _quote(REVENUE_L3)
+    rev_l2 = _quote(REVENUE_L2)
+    mat_l3 = _quote(MATERIAL_L3)
+    ar_l3 = _quote(RECEIVABLE_L3)
+    ap_l3 = _quote(PAYABLE_L3)
+
+    cust_result = session.execute(
+        text(f"""
+            WITH recv AS (
+                SELECT
+                    r.journal_entry_group_number,
+                    r.fiscal_year,
+                    MAX(r.customer_id) AS customer_id
+                FROM fact_gl_line r
+                JOIN dim_gl_account ar
+                  ON ar.account_number_group = r.account_number_group
+                 AND ar.fiscal_year          = r.fiscal_year
+                WHERE ar.level_3 IN ({ar_l3})
+                  AND r.customer_id IS NOT NULL
+                  AND TRIM(r.customer_id) <> ''
+                GROUP BY r.journal_entry_group_number, r.fiscal_year
+                HAVING COUNT(DISTINCT r.customer_id) = 1
+            ),
+            targets AS (
+                SELECT income.booking_line_id, recv.customer_id
+                FROM fact_gl_line income
+                JOIN recv
+                  ON recv.journal_entry_group_number = income.journal_entry_group_number
+                 AND recv.fiscal_year = income.fiscal_year
+                JOIN dim_gl_account ai
+                  ON ai.account_number_group = income.account_number_group
+                 AND ai.fiscal_year          = income.fiscal_year
+                WHERE (ai.level_3 IN ({rev_l3}) OR ai.level_2 IN ({rev_l2}))
+                  AND (income.customer_id IS NULL OR TRIM(income.customer_id) = '')
+            )
+            UPDATE fact_gl_line l
+            SET customer_id = t.customer_id
+            FROM targets t
+            WHERE l.booking_line_id = t.booking_line_id
+        """)
+    )
+
+    supp_result = session.execute(
+        text(f"""
+            WITH pay AS (
+                SELECT
+                    p.journal_entry_group_number,
+                    p.fiscal_year,
+                    MAX(p.supplier_id) AS supplier_id
+                FROM fact_gl_line p
+                JOIN dim_gl_account ap
+                  ON ap.account_number_group = p.account_number_group
+                 AND ap.fiscal_year          = p.fiscal_year
+                WHERE ap.level_3 IN ({ap_l3})
+                  AND p.supplier_id IS NOT NULL
+                  AND TRIM(p.supplier_id) <> ''
+                GROUP BY p.journal_entry_group_number, p.fiscal_year
+                HAVING COUNT(DISTINCT p.supplier_id) = 1
+            ),
+            targets AS (
+                SELECT mat.booking_line_id, pay.supplier_id
+                FROM fact_gl_line mat
+                JOIN pay
+                  ON pay.journal_entry_group_number = mat.journal_entry_group_number
+                 AND pay.fiscal_year = mat.fiscal_year
+                JOIN dim_gl_account am
+                  ON am.account_number_group = mat.account_number_group
+                 AND am.fiscal_year          = mat.fiscal_year
+                WHERE am.level_3 IN ({mat_l3})
+                  AND (mat.supplier_id IS NULL OR TRIM(mat.supplier_id) = '')
+            )
+            UPDATE fact_gl_line l
+            SET supplier_id = t.supplier_id
+            FROM targets t
+            WHERE l.booking_line_id = t.booking_line_id
+        """)
+    )
+
+    return {
+        "income_customer_linked": int(cust_result.rowcount or 0),
+        "material_supplier_linked": int(supp_result.rowcount or 0),
+    }

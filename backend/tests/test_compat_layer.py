@@ -341,6 +341,25 @@ class TestLatestPeriod:
         assert data["year"] == 2023
         assert data["month"] == 12
 
+    def test_latest_period_excludes_synthetic_net_profit_rows(self):
+        """reporting-v2 Phase 3: the synthetic net-profit equity rows (posted at the
+        FY year-end, entry_type='net_profit') must NOT drive the reporting anchor.
+        The latest_period SQL must filter them out so the anchor stays on the last
+        REAL movement — keeping gl_rows mode anchor-identical to report_inject/live.
+        """
+        client, session = _make_client()
+        resp = client.get("/api/v1/metrics", params={"metric": "latest_period"})
+        assert resp.status_code == 200, resp.text
+        # the executed latest_period SQL must exclude net_profit rows
+        executed = [
+            str(call.args[0]) for call in session.execute.call_args_list if call.args
+        ]
+        lp_sql = [s for s in executed if "fact_gl_entry" in s and "posting_date" in s]
+        assert lp_sql, "latest_period query was not executed"
+        assert any("<> 'net_profit'" in s for s in lp_sql), (
+            "latest_period must exclude entry_type='net_profit' rows"
+        )
+
     def test_unknown_metric_returns_400(self):
         """Non-implemented metric should return 400."""
         client, _ = _make_client()

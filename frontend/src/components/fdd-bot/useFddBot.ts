@@ -17,6 +17,7 @@ import {
   listProjectSummaries,
   setActiveProjectId,
   upsertProject,
+  type FddProjectMode,
   type FddProjectRecord,
   type FddProjectSnapshot,
   type FddProjectSummary,
@@ -60,7 +61,8 @@ export interface AdaptiveCardInput {
   max?: number
   label: string
   placeholder?: string
-  default?: string
+  /** String for scalar inputs; string[] for multi_select pre-selection. */
+  default?: string | string[]
   options?: { label: string; value: string }[]
   required?: boolean
   accept?: string
@@ -130,6 +132,13 @@ export interface FddSendOptions {
   userBubbleText?: string
   /** Stable id for the user bubble (used to trim chat on undo). */
   userMessageId?: string
+  /**
+   * Arbitrary metadata forwarded to Rasa in the REST webhook body as
+   * `{ sender, message, metadata }`.  Rasa RestInput makes this available
+   * at `latest_message.metadata` in custom actions.  Use this to send
+   * `data_source_mode` on the greet so ActionSetSessionId can set the slot.
+   */
+  metadata?: Record<string, unknown>
 }
 
 interface RasaMessage {
@@ -294,6 +303,9 @@ export function useFddBot() {
   )
   const [activeProjectId, setActiveProjectIdState] = useState(initialProjectRef.current.id)
   const [projectName, setProjectName] = useState(initialProjectRef.current.name)
+  const [activeMode, setActiveMode] = useState<FddProjectMode>(
+    initialProjectRef.current.mode ?? 'upload',
+  )
   const [projects, setProjects] = useState<FddProjectSummary[]>(() => listProjectSummaries())
   const [sessionEpoch, setSessionEpoch] = useState(0)
   const [messages, setMessages] = useState<ChatMessage[]>(() =>
@@ -507,14 +519,26 @@ export function useFddBot() {
       }
 
       try {
+        const rasaBody: Record<string, unknown> = {
+          sender: senderId.current,
+          message: messageText,
+        }
+        // Propagate JWT so Rasa actions can attach it as Authorization: Bearer
+        // to downstream backend calls.  Never log the token; keep it out of
+        // chat snapshots (the token lives only in its own localStorage key).
+        const _jwt = typeof localStorage !== 'undefined'
+          ? localStorage.getItem('gdpdu_access_token')
+          : null
+        const _meta: Record<string, unknown> = { ...(options?.metadata ?? {}) }
+        if (_jwt) _meta.auth_token = _jwt
+        if (Object.keys(_meta).length > 0) {
+          rasaBody.metadata = _meta
+        }
         const resp = await fetch(`${RASA_URL}/webhooks/rest/webhook`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
-          body: JSON.stringify({
-            sender: senderId.current,
-            message: messageText,
-          }),
+          body: JSON.stringify(rasaBody),
         })
 
         if (generation !== sendGeneration.current) {
@@ -738,25 +762,28 @@ export function useFddBot() {
   }, [])
 
   const saveActiveProject = useCallback(() => {
+    const snap = buildSnapshot(
+      messages,
+      datesContextRef.current,
+      uploadContextRef.current,
+      columnRolesContextRef.current,
+      firstFyRef.current,
+      submittedCardIds,
+      undoStack.current,
+    )
+    snap.mode = activeMode
     const record: FddProjectRecord = {
       id: activeProjectId,
       name: projectName,
       senderId: senderId.current,
       updatedAt: new Date().toISOString(),
-      snapshot: buildSnapshot(
-        messages,
-        datesContextRef.current,
-        uploadContextRef.current,
-        columnRolesContextRef.current,
-        firstFyRef.current,
-        submittedCardIds,
-        undoStack.current,
-      ),
+      mode: activeMode,
+      snapshot: snap,
     }
     upsertProject(record)
     setActiveProjectId(activeProjectId)
     refreshProjectList()
-  }, [activeProjectId, projectName, messages, submittedCardIds, refreshProjectList])
+  }, [activeProjectId, projectName, messages, submittedCardIds, activeMode, refreshProjectList])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -770,6 +797,7 @@ export function useFddBot() {
     setActiveProjectId(record.id)
     setActiveProjectIdState(record.id)
     setProjectName(record.name)
+    setActiveMode(record.mode ?? 'upload')
     firstFyRef.current = record.snapshot.firstFy
     uploadContextRef.current = record.snapshot.uploadContext
     datesContextRef.current = record.snapshot.datesContext
@@ -797,15 +825,16 @@ export function useFddBot() {
     sendGeneration.current += 1
   }, [])
 
-  const createProject = useCallback(() => {
+  const createProject = useCallback((mode: FddProjectMode = 'upload') => {
     saveActiveProject()
-    const project = createEmptyProject()
+    const project = createEmptyProject(undefined, mode)
     upsertProject(project)
     clearSessionState()
     senderId.current = project.senderId
     setActiveProjectId(project.id)
     setActiveProjectIdState(project.id)
     setProjectName(project.name)
+    setActiveMode(mode)
     setSessionEpoch(e => e + 1)
     refreshProjectList()
   }, [saveActiveProject, clearSessionState, refreshProjectList])
@@ -847,22 +876,23 @@ export function useFddBot() {
           return
         }
       }
-      const project = createEmptyProject()
+      const project = createEmptyProject(undefined, activeMode)
       upsertProject(project)
       clearSessionState()
       senderId.current = project.senderId
       setActiveProjectId(project.id)
       setActiveProjectIdState(project.id)
       setProjectName(project.name)
+      setActiveMode(activeMode)
       setSessionEpoch(e => e + 1)
       refreshProjectList()
     },
-    [activeProjectId, saveActiveProject, applyProjectRecord, clearSessionState, refreshProjectList],
+    [activeProjectId, activeMode, saveActiveProject, applyProjectRecord, clearSessionState, refreshProjectList],
   )
 
-  const newSession = useCallback(() => {
-    createProject()
-  }, [createProject])
+  const newSession = useCallback((mode?: FddProjectMode) => {
+    createProject(mode ?? activeMode)
+  }, [createProject, activeMode])
 
   return {
     messages,
@@ -882,6 +912,8 @@ export function useFddBot() {
     saveActiveProject,
     activeProjectId,
     projectName,
+    activeMode,
+    applyProjectRecord,
     projects,
     undoLastCard,
     canUndo: undoStackLen > 0,

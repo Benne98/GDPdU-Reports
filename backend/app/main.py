@@ -14,6 +14,7 @@ from app.db import engine
 from app.routers import admin as admin_router
 from app.routers import action_notes as action_notes_router
 from app.routers import auth as auth_router
+from app.routers import budget as budget_router
 from app.routers import directory as directory_router
 from app.routers import fdd_bot as fdd_bot_router
 from app.routers import er_compat as er_compat_router
@@ -24,6 +25,7 @@ from app.routers import mapping_editor as mapping_editor_router
 from app.routers import meta_compat as meta_compat_router
 from app.routers import metrics_compat as metrics_compat_router
 from app.routers import plan as plan_router
+from app.routers import projects as projects_router
 from app.routers import sales_compat as sales_compat_router
 from app.routers import statements as statements_router
 from app.services.profitability_compat import build_headline_kpis
@@ -59,6 +61,10 @@ app.include_router(ingest_router.router)
 app.include_router(mapping_editor_router.router)
 # DF5 plan / forecast
 app.include_router(plan_router.router)
+# Manual budget (Plan/Forecast extension, Phase 4) — position + partner grain
+app.include_router(budget_router.router)
+# Reporting-v2 Phase 7 — per-project config persistence + rebuild trigger
+app.include_router(projects_router.router)
 # P5 statements (P&L; bs/wc/cf later)
 app.include_router(statements_router.router)
 # Legacy compatibility layer — mirrors the legacy finssentials API surface

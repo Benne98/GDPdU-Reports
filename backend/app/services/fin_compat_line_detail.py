@@ -95,6 +95,7 @@ def build_pl_line_detail(
     timeline_months: int = 12,
     use_llm: bool = True,
     line_mom_keur: Optional[float] = None,
+    concentration_only: bool = False,
 ) -> dict[str, Any]:
     row = _resolve_mapping_row(session, line_code)
     if not row:
@@ -198,6 +199,16 @@ def build_pl_line_detail(
             "counter_gl_account_id": None,
             "counter_account_name": None,
         })
+
+    # ── Concentration-only fast path ──────────────────────────────────────────
+    # The anomaly engine only consumes ``accounts`` + ``top_bookings`` (via
+    # ``gl_concentration_from_detail``); skip the expensive timeline / sub-line /
+    # commentary work.  Concentration math is byte-identical to the full path.
+    if concentration_only:
+        from app.services.fin_compat_narrative_core import concentration_only_payload
+        return concentration_only_payload(
+            line_code, row.get("balance_title", line_code),
+            year, month, entity, accounts_out, top_bookings)
 
     # ── Account timeline ──────────────────────────────────────────────────────
     all_periods = _last_12_periods(year, month)[-timeline_months:]

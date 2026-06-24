@@ -38,7 +38,6 @@ export default function PlDetailOverlay({
   month,
   entity,
   statement = 'pl',
-  narrativeContext,
   onClose,
 }: Props) {
   const load = useStatementLineDetailLoad({

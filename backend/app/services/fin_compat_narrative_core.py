@@ -308,6 +308,41 @@ def detect_hidden_netting(
     return flagged
 
 
+def concentration_only_payload(
+    line_code: str,
+    label: str,
+    year: Optional[int],
+    month: Optional[int],
+    entity: Optional[str],
+    accounts: list[dict[str, Any]],
+    top_bookings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Minimal line-detail payload carrying ONLY the fields ``gl_concentration_from_detail``
+    consumes (``accounts`` + ``top_bookings``).
+
+    Used by the ``build_*_line_detail(..., concentration_only=True)`` fast path the
+    anomaly engine takes: it lets the builders skip the expensive 12-month timeline,
+    sub-line and commentary queries that the GL-concentration classifier never reads.
+    The returned dict is a structural subset of the full payload, so feeding it to
+    ``gl_concentration_from_detail`` yields byte-identical shares.
+    """
+    return {
+        "line_code": line_code,
+        "label": label,
+        "year": year, "month": month, "entity": entity,
+        "accounts": accounts,
+        "top_bookings": top_bookings,
+        "bridge": [],
+        "periods": [],
+        "accounts_timeline": [],
+        "sub_lines": [],
+        "commentary": {"accounts": "", "postings": ""},
+        "outlier_facts": {},
+        "suggested_prompts": [],
+        "meta": {"llm_used": False, "concentration_only": True},
+    }
+
+
 def gl_concentration_from_detail(payload: Optional[dict], *, sign: float = 1.0) -> dict[str, Any]:
     """GL account / booking concentration for a line, from a line-detail payload.
 
@@ -747,6 +782,42 @@ def build_bullets(
             },
         })
     return bullets
+
+
+def merge_finding_bullets(
+    bullets: list[dict[str, Any]],
+    extra: list[dict[str, Any]],
+    cap: int,
+) -> list[dict[str, Any]]:
+    """Append GL-finding bullets (Journal Agent) to the driver bullets, re-index,
+    and clamp the combined list to ``cap``.
+
+    ``bullets`` are the already-rendered key-driver bullets (in table order);
+    ``extra`` are finding-bullets in the SAME shape
+    (``index, line_code, label, text, tone, deep_links, facts``) produced by
+    ``anomaly.gl_findings_as_bullets``.  The driver bullets are kept first (their
+    table order is preserved); the deterministically-ordered findings follow.  The
+    combined list is then truncated to ``clamp_cap(cap)`` so the existing MIN/MAX
+    bullet policy is unchanged, and ``index`` is renumbered 0..n-1.
+
+    No-op safety: with ``extra == []`` the only change is the cap truncation that
+    ``build_bullets`` callers already apply, so passing an empty ``extra`` returns
+    the input bullets re-indexed within the same cap (byte-identical when the input
+    already respected the cap).  This function is only ever called behind the
+    ``journal_agent_narrative`` flag.
+
+    Worked example: 4 driver bullets + 3 findings, cap=5 → first 4 drivers, then 1
+    finding, truncated to 5, indices 0..4.
+    """
+    merged = list(bullets) + list(extra)
+    limit = clamp_cap(cap)
+    merged = merged[:limit]
+    out: list[dict[str, Any]] = []
+    for i, b in enumerate(merged):
+        nb = dict(b)
+        nb["index"] = i
+        out.append(nb)
+    return out
 
 
 # ===========================================================================

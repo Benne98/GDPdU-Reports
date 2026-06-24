@@ -110,11 +110,19 @@ _BS_GRAIN_DIMS = """
             COALESCE(MAX(a.level_3_sort::int), 9999) AS level_3_sort,
             COALESCE(MAX(a.level_4_sort::int), 9999) AS level_4_sort"""
 
+# reporting-v2 Phase 3: synthetic net-profit equity rows (entry_type='net_profit')
+# are filtered out at the JOIN so they NEVER produce a grain group.  The SUM-level
+# guard alone is not enough: hierarchy_from_grains builds a node for EVERY distinct
+# grain group, so a present-but-zero net-profit account row would create a phantom
+# 'Net profit' hierarchy child (live has no such GL row → no node).  Filtering here
+# reproduces live exactly.  Harmless on the P&L net-profit SQL (level_0='PL', no
+# net_profit rows), so the report-injection path is unchanged.
 _BS_FROM = """
         FROM fact_gl_line l
         JOIN fact_gl_entry e
           ON e.journal_entry_group_number = l.journal_entry_group_number
          AND e.fiscal_year = l.fiscal_year
+         AND COALESCE(e.entry_type, '') <> 'net_profit'
         JOIN dim_gl_account a
           ON a.account_number_group = l.account_number_group
          AND a.fiscal_year = l.fiscal_year"""
@@ -122,6 +130,16 @@ _BS_FROM = """
 _BS_GROUP_BY = (
     "GROUP BY a.level_1, a.level_2, a.level_3, a.level_4, a.gl_account_id"
 )
+
+
+#: reporting-v2 Phase 3 guard: TRUE for every NON net-profit row.  Synthetic
+#: net-profit equity bookings (etl.net_profit, entry_type='net_profit') are
+#: single-sided rows that make the *ledger* balance per FY; they must be EXCLUDED
+#: from the BS cumulative-balance grain so the displayed equity hierarchy nodes +
+#: subtotals stay byte-identical to the legacy report-injection path (the
+#: presented 'Net profit' line is still produced by _inject_net_profit from the
+#: P&L SQL).  Used inside every BS balance SUM CASE WHEN.
+_NOT_NET_PROFIT = "COALESCE(e.entry_type, '') <> 'net_profit'"
 
 
 def _sql_alias(name: str) -> str:
@@ -182,8 +200,12 @@ def _bal_amount_expr(cutoff: date) -> str:
     d = cutoff.isoformat()
     snap = _opening_snapshot_date_sql()
     last_ob = _last_ob_date_sql(d)
+    # reporting-v2 Phase 3: synthetic net-profit equity rows (entry_type='net_profit')
+    # are EXCLUDED from the BS cumulative balance so the equity hierarchy nodes +
+    # subtotals stay byte-identical to the report-injection path (no double count).
     return (
-        "COALESCE(SUM(CASE "
+        f"COALESCE(SUM(CASE WHEN {_NOT_NET_PROFIT} THEN "
+        "CASE "
         "WHEN bm.account_number_group IS NOT NULL THEN "
         f"CASE "
         f"WHEN COALESCE(e.entry_type, '') != 'opening_balance' "
@@ -196,7 +218,7 @@ def _bal_amount_expr(cutoff: date) -> str:
         f"AND e.posting_date = {last_ob} "
         f"AND e.posting_date <= '{d}' THEN l.amount "
         f"ELSE 0 END "
-        "END), 0)"
+        "END ELSE 0 END), 0)"
     )
 
 
@@ -216,11 +238,15 @@ def _bal_amount_expr_fy(fiscal_year: int, cutoff: date) -> str:
     """
     d = cutoff.isoformat()
     ob = f"DATE '{fiscal_year}-01-01'"
+    # reporting-v2 Phase 3: exclude synthetic net-profit equity rows from the
+    # FY-scoped BS balance (see _bal_amount_expr); keeps presentation identical.
     return (
         "COALESCE(SUM(CASE "
         f"WHEN e.fiscal_year = {fiscal_year} "
+        f"AND {_NOT_NET_PROFIT} "
         f"AND e.entry_type = 'opening_balance' AND e.posting_date = {ob} THEN l.amount "
         f"WHEN e.fiscal_year = {fiscal_year} "
+        f"AND {_NOT_NET_PROFIT} "
         f"AND COALESCE(e.entry_type, '') != 'opening_balance' "
         f"AND e.posting_date <= '{d}' THEN l.amount "
         "ELSE 0 END), 0)"

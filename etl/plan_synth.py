@@ -113,6 +113,8 @@ UNIFORM_WEIGHT = 1.0 / N_PERIODS
 
 SCENARIO_FORECAST = "forecast"
 SCENARIO_PLAN = "plan"
+SCENARIO_BUDGET = "budget"  # manual-override scenario (Phase 3+); declared here as the
+                           # canonical literal so later phases never re-spell it.
 
 
 # --------------------------------------------------------------------------- #
@@ -385,11 +387,73 @@ def sales_plan(
 
 
 # --------------------------------------------------------------------------- #
+# Com plan (supplier granularity) — symmetric sibling of sales_plan
+# --------------------------------------------------------------------------- #
+def com_plan(
+    fact_com_actuals: pd.DataFrame,
+    base_fy: int,
+    horizon: int,
+    growth_rate: float,
+    group_growth: dict[str, float] | None = None,
+    *,
+    current_fy: int | None = None,
+    last_closed_period: int | None = None,
+    prior_fy: int | None = None,
+    forecast_growth_rate: float = 0.0,
+) -> pd.DataFrame:
+    """fact_com_plan rows by ``supplier_id`` (mirror of :func:`sales_plan`).
+
+    Operates on the positive ``cost_of_materials`` measure (sign convention:
+    ``fact_com.cost_of_materials = amount`` — material is a debit, so it is already
+    positive; the plan stays a positive magnitude).  Because every formula is a
+    multiplication of the actual movement by non-negative growth/seasonal weights,
+    the positive sign is preserved exactly as ``gross_sales_plan`` stays positive.
+
+    Emits plan years FY(base+2)..FY(base+1+horizon) and, if ``current_fy`` /
+    ``last_closed_period`` / ``prior_fy`` are supplied, the forecast year
+    FY(base+1) for open periods.  Reuses ``plan_years`` / ``forecast_open_periods``
+    /  ``seasonal_index`` exactly as the sales path does — pure, no DB, no RNG.
+
+    Input columns:  ['supplier_id', 'fiscal_year', 'fiscal_period', 'cost_of_materials'].
+    Output columns: ['supplier_id', 'fiscal_year', 'fiscal_period', 'scenario',
+                     'cost_of_materials_plan', 'is_synthetic'].
+    """
+    plan = plan_years(
+        fact_com_actuals,
+        base_fy=base_fy,
+        horizon_years=horizon,
+        growth_rate=growth_rate,
+        group_growth=group_growth,
+        key="supplier_id",
+        value_col="cost_of_materials",
+        source_system="synthetic_plan",
+    )
+    frames = [plan]
+    if current_fy is not None and last_closed_period is not None and prior_fy is not None:
+        fc = forecast_open_periods(
+            fact_com_actuals,
+            current_fy=current_fy,
+            last_closed_period=last_closed_period,
+            prior_fy=prior_fy,
+            growth_rate=forecast_growth_rate,
+            key="supplier_id",
+            value_col="cost_of_materials",
+            source_system="synthetic_plan",
+        )
+        frames.append(fc)
+    combined = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(
+        not f.empty for f in frames
+    ) else _empty_frame("supplier_id", "cost_of_materials")
+    return combined.rename(columns={"cost_of_materials": "cost_of_materials_plan"})
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
 def generate_plan(
     gl_actuals: pd.DataFrame,
     sales_actuals: pd.DataFrame,
+    com_actuals: pd.DataFrame | None = None,
     *,
     base_fy: int,
     current_fy: int,
@@ -399,11 +463,15 @@ def generate_plan(
     group_growth: dict[str, float] | None = None,
     group_col: str | None = None,
     forecast_growth_rate: float = 0.0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Produce (fact_gl_plan_rows, fact_sales_plan_rows), ready for insert.
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Produce (fact_gl_plan_rows, fact_sales_plan_rows, fact_com_plan_rows).
 
-    Both DataFrames carry ``is_synthetic=True``.  Horizon = forecast year
+    All three DataFrames carry ``is_synthetic=True``.  Horizon = forecast year
     FY(current_fy) open periods + ``horizon_years`` plan years from FY(base_fy+2).
+
+    ``com_actuals`` (supplier_id × fiscal_period × cost_of_materials) is optional and
+    additive — when omitted (or empty) the third returned frame is an empty
+    fact_com_plan frame, and the GL/sales outputs are **unchanged**.
 
     Defaults: ``growth_rate=0.05`` (overridable, §5.3 — NOT hardcoded into the
     formula, a caller-supplied default), ``horizon_years=4`` → FY26P..FY29P.
@@ -433,9 +501,22 @@ def generate_plan(
         forecast_growth_rate=forecast_growth_rate,
     )
 
+    if com_actuals is not None and not com_actuals.empty:
+        com_out = com_plan(
+            com_actuals, base_fy=base_fy, horizon=horizon_years, growth_rate=growth_rate,
+            group_growth=group_growth, current_fy=current_fy,
+            last_closed_period=last_closed_period, prior_fy=prior_fy,
+            forecast_growth_rate=forecast_growth_rate,
+        )
+    else:
+        com_out = _empty_frame("supplier_id", "cost_of_materials").rename(
+            columns={"cost_of_materials": "cost_of_materials_plan"}
+        )
+
     gl_out = _sort_output(gl_out, "account_number_group")
     sales_out = _sort_output(sales_out, "customer_id")
-    return gl_out, sales_out
+    com_out = _sort_output(com_out, "supplier_id")
+    return gl_out, sales_out, com_out
 
 
 # --------------------------------------------------------------------------- #

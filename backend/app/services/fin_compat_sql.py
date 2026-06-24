@@ -210,6 +210,91 @@ def iso_week_bounds(iso_year: int, iso_week: int) -> tuple[date, date]:
     return mon, mon + timedelta(days=6)
 
 
+# ---------------------------------------------------------------------------
+# Centralized ISO-week grain primitives (reporting-v2 Phase 5)
+# ---------------------------------------------------------------------------
+# Two named primitives express the TWO different ways an ISO week is used so that
+# every weekly SQL path is unambiguous about STOCK vs FLOW and never falls back to
+# a monthly-bucket (fiscal_period) approximation:
+#
+#   * STOCK  (balance-sheet / working-capital): the value is a CLOSING BALANCE
+#     "as of" a single date — the END of the ISO week.  Use ``week_cutoff``.
+#   * FLOW   (P&L / cash flow / sales): the value is the Σ of in-period movements
+#     whose ``posting_date`` falls inside the ISO week.  Use ``week_range``.
+#
+# Both are thin, deterministic wrappers over :func:`iso_week_monday` /
+# :func:`iso_week_bounds` (Monday-start, Sunday-end, ISO-8601).  They are
+# behaviour-IDENTICAL to the dates the existing BS/PL/WC/CF weekly SQL already
+# computes via ``iso_week_bounds`` — introduced as the single canonical entry
+# point so new weekly paths (Sales) route through the same math.
+
+
+def week_cutoff(iso_year: int, iso_week: int) -> date:
+    """Last day (Sunday) of the given ISO week — the STOCK cutoff date.
+
+    For a balance-sheet / working-capital column the value is the cumulative
+    CLOSING BALANCE with ``posting_date <= week_cutoff(iso_year, iso_week)``.
+
+    == FORMULA ==
+        week_cutoff = iso_week_monday(iso_year, iso_week) + 6 days  (the Sunday)
+
+    == WORKED EXAMPLE ==
+        week_cutoff(2025, 1)  → 2025-01-05  (ISO 2025-W01 is Mon 2024-12-30..Sun
+                                              2025-01-05; a BS balance "at W01" is
+                                              the stock through 2025-01-05)
+        week_cutoff(2020, 53) → 2021-01-03  (2020 has an ISO week 53)
+
+    == EDGE CASES ==
+        * ISO week 53 (long years 2020/2026/…): valid, returns that week's Sunday.
+        * Year boundary: week_cutoff(2026, 1) → 2026-01-04 (the W01 Sunday), and a
+          posting on 2025-12-31 (ISO 2026-W01) is INCLUDED because 2025-12-31 <=
+          2026-01-04.  A non-January fiscal-year start does not affect the cutoff —
+          it is a pure calendar/ISO date, independent of fiscal_period.
+    """
+    return iso_week_monday(iso_year, iso_week) + timedelta(days=6)
+
+
+def week_range(iso_year: int, iso_week: int) -> tuple[date, date]:
+    """(Monday, Sunday) span of the given ISO week — the FLOW window.
+
+    For a P&L / cash-flow / sales column the value is the Σ of movements whose
+    ``posting_date`` is BETWEEN the two returned dates (inclusive).
+
+    == FORMULA ==
+        week_range = (iso_week_monday, iso_week_monday + 6 days)
+        flow = Σ amount WHERE posting_date BETWEEN monday AND sunday   (inclusive)
+
+    == WORKED EXAMPLE ==
+        week_range(2025, 31) → (2025-07-28, 2025-08-03)  — note this straddles the
+            Jul/Aug month boundary; a true ISO-week flow therefore counts postings
+            on Aug-01..03 in CW31 (a monthly bucket would have mis-assigned them).
+        A €1,000 gross-sales invoice posted 2025-07-30 lands in CW31's flow; one
+        posted 2025-08-04 lands in CW32 (the next Monday).
+
+    == EDGE CASES ==
+        * The Sunday equals :func:`week_cutoff` (same end date; flow uses the span,
+          stock uses only the end).
+        * Year boundary: week_range(2026, 1) → (2025-12-29, 2026-01-04); a posting
+          on 2025-12-31 falls in this ISO week even though its calendar year is
+          2025 — matching :func:`datetime.date.isocalendar`.
+        * ISO week 53: valid (returns the 7-day span of that long-year week).
+    """
+    mon = iso_week_monday(iso_year, iso_week)
+    return mon, mon + timedelta(days=6)
+
+
+def iso_week_of(d: date) -> tuple[int, int]:
+    """(iso_year, iso_week) that the calendar date ``d`` belongs to (ISO-8601).
+
+    Thin wrapper over :meth:`datetime.date.isocalendar` returning just the
+    (year, week) pair — used to walk a trailing series of ISO weeks back from an
+    anchor date and to label sales weekly buckets by the week their posting_date
+    falls in.  E.g. ``iso_week_of(date(2025, 12, 31)) == (2026, 1)``.
+    """
+    ic = d.isocalendar()
+    return ic[0], ic[1]
+
+
 def prior_iso_week(iso_year: int, iso_week: int) -> tuple[int, int]:
     mon = iso_week_monday(iso_year, iso_week) - timedelta(weeks=1)
     ic = mon.isocalendar()
@@ -1137,5 +1222,113 @@ def plan_grain_sql(year: int, month: int, ent_frag: str, scenario: str) -> tuple
           AND a.level_0 = 'PL'
           {ent_frag_plan}
         GROUP BY a.level_2, a.level_3, NULLIF(TRIM(a.level_4), ''), pl.account_number_group
+    """
+    return sql, params
+
+
+def position_plan_grain_sql(
+    year: int,
+    month: int,
+    ent_frag: str,
+    statement: str = "PL",
+) -> tuple[str, dict]:
+    """Aggregate manual-budget plan amounts from ``fact_position_plan`` by line_code.
+
+    SIBLING of :func:`plan_grain_sql` for the new Phase-3 position-grain budget.
+    Differences from the ``fact_gl_plan`` path:
+
+      * keyed by ``line_code`` DIRECTLY — no level_2/3/4 join (the position is the
+        grain), so the caller maps grain → structure by line_code identity.
+      * partner-driven positions store BOTH a position-level row (partner_id='')
+        and per-partner rows (partner_id<>'').  We **sum every row that rolls into
+        a line_code together** (position-level + all its partners) so the position
+        total = Σ partners + position remainder.  (The roll-up invariant guarantees
+        Σ(partners)+"Other" == position, so summing all rows reproduces the
+        position without double counting.)
+      * SAME presentation sign as ``plan_grain_sql``: ``amount * -1`` (stored GL
+        sign → presented; revenue + / expense −).  This is the single sign flip,
+        identical to the fact_gl_plan path — a divergence here would desync
+        plan-vs-actual, so it MUST match.
+
+    Entity precedence (per the plan): prefer per-entity rows (entity_prefix=:ep)
+    for a given line_code; fall back to consolidated rows (entity_prefix='') ONLY
+    for line_codes that have NO per-entity row.  When no entity filter is requested
+    (``ent_frag`` empty → CONSOLIDATED view) the consolidated total per line_code is
+    EITHER its direct ('') row when one exists (an explicit consolidated override),
+    OR the SUM of the per-entity rows (entity_prefix<>'') when no '' row exists.  So
+    a consolidated plan = Σ entity plans unless staff entered a direct consolidated
+    number.  ``ent_frag`` is the standard ``AND l.entity_prefix = '<ep>'`` fragment;
+    we parse the 2-char prefix out of it (safe: it is a resolved CHAR(2)).
+
+    GOLDEN-SAFETY: this only ever returns rows when fact_position_plan has
+    scenario='budget' rows for the scope; with none, the result set is empty and
+    every caller falls through to forecast/plan → byte-identical output.  The
+    consolidated entity-sum only changes HOW existing budget rows aggregate (Σ
+    per-entity vs '' override) — with no budget rows the WHERE still matches nothing.
+    """
+    params: dict[str, Any] = {
+        "year": year,
+        "scenario": "budget",
+        "statement": statement,
+    }
+
+    # Parse the resolved 2-char entity_prefix out of the standard ent_frag, if any.
+    # ent_frag looks like "AND l.entity_prefix = 'XX'" (or '' for consolidated).
+    ep: Optional[str] = None
+    if ent_frag and "=" in ent_frag:
+        frag_val = ent_frag.split("=", 1)[1].strip().strip("'").strip()
+        if frag_val:
+            ep = frag_val[:2]
+
+    sel_cm = "SUM(CASE WHEN p.fiscal_period = :month THEN p.amount * -1 ELSE 0 END)"
+    sel_ytd = "SUM(CASE WHEN p.fiscal_period <= :month THEN p.amount * -1 ELSE 0 END)"
+    sel_ytg = "SUM(CASE WHEN p.fiscal_period > :month THEN p.amount * -1 ELSE 0 END)"
+    params["month"] = month
+
+    if ep is None:
+        # Consolidated view: the '' row per line_code when it exists (explicit
+        # consolidated override), ELSE the SUM of the per-entity rows.  A row
+        # participates iff it is a '' row, OR it is a per-entity row and NO '' row
+        # exists for the same line_code.  (The GROUP BY line_code then sums the
+        # surviving per-entity rows into the consolidated total.)
+        ent_clause = (
+            "AND ( p.entity_prefix = '' "
+            "      OR ( p.entity_prefix <> '' "
+            "           AND NOT EXISTS ( "
+            "             SELECT 1 FROM fact_position_plan c "
+            "             WHERE c.statement = p.statement "
+            "               AND c.line_code = p.line_code "
+            "               AND c.scenario = p.scenario "
+            "               AND c.fiscal_year = p.fiscal_year "
+            "               AND c.entity_prefix = '' ) ) )"
+        )
+    else:
+        # Per-entity view: per-entity rows, plus consolidated rows ONLY for
+        # line_codes that have no per-entity row (precedence, no double count).
+        params["ep"] = ep
+        ent_clause = (
+            "AND ( p.entity_prefix = :ep "
+            "      OR ( p.entity_prefix = '' "
+            "           AND NOT EXISTS ( "
+            "             SELECT 1 FROM fact_position_plan e "
+            "             WHERE e.statement = p.statement "
+            "               AND e.line_code = p.line_code "
+            "               AND e.scenario = p.scenario "
+            "               AND e.fiscal_year = p.fiscal_year "
+            "               AND e.entity_prefix = :ep ) ) )"
+        )
+
+    sql = f"""
+        SELECT
+            p.line_code,
+            COALESCE({sel_cm},  0) AS plan_cm,
+            COALESCE({sel_ytd}, 0) AS ytd_plan,
+            COALESCE({sel_ytg}, 0) AS ytg
+        FROM fact_position_plan p
+        WHERE p.fiscal_year = :year
+          AND p.scenario = :scenario
+          AND p.statement = :statement
+          {ent_clause}
+        GROUP BY p.line_code
     """
     return sql, params

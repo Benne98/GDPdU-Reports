@@ -35,3 +35,7 @@ Thumbs.db
 # Rasa trained models (local only)
 rasa/models/
 .rasa/
+
+# Golden-snapshot captures (large, machine-generated; keep the README + harness only)
+backend/golden/*/
+!backend/golden/README.md

@@ -29,6 +29,12 @@ from sqlalchemy.orm import Session
 
 from app.auth import User, current_user
 from app.db import get_session
+# NOTE: ``cache_anomalies`` (DELETE+INSERT on fact_anomaly) is intentionally NOT
+# imported here — the anomalies GET is pure-read so a non-admin user can never
+# trigger a write via GET.  Caching stays available in app.services.anomaly for an
+# explicit admin/internal warm path only.
+from app.services.anomaly import anomaly_to_api, detect_anomalies
+from app.services.entity_visibility import visible_entity_codes
 from app.services.fin_compat_bs import (
     build_bs_consolidation,
     build_bs_l4_trend,
@@ -81,6 +87,8 @@ from app.services.fin_compat_sql import (
     pl_l4_trend_sql,
     resolve_entity_prefix,
 )
+from app.services import anomaly_compute
+from app.services.gl_anomaly_tree import list_account_bookings
 
 logger = logging.getLogger(__name__)
 
@@ -1288,6 +1296,280 @@ def get_financials_entity_breakdown_narratives(
     except Exception as exc:
         logger.exception("overview/entity-breakdown/narratives error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ===========================================================================
+# Anomaly detection (reporting-v2 Phase 6) — additive, request-time compute
+# ===========================================================================
+# Scans the built PL/BS/WC/CF statements for material MoM/YoY swings, sign flips,
+# BS balance breaks and GL concentration, reusing fin_compat_narrative_core
+# thresholds.  Compute on request is the source of truth; results are optionally
+# cached into fact_anomaly.  This endpoint is NOT in the golden catalogue and
+# changes no existing payload.
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies
+# ---------------------------------------------------------------------------
+@router.get("/anomalies")
+def get_financials_anomalies(
+    _user: _UserDep,
+    session: _SessionDep,
+    period_grain: str = Query("month", pattern="^(month|week|year)$"),
+    year: Optional[int] = Query(None, ge=2000, le=2100),
+    month: Optional[int] = Query(None, ge=1, le=12),
+    iso_year: Optional[int] = Query(None),
+    iso_week: Optional[int] = Query(None),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """AnomalyResponse — deterministic anomalies over PL/BS/WC/CF for the period.
+
+    Returns ``{ period, entity, anomalies: [...] }`` ordered by severity then
+    magnitude.  PURE READ: request-time compute is the source of truth and this
+    endpoint NEVER writes to ``fact_anomaly``.  Caching (DELETE+INSERT on
+    ``fact_anomaly``) is intentionally NOT reachable from this GET — it must only be
+    driven by an explicit admin/internal warm path (``cache_anomalies``), so a
+    non-admin user can never trigger a write via a GET request.
+    """
+    _validate_period(period_grain, year, month, iso_year, iso_week)
+    period = {
+        "grain": period_grain, "year": year, "month": month,
+        "iso_year": iso_year, "iso_week": iso_week,
+    }
+    try:
+        anomalies = detect_anomalies(session, period, entity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("anomalies error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    ent = entity if (entity and str(entity).strip().lower() not in ("", "all")) else "all"
+    return {
+        "period": {
+            "grain": period_grain, "year": year, "month": month,
+            "iso_year": iso_year, "iso_week": iso_week,
+        },
+        "entity": ent,
+        "anomalies": [anomaly_to_api(a, period) for a in anomalies],
+    }
+
+
+# ===========================================================================
+# Anomaly analysis tree endpoints (anomaly rework, Phase 4) — PARAM-FREE
+# ===========================================================================
+# The reworked Anomaly Detection page no longer takes entity/period/statement
+# filters: the analyses ALWAYS look across all years and the entity split is
+# shown INSIDE the charts/tables.  These GETs are read-through (compute-on-miss +
+# cache per Phase 3); the consolidated scope is the WHOLE ledger for admins and
+# the union of a restricted user's OWN entity prefixes otherwise (never
+# cross-tenant).  None of these GETs writes to a statement/golden table — the only
+# write is the idempotent ``anomaly_analysis_snapshot`` cache upsert in Phase 3.
+#
+# These REPLACE the earlier per-account/period ``/outliers`` /``/seasonality`` /
+# ``/forensic`` handlers (superseded by the L3→L4→account→booking tree). The
+# statement-level ``/anomalies`` list endpoint above is unchanged.
+
+
+# ---------------------------------------------------------------------------
+# Per-user visibility → ANALYSIS entity prefixes
+# ---------------------------------------------------------------------------
+def _anomaly_entity_prefixes(session: Session, user: User) -> Optional[list[str]]:
+    """Map the user's visibility to the analysis scope as 2-char entity prefixes.
+
+    - admin / unrestricted (``visible_entity_codes`` → None) → ``None`` (consolidated
+      over ALL entities).
+    - restricted user → the sorted set of ``entity_prefix`` values for the user's
+      allowed ``legal_entity_code`` values (resolved via ``dim_legal_entity``, the
+      same table :func:`resolve_entity_prefix` uses).
+
+    The anomaly tree/forensic/overview orchestrators consolidate (sum) over the
+    returned prefixes, so a restricted user with several entities sees the union of
+    only their OWN entities — never the whole ledger / cross-tenant data.
+
+    FAIL-CLOSED: a restricted user (non-None ``allowed``) who resolves to ZERO
+    prefixes raises 403.  An empty list must NEVER be forwarded to the builders —
+    they treat empty/None identically as "all entities" (``_normalise_prefixes``),
+    so returning ``[]`` for a denied user would fall open to the WHOLE ledger.
+    """
+    allowed = visible_entity_codes(session, user)
+    if allowed is None:
+        return None  # admin / unrestricted → consolidated over all entities
+    prefixes: set[str] = set()
+    if allowed:
+        rows = session.execute(
+            text(
+                "SELECT DISTINCT entity_prefix FROM dim_legal_entity "
+                "WHERE legal_entity_code = ANY(:codes)"
+            ),
+            {"codes": sorted(allowed)},
+        ).fetchall()
+        prefixes = {str(r[0]).strip()[:2] for r in rows if r and r[0] is not None}
+        prefixes.discard("")
+    if not prefixes:
+        # Restricted user with no resolvable entity prefixes → deny (never widen
+        # to all entities / cross-tenant data).
+        raise HTTPException(
+            status_code=403,
+            detail="You are not permitted to access any entities for this report.",
+        )
+    return sorted(prefixes)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies/overview
+# ---------------------------------------------------------------------------
+@router.get("/anomalies/overview")
+def get_anomalies_overview(_user: _UserDep, session: _SessionDep) -> dict:
+    """Per-L3 overview cards (P&L then BS), each with outlier/seasonality/forensic
+    flags {status, sentence, deep_link}.  Read-through (compute-on-miss + cache);
+    returns the orchestrator payload plus ``cache_hit``.  PURE READ apart from the
+    idempotent snapshot-cache upsert."""
+    prefixes = _anomaly_entity_prefixes(session, _user)
+    try:
+        return anomaly_compute.get_overview(session, entity_prefixes=prefixes)
+    except Exception:
+        logger.exception("anomalies/overview error")
+        raise HTTPException(
+            status_code=500, detail="Internal error building overview."
+        ) from None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies/outliers
+# ---------------------------------------------------------------------------
+@router.get("/anomalies/outliers")
+def get_anomalies_outliers(_user: _UserDep, session: _SessionDep) -> dict:
+    """Hierarchical OUTLIER tree (L3→L4→account), all history, with per-node
+    z-scores + severity.  Read-through (compute-on-miss + cache); returns the
+    orchestrator payload plus ``cache_hit``."""
+    prefixes = _anomaly_entity_prefixes(session, _user)
+    try:
+        return anomaly_compute.get_outliers(session, entity_prefixes=prefixes)
+    except Exception:
+        logger.exception("anomalies/outliers error")
+        raise HTTPException(
+            status_code=500, detail="Internal error building outliers."
+        ) from None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies/seasonality
+# ---------------------------------------------------------------------------
+@router.get("/anomalies/seasonality")
+def get_anomalies_seasonality(_user: _UserDep, session: _SessionDep) -> dict:
+    """Hierarchical SEASONALITY tree (L3→L4→account), all history, additively
+    decomposed with per-node residual z-scores + severity.  Read-through
+    (compute-on-miss + cache); returns the orchestrator payload plus ``cache_hit``."""
+    prefixes = _anomaly_entity_prefixes(session, _user)
+    try:
+        return anomaly_compute.get_seasonality(session, entity_prefixes=prefixes)
+    except Exception:
+        logger.exception("anomalies/seasonality error")
+        raise HTTPException(
+            status_code=500, detail="Internal error building seasonality."
+        ) from None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies/forensic
+# ---------------------------------------------------------------------------
+@router.get("/anomalies/forensic")
+def get_anomalies_forensic(_user: _UserDep, session: _SessionDep) -> dict:
+    """Position-wise FORENSIC signals (unexpected counter accounts, Other positions,
+    suspicious texts) rolled up to L3/L4 with explanations + entity split.
+    Read-through (compute-on-miss + cache); returns the orchestrator payload plus
+    ``cache_hit``."""
+    prefixes = _anomaly_entity_prefixes(session, _user)
+    try:
+        return anomaly_compute.get_forensic(session, entity_prefixes=prefixes)
+    except Exception:
+        logger.exception("anomalies/forensic error")
+        raise HTTPException(
+            status_code=500, detail="Internal error building forensic."
+        ) from None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/anomalies/bookings
+# ---------------------------------------------------------------------------
+# The lazy leaf of the drill: the largest bookings under one account over all
+# history, scoped to the user's own entity prefixes.  LIVE (never cached); each
+# row carries ``booking_line_id`` for the journal-entry-by-booking drill.
+@router.get("/anomalies/bookings")
+def get_anomalies_bookings(
+    _user: _UserDep,
+    session: _SessionDep,
+    account_number_group: str = Query(..., min_length=1),
+    limit: int = Query(200, ge=1, le=500),
+) -> dict:
+    """Largest bookings under one account (all history, ABS(amount) desc), scoped to
+    the caller's own entity prefixes.  LIVE read (not cached); writes nothing."""
+    ang = str(account_number_group or "").strip()
+    if not ang:
+        raise HTTPException(
+            status_code=422, detail="account_number_group is required.",
+        )
+    prefixes = _anomaly_entity_prefixes(session, _user)
+    try:
+        return list_account_bookings(
+            session, ang, entity_prefixes=prefixes, limit=limit,
+        )
+    except Exception:
+        logger.exception("anomalies/bookings error")
+        raise HTTPException(
+            status_code=500, detail="Internal error listing bookings."
+        ) from None
+
+
+# ===========================================================================
+# Budget granularity view — per-position multi-period historical actuals
+# ===========================================================================
+# Powers the Budget-chat granularity panel: per PLANNABLE reporting position (the
+# same set behind getBudgetTree), a short historical actuals series so the FE can
+# pick the granularity to plan at (position / L4 / account; month-24 or FY3+YTD).
+# PURE READ, additive, NOT in the golden catalogue and changes no existing payload.
+# Reuses gl_analysis_common.build_account_monthly_series (one series pull) +
+# gl_hierarchy roll-ups + budget_service._load_positions + budget_positions; see
+# app/services/granularity_view.py for the contract / windowing / sign rules.
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/budget/granularity-view
+# ---------------------------------------------------------------------------
+@router.get("/budget/granularity-view")
+def get_budget_granularity_view(
+    _user: _UserDep,
+    session: _SessionDep,
+    statement: str = Query("PL", pattern="^(PL|BS)$"),
+    grain: str = Query("month", pattern="^(month|year)$"),
+    entity: Optional[str] = Query(None, description="'' / 'all' = consolidated; a code = per-entity"),
+) -> dict:
+    """Per-position multi-period historical actuals for the Budget granularity view.
+
+    grain='month' → the last 24 ledger months; grain='year' → the 3 most recent
+    fiscal years (full-year) + a current-YTD column.  Each plannable position
+    carries its presented series plus (where meaningful) L4 children and account
+    breakdowns.  Entity-scoped via the budget/anomaly visibility helper
+    (admin → consolidated; restricted → own prefixes, fail-closed)."""
+    from app.services import granularity_view
+
+    prefixes = _anomaly_entity_prefixes(session, _user)  # None=admin, else fail-closed set
+    try:
+        return granularity_view.build_granularity_view(
+            session,
+            statement=statement,
+            grain=grain,
+            entity=entity,
+            entity_prefixes=set(prefixes) if prefixes is not None else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("budget/granularity-view error")
+        raise HTTPException(
+            status_code=500, detail="Internal error building granularity view."
+        ) from None
 
 
 # ---------------------------------------------------------------------------

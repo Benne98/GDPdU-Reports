@@ -402,7 +402,10 @@ class TestCfConsolidation:
         session = _mock_session(grain_rows=grain)
         out = build_cf_statement_compat(session, period_grain="year", year=2025, month=7)
         assert out["period_grain"] == "year"
-        assert out["col_labels"]["ltm"] == "FY25F"
+        # Annual CF mirrors the P&L annual col_labels: ``ltm`` is the trailing-12
+        # label and the forecast lives in its own ``fy_f`` column.
+        assert out["col_labels"]["ltm"] == "LTMJul25A"
+        assert out["col_labels"]["fy_f"] == "FY25F"
         assert out["col_labels"]["plan_cm"] == "FY26P"
         rows = {r["line_code"]: r for r in out["rows"]}
         ebitda = rows.get("CF_EBITDA")
@@ -517,6 +520,140 @@ class TestCfWeekly:
         gross = _row_by_label(out["rows"], "Gross cash flow")
         assert ebitda is not None and ebitda["amounts"][wk_key] == 900
         assert gross is not None and gross["amounts"][wk_key] == 800
+
+
+# ===========================================================================
+# (h) DB-backed reconciliation — live v2 GL (opt-in; auto-skip when unreachable)
+# ===========================================================================
+# Guards the CF *value-sourcing* end-to-end against the real GL, which the
+# DB-free tests above CANNOT do (they inject grains via a mock Session and so
+# stay green even when the underlying dimension is empty).  The all-zero CF
+# regression was caused by an UNPOPULATED ``dim_gl_cf`` (the CF mapping
+# dimension) — the join in ``cf_grain_sql_month`` then matched nothing and every
+# amount silently fell to 0, while the row STRUCTURE (20 rows) looked normal.
+#
+# These tests make that condition LOUD: if ``dim_gl_cf`` has no rows for the test
+# fiscal_year, the reconciliation assertions fail (non-zero EBITDA), so the data
+# gap can never again masquerade as a working-but-zero statement.  They also tie
+# CF EBITDA to the P&L EBITDA and verify Gross cash flow = EBITDA + Taxes and the
+# Net cash flow tie-out, exactly as the orchestrator asked.
+import os
+
+_RECON_YEAR = 2025
+_RECON_MONTH = 7
+
+
+def _v2_session_or_skip():
+    from sqlalchemy import text
+
+    from app.db import SessionLocal
+
+    try:
+        s = SessionLocal()
+        s.execute(text("SELECT 1 FROM dim_gl_cf LIMIT 1"))
+        return s
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"v2 CF recon DB not reachable: {exc}")
+
+
+def _pl_row_value(out, label_or_code: str, key: str) -> float:
+    for r in _walk_rows(out["rows"]):
+        if r.get("line_code") == label_or_code or r.get("label") == label_or_code:
+            return float((r.get("amounts") or {}).get(key) or 0.0)
+    raise AssertionError(f"row {label_or_code!r} not found")
+
+
+@pytest.mark.skipif(
+    os.getenv("DB_NAME", "Finssentials") != "finssentials_v2",
+    reason="CF reconciliation runs only against finssentials_v2 (set DB_NAME)",
+)
+class TestCfReconciliationV2:
+    """CF value-sourcing reconciles to the P&L over the real GL (month + year)."""
+
+    def test_dim_gl_cf_is_populated(self):
+        """The CF mapping dimension MUST have rows for the test year.
+
+        An empty ``dim_gl_cf`` is exactly the gap that zeroes the whole CF
+        statement — assert it explicitly so the failure names the cause instead
+        of surfacing as opaque all-zero amounts downstream.
+        """
+        from sqlalchemy import text
+        session = _v2_session_or_skip()
+        n = int(session.execute(
+            text("SELECT COUNT(*) FROM dim_gl_cf WHERE fiscal_year = :fy"),
+            {"fy": _RECON_YEAR},
+        ).scalar() or 0)
+        assert n > 0, (
+            f"dim_gl_cf has no rows for FY{_RECON_YEAR}: the CF statement will be "
+            "all-zero. Re-ingest the account mapping WITH the cf_l1..cf_l5/"
+            "cf_mapping columns filled (etl.load.upsert_account_mapping) — the CF "
+            "builder/SQL are correct; only the dimension is missing."
+        )
+
+    def test_month_grain_ebitda_reconciles_to_pl(self):
+        from app.services.fin_compat_cf import build_cf_statement_compat
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        session = _v2_session_or_skip()
+
+        cf = build_cf_statement_compat(
+            session, period_grain="month", year=_RECON_YEAR, month=_RECON_MONTH,
+            entity=None,
+        )
+        pl = build_pl_statement_compat(
+            session, period_grain="month", year=_RECON_YEAR, month=_RECON_MONTH,
+            entity=None,
+        )
+
+        cf_rows = {r["line_code"]: r for r in _walk_rows(cf["rows"])}
+        cf_ebitda = cf_rows.get("CF_EBITDA")
+        assert cf_ebitda is not None, "CF_EBITDA row missing from CF structure"
+        cf_eb_ytd = float((cf_ebitda.get("amounts") or {}).get("ytd") or 0.0)
+        cf_eb_cm = float((cf_ebitda.get("amounts") or {}).get("cm") or 0.0)
+
+        # (1) Non-zero — the regression symptom.
+        assert cf_eb_ytd != 0.0, "CF EBITDA YTD is 0 (dim_gl_cf likely empty)"
+        assert cf_eb_cm != 0.0, "CF EBITDA cm is 0 (dim_gl_cf likely empty)"
+
+        # (2) Ties to the P&L EBITDA (same GL, same period; the CF EBITDA leaf is
+        #     the EBITDA carried into the indirect cash flow).
+        pl_eb_ytd = _pl_row_value(pl, "EBITDA", "ytd")
+        pl_eb_cm = _pl_row_value(pl, "EBITDA", "cm")
+        assert cf_eb_ytd == pytest.approx(pl_eb_ytd, rel=1e-6, abs=1.0)
+        assert cf_eb_cm == pytest.approx(pl_eb_cm, rel=1e-6, abs=1.0)
+
+        # (3) Gross cash flow = EBITDA + Taxes (operating intermediate).
+        gross = cf_rows.get("CF_GROSS_CASH_FLOW") or _row_by_label(cf["rows"], "Gross cash flow")
+        taxes = _row_by_label(cf["rows"], "Taxes on income")
+        assert gross is not None and taxes is not None
+        g_ytd = float((gross.get("amounts") or {}).get("ytd") or 0.0)
+        t_ytd = float((taxes.get("amounts") or {}).get("ytd") or 0.0)
+        assert g_ytd != 0.0
+        assert g_ytd == pytest.approx(cf_eb_ytd + t_ytd, rel=1e-6, abs=1.0)
+
+        # (4) Net cash flow non-zero and equals Σ of every mapped CF leaf (YTD).
+        net = _row_by_label(cf["rows"], "Net cash flow")
+        assert net is not None
+        net_ytd = float((net.get("amounts") or {}).get("ytd") or 0.0)
+        assert net_ytd != 0.0
+        leaf_sum = sum(
+            float((r.get("amounts") or {}).get("ytd") or 0.0)
+            for r in _walk_rows(cf["rows"]) if r.get("row_kind") == "line"
+        )
+        assert net_ytd == pytest.approx(leaf_sum, rel=1e-6, abs=1.0)
+
+    def test_year_grain_ebitda_non_zero(self):
+        from app.services.fin_compat_cf import build_cf_statement_compat
+        session = _v2_session_or_skip()
+        out = build_cf_statement_compat(
+            session, period_grain="year", year=_RECON_YEAR, month=_RECON_MONTH,
+            entity=None,
+        )
+        assert out["period_grain"] == "year"
+        rows = {r["line_code"]: r for r in _walk_rows(out["rows"])}
+        eb = rows.get("CF_EBITDA")
+        assert eb is not None
+        # Annual ER-flow YTD column must be non-zero (year grain mirrors P&L annual).
+        assert float((eb.get("amounts") or {}).get("ytd") or 0.0) != 0.0
 
 
 if __name__ == "__main__":  # pragma: no cover

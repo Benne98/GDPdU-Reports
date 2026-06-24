@@ -16,6 +16,9 @@ import {
   RefreshCw,
   Banknote,
   FileText,
+  TrendingUp,
+  CalendarRange,
+  Search,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
@@ -24,16 +27,25 @@ import { useAuth } from '../context/AuthContext'
 // ---------------------------------------------------------------------------
 
 const REPORTING_NAV = [
-  { to: '/overview',          label: 'Overview',          Icon: LayoutDashboard },
-  { to: '/income-statement',  label: 'Income statement',  Icon: BookOpen        },
-  { to: '/balance-sheet',     label: 'Balance sheet',     Icon: Scale           },
-  { to: '/working-capital',   label: 'Working capital',   Icon: RefreshCw       },
-  { to: '/cash-flow',         label: 'Cash flow',         Icon: Banknote        },
-  { to: '/account-statement', label: 'Export', Icon: FileText        },
+  { to: '/overview',            label: 'Overview',            Icon: LayoutDashboard },
+  { to: '/income-statement',    label: 'Income statement',    Icon: BookOpen        },
+  { to: '/balance-sheet',       label: 'Balance sheet',       Icon: Scale           },
+  { to: '/working-capital',     label: 'Working capital',     Icon: RefreshCw       },
+  { to: '/cash-flow',           label: 'Cash flow',           Icon: Banknote        },
+  { to: '/account-statement',   label: 'Export',              Icon: FileText        },
 ] as const
 
-/** Exact paths that belong to the financial-reporting section. */
+/** Exact paths that belong to the financial-reporting section.
+ *  '/anomaly-detection' is deliberately NOT included: it is reached only via the home
+ *  tile and must show an EMPTY page-selection nav (it is not a reporting page). */
 const REPORTING_PATHS: ReadonlySet<string> = new Set(REPORTING_NAV.map(n => n.to))
+
+const ANOMALY_NAV = [
+  { to: '/anomaly-detection',             label: 'Overview',    Icon: LayoutDashboard },
+  { to: '/anomaly-detection/outliers',    label: 'Outliers',    Icon: TrendingUp      },
+  { to: '/anomaly-detection/seasonality', label: 'Seasonality', Icon: CalendarRange   },
+  { to: '/anomaly-detection/forensic',    label: 'Forensic',    Icon: Search          },
+] as const
 
 // ---------------------------------------------------------------------------
 // Logo
@@ -84,6 +96,7 @@ export default function AppHeader() {
   const navigate = useNavigate()
 
   const isReportingRoute = REPORTING_PATHS.has(location.pathname)
+  const isAnomalyRoute = location.pathname.startsWith('/anomaly-detection')
 
   async function handleLogout() {
     await logout()
@@ -131,9 +144,42 @@ export default function AppHeader() {
             </nav>
           )}
 
+          {isAnomalyRoute && (
+            <nav className="flex flex-wrap items-center justify-end gap-0.5">
+              {ANOMALY_NAV.map(({ to, label, Icon }) => {
+                const isActive = to === '/anomaly-detection'
+                  ? location.pathname === '/anomaly-detection'
+                  : location.pathname === to
+                return (
+                  <NavLink
+                    key={to}
+                    to={to}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all duration-150"
+                    style={() => pillStyle(isActive)}
+                    onMouseEnter={e => {
+                      if (!isActive) {
+                        ;(e.currentTarget as HTMLElement).style.color = '#1E3A5F'
+                        ;(e.currentTarget as HTMLElement).style.background = 'rgba(30,58,95,0.05)'
+                      }
+                    }}
+                    onMouseLeave={e => {
+                      if (!isActive) {
+                        ;(e.currentTarget as HTMLElement).style.color = '#475569'
+                        ;(e.currentTarget as HTMLElement).style.background = 'transparent'
+                      }
+                    }}
+                  >
+                    <Icon size={13} aria-hidden />
+                    {label}
+                  </NavLink>
+                )
+              })}
+            </nav>
+          )}
+
           {user && (
             <>
-              {isReportingRoute && (
+              {(isReportingRoute || isAnomalyRoute) && (
                 <div
                   className="mx-4 w-px h-5 flex-shrink-0"
                   style={{ background: '#CBD5E1' }}

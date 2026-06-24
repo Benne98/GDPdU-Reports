@@ -127,13 +127,19 @@ def _latest_period(session: Session, entity: Optional[str]) -> dict:
             safe_ep = str(ep_row[0]).replace("'", "")[:2]
             ent_cond = f"AND e.entity_prefix = '{safe_ep}'"
 
+    # reporting-v2 Phase 3: the synthetic net-profit equity bookings (gl_rows mode)
+    # are posted at the FY year-end (Dec-31) purely to land in the cumulative BS
+    # balance; they are NOT real movements and must not drive the reporting anchor.
+    # Excluding them keeps latest_period identical to report_inject / live (which
+    # have no such rows) — matching this metric's intent (real 'actual' postings).
     row = session.execute(text(f"""
         SELECT
             TO_CHAR(MAX(e.posting_date), 'YYYY-MM')            AS period,
             EXTRACT(ISOYEAR FROM MAX(e.posting_date))::int      AS iso_year,
             EXTRACT(WEEK   FROM MAX(e.posting_date))::int       AS iso_week
         FROM fact_gl_entry e
-        WHERE e.posting_date IS NOT NULL {ent_cond}
+        WHERE e.posting_date IS NOT NULL
+          AND COALESCE(e.entry_type, '') <> 'net_profit' {ent_cond}
     """)).fetchone()
 
     if not row or not row[0]:

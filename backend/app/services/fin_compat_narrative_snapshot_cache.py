@@ -12,9 +12,28 @@ _STMTS = frozenset({"pl", "bs", "cf", "wc"})
 
 
 def entity_scope_key(entity: Optional[str]) -> str:
+    """Snapshot cache scope for an entity, namespaced by the Journal Agent flag.
+
+    The narrative snapshot primary key is
+    ``(fiscal_year, fiscal_month, entity_scope, statement, period_grain)``; both the
+    read (:func:`get_cached_snapshot`) and the write (:func:`save_snapshot`) derive
+    ``entity_scope`` from THIS function, so namespacing it here keeps read/write keys
+    consistent automatically.
+
+    When ``journal_agent_narrative`` is ON the scope gets a ``|ja`` suffix so an
+    OFF-warmed snapshot can never be served while ON (and vice-versa).  When OFF
+    (the default) the scope is byte-identical to the legacy value — no suffix — so
+    existing snapshots and the golden output are untouched.
+    """
+    from app.config import settings
+
     if not entity or str(entity).strip().lower() in ("", "all"):
-        return ""
-    return str(entity).strip()
+        base = ""
+    else:
+        base = str(entity).strip()
+    if settings.journal_agent_narrative:
+        return f"{base}|ja"
+    return base
 
 
 def tables_exist(session: Session) -> bool:

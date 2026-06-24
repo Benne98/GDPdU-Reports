@@ -439,6 +439,140 @@ def fetch_bs_structure(session: Any) -> list[BsStructureLine]:
     return out
 
 
+def _fetch_bs_budget_movements(
+    session: Any,
+    years_list: list[int],
+    *,
+    entity_prefix: Optional[str] = None,
+) -> list[BsMovement]:
+    """BS manual-budget reader (fact_position_plan, statement='BS', scenario='budget').
+
+    STOCK vs MOVEMENT (plan risk, docs §risks):  AR/AP partner budget — and every
+    BS budget position — is stored as a **closing balance (STOCK) per period**, NOT
+    a per-period movement.  The pure BS core (:func:`aggregate_bs`) is CUMULATIVE:
+    a column's value is Σ(movement) for ``(fy,period) <= cutoff``.  Feeding a stock
+    in as if it were a movement would double-count (cumulative sum of stocks).
+
+    So we **delta-encode** the stock into synthetic movements: for each
+    (line_code, fy, period) we emit ``stock(p) − stock(prev)`` where ``prev`` is the
+    immediately-preceding stored period for that line (prior period same year, else
+    closing of the prior year, else 0).  Then the core's cumulative sum up to any
+    cutoff p* exactly reconstructs ``stock(p*)`` — the intended BS budget balance —
+    while still flowing correctly into multi-year cumulative columns.
+
+    The budget is keyed by ``line_code`` (position grain).  The BS core matches on
+    level_2/3/4, so we resolve each line_code → (level_2, level_3, level_4) via the
+    BS rows of ``dim_pl_structure`` and emit movements at that grain.  Partner rows
+    (partner_id<>'') and the position row (partner_id='') for the same line_code are
+    summed together into the position's stock (the roll-up invariant guarantees
+    Σ(partners)+Other == position).  ``amount`` is returned in the STORED GL sign
+    (the BS sign flip lives solely in ``_present_bs``), exactly like the GL path.
+
+    Entity precedence: per-entity rows (entity_prefix=:ep) override consolidated
+    ('') rows for the same line_code; consolidated rows are used only where no
+    per-entity row exists.  Consolidated view (entity_prefix None): the '' row per
+    line_code when one exists (an explicit consolidated override), ELSE the SUM of
+    the per-entity rows (Σ entity budgets) — mirroring the PL position reader.
+
+    GOLDEN-SAFETY: returns [] when no budget BS rows exist for the scope → caller
+    falls back to fact_gl_plan → byte-identical.  The consolidated entity-sum only
+    changes how EXISTING budget rows aggregate; with none, the query matches nothing.
+    """
+    from sqlalchemy import text
+
+    if not years_list:
+        return []
+
+    # line_code → (level_2, level_3, level_4) from the BS structure rows.
+    struct_rows = session.execute(
+        text(
+            "SELECT line_code, level_2, level_3, level_4 "
+            "FROM dim_pl_structure WHERE kpi_code LIKE 'BS:%'"
+        )
+    ).fetchall()
+    code_levels: dict[str, tuple[Any, Any, Any]] = {
+        str(r[0]): (r[1], r[2], r[3]) for r in struct_rows
+    }
+
+    ep = (entity_prefix or "").strip() or None
+    params: dict[str, Any] = {"years": years_list}
+    if ep is None:
+        # Consolidated: '' row per line_code when present (explicit override), ELSE
+        # Σ of the per-entity rows.  A row participates iff it is '' OR it is a
+        # per-entity row with no '' row for the same line_code.
+        ent_clause = (
+            "AND ( p.entity_prefix = '' "
+            "      OR ( p.entity_prefix <> '' "
+            "           AND NOT EXISTS ( "
+            "             SELECT 1 FROM fact_position_plan c "
+            "             WHERE c.statement = 'BS' AND c.scenario = 'budget' "
+            "               AND c.line_code = p.line_code "
+            "               AND c.fiscal_year = p.fiscal_year "
+            "               AND c.entity_prefix = '' ) ) )"
+        )
+    else:
+        params["ep"] = ep
+        ent_clause = (
+            "AND ( p.entity_prefix = :ep "
+            "      OR ( p.entity_prefix = '' "
+            "           AND NOT EXISTS ( "
+            "             SELECT 1 FROM fact_position_plan e "
+            "             WHERE e.statement = 'BS' AND e.scenario = 'budget' "
+            "               AND e.line_code = p.line_code "
+            "               AND e.fiscal_year = p.fiscal_year "
+            "               AND e.entity_prefix = :ep ) ) )"
+        )
+
+    # Σ position-level + partner rows into the line_code stock per (line_code, fy, p).
+    sql = text(f"""
+        SELECT p.line_code, p.fiscal_year, p.fiscal_period,
+               SUM(p.amount) AS stock
+        FROM fact_position_plan p
+        WHERE p.statement = 'BS'
+          AND p.scenario = 'budget'
+          AND p.fiscal_year = ANY(:years)
+          AND p.fiscal_period BETWEEN 1 AND 12
+          {ent_clause}
+        GROUP BY p.line_code, p.fiscal_year, p.fiscal_period
+    """)
+    rows = session.execute(sql, params).fetchall()
+    if not rows:
+        return []
+
+    # stocks[line_code][(fy, period)] = closing balance (stored sign).
+    stocks: dict[str, dict[tuple[int, int], float]] = {}
+    for r in rows:
+        code = str(r[0])
+        stocks.setdefault(code, {})[(int(r[1]), int(r[2]))] = float(r[3])
+
+    out: list[BsMovement] = []
+    for code, by_period in stocks.items():
+        levels = code_levels.get(code)
+        if levels is None:
+            # No structure mapping → cannot be matched by the core; skip (would be
+            # surfaced as unmapped only if it were a movement — but a stock with no
+            # home has no defined level, so we drop it rather than mis-bucket).
+            continue
+        l2, l3, l4 = levels
+        ordered = sorted(by_period.keys())  # lexicographic (fy, period)
+        prev_stock = 0.0
+        for key in ordered:
+            stock = by_period[key]
+            delta = stock - prev_stock
+            prev_stock = stock
+            out.append(
+                BsMovement(
+                    fiscal_year=key[0],
+                    fiscal_period=key[1],
+                    level_2=l2,
+                    level_3=l3,
+                    level_4=l4,
+                    amount=delta,
+                )
+            )
+    return out
+
+
 def fetch_bs_movements(
     session: Any,
     fiscal_years: tuple[int, ...],
@@ -463,6 +597,18 @@ def fetch_bs_movements(
     if entity_prefix:
         entity_clause = "AND a.entity_prefix = :entity"
         params["entity"] = entity_prefix
+
+    if scenario:
+        # Resolution: a requested plan scenario FIRST tries the manual budget
+        # (fact_position_plan, statement='BS') and falls back to fact_gl_plan when
+        # the budget has no BS rows for the scope.  GOLDEN-SAFETY: with no budget
+        # rows this returns [] and we fall through to the legacy fact_gl_plan path
+        # → byte-identical output.
+        budget_mvs = _fetch_bs_budget_movements(
+            session, years_list, entity_prefix=entity_prefix
+        )
+        if budget_mvs:
+            return budget_mvs
 
     if scenario:
         params["scenario"] = scenario

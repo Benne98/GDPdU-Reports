@@ -8,6 +8,7 @@ const EXPLORE_LINKS = [
   { to: '/working-capital', label: 'Working capital' },
   { to: '/cash-flow', label: 'Cash flow' },
   { to: '/fdd-bot', label: 'FDD-Bot' },
+  { to: '/anomaly-detection', label: 'Anomaly Detection' },
 ]
 
 const LEGAL_LINKS = [

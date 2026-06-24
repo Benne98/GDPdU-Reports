@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.services.fin_compat_pl import _load_plan_map, build_pl_statement_compat
 from app.services.fin_compat_sql import (
     col_labels_month,
@@ -332,6 +333,21 @@ def build_pl_narrative(
         movement_noun="the move",
     )
     bullets = core.build_bullets(drivers, ctx)
+
+    # Journal Agent (Phase 6) — merge GL findings into the PL bullets, flag-gated.
+    # Default OFF makes this a literal no-op: detect_gl_findings is NOT called and
+    # the bullet list is byte-identical to the legacy output (golden guard).
+    if settings.journal_agent_narrative:
+        from app.services import anomaly
+        period = {
+            "grain": period_grain, "year": year, "month": month,
+            "iso_year": iso_year, "iso_week": iso_week,
+        }
+        bullets = core.merge_finding_bullets(
+            bullets,
+            anomaly.gl_findings_as_bullets(session, period, entity, "pl"),
+            cap,
+        )
 
     # Net-profit anchor for headline + intro.
     np_row = _find_row(rows, "NET_PROFIT")

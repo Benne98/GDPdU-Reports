@@ -598,6 +598,7 @@ def build_bs_monthly(
     month: int,
     entity: Optional[str] = None,
     span: str = "12m",
+    ent_frag_override: Optional[str] = None,
 ) -> dict[str, Any]:
     """MonthlyResponse for the balance sheet: each ``amounts[YYYY-MM]`` is that
     month-END cumulative balance.
@@ -607,9 +608,16 @@ def build_bs_monthly(
         year-end balances + YTD balance at the anchor month-end).
     Section-aware running-sum subtotals; credit-side flip; net-profit injected
     into equity (and ancestor subtotals incl. E&L); Equity-ratio KPI per column.
+
+    ``ent_frag_override`` (additive, golden-safe): when given, this pre-built
+    entity SQL fragment is used VERBATIM instead of resolving ``entity``.  ``None``
+    preserves the existing single-entity behaviour exactly.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if ent_frag_override is not None:
+        ent_frag = ent_frag_override
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
 
     effective_span = "fy3" if span == "fy3" else "12m"
     if effective_span == "fy3":
@@ -927,13 +935,27 @@ def build_bs_snapshot_annual(
     year: int,
     month: int,
     entity: Optional[str] = None,
+    ent_frag_override: Optional[str] = None,
 ) -> dict[str, Any]:
     """ErSnapshotResponse for the balance sheet — cumulative balances at 4 dates
     (fy_py / fy / cm_py / cm) with snapshot deltas, credit-side flip, net-profit in
     equity, and an Equity-ratio KPI.  Mirrors legacy get_er_balance_sheet.
+
+    ``ent_frag_override`` (additive, golden-safe): when given, this pre-built
+    entity SQL fragment is used VERBATIM instead of resolving ``entity``.  ``None``
+    preserves the existing single-entity behaviour exactly.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if ent_frag_override is not None:
+        ent_frag = ent_frag_override
+        # An override is an entity-restricted scope (single prefix or a union of a
+        # caller's own prefixes); a non-empty fragment means "scoped", so use the
+        # per-scope closing bridge for net profit (closes Assets = E&L), matching
+        # the single-entity branch below.
+        is_entity_scoped = bool(ent_frag.strip())
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
+        is_entity_scoped = bool(ep)
 
     sql, params = bs_snapshot_grain_sql(year, month, ent_frag)
     grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
@@ -943,7 +965,7 @@ def build_bs_snapshot_annual(
     np_sql, np_params = bs_snapshot_net_profit_sql(year, month, ent_frag)
     np_row = session.execute(text(np_sql), np_params).fetchone()
     np_map = dict(np_row._mapping) if (np_row is not None and hasattr(np_row, "_mapping")) else {}
-    if ep:
+    if is_entity_scoped:
         net_profit = _equity_bridge_from_grains(grains, keys)
     else:
         net_profit = {k: float(np_map.get(k) or 0.0) for k in keys}
@@ -1400,6 +1422,7 @@ def build_bs_line_detail(
     timeline_months: int = 12,
     use_llm: bool = True,
     line_mom_keur: Optional[float] = None,
+    concentration_only: bool = False,
 ) -> dict[str, Any]:
     """PlLineDetailResponse for a BS line — CUMULATIVE balances (stock).
 
@@ -1420,13 +1443,16 @@ def build_bs_line_detail(
     d_pm = _bs_last_day(pm_y, pm_m).isoformat()
 
     # Cumulative account balances at CM / PM month-ends (raw stored sign).
+    # reporting-v2 Phase 3: exclude synthetic net-profit equity rows from the raw
+    # account balances (same exclusion as the BS grain; presentation unchanged).
+    _np_guard = "AND COALESCE(e.entry_type,'') <> 'net_profit'"
     acc_sql = text(f"""
         SELECT
             l.account_number_group,
             MAX(a.gl_account_id)   AS gl_account_id,
             MAX(a.account_name)    AS account_name,
-            COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm THEN l.amount ELSE 0 END), 0)::float8 AS balance_cm,
-            COALESCE(SUM(CASE WHEN e.posting_date <= :d_pm THEN l.amount ELSE 0 END), 0)::float8 AS balance_pm
+            COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm {_np_guard} THEN l.amount ELSE 0 END), 0)::float8 AS balance_cm,
+            COALESCE(SUM(CASE WHEN e.posting_date <= :d_pm {_np_guard} THEN l.amount ELSE 0 END), 0)::float8 AS balance_pm
         FROM fact_gl_line l
         JOIN fact_gl_entry e
           ON e.journal_entry_group_number = l.journal_entry_group_number
@@ -1437,8 +1463,8 @@ def build_bs_line_detail(
         WHERE {scope_sql}
           AND e.posting_date <= :d_cm
         GROUP BY l.account_number_group
-        HAVING ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm THEN l.amount ELSE 0 END), 0)) > 0.01
-        ORDER BY ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm THEN l.amount ELSE 0 END), 0)) DESC
+        HAVING ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm {_np_guard} THEN l.amount ELSE 0 END), 0)) > 0.01
+        ORDER BY ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm {_np_guard} THEN l.amount ELSE 0 END), 0)) DESC
         LIMIT 30
     """)
     acc_rows = session.execute(acc_sql, {**base_params, "d_cm": d_cm, "d_pm": d_pm}).fetchall()
@@ -1497,6 +1523,13 @@ def build_bs_line_detail(
             "counter_gl_account_id": None, "counter_account_name": None,
         })
 
+    # Concentration-only fast path (anomaly engine) — skip timeline/sub-lines/commentary.
+    if concentration_only:
+        from app.services.fin_compat_narrative_core import concentration_only_payload
+        return concentration_only_payload(
+            line_code, row.get("balance_title", line_code),
+            year, month, entity, accounts_out, top_bookings)
+
     # 12-month cumulative balance timeline (one balance per month-end).
     periods = _last_12_periods(year, month)[-timeline_months:]
     period_defs = [
@@ -1506,7 +1539,7 @@ def build_bs_line_detail(
     ]
     tl_cases = " ".join(
         f"COALESCE(SUM(CASE WHEN e.posting_date <= '{_bs_last_day(y, m).isoformat()}' "
-        f"THEN l.amount ELSE 0 END),0) AS \"{period_key(y, m)}\","
+        f"{_np_guard} THEN l.amount ELSE 0 END),0) AS \"{period_key(y, m)}\","
         for y, m in periods
     ).rstrip(",")
     tl_sql = text(f"""
@@ -1525,8 +1558,8 @@ def build_bs_line_detail(
         WHERE {scope_sql}
           AND e.posting_date <= :d_cm
         GROUP BY l.account_number_group
-        HAVING ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm THEN l.amount ELSE 0 END),0)) > 0.01
-        ORDER BY ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm THEN l.amount ELSE 0 END),0)) DESC
+        HAVING ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm {_np_guard} THEN l.amount ELSE 0 END),0)) > 0.01
+        ORDER BY ABS(COALESCE(SUM(CASE WHEN e.posting_date <= :d_cm {_np_guard} THEN l.amount ELSE 0 END),0)) DESC
         LIMIT 10
     """)
     tl_rows = session.execute(tl_sql, {**base_params, "d_cm": d_cm}).fetchall()

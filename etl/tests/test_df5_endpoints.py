@@ -42,7 +42,7 @@ from etl import plan_synth as P
 
 
 def _make_gl_plan() -> pd.DataFrame:
-    gl, _ = P.generate_plan(
+    gl, _, _ = P.generate_plan(
         plan_gl_actuals(), plan_sales_actuals(),
         base_fy=2024, current_fy=2025, last_closed_period=2,
         horizon_years=1, growth_rate=0.05,
@@ -51,7 +51,7 @@ def _make_gl_plan() -> pd.DataFrame:
 
 
 def _make_sales_plan() -> pd.DataFrame:
-    _, sales = P.generate_plan(
+    _, sales, _ = P.generate_plan(
         plan_gl_actuals(), plan_sales_actuals(),
         base_fy=2024, current_fy=2025, last_closed_period=2,
         horizon_years=1, growth_rate=0.05,

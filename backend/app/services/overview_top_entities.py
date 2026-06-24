@@ -62,19 +62,26 @@ def rank_top_entities(
     id_field: str,
     rank_by: str = "cm",
     limit: int = 5000,
+    plan_by_id: Optional[dict[Any, float]] = None,
 ) -> list[dict[str, Any]]:
-    """Rank aggregated partner rows and attach deltas / placeholder plan fields.
+    """Rank aggregated partner rows and attach deltas / plan fields.
 
     ``agg_rows`` : one dict per partner, with keys ``name``, ``<id_field>`` and the
                    period sums (kEUR) cm / pm / py_cm / ytd / ytd_py.
     ``id_field`` : 'customer_id' or 'supplier_id'.
     ``rank_by``  : 'cm' (default) or 'ytd' — the descending sort key.
+    ``plan_by_id``: optional {partner_id: plan_cm (kEUR)} — when a partner has a
+                   budget/forecast/plan value it populates ``plan_cm`` and
+                   ``coverage``; partners absent from the map keep 0.0 (today's
+                   behaviour, so an empty map is byte-identical to the old stub).
 
     === FORMULAS ===
       delta_cm_pm = cm  - pm
       delta_cm_py = cm  - py_cm
       delta_ytd   = ytd - ytd_py
       rank        = 1-based position after sorting by ``rank_by`` desc.
+      plan_cm     = plan_by_id[partner_id]  (0.0 if absent)
+      coverage    = cm / |plan_cm| * 100    (0.0 when |plan_cm| < 1e-6)
 
     === WORKED EXAMPLE (rank_by='cm') ===
       A: cm=120, pm=100, py_cm=90, ytd=700, ytd_py=600
@@ -98,6 +105,7 @@ def rank_top_entities(
     kept.sort(key=lambda r: float(r.get(sort_key) or 0.0), reverse=True)
     kept = kept[:limit]
 
+    pm_map = plan_by_id or {}
     out: list[dict[str, Any]] = []
     for i, r in enumerate(kept, start=1):
         cm = round(float(r.get("cm") or 0.0), 2)
@@ -105,6 +113,10 @@ def rank_top_entities(
         py_cm = round(float(r.get("py_cm") or 0.0), 2)
         ytd = round(float(r.get("ytd") or 0.0), 2)
         ytd_py = round(float(r.get("ytd_py") or 0.0), 2)
+        plan_cm = round(float(pm_map.get(r.get(id_field)) or 0.0), 2)
+        coverage = (
+            round(cm / abs(plan_cm) * 100.0, 2) if abs(plan_cm) > 1e-6 else 0.0
+        )
         out.append({
             "rank": i,
             "name": r.get("name"),
@@ -118,8 +130,8 @@ def rank_top_entities(
             "delta_cm_pm": round(cm - pm, 2),
             "delta_cm_py": round(cm - py_cm, 2),
             "delta_ytd": round(ytd - ytd_py, 2),
-            "plan_cm": 0.0,
-            "coverage": 0.0,
+            "plan_cm": plan_cm,
+            "coverage": coverage,
         })
     return out
 
@@ -140,6 +152,97 @@ def _top_entities_col_labels(year: int, month: int) -> dict[str, str]:
         "plan_cm": f"Plan {cm_lbl}",
         "coverage": "Coverage",
     }
+
+
+# ---------------------------------------------------------------------------
+# Plan-cm lookup (budget → forecast/plan → sales/com plan)
+# ---------------------------------------------------------------------------
+
+def _load_partner_plan_cm(
+    session: Session,
+    *,
+    year: int,
+    month: int,
+    is_customer: bool,
+    ent_prefix: Optional[str],
+) -> tuple[dict[Any, float], str]:
+    """Return ({partner_id: plan_cm in kEUR for the anchor month}, plan_mix).
+
+    Resolution (golden-safe; each tier is gated on returning a non-empty map):
+      customers : fact_position_plan partner rows (kind='customer', scenario
+                  'budget') → else fact_sales_plan ('budget'→'forecast'→'plan').
+      suppliers : fact_position_plan partner rows (kind='supplier', scenario
+                  'budget') → else fact_com_plan ('budget'→'forecast'→'plan').
+    Returns ({}, 'py_proxy') when nothing is found → identical to today's stub.
+
+    SIGN/SCALE: values are returned in kEUR (Σ/1000) to match the cm column.
+      * fact_position_plan customer rows are revenue (credit, stored −) → present
+        with ``amount * -1`` (positive), same flip as the P&L/sales reader.
+      * fact_position_plan supplier rows are cost (debit, stored +) → no flip.
+      * fact_sales_plan.gross_sales_plan / fact_com_plan.cost_of_materials_plan are
+        already positive magnitudes (mirror fact_sales / fact_com) → no flip.
+    """
+    params: dict[str, Any] = {"year": year, "month": month}
+    # entity scope for fact_position_plan: prefer the entity's rows; '' = consolidated.
+    if ent_prefix:
+        params["ep"] = str(ent_prefix)[:2]
+        pos_ent = (
+            "AND ( p.entity_prefix = :ep "
+            "      OR ( p.entity_prefix = '' AND NOT EXISTS ("
+            "        SELECT 1 FROM fact_position_plan e "
+            "        WHERE e.statement='PL' AND e.scenario='budget' "
+            "          AND e.partner_kind = p.partner_kind "
+            "          AND e.partner_id = p.partner_id "
+            "          AND e.fiscal_year = p.fiscal_year "
+            "          AND e.entity_prefix = :ep ) ) )"
+        )
+    else:
+        pos_ent = "AND p.entity_prefix = ''"
+
+    kind = "customer" if is_customer else "supplier"
+    sign = "* -1" if is_customer else ""
+    params["kind"] = kind
+    pos_sql = text(f"""
+        SELECT p.partner_id AS pid,
+               COALESCE(SUM(CASE WHEN p.fiscal_period = :month
+                            THEN p.amount {sign} ELSE 0 END), 0) / 1000.0 AS plan_cm
+        FROM fact_position_plan p
+        WHERE p.statement = 'PL'
+          AND p.scenario = 'budget'
+          AND p.partner_kind = :kind
+          AND p.partner_id <> ''
+          AND p.fiscal_year = :year
+          {pos_ent}
+        GROUP BY p.partner_id
+    """)
+    pos_rows = session.execute(pos_sql, params).fetchall()
+    pos_map = {r[0]: float(r[1] or 0.0) for r in pos_rows if abs(float(r[1] or 0.0)) > 1e-9}
+    if pos_map:
+        return pos_map, "budget"
+
+    # Fallback to the per-partner synthetic plan tables (budget→forecast→plan).
+    if is_customer:
+        fact, id_col, val_col = "fact_sales_plan", "customer_id", "gross_sales_plan"
+    else:
+        fact, id_col, val_col = "fact_com_plan", "supplier_id", "cost_of_materials_plan"
+
+    for scenario in ("budget", "forecast", "plan"):
+        sp = dict(params)
+        sp["scenario"] = scenario
+        sql = text(f"""
+            SELECT {id_col} AS pid,
+                   COALESCE(SUM(CASE WHEN fiscal_period = :month
+                                THEN {val_col} ELSE 0 END), 0) / 1000.0 AS plan_cm
+            FROM {fact}
+            WHERE fiscal_year = :year AND scenario = :scenario
+            GROUP BY {id_col}
+        """)
+        rows = session.execute(sql, sp).fetchall()
+        m = {r[0]: float(r[1] or 0.0) for r in rows if abs(float(r[1] or 0.0)) > 1e-9}
+        if m:
+            return m, scenario
+
+    return {}, "py_proxy"
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +339,18 @@ def build_top_entities(
             "ytd_py": float(r.get("ytd_py") or 0.0),
         })
 
-    rows = rank_top_entities(agg_rows, id_field=id_col, rank_by=rank_by, limit=limit)
+    plan_by_id, plan_mix = _load_partner_plan_cm(
+        session, year=year, month=month, is_customer=is_customer, ent_prefix=ep
+    )
+
+    rows = rank_top_entities(
+        agg_rows, id_field=id_col, rank_by=rank_by, limit=limit, plan_by_id=plan_by_id
+    )
 
     return {
         "rows": rows,
         "col_labels": _top_entities_col_labels(year, month),
         "period_grain": "week" if period_grain == "week" else "month",
         "rank_by": rank_by,
-        "plan_mix": "py_proxy",
+        "plan_mix": plan_mix,
     }

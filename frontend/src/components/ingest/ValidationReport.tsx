@@ -18,6 +18,11 @@ interface ValidationReportProps {
   onExcludeLines?: (lineIds: number[]) => void | Promise<void>;
   onClearExclusions?: () => void | Promise<void>;
   validateContext?: ValidateContext;
+  /**
+   * When true the "Import data" commit button is hidden.
+   * Used by wizards that collect staged validation results without writing to the DB yet.
+   */
+  hideCommit?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +726,7 @@ export default function ValidationReport({
   onExcludeLines,
   onClearExclusions,
   validateContext,
+  hideCommit = false,
 }: ValidationReportProps) {
   const [warningAction, setWarningAction] = useState<WarningAction | null>(null);
 
@@ -972,32 +978,34 @@ export default function ValidationReport({
 
       {key_preview.length > 0 && <KeyPreview rows={key_preview} />}
 
-      {/* Import action */}
-      <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-3">
-        <div className="text-sm text-slate-600">
-          {hasBlocking
-            ? hasSoftWarnings
-              ? "Fix the required issues first. You can acknowledge warnings afterwards."
-              : "Resolve the blocking issues above, then run checks again."
-            : hasSoftWarnings && !warningsReviewed
-            ? "Acknowledge or ignore the warnings above to enable import."
-            : hasSoftWarnings
-            ? "Import is enabled — click Import data below."
-            : "All checks passed. You can import now."}
+      {/* Import action — hidden in staging/wizard mode */}
+      {!hideCommit && (
+        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <div className="text-sm text-slate-600">
+            {hasBlocking
+              ? hasSoftWarnings
+                ? "Fix the required issues first. You can acknowledge warnings afterwards."
+                : "Resolve the blocking issues above, then run checks again."
+              : hasSoftWarnings && !warningsReviewed
+              ? "Acknowledge or ignore the warnings above to enable import."
+              : hasSoftWarnings
+              ? "Import is enabled — click Import data below."
+              : "All checks passed. You can import now."}
+          </div>
+          <button
+            type="button"
+            disabled={!canImport || committing}
+            onClick={handleCommitClick}
+            className={`rounded-md px-5 py-2 text-sm font-semibold transition ${
+              !canImport || committing
+                ? "bg-slate-200 text-slate-400 cursor-not-allowed"
+                : "bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800"
+            }`}
+          >
+            {committing ? "Importing… (large files may take several minutes)" : "Import data"}
+          </button>
         </div>
-        <button
-          type="button"
-          disabled={!canImport || committing}
-          onClick={handleCommitClick}
-          className={`rounded-md px-5 py-2 text-sm font-semibold transition ${
-            !canImport || committing
-              ? "bg-slate-200 text-slate-400 cursor-not-allowed"
-              : "bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800"
-          }`}
-        >
-          {committing ? "Importing… (large files may take several minutes)" : "Import data"}
-        </button>
-      </div>
+      )}
     </div>
   );
 }

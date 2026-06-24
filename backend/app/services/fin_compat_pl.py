@@ -42,6 +42,7 @@ from app.services.fin_compat_sql import (
     pl_monthly_grain_sql,
     pl_weekly_breakdown_sql,
     plan_grain_sql,
+    position_plan_grain_sql,
     resolve_entity_prefix,
     weekly_breakdown_layout,
 )
@@ -322,7 +323,19 @@ def _load_plan_map(
     year: int, month: int,
     ent_frag: str,
 ) -> dict[str, dict[str, float]]:
-    """Load plan data from fact_gl_plan; prefer 'forecast', fallback to 'plan'.
+    """Load plan data; resolution order budget → forecast → plan (first with signal).
+
+    * ``budget``   reads ``fact_position_plan`` (Phase 3 manual budget) at POSITION
+                   grain — partner rows already rolled into their line_code — keyed
+                   by ``line_code`` directly (no level-based ``_match_grain``).
+    * ``forecast`` / ``plan`` read ``fact_gl_plan`` via :func:`plan_grain_sql` and
+                   map grain → structure by level_2/3/4 (``_match_grain``).
+
+    GOLDEN-SAFETY: every scenario is gated by ``has_signal``; an EMPTY budget read
+    produces no signal and falls through to forecast/plan → byte-identical to the
+    pre-budget behaviour whenever no budget rows exist.  The budget position-grain
+    SQL applies the SAME ``amount * -1`` presentation flip as ``plan_grain_sql`` so
+    a budget value never desyncs the sign vs the fact_gl_plan path.
 
     Subtotal/calc/grandtotal plan values use the SAME running-sum semantics as
     actuals — the cumulative sum of the mapping-line plan values above them — so
@@ -332,25 +345,46 @@ def _load_plan_map(
                  if _is_pl_structure_row(r)]
     plan_keys = ["plan_cm", "ytd_plan", "ytg"]
 
-    for scenario in ("forecast", "plan"):
-        sql, params = plan_grain_sql(year, month, ent_frag, scenario)
-        plan_grains = [
-            dict(r._mapping) for r in session.execute(text(sql), params).fetchall()
-        ]
-        if not plan_grains:
-            continue
-
-        mapping_plan: dict[str, dict[str, float]] = {}
-        for r in struct_pl:
-            if r.get("row_type") != "mapping":
+    for scenario in ("budget", "forecast", "plan"):
+        if scenario == "budget":
+            # Position-grain budget: key grain rows by line_code directly.
+            sql, params = position_plan_grain_sql(year, month, ent_frag, "PL")
+            plan_grains = [
+                dict(r._mapping) for r in session.execute(text(sql), params).fetchall()
+            ]
+            if not plan_grains:
                 continue
-            code = r["line_code"]
-            acc: dict[str, float] = {k: 0.0 for k in plan_keys}
-            for g in plan_grains:
-                if _match_grain(g, r):
-                    for k in plan_keys:
-                        acc[k] += float(g.get(k) or 0)
-            mapping_plan[code] = acc
+            by_code = {str(g.get("line_code")): g for g in plan_grains}
+            mapping_plan = {}
+            for r in struct_pl:
+                if r.get("row_type") != "mapping":
+                    continue
+                code = r["line_code"]
+                g = by_code.get(str(code))
+                mapping_plan[code] = (
+                    {k: float(g.get(k) or 0.0) for k in plan_keys}
+                    if g is not None
+                    else {k: 0.0 for k in plan_keys}
+                )
+        else:
+            sql, params = plan_grain_sql(year, month, ent_frag, scenario)
+            plan_grains = [
+                dict(r._mapping) for r in session.execute(text(sql), params).fetchall()
+            ]
+            if not plan_grains:
+                continue
+
+            mapping_plan = {}
+            for r in struct_pl:
+                if r.get("row_type") != "mapping":
+                    continue
+                code = r["line_code"]
+                acc: dict[str, float] = {k: 0.0 for k in plan_keys}
+                for g in plan_grains:
+                    if _match_grain(g, r):
+                        for k in plan_keys:
+                            acc[k] += float(g.get(k) or 0)
+                mapping_plan[code] = acc
 
         running = _compute_running_values(struct_pl, mapping_plan, plan_keys)
         line_plan = {
@@ -667,6 +701,7 @@ def build_pl_annual_compat(
     year: int,
     month: int,
     entity: Optional[str] = None,
+    ent_frag_override: Optional[str] = None,
 ) -> dict[str, Any]:
     """Annual (exit-readiness flow) P&L — FY/YTD/LTM columns over the GDPdU GL.
 
@@ -698,9 +733,17 @@ def build_pl_annual_compat(
       * invert_delta lines have their three deltas negated.
       * entity=None → no entity filter; fiscal_period 13 excluded in the SQL.
       * month == 12 → LTM/LTM_PY are full calendar years (see pl_grain_sql_annual).
+
+    ``ent_frag_override`` (additive, golden-safe): when given, this pre-built
+    entity SQL fragment is used VERBATIM instead of resolving ``entity`` — lets
+    callers scope to a multi-prefix union (e.g. a restricted user's own
+    entities).  ``None`` preserves the existing single-entity behaviour exactly.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if ent_frag_override is not None:
+        ent_frag = ent_frag_override
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
 
     sql, params = pl_grain_sql_annual(year, month, ent_frag)
     grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
@@ -1324,6 +1367,7 @@ def build_pl_monthly(
     iso_week: Optional[int] = None,
     entity: Optional[str] = None,
     span: str = "12m",
+    ent_frag_override: Optional[str] = None,
 ) -> dict[str, Any]:
     """Monthly sparkline view per P&L line.
 
@@ -1347,9 +1391,16 @@ def build_pl_monthly(
         * week grain ignores span (always last 3 months, no totals).
         * span='fy3' with month==12 → anchor year contributes all 12 months.
         * total denominator ~0 → KPI total column 0.
+
+    ``ent_frag_override`` (additive, golden-safe): when given, this pre-built
+    entity SQL fragment is used VERBATIM instead of resolving ``entity``.  ``None``
+    preserves the existing single-entity behaviour exactly.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if ent_frag_override is not None:
+        ent_frag = ent_frag_override
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
 
     totals: list[dict[str, Any]] = []
     effective_span = "12m"

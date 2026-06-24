@@ -5821,6 +5821,611 @@ export const api = {
     is_active: boolean
   }): Promise<AdminUser> =>
     put(`/api/v1/admin/users/${id}`, body),
+
+  // ── Anomaly Detection ──────────────────────────────────────────────────────
+
+  financialsAnomalies: (
+    params: AnomalyPeriodParams,
+    entity?: string,
+  ): Promise<AnomaliesResponse> => {
+    const q: Record<string, string | number | undefined> = {
+      period_grain: params.period_grain,
+      entity,
+    }
+    if (params.period_grain === 'week') {
+      q.iso_year = params.iso_year
+      q.iso_week = params.iso_week
+    } else {
+      q.year = params.year
+      if (params.period_grain === 'month') q.month = params.month
+    }
+    // Anomaly detection scans P&L/BS/WC/CF + GL concentration — can take ~40s on large
+    // datasets, well over the default 60s but bounded; allow generous headroom.
+    return get('/api/v1/financials/anomalies', q, { timeoutMs: 180_000 })
+  },
+
+  financialsOutliers: (
+    params: AnomalyPeriodParams,
+    entity?: string,
+    statement: OutlierStatement = 'all',
+  ): Promise<OutliersResponse> => {
+    const q: Record<string, string | number | undefined> = {
+      period_grain: params.period_grain,
+      entity,
+      statement,
+    }
+    if (params.period_grain === 'week') {
+      q.iso_year = params.iso_year
+      q.iso_week = params.iso_week
+    } else {
+      q.year = params.year
+      if (params.period_grain === 'month') q.month = params.month
+    }
+    // One bounded all-history pull per period/entity; the σ slider re-thresholds
+    // client-side (no refetch). Generous timeout — the wide grouped query is bounded.
+    return get('/api/v1/financials/anomalies/outliers', q, { timeoutMs: 120_000 })
+  },
+
+  financialsSeasonality: (
+    params: AnomalyPeriodParams,
+    entity?: string,
+    statement: SeasonalityStatement = 'all',
+  ): Promise<SeasonalityResponse> => {
+    const q: Record<string, string | number | undefined> = {
+      period_grain: params.period_grain,
+      entity,
+      statement,
+    }
+    if (params.period_grain === 'week') {
+      q.iso_year = params.iso_year
+      q.iso_week = params.iso_week
+    } else {
+      q.year = params.year
+      if (params.period_grain === 'month') q.month = params.month
+    }
+    // One bounded all-history pull per period/entity; the σ slider re-thresholds
+    // off-season months client-side (no refetch). Generous timeout — the wide grouped
+    // query plus the per-account additive decomposition is bounded.
+    return get('/api/v1/financials/anomalies/seasonality', q, { timeoutMs: 120_000 })
+  },
+
+  financialsForensic: (
+    params: AnomalyPeriodParams,
+    entity?: string,
+  ): Promise<ForensicResponse> => {
+    const q: Record<string, string | number | undefined> = {
+      period_grain: params.period_grain,
+      entity,
+    }
+    if (params.period_grain === 'week') {
+      q.iso_year = params.iso_year
+      q.iso_week = params.iso_week
+    } else {
+      q.year = params.year
+      if (params.period_grain === 'month') q.month = params.month
+    }
+    // Forensic analysis: co-occurrence learner over the full GL history + self-join on
+    // journal entries — can be slow on a cold cache. Allow generous headroom (180 s).
+    return get('/api/v1/financials/anomalies/forensic', q, { timeoutMs: 180_000 })
+  },
+
+  // ── Project Setup (Phase 7) ──────────────────────────────────────────────
+
+  getProject: (id = 'default'): Promise<ProjectConfigResponse> =>
+    get(`/api/v1/projects/${id}`),
+
+  putProject: (id = 'default', config: ProjectConfig): Promise<ProjectConfigResponse> =>
+    put(`/api/v1/projects/${id}`, config),
+
+  rebuildProject: (id = 'default'): Promise<RebuildResponse> =>
+    post(`/api/v1/projects/${id}/rebuild`, {}),
+
+  financialsAnomalyOverview: (): Promise<AnomalyOverviewResponse> =>
+    get('/api/v1/financials/anomalies/overview', {}, { timeoutMs: 180_000 }),
+
+  financialsAnomalyOutliers: (): Promise<AnomalyTreeResponse> =>
+    get('/api/v1/financials/anomalies/outliers', {}, { timeoutMs: 180_000 }),
+
+  financialsAnomalySeasonality: (): Promise<AnomalyTreeResponse> =>
+    get('/api/v1/financials/anomalies/seasonality', {}, { timeoutMs: 180_000 }),
+
+  financialsAnomalyForensic: (): Promise<ForensicPositionsResponse> =>
+    get('/api/v1/financials/anomalies/forensic', {}, { timeoutMs: 180_000 }),
+
+  financialsAnomalyBookings: (
+    accountNumberGroup: string,
+    limit = 200,
+  ): Promise<AnomalyBookingsResponse> =>
+    get('/api/v1/financials/anomalies/bookings', {
+      account_number_group: accountNumberGroup,
+      limit,
+    }, { timeoutMs: 60_000 }),
+}
+
+// ─── Anomaly Detection types ──────────────────────────────────────────────────
+
+export type AnomalyKind =
+  | 'mom_swing'
+  | 'yoy_swing'
+  | 'sign_flip'
+  | 'balance_break'
+  | 'gl_concentration'
+
+export type AnomalySeverity = 'high' | 'medium' | 'low'
+
+export type AnomalyStatement = 'pl' | 'bs' | 'wc' | 'cf'
+
+export interface AnomalyItem {
+  id: string
+  statement: AnomalyStatement
+  line_code: string
+  label: string
+  kind: AnomalyKind
+  severity: AnomalySeverity
+  period_label: string
+  entity: string
+  value: number
+  delta: number
+  magnitude_eur: number
+  description: string
+}
+
+export type AnomalyPeriodGrain = 'year' | 'month' | 'week'
+
+export type AnomalyPeriodParams =
+  | { period_grain: 'year'; year: number }
+  | { period_grain: 'month'; year: number; month: number }
+  | { period_grain: 'week'; iso_year: number; iso_week: number }
+
+export interface AnomalyPeriodMeta {
+  grain: AnomalyPeriodGrain
+  year?: number
+  month?: number
+  iso_year?: number
+  iso_week?: number
+}
+
+export interface AnomaliesResponse {
+  period: AnomalyPeriodMeta
+  entity: string
+  anomalies: AnomalyItem[]
+}
+
+// ─── Outliers (Journal Agent, Phase 1) ────────────────────────────────────────
+// Per material GL account: the all-history monthly value series with a per-point
+// mean-residual z-score + stats(mean/std/n). The σ threshold (|z| >= σ) is applied
+// CLIENT-side via a slider — the server returns the full series, never the flags.
+
+export type OutlierStatement = 'all' | 'pl' | 'bs'
+
+export interface OutlierPoint {
+  period_key: string
+  label: string
+  value_keur: number
+  residual_keur: number
+  z: number
+}
+
+export interface OutlierStats {
+  mean_keur: number
+  std_keur: number
+  n: number
+}
+
+export interface OutlierAccount {
+  gl_account_id: string
+  account_name: string
+  statement: string
+  level_2: string
+  level_3: string
+  entity_prefix: string
+  series: OutlierPoint[]
+  stats: OutlierStats
+}
+
+export interface OutliersMeta {
+  sigma_default: number
+  sigma_min: number
+  sigma_max: number
+  algorithm_version: string
+}
+
+export interface OutliersPeriodMeta extends AnomalyPeriodMeta {
+  label: string
+}
+
+export interface OutliersResponse {
+  period: OutliersPeriodMeta
+  entity: string
+  statement: OutlierStatement
+  accounts: OutlierAccount[]
+  meta: OutliersMeta
+}
+
+// ─── Seasonality (Journal Agent, Phase 2) ─────────────────────────────────────
+// Per material GL account: the all-history monthly value series ADDITIVELY decomposed
+// into trend + seasonal_index + residual, with a per-point residual z-score, the 12
+// seasonal factors, and stats(resid_std/n). Off-season (|z| >= σ) is applied
+// CLIENT-side via a slider — the server returns the full series, never the flags.
+// Additive (not multiplicative) because GL values can be zero/negative. trend/z can be
+// null at the series ends (NaN trend); resid_std == 0 → no flags.
+
+export type SeasonalityStatement = 'all' | 'pl' | 'bs'
+
+export interface SeasonalityPoint {
+  period_key: string
+  label: string
+  fiscal_period: number
+  actual_keur: number
+  trend_keur: number | null
+  seasonal_index: number
+  expected_keur: number | null
+  residual_keur: number | null
+  z: number | null
+}
+
+export interface SeasonalityMonthFactor {
+  month: number
+  seasonal_index: number
+}
+
+export interface SeasonalityStats {
+  resid_std_keur: number
+  n: number
+}
+
+export interface SeasonalityAccount {
+  gl_account_id: string
+  account_name: string
+  statement: string
+  level_2: string
+  level_3: string
+  entity_prefix: string
+  insufficient_history: boolean
+  series: SeasonalityPoint[]
+  month_index: SeasonalityMonthFactor[]
+  stats: SeasonalityStats
+}
+
+export interface SeasonalityMeta {
+  sigma_default: number
+  sigma_min: number
+  sigma_max: number
+  min_years: number
+  algorithm_version: string
+}
+
+export interface SeasonalityResponse {
+  period: OutliersPeriodMeta
+  entity: string
+  statement: SeasonalityStatement
+  accounts: SeasonalityAccount[]
+  meta: SeasonalityMeta
+}
+
+// ─── Forensic (Journal Agent, Phase 4) ────────────────────────────────────────
+// Three signals for manual-entry / counter-account review:
+//   1. unexpected_counter_accounts — counter GL accounts that are new or rare (< freq_threshold_pct)
+//      for a given debit/credit account, learned over the full GL history excl. the analysed period.
+//   2. other_positions — material / growing "Other" P&L / BS accounts (matched by token).
+//   3. suspicious_texts — booking lines whose line_note matches a suspicious keyword.
+// The backend contract is read-only GET; the frontend never writes.
+
+export type ForensicNovelty = 'new' | 'rare'
+
+export interface CounterAccountRow {
+  gl_account_id: string
+  account_name: string
+  counter_gl_account_id: string
+  counter_account_name: string
+  booking_line_id: number
+  journal_entry_number: string
+  posting_date: string
+  amount_keur: number
+  line_note: string
+  pair_freq: number
+  acct_total_pairs: number
+  freq_pct: number
+  novelty: ForensicNovelty
+}
+
+export interface OtherPositionRow {
+  gl_account_id: string
+  account_name: string
+  level_path: string
+  balance_cm_keur: number
+  balance_pm_keur: number
+  delta_keur: number
+  yoy_keur: number
+  growth_pct: number
+  matched_token: string
+}
+
+export interface SuspiciousTextRow {
+  booking_line_id: number
+  gl_account_id: string
+  account_name: string
+  posting_date: string
+  amount_keur: number
+  line_note: string
+  matched_keyword: string
+  journal_entry_number: string
+}
+
+export interface ForensicMeta {
+  freq_threshold_pct: number
+  algorithm_version: string
+}
+
+export interface ForensicResponse {
+  period: OutliersPeriodMeta
+  entity: string
+  unexpected_counter_accounts: CounterAccountRow[]
+  other_positions: OtherPositionRow[]
+  suspicious_texts: SuspiciousTextRow[]
+  meta: ForensicMeta
+}
+
+// ─── Anomaly Tree types (param-free endpoints, Phase 4/6) ────────────────────
+
+export type AnomalyStatus = 'high' | 'medium' | 'low' | 'none'
+
+export interface AnomalyFlag {
+  status?: AnomalyStatus
+  sentence?: string
+  deep_link: string
+  score?: number
+  band?: string
+}
+
+export interface AnomalyOverviewCard {
+  key: string
+  label: string
+  level_0: string
+  level_3: string
+  statement: string
+  max_severity: AnomalyStatus
+  signal_score?: number
+  band?: string
+  headline?: string
+  bullets?: string[]
+  spark_series?: Array<{ label: string; value: number; expected: number | null; signal_score: number }>
+  flags: {
+    outliers: AnomalyFlag
+    seasonality: AnomalyFlag
+    forensic: AnomalyFlag
+  }
+}
+
+export interface AnomalyOverviewResponse {
+  analysis: string
+  cards: AnomalyOverviewCard[]
+  groups: { pl: string[]; bs: string[] }
+  meta: Record<string, unknown>
+  cache_hit: boolean
+}
+
+// Tree node types (outliers + seasonality share the same shape)
+export interface OutlierSeriesPoint {
+  period_key: string
+  label: string
+  value_keur: number
+  residual_keur: number
+  z: number
+  signal_score?: number
+}
+
+export interface OutlierPayloadStats {
+  mean_keur: number
+  std_keur: number
+  n: number
+}
+
+export interface OutlierNodePayload {
+  series: OutlierSeriesPoint[]
+  stats: OutlierPayloadStats
+  regression?: { slope: number; intercept: number; r_squared: number; trend_start: number; trend_end: number } | null
+  histogram?: Array<{ bin_lo: number; bin_hi: number; count: number }> | null
+  distribution?: { min: number; max: number; median: number; q1: number; q3: number; iqr: number } | null
+}
+
+export interface SeasonalSeriesPoint {
+  period_key: string
+  label: string
+  fiscal_period: number
+  actual_keur: number
+  trend_keur: number | null
+  seasonal_index: number | null
+  expected_keur: number | null
+  residual_keur: number | null
+  z: number | null
+  signal_score?: number
+}
+
+export interface SeasonalMonthIndex {
+  month: number
+  seasonal_index: number
+}
+
+export interface SeasonalPayloadStats {
+  resid_std_keur: number
+  n: number
+  insufficient_history: boolean
+}
+
+export interface SeasonalNodePayload {
+  series: SeasonalSeriesPoint[]
+  month_index: SeasonalMonthIndex[]
+  stats: SeasonalPayloadStats
+  insufficient_history: boolean
+  regression?: { slope: number; intercept: number; r_squared: number; trend_start: number; trend_end: number } | null
+  histogram?: Array<{ bin_lo: number; bin_hi: number; count: number }> | null
+  distribution?: { min: number; max: number; median: number; q1: number; q3: number; iqr: number } | null
+}
+
+export interface AnomalyTreeNode {
+  level: 'level_3' | 'level_4' | 'account'
+  key: string
+  label: string
+  level_0: string
+  level_2?: string
+  level_3?: string
+  level_4?: string
+  statement: string
+  gl_account_id?: string
+  account_number_group?: string
+  payload: OutlierNodePayload | SeasonalNodePayload
+  max_abs_z: number
+  severity: AnomalyStatus
+  signal_score?: number
+  band?: string
+  entity_split: Record<string, unknown>
+  members: string[]
+  children: AnomalyTreeNode[]
+}
+
+export interface AnomalyTreeResponse {
+  analysis: 'outliers' | 'seasonality'
+  tree: AnomalyTreeNode[]
+  meta: Record<string, unknown>
+  cache_hit: boolean
+}
+
+// Forensic position-level types
+export interface ForensicWorstExample {
+  account_name?: string
+  gl_account_id?: string
+  counter_account_name?: string
+  counter_gl_account_id?: string
+  amount_keur?: number
+  posting_date?: string | null
+  line_note?: string
+  freq_pct?: number
+  novelty?: string
+  entity_prefix?: string
+}
+
+export interface ForensicEvidenceRow {
+  booking_line_id?: number
+  journal_entry_number?: string
+  account_name?: string
+  gl_account_id?: string
+  counter_account_name?: string
+  counter_gl_account_id?: string
+  amount_keur?: number
+  posting_date?: string | null
+  line_note?: string
+  freq_pct?: number
+  pair_freq?: number
+  novelty?: string
+  entity_prefix?: string
+}
+
+export interface ForensicEntitySplit {
+  [entity_prefix: string]: { count?: number; abs_amount_keur?: number; balance_cm_keur?: number; delta_keur?: number }
+}
+
+export interface ForensicCounterPosition {
+  position: string
+  level_0: string
+  level_2: string
+  level_3: string
+  level_4: string
+  new_count: number
+  rare_count: number
+  flag_count: number
+  abs_amount_keur: number
+  distinct_counter_accounts: number
+  worst_example: ForensicWorstExample
+  entity_split: ForensicEntitySplit
+  evidence: ForensicEvidenceRow[]
+}
+
+export interface ForensicOtherPosition {
+  position: string
+  level_0: string
+  level_2: string
+  level_3: string
+  level_4: string
+  balance_cm_keur: number
+  balance_pm_keur: number
+  delta_keur: number
+  yoy_keur: number
+  growth_pct: number
+  matched_token: string | null
+  account_count: number
+  entity_split: ForensicEntitySplit
+  evidence: Array<{
+    gl_account_id?: string
+    account_name?: string
+    level_path?: string
+    balance_cm_keur?: number
+    balance_pm_keur?: number
+    delta_keur?: number
+    yoy_keur?: number
+    growth_pct?: number
+    matched_token?: string
+    entity_prefix?: string
+  }>
+}
+
+export interface ForensicSuspiciousText {
+  booking_line_id?: number
+  journal_entry_number?: string
+  account_name?: string
+  gl_account_id?: string
+  amount_keur?: number
+  posting_date?: string | null
+  line_note?: string
+  matched_keyword?: string
+  entity_prefix?: string
+  position?: string
+  level_path?: string
+}
+
+export interface ForensicPositionsMeta {
+  entity_prefixes?: string[]
+  anchor?: { year: number; month: number } | null
+  freq_threshold_pct?: number
+  algorithm_version?: string
+  base_algorithm_version?: string
+  llm_used?: boolean
+  explanations: Record<string, string>
+  columns_help: Record<string, Record<string, string>>
+  report_views?: Record<string, { headline: string; bullets: string[]; omitted_count?: number }>
+  omitted_counts?: Record<string, number>
+}
+
+export interface ForensicPositionsResponse {
+  unexpected_counter_positions: ForensicCounterPosition[]
+  other_positions: ForensicOtherPosition[]
+  suspicious_texts: ForensicSuspiciousText[]
+  meta: ForensicPositionsMeta
+  cache_hit: boolean
+}
+
+// Bookings drill
+export interface AnomalyBookingRow {
+  booking_line_id: number
+  journal_entry_group_number: string
+  journal_entry_number: string
+  entity_prefix: string
+  fiscal_year: number | null
+  fiscal_period: number | null
+  amount_keur: number
+  line_note: string
+  posting_date: string | null
+  z: number
+  large_booking: boolean
+  counter_account_id: string | null
+  counter_account_name: string | null
+}
+
+export interface AnomalyBookingsResponse {
+  account_number_group: string
+  bookings: AnomalyBookingRow[]
+  stats: { n: number }
+  meta?: Record<string, unknown>
 }
 
 export interface InternalContact {
@@ -5959,6 +6564,45 @@ export interface ActionBoard {
   }>
   activity_log?: Array<{ type?: string; at?: string; message?: string }>
   evidence?: Array<{ pin_id?: string; label?: string; route?: string }>
+}
+
+// ─── Project Setup types (Phase 7) ───────────────────────────────────────────
+
+export interface ProjectEntity {
+  code:   string
+  prefix: string
+  name:   string
+}
+
+export type OpeningBalanceMode  = 'in_data' | 'file' | 'carry_forward'
+export type NetProfitSource     = 'report_inject' | 'gl_rows'
+export type MappingSource       = 'library' | 'client_coa'
+export type PartnerMasterSource = 'files' | 'gdpdu'
+
+export interface ProjectConfig {
+  name:                  string
+  fy_start_month:        number
+  entities:              ProjectEntity[]
+  opening_balance_mode:  OpeningBalanceMode
+  net_profit_source:     NetProfitSource
+  mapping_source:        MappingSource
+  partner_master_source: PartnerMasterSource
+  sales_label:           string
+  cost_label:            string
+}
+
+/** Backend GET /api/v1/projects/{id} returns the config NESTED under `config`,
+ *  with name + fy_start_month also mirrored at the top level (dim_project columns). */
+export interface ProjectConfigResponse {
+  project_id: string
+  name: string
+  fy_start_month: number
+  config: ProjectConfig
+}
+
+export interface RebuildResponse {
+  status:  string
+  message: string
 }
 
 // ─── Admin types ──────────────────────────────────────────────────────────────

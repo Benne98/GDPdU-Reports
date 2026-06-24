@@ -916,6 +916,7 @@ def build_cf_line_detail(
     timeline_months: int = 12,
     use_llm: bool = True,
     line_mom_keur: Optional[float] = None,
+    concentration_only: bool = False,
 ) -> dict[str, Any]:
     """PlLineDetailResponse for a CF line — period-FLOW account detail.
 
@@ -1032,6 +1033,12 @@ def build_cf_line_detail(
             "line_note": b[8] or "", "reference": b[9] or "",
             "counter_gl_account_id": None, "counter_account_name": None,
         })
+
+    # Concentration-only fast path (anomaly engine) — skip timeline/sub-lines/commentary.
+    if concentration_only:
+        from app.services.fin_compat_narrative_core import concentration_only_payload
+        return concentration_only_payload(
+            line_code, cf_title, year, month, entity, accounts_out, top_bookings)
 
     # 12-month flow timeline (one flow per month) for the top accounts.
     periods = _last_12_periods(year, month)[-timeline_months:]

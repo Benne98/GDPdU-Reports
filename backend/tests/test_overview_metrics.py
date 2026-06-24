@@ -329,6 +329,18 @@ def _top_mock_session(raw_rows: list[dict]):
 
     def _execute(stmt, params=None):
         result = MagicMock()
+        sql = str(stmt)
+        # The Phase-3 plan-cm lookup issues separate queries against the plan
+        # tables; with no budget/forecast/plan rows they return empty (the default,
+        # golden-safe path → plan_mix stays 'py_proxy').
+        if (
+            "fact_position_plan" in sql
+            or "fact_sales_plan" in sql
+            or "fact_com_plan" in sql
+        ):
+            result.fetchall.return_value = []
+            result.fetchone.return_value = None
+            return result
         rows = [_dict_row(r) for r in raw_rows]
         result.fetchall.return_value = rows
         result.fetchone.return_value = rows[0] if rows else None

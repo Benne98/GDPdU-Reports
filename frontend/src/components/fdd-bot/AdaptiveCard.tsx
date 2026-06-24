@@ -886,9 +886,33 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {}
     for (const inp of inputs) {
-      if (inp.type === 'multi_select') init[inp.id] = []
-      else if (inp.type === 'sortable_list') init[inp.id] = inp.options?.map(o => o.value) ?? []
-      else init[inp.id] = inp.default ?? ''
+      if (inp.type === 'multi_select') {
+        // Honour a `default` array when provided (e.g. gl_databook_scope pre-selects all
+        // entities/fiscal-years). Accept a JSON-encoded string, a real array, or fall back
+        // to an empty selection when no default is given.
+        if (inp.default !== undefined && inp.default !== null && inp.default !== '') {
+          if (Array.isArray(inp.default)) {
+            init[inp.id] = inp.default as string[]
+          } else {
+            try {
+              const parsed: unknown = JSON.parse(String(inp.default))
+              init[inp.id] = Array.isArray(parsed) ? parsed : []
+            } catch {
+              // Treat a plain comma-separated string as a fallback encoding.
+              init[inp.id] = String(inp.default)
+                .split(',')
+                .map(s => s.trim())
+                .filter(Boolean)
+            }
+          }
+        } else {
+          init[inp.id] = []
+        }
+      } else if (inp.type === 'sortable_list') {
+        init[inp.id] = inp.options?.map(o => o.value) ?? []
+      } else {
+        init[inp.id] = inp.default ?? ''
+      }
     }
     return init
   })

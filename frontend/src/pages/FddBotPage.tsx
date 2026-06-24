@@ -1,9 +1,15 @@
 /**
  * FddBotPage — Full-page, standalone FDD-Bot interface.
  *
- * No drawer / slide-over. Two-phase flow:
+ * Two-phase flow:
  *   1. Choice screen — pick "Pipeline data" or "Upload new data"
- *   2. Chat canvas — full BotConversation with mode-aware chrome
+ *   2. Unified chat canvas — wide two-column layout:
+ *        left  = history sidebar (chats for the current mode only)
+ *        right = BotConversation card-canvas with toolbar
+ *
+ * Both modes use the same canvas design. FddChatPanel is no longer the active
+ * render path for upload; its behaviour (preloadedFile bootstrap, autoHello,
+ * project sidebar) has been migrated here.
  */
 
 import { useState, useCallback, useEffect } from 'react'
@@ -15,14 +21,21 @@ import {
   Undo2,
   RotateCcw,
   WifiOff,
+  Plus,
+  X,
+  MessageSquare,
 } from 'lucide-react'
 import { useFddBot } from '../components/fdd-bot/useFddBot'
 import BotConversation from '../components/fdd-bot/BotConversation'
-import FddChatPanel, { type FddPanelMode } from '../components/fdd-bot/FddChatPanel'
+import {
+  listProjectSummariesByMode,
+  type FddProjectMode,
+  type FddProjectSummary,
+} from '../components/fdd-bot/fddProjectStore'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Mode = 'pipeline' | 'upload'
+type Mode = FddProjectMode  // 'pipeline' | 'upload'
 
 // ─── ChoiceCard ───────────────────────────────────────────────────────────────
 
@@ -166,7 +179,7 @@ function ModeBadge({ mode }: { mode: Mode }) {
     <span
       className="inline-flex items-center gap-1.5 rounded-full text-xs font-semibold px-2.5 py-1"
       style={{
-        background: mode === 'pipeline' ? 'rgba(30,58,95,0.09)' : 'rgba(30,58,95,0.09)',
+        background: 'rgba(30,58,95,0.09)',
         color: '#1E3A5F',
       }}
     >
@@ -180,40 +193,186 @@ function ModeBadge({ mode }: { mode: Mode }) {
   )
 }
 
+// ─── ChatHistorySidebar ───────────────────────────────────────────────────────
+// Renders only the chats whose mode matches the currently active tile.
+
+interface ChatHistorySidebarProps {
+  mode: Mode
+  activeProjectId: string
+  onNewChat: () => void
+  onSelectChat: (id: string) => void
+  onDeleteChat: (id: string) => void
+  /** Re-render trigger: incremented whenever the project list may have changed */
+  refreshKey: number
+}
+
+function ChatHistorySidebar({
+  mode,
+  activeProjectId,
+  onNewChat,
+  onSelectChat,
+  onDeleteChat,
+  refreshKey,
+}: ChatHistorySidebarProps) {
+  const [projects, setProjects] = useState<FddProjectSummary[]>([])
+
+  useEffect(() => {
+    setProjects(listProjectSummariesByMode(mode))
+  }, [mode, refreshKey])
+
+  return (
+    <aside
+      className="flex flex-col shrink-0"
+      style={{
+        width: 240,
+        background: '#FFFFFF',
+        borderRight: '1px solid #E2E8F0',
+        minHeight: 0,
+      }}
+    >
+      {/* New chat button */}
+      <div className="p-3 shrink-0">
+        <button
+          type="button"
+          onClick={onNewChat}
+          className="flex items-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+          style={{
+            color: '#1E3A5F',
+            border: '1px solid #E2E8F0',
+            background: '#F8FAFC',
+          }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#EFF6FF' }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = '#F8FAFC' }}
+        >
+          <Plus size={15} />
+          New chat
+        </button>
+      </div>
+
+      {/* Section label */}
+      <div className="px-4 pb-2 shrink-0">
+        <p className="text-[10px] font-bold uppercase tracking-wide" style={{ color: '#94A3B8' }}>
+          {mode === 'pipeline' ? 'Pipeline chats' : 'Upload chats'}
+        </p>
+      </div>
+
+      {/* Chat list */}
+      <div className="flex-1 overflow-y-auto px-2 pb-3 min-h-0">
+        {projects.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 px-3 py-6 text-center">
+            <MessageSquare size={20} style={{ color: '#CBD5E1' }} />
+            <p className="text-xs leading-relaxed" style={{ color: '#94A3B8' }}>
+              No chats yet. Start one above.
+            </p>
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-0.5">
+            {projects.map(project => {
+              const isActive = project.id === activeProjectId
+              const date = new Date(project.updatedAt)
+              const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+              return (
+                <li key={project.id} className="group relative">
+                  <button
+                    type="button"
+                    onClick={() => onSelectChat(project.id)}
+                    className="w-full text-left px-3 py-2 pr-8 rounded-lg transition-colors"
+                    style={{
+                      background: isActive ? 'rgba(30,58,95,0.08)' : 'transparent',
+                    }}
+                    title={project.name}
+                  >
+                    <p
+                      className="text-sm truncate"
+                      style={{
+                        color: isActive ? '#1E3A5F' : '#334155',
+                        fontWeight: isActive ? 600 : 400,
+                      }}
+                    >
+                      {project.name}
+                    </p>
+                    <p className="text-[10px] mt-0.5" style={{ color: '#94A3B8' }}>
+                      {dateStr}
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={e => {
+                      e.stopPropagation()
+                      onDeleteChat(project.id)
+                    }}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                    style={{ color: '#94A3B8' }}
+                    aria-label="Delete chat"
+                  >
+                    <X size={13} />
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+    </aside>
+  )
+}
+
 // ─── FddBotPage ───────────────────────────────────────────────────────────────
 
 export default function FddBotPage() {
   const bot = useFddBot()
   const [mode, setMode] = useState<Mode | null>(null)
-  const [panelMode, setPanelMode] = useState<FddPanelMode>('closed')
-  const [preloadedFile, setPreloadedFile] = useState<File | null>(null)
+  const [preloadedFile] = useState<File | null>(null)
+  // Sidebar refresh counter — bumped after any project mutation so the sidebar re-reads storage.
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0)
 
-  // Track whether Rasa is reachable — set to true once send() returns an error
-  // (bot.error is transient; we show the banner persistently once it fires)
   const [rasaUnreachable, setRasaUnreachable] = useState(false)
 
   useEffect(() => {
     if (bot.error) setRasaUnreachable(true)
   }, [bot.error])
 
+  // Bump the sidebar refresh key whenever bot.projects changes (debounced persist fires).
+  useEffect(() => {
+    setSidebarRefreshKey(k => k + 1)
+  }, [bot.projects])
+
   const handleSelectMode = useCallback((selected: Mode) => {
     setRasaUnreachable(false)
-    setPreloadedFile(null)
     setMode(selected)
-    if (selected === 'upload') {
-      setPanelMode('expanded')
-    } else {
-      setPanelMode('closed')
-    }
+    // Start a fresh chat in this mode (saves any existing session first).
+    bot.createProject(selected)
+  // bot.createProject is stable (useCallback with stable deps); exclude bot object itself.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const handleBack = useCallback(() => {
     setMode(null)
-    setPanelMode('closed')
-    setPreloadedFile(null)
   }, [])
 
-  // ── Page-level page header ─────────────────────────────────────────────────
+  const handleNewChat = useCallback(() => {
+    if (!mode) return
+    bot.createProject(mode)
+    setSidebarRefreshKey(k => k + 1)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode])
+
+  const handleSelectChat = useCallback((id: string) => {
+    // switchProject saves the current session, loads the target record,
+    // and bumps sessionEpoch only for empty chats (triggering autoHello).
+    // For non-empty chats the transcript is restored without re-greeting.
+    bot.switchProject(id)
+    setSidebarRefreshKey(k => k + 1)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleDeleteChat = useCallback((id: string) => {
+    bot.deleteProject(id)
+    setSidebarRefreshKey(k => k + 1)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Page-level header ──────────────────────────────────────────────────────
 
   const header = (
     <motion.div
@@ -257,7 +416,7 @@ export default function FddBotPage() {
               title="Work with pipeline data"
               description="Ask questions and run analyses on the GL data already loaded into reporting — P&L, balance sheet, working capital and cash flow."
               badge="Reporting"
-              onClick={() => void handleSelectMode('pipeline')}
+              onClick={() => handleSelectMode('pipeline')}
             />
             <ChoiceCard
               index={1}
@@ -265,7 +424,7 @@ export default function FddBotPage() {
               title="Upload new data"
               description="Bring in a new GL export, trial balance (SuSa) or sales file and let the bot map and prepare it step by step."
               badge="Ingestion"
-              onClick={() => void handleSelectMode('upload')}
+              onClick={() => handleSelectMode('upload')}
             />
           </div>
         </motion.div>
@@ -273,61 +432,51 @@ export default function FddBotPage() {
     </AnimatePresence>
   )
 
-  // ── Upload: Mathis FddChatPanel (fullscreen below app header) ───────────────
+  // ── Unified chat canvas (both modes) ──────────────────────────────────────
 
-  const uploadPanel =
-    mode === 'upload' ? (
-      <>
-        <button
-          type="button"
-          onClick={handleBack}
-          className="fixed left-4 z-[45] flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium shadow-md"
+  const footerNote =
+    mode === 'pipeline'
+      ? 'FDD Bot · Working with loaded pipeline data'
+      : 'FDD Bot · Upload and prepare new data'
+
+  const inputPlaceholder =
+    mode === 'pipeline'
+      ? 'Ask about P&L, balance sheet, working capital…'
+      : 'Type a message or use the cards above…'
+
+  const chatCanvas = mode !== null ? (
+    <AnimatePresence mode="wait">
+      <motion.div
+        key={`chat-${mode}`}
+        initial={{ opacity: 0, y: 18 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -10 }}
+        transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+        className="w-full"
+        style={{ maxWidth: '100%' }}
+      >
+        <div
+          className="rounded-2xl overflow-hidden flex"
           style={{
-            top: 72,
-            color: '#1E3A5F',
-            border: '1px solid #E2E8F0',
             background: '#FFFFFF',
+            border: '1px solid #E2E8F0',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.06), 0 12px 40px rgba(0,0,0,0.06)',
+            minHeight: '76vh',
           }}
         >
-          <ArrowLeft size={12} aria-hidden />
-          Modus wechseln
-        </button>
-        {rasaUnreachable && (
-          <div className="fixed left-4 right-4 z-[45] max-w-lg" style={{ top: 112 }}>
-            <ErrorBanner />
-          </div>
-        )}
-        <FddChatPanel
-          mode={panelMode}
-          preloadedFile={preloadedFile}
-          bot={bot}
-          topOffsetPx={112}
-          bottomOffsetPx={20}
-        />
-      </>
-    ) : null
+          {/* ── Left: history sidebar ── */}
+          <ChatHistorySidebar
+            mode={mode}
+            activeProjectId={bot.activeProjectId}
+            onNewChat={handleNewChat}
+            onSelectChat={handleSelectChat}
+            onDeleteChat={handleDeleteChat}
+            refreshKey={sidebarRefreshKey}
+          />
 
-  const pipelineCanvas = (
-    <AnimatePresence mode="wait">
-      {mode === 'pipeline' && (
-        <motion.div
-          key="chat-pipeline"
-          initial={{ opacity: 0, y: 18 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -10 }}
-          transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-          className="max-w-[880px] mx-auto"
-        >
-          <div
-            className="rounded-2xl overflow-hidden flex flex-col"
-            style={{
-              background: '#FFFFFF',
-              border: '1px solid #E2E8F0',
-              boxShadow:
-                '0 2px 8px rgba(0,0,0,0.06), 0 12px 40px rgba(0,0,0,0.06)',
-              minHeight: '72vh',
-            }}
-          >
+          {/* ── Right: chat area ── */}
+          <div className="flex flex-col flex-1 min-w-0">
+            {/* Toolbar */}
             <div
               className="flex items-center gap-3 px-5 py-3 shrink-0 flex-wrap"
               style={{
@@ -355,7 +504,7 @@ export default function FddBotPage() {
                   <ArrowLeft size={12} aria-hidden />
                   Change mode
                 </button>
-                <ModeBadge mode="pipeline" />
+                <ModeBadge mode={mode} />
                 {bot.loading && (
                   <span className="text-xs" style={{ color: '#94A3B8' }}>
                     Thinking…
@@ -381,7 +530,7 @@ export default function FddBotPage() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => bot.newSession()}
+                  onClick={() => bot.newSession(mode)}
                   title="New session"
                   className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors"
                   style={{
@@ -402,33 +551,36 @@ export default function FddBotPage() {
               </div>
             )}
 
-            <div className="flex flex-col flex-1 min-h-0" style={{ minHeight: '60vh' }}>
+            <div className="flex flex-col flex-1 min-h-0">
               <BotConversation
                 bot={bot}
                 active={true}
                 autoHello={true}
-                footerNote="FDD Bot · Working with loaded pipeline data"
-                inputPlaceholder="Ask about P&L, balance sheet, working capital…"
+                preloadedFile={preloadedFile}
+                footerNote={footerNote}
+                inputPlaceholder={inputPlaceholder}
+                wide={true}
+                mode={mode ?? undefined}
               />
             </div>
           </div>
-        </motion.div>
-      )}
+        </div>
+      </motion.div>
     </AnimatePresence>
-  )
+  ) : null
 
   // ── Page render ────────────────────────────────────────────────────────────
 
   return (
-    <div className="min-h-screen" style={{ background: mode === 'upload' ? '#F8FAFC' : '#F4F6F9' }}>
-      {mode !== 'upload' && (
-        <div className="max-w-[1120px] mx-auto px-6 py-10">
-          {mode === null && header}
-          {choiceScreen}
-          {pipelineCanvas}
-        </div>
-      )}
-      {uploadPanel}
+    <div className="min-h-screen" style={{ background: '#F4F6F9' }}>
+      <div
+        className="mx-auto px-6 py-10"
+        style={{ maxWidth: mode !== null ? '1400px' : '1120px' }}
+      >
+        {mode === null && header}
+        {choiceScreen}
+        {chatCanvas}
+      </div>
     </div>
   )
 }

@@ -8,13 +8,21 @@ within each entity (GL has no customer-level cost linkage).
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from typing import Any, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services.fin_compat_sql import col_labels_month, last_day, pm as _pm, resolve_entity_prefix
+from app.services.fin_compat_sql import (
+    col_labels_month,
+    iso_week_of,
+    last_day,
+    pm as _pm,
+    prior_iso_week,
+    resolve_entity_prefix,
+    week_range,
+)
 from app.services.geo_reference import sql_country_label_expr, sql_end_customer_region_expr
 
 _ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -31,6 +39,47 @@ _ALLOWED_DIMS = frozenset(_DIM_LABELS)
 
 def _month_bounds(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), last_day(year, month)
+
+
+def trailing_iso_weeks(
+    year: int, month: int, n: int = 12,
+) -> list[dict[str, Any]]:
+    """The ``n`` ISO weeks ending at the anchor week, oldest→newest (FLOW windows).
+
+    The anchor week is the ISO week that contains the anchor month-END date
+    (``last_day(year, month)``).  Each entry is a true ISO-week FLOW window from
+    :func:`week_range` — so a sales week sums ``fact_sales.gross_sales`` whose
+    ``posting_date`` falls in that Monday..Sunday span, the same grain BS/PL/WC/CF
+    weekly already use.  This REPLACES the previous rolling-7-day-from-month-end
+    approximation (windows that were not Monday-aligned and not ISO weeks).
+
+    == WORKED EXAMPLE (year=2025, month=7, n=3) ==
+        anchor month-end 2025-07-31 → ISO 2025-W31 (Mon 2025-07-28..Sun 2025-08-03).
+        Walking back: 2025-W31, 2025-W30, 2025-W29.  Returned oldest→newest:
+        [W29 (2025-07-14..20), W30 (2025-07-21..27), W31 (2025-07-28..08-03)].
+
+    == EDGE CASES ==
+        * Year boundary: an anchor in early January walks back across the ISO-year
+          boundary via :func:`prior_iso_week` (e.g. 2026-W01 → 2025-W52/W53),
+          handled by date arithmetic, not by decrementing the week number.
+        * ISO week 53 long years are produced naturally when stepped over.
+    """
+    anchor_iy, anchor_iw = iso_week_of(last_day(year, month))
+    weeks: list[tuple[int, int]] = []
+    iy, iw = anchor_iy, anchor_iw
+    for _ in range(max(1, n)):
+        weeks.append((iy, iw))
+        iy, iw = prior_iso_week(iy, iw)
+    weeks.reverse()  # oldest → newest
+    out: list[dict[str, Any]] = []
+    for wy, ww in weeks:
+        d0, d1 = week_range(wy, ww)
+        out.append({
+            "iso_year": wy, "iso_week": ww,
+            "label": f"CW{ww:02d}'{str(wy)[-2:]}",
+            "d0": d0, "d1": d1,
+        })
+    return out
 
 
 def _entity_frag(session: Session, entity: Optional[str]) -> str:
@@ -259,11 +308,13 @@ def build_geo_trend(
                 "d1": date(fy, 12, 31),
             })
     elif grain == "week":
-        cm_t = last_day(year, month)
-        for w in range(11, -1, -1):
-            we = cm_t - timedelta(weeks=w)
-            ws = we - timedelta(days=6)
-            periods.append({"label": f"W{we.isocalendar()[1]:02d}", "d0": ws, "d1": we})
+        # TRUE ISO-week granularity (reporting-v2 Phase 5): each bucket sums
+        # gross_sales whose posting_date falls in a Monday..Sunday ISO week via
+        # ``week_range`` — NOT the previous rolling-7-day-from-month-end windows.
+        for wk in trailing_iso_weeks(year, month, n=12):
+            periods.append({
+                "label": wk["label"], "d0": wk["d0"], "d1": wk["d1"],
+            })
     else:
         y_p, m_p = year, month
         for _ in range(12):

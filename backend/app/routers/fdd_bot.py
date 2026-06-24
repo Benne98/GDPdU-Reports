@@ -33,9 +33,15 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 import pandas as pd
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import bindparam, text
+from sqlalchemy.orm import Session
+from typing import Annotated  # noqa: E402  (typing imported lazily-style for FastAPI deps)
+
+from app.auth import User, current_user
+from app.db import get_session
 
 router = APIRouter(prefix="/api/v1/fdd", tags=["fdd-bot"])
 
@@ -103,6 +109,38 @@ def _resolve_output_folder(raw: str | None, session_id: str) -> str:
         p = p.resolve()
     p.mkdir(parents=True, exist_ok=True)
     return str(p)
+
+
+def _safe_master_workbook_path(session_id: str, output_folder: str) -> Path:
+    """Resolve the Master workbook path and assert it stays under ``output_folder``.
+
+    Guards against path traversal via ``session_id`` (e.g. ``../../etc``) or any
+    component that would make the resolved workbook escape the resolved output
+    root. Raises HTTP 400 on escape. The output root itself is whatever
+    :func:`_resolve_output_folder` already vetted (uploads default or an explicit
+    user-selected folder), so this only enforces that the file lands INSIDE it.
+    """
+    from databook_helpers import master_workbook_path
+
+    root = Path(output_folder).resolve()
+    master = master_workbook_path(session_id, output_folder)
+    try:
+        resolved = master.resolve()
+    except OSError:
+        raise HTTPException(status_code=400, detail="Invalid output path.")
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        logger.warning(
+            "fdd: rejected master path escaping output root session_id=%r folder=%r",
+            session_id,
+            output_folder,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid session_id or output_folder (path traversal not allowed).",
+        )
+    return resolved
 
 
 def _script_python() -> str:
@@ -784,6 +822,17 @@ class DatabookSusaRequest(BaseModel):
     strict_mapping: bool = False
 
 
+class DatabookGlMasterRequest(BaseModel):
+    """Build Master_BS / Master_PL directly from loaded GDPdU GL data (pipeline path)."""
+
+    session_id: str
+    entity_codes: list[str] = Field(default_factory=list)
+    fiscal_years: list[int] = Field(default_factory=list)
+    fy_end_month: Optional[int] = None
+    fiscal_start_month: Optional[int] = None
+    output_folder: Optional[str] = None
+
+
 # ─── Script execution helpers ──────────────────────────────────────────────────
 
 
@@ -1243,9 +1292,7 @@ def run_databook_susa(req: DatabookSusaRequest):
             detail="No uploaded files could be resolved for Databook (check file_id and session_id).",
         )
 
-    from databook_helpers import master_workbook_path
-
-    master = master_workbook_path(req.session_id, output_folder)
+    master = _safe_master_workbook_path(req.session_id, output_folder)
     out_xlsx = str(master)
     flat_paths = [p for cell in resolved_cells for p in cell["paths"]]
 
@@ -1297,6 +1344,216 @@ def run_databook_susa(req: DatabookSusaRequest):
     result["run_id"] = run_id
     result["session_id"] = req.session_id
     result["master_path"] = out_xlsx
+    if master.is_file():
+        result["output_file"] = out_xlsx
+        result["output_filename"] = master.name
+    return result
+
+
+# ─── GL pipeline: entity visibility + data-status + Master from GL ─────────────
+#
+# SECURITY NOTE (for review): As of this change there is NO row-level / per-user
+# entity isolation enforced anywhere in the data-read paths of this codebase.
+# The schema DOES model it — ``user_role`` × ``role_entity_visibility`` map a user
+# (via their roles) to a set of ``legal_entity_code`` values — but that mapping is
+# currently only WRITTEN/managed by the admin router (``admin.py``); no reporting
+# endpoint (trial balance, GL lines, financials) filters reads by it today.
+#
+# This endpoint pair is the FIRST data path to honour it. ``_visible_entity_codes``
+# resolves the allow-list for the current user:
+#   - admins and users with NO ``role_entity_visibility`` rows at all → ``None``
+#     (= "all entities"), matching the admin contract ("empty list = all entities").
+#   - otherwise → the explicit set of ``legal_entity_code`` the user's roles grant.
+# ``data-status`` only lists allowed entities; ``gl-master`` rejects any requested
+# ``entity_codes`` outside the allow-list. Because the rest of the app does NOT yet
+# enforce isolation, this is a localized guard, NOT system-wide tenant isolation —
+# flagged explicitly for the security review.
+
+
+# ``_visible_entity_codes`` now lives in app.services.entity_visibility so this
+# router and app.routers.financials_compat share ONE implementation. Kept as a
+# module-level alias so existing references and the contract here are unchanged.
+from app.services.entity_visibility import visible_entity_codes as _visible_entity_codes
+
+
+@router.get("/gl/data-status")
+def gl_data_status(
+    user: Annotated[User, Depends(current_user)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Summarize loaded GDPdU GL (and Sales) data the current user is allowed to see."""
+    allowed = _visible_entity_codes(session, user)
+
+    if allowed is not None and not allowed:
+        # User restricted to no entities → nothing visible.
+        return {
+            "gl_loaded": False,
+            "entities": [],
+            "fiscal_years": [],
+            "period_min": None,
+            "period_max": None,
+            "sales_loaded": False,
+        }
+
+    # Entities that actually have GL accounts loaded (visible ones only).
+    entity_sql = (
+        "SELECT DISTINCT le.legal_entity_code, le.entity_name "
+        "FROM dim_legal_entity le "
+        "JOIN dim_gl_account a ON a.entity_prefix = le.entity_prefix "
+    )
+    params: dict[str, Any] = {}
+    if allowed is not None:
+        entity_sql += "WHERE le.legal_entity_code IN :codes "
+        params["codes"] = sorted(allowed)
+    entity_sql += "ORDER BY le.legal_entity_code"
+
+    entity_stmt = text(entity_sql)
+    if allowed is not None:
+        entity_stmt = entity_stmt.bindparams(bindparam("codes", expanding=True))
+    entity_rows = session.execute(entity_stmt, params).fetchall()
+    entities = [{"code": r[0], "name": r[1]} for r in entity_rows]
+
+    # Fiscal years present in the GL — scoped to visible entities (join via the
+    # account's entity_prefix → dim_legal_entity.legal_entity_code).
+    fy_sql = "SELECT DISTINCT a.fiscal_year FROM dim_gl_account a "
+    fy_params: dict[str, Any] = {}
+    if allowed is not None:
+        fy_sql += (
+            "JOIN dim_legal_entity le ON le.entity_prefix = a.entity_prefix "
+            "WHERE le.legal_entity_code IN :codes "
+        )
+        fy_params["codes"] = sorted(allowed)
+    fy_sql += "ORDER BY a.fiscal_year"
+    fy_stmt = text(fy_sql)
+    if allowed is not None:
+        fy_stmt = fy_stmt.bindparams(bindparam("codes", expanding=True))
+    fy_rows = session.execute(fy_stmt, fy_params).fetchall()
+    fiscal_years = [int(r[0]) for r in fy_rows if r and r[0] is not None]
+
+    # Period bounds from posted GL entries (visible entities only). Scope via the
+    # GL line's entity_prefix → dim_legal_entity.legal_entity_code.
+    bounds_params: dict[str, Any] = {}
+    if allowed is not None:
+        bounds_sql = (
+            "SELECT MIN(e.posting_date)::text, MAX(e.posting_date)::text "
+            "FROM fact_gl_entry e "
+            "JOIN fact_gl_line l "
+            "  ON l.journal_entry_group_number = e.journal_entry_group_number "
+            " AND l.fiscal_year = e.fiscal_year "
+            "JOIN dim_legal_entity le ON le.entity_prefix = l.entity_prefix "
+            "WHERE le.legal_entity_code IN :codes"
+        )
+        bounds_params["codes"] = sorted(allowed)
+        bounds_stmt = text(bounds_sql).bindparams(bindparam("codes", expanding=True))
+    else:
+        bounds_stmt = text(
+            "SELECT MIN(e.posting_date)::text, MAX(e.posting_date)::text "
+            "FROM fact_gl_entry e"
+        )
+    bounds = session.execute(bounds_stmt, bounds_params).fetchone()
+
+    def _ym(raw) -> Optional[str]:
+        if not raw:
+            return None
+        s = str(raw)
+        return s[:7] if len(s) >= 7 else None
+
+    period_min = _ym(bounds[0]) if bounds else None
+    period_max = _ym(bounds[1]) if bounds else None
+
+    sales_loaded = False
+    try:
+        sales_row = session.execute(
+            text("SELECT 1 FROM fact_sales LIMIT 1")
+        ).fetchone()
+        sales_loaded = sales_row is not None
+    except Exception:
+        # fact_sales may not exist in this deployment → report False, never raise.
+        sales_loaded = False
+
+    return {
+        "gl_loaded": bool(entities),
+        "entities": entities,
+        "fiscal_years": fiscal_years,
+        "period_min": period_min,
+        "period_max": period_max,
+        "sales_loaded": sales_loaded,
+    }
+
+
+@router.post("/run/databook/gl-master")
+def run_databook_gl_master(
+    req: DatabookGlMasterRequest,
+    user: Annotated[User, Depends(current_user)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Build Master_BS / Master_PL in-process from loaded GL data (no upload, no subprocess).
+
+    Mirrors ``run_databook_susa``'s result shape so the Rasa
+    ``_databook_after_susa_run`` consumer is unchanged.
+    """
+    if not req.fiscal_years:
+        raise HTTPException(status_code=400, detail="fiscal_years must be a non-empty list.")
+
+    # Restrict the requested entities to the user's allow-list.
+    allowed = _visible_entity_codes(session, user)
+    requested = [str(c) for c in (req.entity_codes or []) if str(c).strip()]
+    if allowed is not None:
+        if not allowed:
+            raise HTTPException(
+                status_code=400,
+                detail="You are not permitted to access any entities for this report.",
+            )
+        if requested:
+            requested = [c for c in requested if c in allowed]
+            if not requested:
+                raise HTTPException(
+                    status_code=400,
+                    detail="None of the requested entities are visible to you.",
+                )
+        else:
+            # No explicit selection → fall back to the full allowed set.
+            requested = sorted(allowed)
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    master = _safe_master_workbook_path(req.session_id, output_folder)
+    out_xlsx = str(master)
+
+    fy_end_month = int(req.fy_end_month or 12)
+
+    try:
+        from app.services.fin_compat_master_from_gl import (
+            build_master_frames_from_gl,
+            write_master_workbook,
+        )
+
+        df_bs, df_pl = build_master_frames_from_gl(
+            session,
+            entity_codes=requested or None,
+            fiscal_years=[int(y) for y in req.fiscal_years],
+            fy_end_month=fy_end_month,
+            fiscal_start_month=req.fiscal_start_month,
+        )
+        write_master_workbook(df_bs, df_pl, out_xlsx)
+    except HTTPException:
+        raise
+    except Exception:
+        # Keep the full traceback in the server log only; never echo raw exception
+        # text (paths, SQL, tenant data) back to the client.
+        logger.exception("gl-master databook build failed")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not build Master_BS / Master_PL from GL data.",
+        ) from None
+
+    result: dict[str, Any] = {
+        "success": True,
+        "message": "Master_BS and Master_PL created from loaded GL data.",
+        "output_path": output_folder,
+        "session_id": req.session_id,
+        "master_path": out_xlsx,
+    }
     if master.is_file():
         result["output_file"] = out_xlsx
         result["output_filename"] = master.name

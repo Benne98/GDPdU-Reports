@@ -17,6 +17,11 @@ import PlanPage from "./pages/PlanPage";
 import WorkingCapitalPage from "./pages/WorkingCapitalPage";
 import RoleManagementPage from "./pages/RoleManagementPage";
 import AccountStatementPage from "./pages/AccountStatementPage";
+import AnomalyDetectionPage from "./pages/AnomalyDetectionPage";
+import ProjectSetupWizard from "./pages/ProjectSetupWizard";
+// BudgetPage kept for reference — not routed (replaced by BudgetChatPage)
+// import BudgetPage from "./pages/BudgetPage";
+import BudgetChatPage from "./pages/BudgetChatPage";
 
 // ---------------------------------------------------------------------------
 // Shell — uses AppHeader + GdpduFooter
@@ -146,6 +151,48 @@ function AppRoutes() {
         }
       />
 
+      {/* Anomaly Detection */}
+      <Route
+        path="/anomaly-detection"
+        element={
+          <ProtectedRoute>
+            <Shell>
+              <AnomalyDetectionPage view="overview" />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/anomaly-detection/outliers"
+        element={
+          <ProtectedRoute>
+            <Shell>
+              <AnomalyDetectionPage view="outliers" />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/anomaly-detection/seasonality"
+        element={
+          <ProtectedRoute>
+            <Shell>
+              <AnomalyDetectionPage view="seasonality" />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/anomaly-detection/forensic"
+        element={
+          <ProtectedRoute>
+            <Shell>
+              <AnomalyDetectionPage view="forensic" />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+
       {/* ── Admin-only routes ── */}
 
       <Route
@@ -188,11 +235,33 @@ function AppRoutes() {
       />
 
       <Route
+        path="/budget"
+        element={
+          <ProtectedRoute adminOnly>
+            <Shell>
+              <BudgetChatPage />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
         path="/role-management"
         element={
           <ProtectedRoute adminOnly>
             <Shell>
               <RoleManagementPage />
+            </Shell>
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
+        path="/project-setup"
+        element={
+          <ProtectedRoute adminOnly>
+            <Shell>
+              <ProjectSetupWizard />
             </Shell>
           </ProtectedRoute>
         }

@@ -984,3 +984,652 @@ async function throwApiError(res: Response): Promise<never> {
   }
   throw new ApiError(res.status, body);
 }
+
+// ---------------------------------------------------------------------------
+// Budget Planning — Phase 5 (manual BS/PL position planning)
+// ---------------------------------------------------------------------------
+
+/** A single partner row within a partner-driven budget position. */
+export interface BudgetPartnerRow {
+  partner_id: string;
+  name: string;
+  annual: number;
+  months: number[];
+}
+
+/** One reporting position in the budget grid. */
+export interface BudgetPositionRow {
+  line_code: string;
+  label: string;
+  annual: number;
+  months: number[];
+  synthetic_annual: number;
+  is_partner_driven: boolean;
+  partners?: BudgetPartnerRow[];
+  /** Read-only residual: position.annual − Σ partners.annual */
+  other?: number;
+}
+
+/** Full budget grid response for one statement + fiscal year + entity scope. */
+export interface BudgetGridResponse {
+  statement: string;
+  fiscal_year: number;
+  entity: string;
+  top_n: number;
+  positions: BudgetPositionRow[];
+}
+
+/** Write-operation response (seed / cell / position / delete). */
+export interface BudgetWriteResponse {
+  ok: boolean;
+  rows_upserted: number;
+  rows_seeded: number;
+  deleted: number;
+}
+
+/** Body for PUT /api/v1/budget/cell */
+export interface BudgetCellRequest {
+  statement: string;
+  line_code: string;
+  entity?: string;
+  partner_id?: string;
+  partner_kind?: string;
+  fiscal_year: number;
+  months?: number[];
+  annual?: number;
+  weights?: Record<number, number>;
+  /** L4 sub-position key; omit or '' for the L3-level row. */
+  level_4?: string;
+}
+
+/** Body for PATCH /api/v1/budget/position */
+export interface BudgetPositionPatchRequest {
+  statement: string;
+  line_code: string;
+  entity?: string;
+  fiscal_year: number;
+  position?: { months?: number[]; annual?: number };
+  partners?: Array<{ partner_id: string; months?: number[]; annual?: number }>;
+  weights?: Record<number, number>;
+  /** L4 sub-position key; omit or '' for the L3-level row. */
+  level_4?: string;
+}
+
+/** Body for POST /api/v1/budget/seed */
+export interface BudgetSeedRequest {
+  statement: string;
+  fiscal_year: number;
+  entity?: string;
+  top_n?: number;
+  /** When true, writes each position's heuristic suggestion instead of the legacy synthetic. */
+  materialize_suggestion?: boolean;
+  heuristic?: "prior_year" | "trend_cagr" | "run_rate";
+  growth_pct?: number;
+}
+
+/**
+ * GET /api/v1/budget — editable grid (pure-read).
+ * Seeded with synthetic values where no manual budget exists.
+ */
+export async function getBudget(
+  statement: "PL" | "BS",
+  fiscal_year: number,
+  entity?: string,
+  top_n?: number,
+): Promise<BudgetGridResponse> {
+  const qs = new URLSearchParams();
+  qs.set("statement", statement);
+  qs.set("fiscal_year", String(fiscal_year));
+  if (entity && entity !== "all") qs.set("entity", entity);
+  if (top_n != null) qs.set("top_n", String(top_n));
+  const res = await apiFetch(`/api/v1/budget?${qs.toString()}`);
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetGridResponse>;
+}
+
+/**
+ * POST /api/v1/budget/seed — materialise synthetic seed (idempotent, admin only).
+ */
+export async function seedBudget(
+  payload: BudgetSeedRequest,
+): Promise<BudgetWriteResponse> {
+  const res = await apiFetch("/api/v1/budget/seed", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetWriteResponse>;
+}
+
+/**
+ * PUT /api/v1/budget/cell — save one cell; annual is seasonalized server-side (admin only).
+ */
+export async function putBudgetCell(
+  payload: BudgetCellRequest,
+): Promise<BudgetWriteResponse> {
+  const res = await apiFetch("/api/v1/budget/cell", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetWriteResponse>;
+}
+
+/**
+ * PATCH /api/v1/budget/position — bulk-save position + partners in one transaction (admin only).
+ */
+export async function patchBudgetPosition(
+  payload: BudgetPositionPatchRequest,
+): Promise<BudgetWriteResponse> {
+  const res = await apiFetch("/api/v1/budget/position", {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetWriteResponse>;
+}
+
+/**
+ * DELETE /api/v1/budget — drop budget rows → readers revert to forecast/plan (admin only).
+ */
+export async function deleteBudget(
+  statement: "PL" | "BS",
+  fiscal_year: number,
+  entity?: string,
+): Promise<BudgetWriteResponse> {
+  const qs = new URLSearchParams();
+  qs.set("statement", statement);
+  qs.set("fiscal_year", String(fiscal_year));
+  if (entity && entity !== "all") qs.set("entity", entity);
+  const res = await apiFetch(`/api/v1/budget?${qs.toString()}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetWriteResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Budget Planning — Phase 5 extended types and functions
+// ---------------------------------------------------------------------------
+
+/** L4 child row within a budget position. */
+export interface BudgetChild {
+  level_4: string;
+  label: string;
+  annual: number;
+  months: number[];
+}
+
+/**
+ * Full budget position for the tree grid (Phase 5).
+ * Extends the simpler BudgetPositionRow with suggestion, explanation, children, and level_3.
+ */
+export interface BudgetPosition {
+  line_code: string;
+  label: string;
+  level_3: string;
+  annual: number;
+  months: number[];
+  synthetic_annual: number;
+  is_partner_driven: boolean;
+  suggestion: { annual: number; months: number[] } | null;
+  explanation: Record<string, unknown> | null;
+  children: BudgetChild[] | null;
+  partners: BudgetPartnerRow[] | null;
+  other: number | null;
+}
+
+/** Full budget tree response (Phase 5 GET /api/v1/budget). */
+export interface BudgetTreeResponse {
+  statement: string;
+  fiscal_year: number;
+  entity: string;
+  top_n: number;
+  level: string;
+  positions: BudgetPosition[];
+}
+
+/** Entity list response. */
+export interface BudgetEntitiesResponse {
+  entities: Array<{ code: string; label: string; prefix: string }>;
+  can_consolidate: boolean;
+}
+
+/** Upload preview response. */
+export interface BudgetUploadPreview {
+  file_id: string;
+  statement: string;
+  fiscal_year: number;
+  entity: string;
+  changes: Array<{
+    line_code: string;
+    field: string;
+    old: number;
+    new: number;
+    level_4?: string;
+    partner_id?: string;
+  }>;
+  unknown_line_codes: string[];
+  summary: Record<string, unknown>;
+}
+
+/** Commit response. */
+export interface BudgetCommitResponse {
+  ok: boolean;
+  rows_written: number;
+}
+
+/**
+ * GET /api/v1/budget — tree grid with heuristic params (Phase 5).
+ */
+export async function getBudgetTree(params: {
+  statement: "PL" | "BS";
+  fiscal_year: number;
+  entity?: string;
+  level?: "L3" | "L4";
+  heuristic?: "prior_year" | "trend_cagr" | "run_rate";
+  growth_pct?: number;
+  top_n?: number;
+}): Promise<BudgetTreeResponse> {
+  const qs = new URLSearchParams();
+  qs.set("statement", params.statement);
+  qs.set("fiscal_year", String(params.fiscal_year));
+  if (params.entity && params.entity !== "") qs.set("entity", params.entity);
+  if (params.level) qs.set("level", params.level);
+  if (params.heuristic) qs.set("heuristic", params.heuristic);
+  if (params.growth_pct != null) qs.set("growth_pct", String(params.growth_pct));
+  if (params.top_n != null) qs.set("top_n", String(params.top_n));
+  const res = await apiFetch(`/api/v1/budget?${qs.toString()}`);
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetTreeResponse>;
+}
+
+/**
+ * GET /api/v1/budget/entities — list available entities for budget planning.
+ */
+export async function budgetEntities(): Promise<BudgetEntitiesResponse> {
+  const res = await apiFetch("/api/v1/budget/entities");
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetEntitiesResponse>;
+}
+
+/**
+ * POST /api/v1/budget/upload — upload xlsx, returns preview of changes.
+ */
+export async function budgetUpload(
+  file: File,
+  statement: string,
+  fiscal_year: number,
+  entity: string,
+  top_n?: number,
+): Promise<BudgetUploadPreview> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("statement", statement);
+  form.append("fiscal_year", String(fiscal_year));
+  form.append("entity", entity);
+  if (top_n != null) form.append("top_n", String(top_n));
+  const res = await apiFetch("/api/v1/budget/upload", {
+    method: "POST",
+    body: form,
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetUploadPreview>;
+}
+
+/**
+ * POST /api/v1/budget/commit — commit an uploaded preview by file_id.
+ */
+export async function budgetCommit(payload: {
+  file_id: string;
+  statement: string;
+  entity: string;
+  fiscal_year: number;
+}): Promise<BudgetCommitResponse> {
+  const res = await apiFetch("/api/v1/budget/commit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetCommitResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// CoA Master Template download (Phase 3 — Project Setup Wizard)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/projects/coa-template — fetch the CoA Master Excel template
+ * (Master_BS + Master_PL, L1–L4 hierarchy pre-filled from the chosen library)
+ * and trigger a browser download.
+ *
+ * Mirrors the downloadBudgetTemplate pattern: Bearer fetch → blob → anchor click.
+ *
+ * Query params forwarded to the backend:
+ *   entity      — legal entity code (optional)
+ *   fiscal_year — fiscal year integer (optional)
+ *   library     — library variant slug, e.g. "skr03" | "statutory" | "past_projects"
+ */
+export async function downloadCoaTemplate(params: {
+  entity?: string;
+  fiscalYear?: number;
+  library?: string;
+}): Promise<void> {
+  const qs = new URLSearchParams();
+  if (params.entity) qs.set("entity", params.entity);
+  if (params.fiscalYear != null) qs.set("fiscal_year", String(params.fiscalYear));
+  if (params.library) qs.set("library", params.library);
+
+  const res = await apiFetch(`/api/v1/projects/coa-template?${qs.toString()}`);
+  if (!res.ok) await throwApiError(res);
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const match = /filename[^;=\n]*=([^;\n]*)/.exec(disposition);
+  const filename =
+    match?.[1]?.trim().replace(/['"]/g, "") ??
+    `CoA_Master_Template${params.entity ? `_${params.entity}` : ""}${params.fiscalYear ? `_${params.fiscalYear}` : ""}.xlsx`;
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * GET /api/v1/budget/template — fetch xlsx template with Bearer auth and trigger browser download.
+ */
+export async function downloadBudgetTemplate(params: {
+  statement: string;
+  fiscal_year: number;
+  entity: string;
+  level: string;
+  top_n?: number;
+}): Promise<void> {
+  const qs = new URLSearchParams();
+  qs.set("statement", params.statement);
+  qs.set("fiscal_year", String(params.fiscal_year));
+  if (params.entity) qs.set("entity", params.entity);
+  qs.set("level", params.level);
+  if (params.top_n != null) qs.set("top_n", String(params.top_n));
+
+  const res = await apiFetch(`/api/v1/budget/template?${qs.toString()}`);
+  if (!res.ok) await throwApiError(res);
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+
+  // Try to extract filename from Content-Disposition, fallback to constructed name
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const match = /filename[^;=\n]*=([^;\n]*)/.exec(disposition);
+  const filename =
+    match?.[1]?.trim().replace(/['"]/g, "") ??
+    `budget_template_${params.statement}_${params.entity || "consolidated"}_${params.fiscal_year}.xlsx`;
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ---------------------------------------------------------------------------
+// Opening Balance upload (Phase 4 — Project Setup Wizard)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/v1/ingest/opening-balance/upload
+ * Uploads an opening balance file and returns parsed columns + sample rows.
+ * Reuses the same UploadResponse shape as the GL upload.
+ * Commit is deferred to Phase 5 Finish via /ingest/opening-balance/commit.
+ */
+export async function uploadOpeningBalance(file: File): Promise<UploadResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await apiFetch("/api/v1/ingest/opening-balance/upload", {
+    method: "POST",
+    body: form,
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<UploadResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Partner Master upload (Phase 4 — Project Setup Wizard)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/v1/ingest/partner-master/upload
+ * Uploads a partner master file (customers or suppliers) and returns parsed
+ * columns + sample rows.
+ * Reuses the same UploadResponse shape as the GL upload.
+ * Commit is deferred to Phase 5 Finish via /ingest/partner-master/commit.
+ */
+export async function uploadPartnerMaster(file: File): Promise<UploadResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await apiFetch("/api/v1/ingest/partner-master/upload", {
+    method: "POST",
+    body: form,
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<UploadResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Opening Balance commit (Phase 5 — Project Setup Wizard Finish)
+// ---------------------------------------------------------------------------
+
+export interface ObCommitRequest {
+  file_id: string;
+  sheet?: string;
+  /** Serialised GL MappingProfile dict (reused for column mapping). */
+  profile: Record<string, unknown>;
+  /** 'first_year' | 'all' */
+  scope: "first_year" | "all";
+}
+
+export interface ObCommitResponse {
+  load_id: number | null;
+  entries: number;
+  lines: number;
+  fiscal_years: number[];
+  scope: string;
+  loaded_at: string;
+}
+
+/**
+ * POST /api/v1/ingest/opening-balance/commit
+ * Loads OB rows tagged entry_type='opening_balance', fiscal_period=0.
+ * scope='first_year' keeps only the earliest FY; scope='all' keeps every year.
+ */
+export async function commitOpeningBalance(
+  payload: ObCommitRequest
+): Promise<ObCommitResponse> {
+  const res = await apiFetch("/api/v1/ingest/opening-balance/commit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<ObCommitResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Partner Master commit (Phase 5 — Project Setup Wizard Finish)
+// ---------------------------------------------------------------------------
+
+/**
+ * PartnerMappingProfile as expected by POST /api/v1/ingest/partner-master/commit.
+ * Matches the WizardPartnerState.profile shape from ProjectSetupWizard.tsx.
+ */
+export interface PartnerCommitProfile {
+  side: "customer" | "supplier";
+  entity: { mode: "fixed" | "column"; value: string };
+  join_key: { column: string };
+  columns: {
+    name_line_1: string;
+    name_line_2?: string;
+    country_code?: string;
+    city?: string;
+    postal_code?: string;
+  };
+}
+
+export interface PartnerCommitRequest {
+  file_id: string;
+  sheet?: string;
+  /** Serialised PartnerMappingProfile dict. */
+  profile: PartnerCommitProfile;
+}
+
+export interface PartnerCommitResponse {
+  side: string;
+  upserted: number;
+  loaded_at: string;
+}
+
+/**
+ * POST /api/v1/ingest/partner-master/commit
+ * Column-mapped UPSERT of a partner-master file into dim_customer / dim_supplier.
+ */
+export async function commitPartnerMaster(
+  payload: PartnerCommitRequest
+): Promise<PartnerCommitResponse> {
+  const res = await apiFetch("/api/v1/ingest/partner-master/commit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<PartnerCommitResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Budget Granularity View — GET /api/v1/financials/budget/granularity-view
+// ---------------------------------------------------------------------------
+
+/** One period entry returned by the granularity-view endpoint. */
+export interface BudgetGranularityPeriod {
+  key: string;
+  label: string;
+}
+
+/** One GL account row within a position or L4 child. */
+export interface BudgetGranularityAccount {
+  gl_account_id: string;
+  label: string;
+  /** EUR values aligned to periods[]. */
+  values: number[];
+}
+
+/** One L4 child within a granularity-view position. */
+export interface BudgetGranularityChild {
+  level_4: string;
+  label: string;
+  /** EUR values aligned to periods[]. */
+  values: number[];
+  accounts: BudgetGranularityAccount[];
+}
+
+/**
+ * One row in the full-structure granularity-view response.
+ *
+ *   kind = 'line'       — a plannable mapping row; gets granularity buttons.
+ *   kind = 'subtotal'   — structural bold row (e.g. "Gross profit", "EBITDA");
+ *                          shown bold, no granularity buttons.
+ *   kind = 'grandtotal' — top-level structural row (e.g. "Total assets",
+ *                          "Total liabilities"); bold, no granularity buttons.
+ *
+ * For backward compatibility the old `series` field is accepted as an alias
+ * for `values` (the new canonical name).
+ */
+export interface BudgetGranularityRow {
+  id: string;
+  line_code: string;
+  label: string;
+  kind: "line" | "subtotal" | "grandtotal";
+  /** Hierarchy depth — drives left-padding on the label cell. */
+  indent: number;
+  is_bold: boolean;
+  /** EUR values aligned to periods[]. Divide by 1000 to display as kEUR. */
+  values: number[];
+  /** Only meaningful on kind='line' rows. */
+  plannable?: boolean;
+  is_partner_driven?: boolean;
+  partner_kind?: "customer" | "supplier" | null;
+  has_l4?: boolean;
+  children?: BudgetGranularityChild[];
+  accounts?: BudgetGranularityAccount[];
+}
+
+/**
+ * @deprecated Use BudgetGranularityRow instead.
+ * Kept for backward compatibility with PositionGranularityPicker internals.
+ */
+export interface BudgetGranularityPosition {
+  line_code: string;
+  label: string;
+  level_3: string;
+  is_partner_driven: boolean;
+  partner_kind: "customer" | "supplier" | null;
+  has_l4: boolean;
+  /** @deprecated Use values instead. Kept for backward compat. */
+  series: number[];
+  values?: number[];
+  children: BudgetGranularityChild[];
+  accounts: BudgetGranularityAccount[];
+}
+
+/** Full response from GET /api/v1/financials/budget/granularity-view */
+export interface BudgetGranularityViewResponse {
+  statement: string;
+  grain: "month" | "year";
+  periods: BudgetGranularityPeriod[];
+  /**
+   * Full ordered statement structure.
+   * Replaces the old flat `positions` array.
+   * Contains 'line', 'subtotal', and 'grandtotal' rows in display order.
+   */
+  rows: BudgetGranularityRow[];
+  /**
+   * @deprecated Use rows instead.
+   * Kept for backward compatibility during migration. May be absent on newer API responses.
+   */
+  positions?: BudgetGranularityPosition[];
+}
+
+/**
+ * GET /api/v1/financials/budget/granularity-view
+ * Returns multi-period historical series for all plannable positions in a statement.
+ * Used by PositionGranularityPicker to display multi-column period context.
+ *
+ * @param statement  'PL' | 'BS'
+ * @param grain      'month' (24 columns) | 'year' (FY23A/FY24A/FY25A/YTDJul25A)
+ * @param entity     legal entity code; '' for consolidated
+ */
+export async function getBudgetGranularityView(params: {
+  statement: "PL" | "BS";
+  grain: "month" | "year";
+  entity: string;
+}): Promise<BudgetGranularityViewResponse> {
+  const qs = new URLSearchParams();
+  qs.set("statement", params.statement);
+  qs.set("grain", params.grain);
+  if (params.entity) qs.set("entity", params.entity);
+  const res = await apiFetch(
+    `/api/v1/financials/budget/granularity-view?${qs.toString()}`
+  );
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetGranularityViewResponse>;
+}

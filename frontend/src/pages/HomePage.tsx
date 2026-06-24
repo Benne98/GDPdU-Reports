@@ -8,10 +8,12 @@ import { motion } from 'framer-motion'
 import {
   LayoutDashboard,
   Bot,
+  AlertTriangle,
   Database,
-  TrendingUp,
   Users,
+  Settings2,
   ArrowRight,
+  CalendarRange,
   type LucideIcon,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
@@ -26,20 +28,22 @@ interface ModuleCardProps {
   description: string
   path:        string
   index:       number
+  /** Internal / Finssentials-staff tile — rendered visually de-emphasised (greyed). */
+  muted?:      boolean
 }
 
-function ModuleCard({ icon: Icon, title, description, path, index }: ModuleCardProps) {
+function ModuleCard({ icon: Icon, title, description, path, index, muted = false }: ModuleCardProps) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 28 }}
-      animate={{ opacity: 1, y: 0 }}
+      animate={{ opacity: muted ? 0.62 : 1, y: 0 }}
+      whileHover={{ y: -2, opacity: muted ? 0.85 : 1, transition: { duration: 0.18 } }}
       transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1], delay: index * 0.07 }}
-      whileHover={{ y: -2, transition: { duration: 0.18 } }}
       className="group relative flex flex-col rounded-xl overflow-hidden"
       style={{
-        background: '#FFFFFF',
-        border:     '1px solid #E2E8F0',
-        boxShadow:  '0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04)',
+        background: muted ? '#F8FAFC' : '#FFFFFF',
+        border:     muted ? '1px dashed #CBD5E1' : '1px solid #E2E8F0',
+        boxShadow:  muted ? 'none' : '0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04)',
       }}
     >
       {/* Top accent */}
@@ -76,8 +80,8 @@ function ModuleCard({ icon: Icon, title, description, path, index }: ModuleCardP
           {title}
         </h2>
 
-        {/* Description */}
-        <p className="text-sm leading-relaxed flex-1" style={{ color: '#475569' }}>
+        {/* Description — always a single concise line */}
+        <p className="text-sm leading-relaxed flex-1 line-clamp-1" style={{ color: '#475569' }} title={description}>
           {description}
         </p>
 
@@ -108,6 +112,8 @@ type ModuleDef = {
   description: string
   path:        string
   adminOnly?:  boolean
+  /** Finssentials-internal setup tool — shown below a divider, separated from end-user modules. */
+  staff?:      boolean
 }
 
 const MODULES: ModuleDef[] = [
@@ -124,6 +130,12 @@ const MODULES: ModuleDef[] = [
     path:        '/fdd-bot',
   },
   {
+    icon:        AlertTriangle,
+    title:       'Anomaly Detection',
+    description: 'Material swings, sign flips and balance breaks.',
+    path:        '/anomaly-detection',
+  },
+  {
     icon:        Database,
     title:       'Data Update',
     description: 'Upload accounting data and refresh ledgers.',
@@ -131,10 +143,10 @@ const MODULES: ModuleDef[] = [
     adminOnly:   true,
   },
   {
-    icon:        TrendingUp,
-    title:       'Plan / Forecast',
-    description: 'Generate plan and forecast scenarios.',
-    path:        '/plan',
+    icon:        CalendarRange,
+    title:       'Budget Planning',
+    description: 'Plan BS/PL positions and per Debtor / Creditor.',
+    path:        '/budget',
     adminOnly:   true,
   },
   {
@@ -143,6 +155,14 @@ const MODULES: ModuleDef[] = [
     description: 'Users, roles and page access.',
     path:        '/role-management',
     adminOnly:   true,
+  },
+  {
+    icon:        Settings2,
+    title:       'Project Setup',
+    description: 'One-time setup: entities, mapping and balances.',
+    path:        '/project-setup',
+    adminOnly:   true,
+    staff:       true,
   },
 ]
 
@@ -154,6 +174,8 @@ export default function HomePage() {
   const { user, isAdmin } = useAuth()
 
   const visibleModules = MODULES.filter(m => !m.adminOnly || isAdmin)
+  const endUserModules = visibleModules.filter(m => !m.staff)
+  const staffModules = visibleModules.filter(m => m.staff)
 
   const greeting = user?.display_name
     ? `Welcome back, ${user.display_name}`
@@ -161,7 +183,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen" style={{ background: '#F4F6F9' }}>
-      <div className="max-w-[1220px] mx-auto px-6 py-10">
+      <div className="mx-auto w-full max-w-[1680px] px-6 py-10">
         {/* Page header */}
         <motion.div
           initial={{ opacity: 0, y: 16 }}
@@ -186,9 +208,9 @@ export default function HomePage() {
           </p>
         </motion.div>
 
-        {/* Module grid */}
+        {/* End-user module grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-          {visibleModules.map((mod, i) => (
+          {endUserModules.map((mod, i) => (
             <ModuleCard
               key={mod.path}
               icon={mod.icon}
@@ -199,6 +221,35 @@ export default function HomePage() {
             />
           ))}
         </div>
+
+        {/* Divider + Finssentials-internal area (staff only) */}
+        {staffModules.length > 0 && (
+          <>
+            <div className="flex items-center gap-3 mt-12 mb-6">
+              <div className="h-px flex-1" style={{ background: '#E2E8F0' }} />
+              <span
+                className="text-[11px] font-semibold uppercase tracking-widest whitespace-nowrap"
+                style={{ color: '#94A3B8' }}
+              >
+                For Finssentials staff
+              </span>
+              <div className="h-px flex-1" style={{ background: '#E2E8F0' }} />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+              {staffModules.map((mod, i) => (
+                <ModuleCard
+                  key={mod.path}
+                  icon={mod.icon}
+                  title={mod.title}
+                  description={mod.description}
+                  path={mod.path}
+                  index={i}
+                  muted
+                />
+              ))}
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

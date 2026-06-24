@@ -1106,16 +1106,20 @@ def load_plan(
     session: Session,
     gl_plan_df: pd.DataFrame,
     sales_plan_df: pd.DataFrame,
+    com_plan_df: pd.DataFrame | None = None,
 ) -> dict[str, int]:
-    """Transactional idempotent UPSERT of plan rows into fact_gl_plan and fact_sales_plan.
+    """Transactional idempotent UPSERT of plan rows into fact_gl_plan, fact_sales_plan
+    and (optionally) fact_com_plan.
 
-    Both DataFrames are the direct output of ``etl.plan_synth.generate_plan``.
+    All DataFrames are the direct output of ``etl.plan_synth.generate_plan``.
 
-    fact_gl_plan PK:   (account_number_group, fiscal_year, fiscal_period, scenario)
+    fact_gl_plan PK:    (account_number_group, fiscal_year, fiscal_period, scenario)
     fact_sales_plan PK: (customer_id, fiscal_year, fiscal_period, scenario)
+    fact_com_plan PK:   (supplier_id, fiscal_year, fiscal_period, scenario)
 
-    ON CONFLICT DO UPDATE: only ``amount`` / ``gross_sales_plan`` and
-    ``is_synthetic`` are overwritten on re-run (idempotent re-generation).
+    ON CONFLICT DO UPDATE: only ``amount`` / ``gross_sales_plan`` /
+    ``cost_of_materials_plan`` and ``is_synthetic`` (and ``source_system`` for
+    gl/com) are overwritten on re-run (idempotent re-generation).
 
     Parameters
     ----------
@@ -1127,10 +1131,16 @@ def load_plan(
     sales_plan_df : pd.DataFrame
         Columns: customer_id, fiscal_year, fiscal_period, scenario,
                  gross_sales_plan, is_synthetic, source_system.
+    com_plan_df : pd.DataFrame | None
+        Optional (additive).  Columns: supplier_id, fiscal_year, fiscal_period,
+        scenario, cost_of_materials_plan, is_synthetic, source_system.  When None,
+        fact_com_plan is left untouched and the returned dict omits the ``com_plan``
+        key (backward-compatible 2-table behaviour).
 
     Returns
     -------
-    dict with keys: gl_plan (int), sales_plan (int) — rows upserted per table.
+    dict with keys gl_plan (int), sales_plan (int) and — only when ``com_plan_df``
+    is supplied — com_plan (int): rows upserted per table.
 
     Raises
     ------
@@ -1141,6 +1151,7 @@ def load_plan(
 
     gl_upserted = 0
     sales_upserted = 0
+    com_upserted = 0
 
     try:
         # -------------------------------------------------------- fact_gl_plan
@@ -1195,10 +1206,38 @@ def load_plan(
             )
             sales_upserted += 1
 
+        # -------------------------------------------------------- fact_com_plan (optional)
+        if com_plan_df is not None:
+            for _, row in com_plan_df.iterrows():
+                session.execute(
+                    text("""
+                        INSERT INTO fact_com_plan
+                          (supplier_id, fiscal_year, fiscal_period, scenario,
+                           cost_of_materials_plan, is_synthetic, source_system)
+                        VALUES
+                          (:sid, :fy, :fp, :sc, :com, :syn, :ss)
+                        ON CONFLICT (supplier_id, fiscal_year, fiscal_period, scenario)
+                        DO UPDATE SET
+                          cost_of_materials_plan = EXCLUDED.cost_of_materials_plan,
+                          is_synthetic           = EXCLUDED.is_synthetic,
+                          source_system          = EXCLUDED.source_system
+                    """),
+                    {
+                        "sid": str(row["supplier_id"]),
+                        "fy":  int(row["fiscal_year"]),
+                        "fp":  int(row["fiscal_period"]),
+                        "sc":  str(row["scenario"]),
+                        "com": float(row["cost_of_materials_plan"]),
+                        "syn": bool(row.get("is_synthetic", True)),
+                        "ss":  str(row.get("source_system") or "synthetic_plan"),
+                    },
+                )
+                com_upserted += 1
+
         session.commit()
         logger.info(
-            "load_plan: %d fact_gl_plan, %d fact_sales_plan rows upserted",
-            gl_upserted, sales_upserted,
+            "load_plan: %d fact_gl_plan, %d fact_sales_plan, %d fact_com_plan rows upserted",
+            gl_upserted, sales_upserted, com_upserted,
         )
 
     except Exception:
@@ -1206,4 +1245,7 @@ def load_plan(
         logger.exception("load_plan: rollback on error")
         raise
 
-    return {"gl_plan": gl_upserted, "sales_plan": sales_upserted}
+    result = {"gl_plan": gl_upserted, "sales_plan": sales_upserted}
+    if com_plan_df is not None:
+        result["com_plan"] = com_upserted
+    return result

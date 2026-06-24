@@ -1,4 +1,4 @@
-# FDD Rasa for GDPdU merge stack — REST :5005, actions :5055 (Mathis_18_06_26 ports).
+# FDD Rasa for GDPdU merge stack — REST :5015, actions :5065 (re-ported off the SELFMADE stack on 5005/5055).
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $rasaDir = Join-Path $root "rasa"
@@ -14,4 +14,4 @@ if (-not $python) {
 }
 
 Set-Location $rasaDir
-& $python -m rasa run --enable-api --cors "*" --port 5005
+& $python -m rasa run --enable-api --cors "*" --port 5015

@@ -54,6 +54,25 @@ class Settings(BaseSettings):
     # Environment indicator — default "dev" so existing tests run unchanged.
     app_env: str = "dev"
 
+    # ── Reporting-v2 pipeline flags (defaults = legacy/5176 behavior) ──────────
+    # Where the balance-sheet net profit comes from:
+    #   "report_inject" = virtual report-layer injection (legacy, fin_compat_bs.py)
+    #   "gl_rows"       = real synthetic net-profit GL bookings (reporting-v2)
+    bs_net_profit_source: str = Field(default="report_inject", validation_alias="BS_NET_PROFIT_SOURCE")
+    # Opening-balance acquisition: "in_data" | "file" | "carry_forward"
+    opening_balance_mode: str = Field(default="in_data", validation_alias="OPENING_BALANCE_MODE")
+    # Run the full deterministic rebuild on every ingest commit (reporting-v2).
+    rebuild_on_commit: bool = Field(default=False, validation_alias="REBUILD_ON_COMMIT")
+    # Journal Agent (Phase 6): when True, the GL findings (outliers / seasonality /
+    # forensic counter-accounts + Other + suspicious texts) are merged into the
+    # existing narrative bullets.  Default False = legacy/golden-identical output.
+    journal_agent_narrative: bool = Field(default=False, validation_alias="JOURNAL_AGENT_NARRATIVE")
+    # Forensic benignity filter (anomaly refinement): when True AND ANTHROPIC_API_KEY is
+    # set, an optional LLM pass further narrows the flagged unexpected-counter rows after
+    # the deterministic heuristic.  Default False = heuristic-only, no API calls (tests
+    # never hit Anthropic).  Fail-closed: any LLM error keeps the row.
+    forensic_use_llm: bool = Field(default=False, validation_alias="FORENSIC_USE_LLM")
+
     @model_validator(mode="after")
     def _assemble_database_url(self) -> "Settings":
         """Build database_url from DB_* after pydantic has loaded backend/.env."""

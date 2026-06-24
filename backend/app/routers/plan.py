@@ -74,6 +74,7 @@ class PlanGenerateRequest(BaseModel):
 class PlanGenerateResponse(BaseModel):
     gl_plan: int
     sales_plan: int
+    com_plan: int = 0
     scenarios: list[str]
     message: str
 
@@ -149,11 +150,24 @@ def plan_generate(
 
     # Sales actuals may be empty (no revenue lines yet) — generate_plan handles this gracefully.
 
+    # ------------------------------------------------------------------ Com (supplier) actuals
+    try:
+        com_actuals = _fetch_com_actuals(session, body.base_fy)
+    except Exception as exc:
+        logger.error("plan_generate: com actuals query failed: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to read supplier (com) actuals from DB. Check server logs.",
+        ) from exc
+
+    # Com actuals may be empty (no material lines yet) — generate_plan handles this gracefully.
+
     # ------------------------------------------------------------------ Generate
     try:
-        gl_plan_df, sales_plan_df = generate_plan(
+        gl_plan_df, sales_plan_df, com_plan_df = generate_plan(
             gl_actuals,
             sales_actuals,
+            com_actuals,
             base_fy=body.base_fy,
             current_fy=body.current_fy,
             last_closed_period=body.last_closed_period,
@@ -170,17 +184,18 @@ def plan_generate(
             detail="Plan generation failed. Check server logs.",
         ) from exc
 
-    if gl_plan_df.empty and sales_plan_df.empty:
+    if gl_plan_df.empty and sales_plan_df.empty and com_plan_df.empty:
         return PlanGenerateResponse(
             gl_plan=0,
             sales_plan=0,
+            com_plan=0,
             scenarios=[],
             message="No plan rows generated (actuals present but produced empty output).",
         )
 
     # ------------------------------------------------------------------ Write to DB
     try:
-        counts = load_plan(session, gl_plan_df, sales_plan_df)
+        counts = load_plan(session, gl_plan_df, sales_plan_df, com_plan_df)
     except Exception as exc:
         # load_plan already rolled back
         logger.error("plan_generate: load_plan failed: %s", exc)
@@ -193,14 +208,17 @@ def plan_generate(
     scenarios = sorted(
         set(gl_plan_df["scenario"].unique().tolist() if not gl_plan_df.empty else [])
         | set(sales_plan_df["scenario"].unique().tolist() if not sales_plan_df.empty else [])
+        | set(com_plan_df["scenario"].unique().tolist() if not com_plan_df.empty else [])
     )
     return PlanGenerateResponse(
         gl_plan=counts["gl_plan"],
         sales_plan=counts["sales_plan"],
+        com_plan=counts.get("com_plan", 0),
         scenarios=scenarios,
         message=(
             f"Plan generated: {counts['gl_plan']} GL rows, "
-            f"{counts['sales_plan']} sales rows across scenarios {scenarios}."
+            f"{counts['sales_plan']} sales rows, "
+            f"{counts.get('com_plan', 0)} com rows across scenarios {scenarios}."
         ),
     )
 
@@ -247,6 +265,28 @@ def plan_summary(
                 fiscal_year=int(r[1]),
                 row_count=int(r[2]),
             ))
+
+        # Manual budget (Phase 4) — count fact_position_plan rows by scenario/year.
+        # The table is additive (migration 0013); guard so a DB without it (e.g.
+        # the live 5176 profile) does not break the summary.
+        try:
+            bp_rows = session.execute(
+                text(
+                    "SELECT scenario, fiscal_year, COUNT(*) AS cnt "
+                    "FROM fact_position_plan "
+                    "GROUP BY scenario, fiscal_year "
+                    "ORDER BY fiscal_year, scenario"
+                )
+            ).fetchall()
+            for r in bp_rows:
+                rows.append(PlanSummaryRow(
+                    table="fact_position_plan",
+                    scenario=r[0],
+                    fiscal_year=int(r[1]),
+                    row_count=int(r[2]),
+                ))
+        except Exception:  # noqa: BLE001 — table absent on profiles without 0013
+            session.rollback()
     except Exception as exc:
         logger.error("plan_summary: query failed: %s", exc)
         short = str(exc).split("\n")[0][:200]
@@ -351,4 +391,43 @@ def _fetch_sales_actuals(session: Session, base_fy: int) -> pd.DataFrame:
     df["fiscal_year"] = df["fiscal_year"].astype(int)
     df["fiscal_period"] = df["fiscal_period"].astype(int)
     df["gross_sales"] = df["gross_sales"].astype(float)
+    return df
+
+
+def _fetch_com_actuals(session: Session, base_fy: int) -> pd.DataFrame:
+    """Aggregate fact_com × fact_gl_entry into supplier_id × fiscal_year × fiscal_period.
+
+    Mirror of :func:`_fetch_sales_actuals` on the supplier/cost-of-materials side:
+    joins fact_com → fact_gl_line (booking_line_id) → fact_gl_entry for fiscal_period,
+    and aggregates the positive ``cost_of_materials`` measure per
+    (supplier_id, fiscal_year, fiscal_period).
+
+    Returns columns: supplier_id, fiscal_year, fiscal_period, cost_of_materials.
+    Filters supplier_id IS NOT NULL and fiscal_year >= base_fy - 1.
+    """
+    sql = text("""
+        SELECT
+            c.supplier_id,
+            c.fiscal_year,
+            e.fiscal_period,
+            SUM(c.cost_of_materials) AS cost_of_materials
+        FROM fact_com c
+        JOIN fact_gl_line l ON l.booking_line_id = c.booking_line_id
+        JOIN fact_gl_entry e
+          ON e.journal_entry_group_number = l.journal_entry_group_number
+         AND e.fiscal_year = l.fiscal_year
+        WHERE c.supplier_id IS NOT NULL
+          AND c.fiscal_year >= :min_fy
+          AND e.fiscal_period BETWEEN 1 AND 12
+        GROUP BY c.supplier_id, c.fiscal_year, e.fiscal_period
+        ORDER BY c.supplier_id, c.fiscal_year, e.fiscal_period
+    """)
+    rows = session.execute(sql, {"min_fy": base_fy - 1}).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["supplier_id", "fiscal_year", "fiscal_period", "cost_of_materials"])
+
+    df = pd.DataFrame(rows, columns=["supplier_id", "fiscal_year", "fiscal_period", "cost_of_materials"])
+    df["fiscal_year"] = df["fiscal_year"].astype(int)
+    df["fiscal_period"] = df["fiscal_period"].astype(int)
+    df["cost_of_materials"] = df["cost_of_materials"].astype(float)
     return df

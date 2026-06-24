@@ -21,6 +21,12 @@ export interface BotConversationProps {
   inputPlaceholder?: string
   /** Use full width centered content column */
   wide?: boolean
+  /**
+   * Active mode ('upload' | 'pipeline').  When provided, the greet message
+   * includes `metadata: { data_source_mode, data_source }` so Rasa's
+   * ActionSetSessionId can set the `data_source_mode` slot on the first turn.
+   */
+  mode?: 'upload' | 'pipeline'
 }
 
 export default function BotConversation({
@@ -31,6 +37,7 @@ export default function BotConversation({
   footerNote,
   inputPlaceholder = 'Type a message or use the cards above…',
   wide = false,
+  mode,
 }: BotConversationProps) {
   const {
     messages,
@@ -49,6 +56,17 @@ export default function BotConversation({
   const hasPreloadedFile = useRef(false)
   const preloadComplete = useRef(false)
 
+  /**
+   * Build greet send-options for a given mode value.
+   * Inlined at each call-site so effects capture the primitive `mode`, not
+   * a freshly-allocated object (avoids stale-closure and lint churn).
+   */
+  function makeGreetOptions(m: typeof mode) {
+    return m
+      ? { skipUserBubble: true, metadata: { data_source_mode: m, data_source: m } }
+      : { skipUserBubble: true }
+  }
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading, scriptJobLoading])
@@ -64,9 +82,10 @@ export default function BotConversation({
         return
       }
       hasInitiated.current = true
-      void send('/greet', { skipUserBubble: true })
+      void send('/greet', makeGreetOptions(mode))
     }
-  }, [sessionEpoch, active, autoHello, send, preloadedFile, messages.length])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionEpoch, active, autoHello, send, preloadedFile, messages.length, mode])
 
   useEffect(() => {
     if (!active || !autoHello || hasInitiated.current) return
@@ -78,8 +97,9 @@ export default function BotConversation({
     // stored in the Rasa session before starting the guided conversation.
     if (preloadedFile && !preloadComplete.current) return
     hasInitiated.current = true
-    void send('/greet', { skipUserBubble: true })
-  }, [active, autoHello, send, preloadedFile, messages.length])
+    void send('/greet', makeGreetOptions(mode))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, autoHello, send, preloadedFile, messages.length, mode])
 
   useEffect(() => {
     // If a file was preloaded before starting the bot (e.g. Exit Readiness tab),
@@ -107,7 +127,7 @@ export default function BotConversation({
           // Kick off the normal hello flow if it hasn't started yet.
           if (active && autoHello && !hasInitiated.current) {
             hasInitiated.current = true
-            void send('/greet', { skipUserBubble: true })
+            void send('/greet', makeGreetOptions(mode))
           }
         }
       })

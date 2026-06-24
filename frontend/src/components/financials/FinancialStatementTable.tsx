@@ -300,7 +300,7 @@ export default function FinancialStatementTable({
         }}
       >
         <td
-          className={`${FIN_TABLE_CELL_CLASS} text-left whitespace-nowrap`}
+          className={`${FIN_TABLE_CELL_CLASS} text-left`}
           style={{ minWidth: 168, paddingLeft: pad, paddingRight: 8, fontSize: FIN_TABLE_VALUE_FONT }}
         >
           <div className="flex items-center gap-0.5">
