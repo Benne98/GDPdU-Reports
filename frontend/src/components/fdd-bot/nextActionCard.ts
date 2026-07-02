@@ -13,6 +13,7 @@ const SCRIPT_LABELS: Record<string, string> = {
   top: 'TOP Report',
   churn: 'Churn / ARR Bridge',
   bubble: 'Bubble Scatter Plot',
+  fixed_assets_rollf: 'Fixed Assets Rollforward',
   working_capital: 'Working capital',
 }
 

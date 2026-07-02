@@ -809,7 +809,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
     chain (Rasa tracker persistence); `desired_output` stays set — use it as fallback.
     """
     raw = tracker.get_slot("active_filter_context")
-    if raw in ("gst", "pvm", "top", "bs", "churn"):
+    if raw in ("gst", "pvm", "top", "bs", "churn", "fa"):
         return str(raw)
     desired = str(tracker.get_slot("desired_output") or "").strip()
     return {
@@ -818,6 +818,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
         "top_report": "top",
         "bubble_scatter": "bs",
         "churn": "churn",
+        "fixed_assets_rollforward": "fa",
     }.get(desired, "gst")
 
 
@@ -1535,7 +1536,7 @@ def _propagate_shared_filters(tracker: Tracker) -> list:
     """
     template_json = ""
     template_disp = ""
-    for ctx in ("gst", "pvm", "top", "bs"):
+    for ctx in ("gst", "pvm", "top", "bs", "fa"):
         raw = tracker.get_slot(f"{ctx}_filter_rules_json") or "[]"
         try:
             rules = json.loads(raw)
@@ -1555,7 +1556,7 @@ def _propagate_shared_filters(tracker: Tracker) -> list:
         return []
     fallback_disp = _build_filter_display(template_rules).strip()
     events = []
-    for ctx in ("gst", "pvm", "top", "bs"):
+    for ctx in ("gst", "pvm", "top", "bs", "fa"):
         raw = tracker.get_slot(f"{ctx}_filter_rules_json") or "[]"
         try:
             cur = json.loads(raw)
@@ -1901,6 +1902,11 @@ class ActionDispatchCard(Action):
             "bs_filter_checkpoint": ActionProcessBsFilterCheckpoint(),
             "bs_review": ActionShowBsReview(),
             "bs_proceed": ActionRunBubble(),
+            # Fixed assets rollforward
+            "fa_rollf_files": ActionProcessFaRollfFiles(),
+            "fa_rollf_columns": ActionProcessFaRollfColumns(),
+            "fa_rollf_grouping": ActionProcessFaRollfGrouping(),
+            "fa_filter_checkpoint": ActionProcessFaFilterCheckpoint(),
             # Filters
             "filter_start": ActionStartFilter(),
             "filter_rule": ActionProcessFilterRule(),
@@ -2052,6 +2058,10 @@ def _undo_redo_handlers() -> dict[str, Any]:
         "action_enter_churn_filter_checkpoint": ActionEnterChurnFilterCheckpoint(),
         "action_show_bs_review": ActionShowBsReview(),
         "action_enter_bs_filter_checkpoint": ActionEnterBsFilterCheckpoint(),
+        "action_show_fa_rollf_files": ActionShowFaRollfFiles(),
+        "action_reshow_fa_rollf_columns": ActionReshowFaRollfColumns(),
+        "action_show_fa_rollf_grouping": ActionShowFaRollfGrouping(),
+        "action_enter_fa_filter_checkpoint": ActionEnterFaFilterCheckpoint(),
     }
     return _UNDO_REDO_HANDLERS
 
@@ -2558,6 +2568,7 @@ class ActionProcessFxCard(Action):
                                 {"label": "General Sales Table", "value": "general_sales_table"},
                                 {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
+                                {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
                             ],
                         }
                     ],
@@ -2616,6 +2627,10 @@ class ActionProcessDesiredOutput(Action):
                     },
                 )
             )
+        elif desired == "fixed_assets_rollforward":
+            dispatcher.utter_message(text="Great! Let's configure the Fixed Assets Rollforward.")
+            dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
+            events.append(SlotSet("output_type", "fixed_assets_rollforward"))
 
         return events
 
@@ -5512,6 +5527,370 @@ class ActionRunBubble(Action):
         return []
 
 
+# ─── Fixed Assets Rollforward flow ─────────────────────────────────────────────
+
+FA_MAX_GROUP_LEVELS = 2
+
+
+def _fa_rollf_files_card(tracker: Tracker) -> dict[str, Any]:
+    years = _compute_databook_period_labels(tracker)
+    grid_options = _databook_grid_options(tracker)
+    has_ytd = any(is_ytd_grid_label(y) for y in years)
+    note = "One Anlagengitter (.xlsx) per fiscal year."
+    if has_ytd:
+        note += " YTD column is optional (upload only if available)."
+    return {
+        "type": "adaptive_card",
+        "card": "fa_rollf_files",
+        "title": "Fixed Assets — Register files",
+        "subtitle": "Upload your annual fixed-asset register extracts for each period.",
+        "inputs": [
+            {
+                "id": "susa_files",
+                "type": "susa_grid",
+                "label": "Register files",
+                "options": grid_options,
+                "entity_count": 1,
+                "grid_mode": "single_file",
+                "fixed_entity_name": "Fixed assets",
+            }
+        ],
+        "susa_grid_note": note,
+        "submit_label": "Continue",
+    }
+
+
+def _fa_periods_from_grid(groups: dict[str, list[str]], tracker: Tracker) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for key, ids in groups.items():
+        if not ids:
+            continue
+        parts = str(key).split("_")
+        if len(parts) < 3 or parts[0] != "entity":
+            continue
+        fy_label = "_".join(parts[2:])
+        rows.append({"label": fy_label, "file_id": str(ids[0])})
+    order = {label: i for i, label in enumerate(_compute_databook_period_labels(tracker))}
+    rows.sort(key=lambda r: order.get(r["label"], 999))
+    return rows
+
+
+def _fa_mapped_column_names(tracker: Tracker) -> set[str]:
+    names: set[str] = set()
+    for slot in ("fa_opening_col", "fa_additions_col", "fa_disposals_col"):
+        v = str(tracker.get_slot(slot) or "").strip()
+        if v:
+            names.add(v)
+    raw_dep = tracker.get_slot("fa_depreciation_cols_json") or "[]"
+    try:
+        dep_cols = json.loads(raw_dep)
+    except (json.JSONDecodeError, TypeError):
+        dep_cols = []
+    if isinstance(dep_cols, list):
+        for c in dep_cols:
+            s = str(c).strip()
+            if s:
+                names.add(s)
+    legacy = str(tracker.get_slot("fa_depreciation_col") or "").strip()
+    if legacy:
+        names.add(legacy)
+    return names
+
+
+def _emit_fa_rollf_columns_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    periods = json.loads(tracker.get_slot("fa_periods_json") or "[]")
+    preview_id = ""
+    preview_sheet = ""
+    if periods:
+        preview_id = str(periods[0].get("file_id") or tracker.get_slot("file_id") or "")
+        preview_sheet = str(periods[0].get("sheet_name") or tracker.get_slot("sheet_name") or "")
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "fa_rollf_columns",
+            "wide": True,
+            "title": "Map fixed-asset columns",
+            "subtitle": (
+                "Click a column header for opening, additions, and disposals. "
+                "Then select one or more depreciation columns to sum and confirm."
+            ),
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": preview_id,
+                "sheet_name": preview_sheet,
+                "header_row": 0,
+            },
+            "inputs": [],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _emit_fa_rollf_grouping_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    headers = _headers_from_sources(tracker)
+    mapped = _fa_mapped_column_names(tracker)
+    dim_opts = [{"label": "None", "value": ""}] + [{"label": h, "value": h} for h in headers if h and h not in mapped]
+    inputs: list[dict[str, Any]] = [
+        {
+            "id": "fa_group_col_1",
+            "type": "dropdown",
+            "label": "Grouping — level 1 (e.g. Bilanzposition)",
+            "options": dim_opts,
+            "default": str(tracker.get_slot("fa_group_col_1") or ""),
+        },
+        {
+            "id": "fa_group_col_2",
+            "type": "dropdown",
+            "label": "Grouping — level 2 (optional, e.g. Anlagenklasse)",
+            "options": dim_opts,
+            "default": str(tracker.get_slot("fa_group_col_2") or ""),
+        },
+    ]
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "fa_rollf_grouping",
+            "title": "Fixed assets — Grouping",
+            "subtitle": "Choose up to two grouping columns for the rollforward hierarchy.",
+            "inputs": inputs,
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _fa_group_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    p = payload or {}
+    cols: list[str] = []
+    for i in range(1, FA_MAX_GROUP_LEVELS + 1):
+        raw = p.get(f"fa_group_col_{i}")
+        if raw in (None, ""):
+            raw = tracker.get_slot(f"fa_group_col_{i}")
+        text = str(raw or "").strip()
+        if text:
+            cols.append(text)
+    return cols
+
+
+class ActionShowFaRollfFiles(Action):
+    def name(self) -> str:
+        return "action_show_fa_rollf_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
+        return []
+
+
+class ActionProcessFaRollfFiles(Action):
+    def name(self) -> str:
+        return "action_process_fa_rollf_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        groups = _parse_susa_grid_file_groups(payload)
+        periods = _fa_periods_from_grid(groups, tracker)
+        if not periods:
+            dispatcher.utter_message(text="Please upload at least one period file in the grid.")
+            dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
+            return []
+        events = [SlotSet("fa_periods_json", json.dumps(periods, ensure_ascii=False))]
+        _emit_fa_rollf_columns_card(dispatcher, tracker)
+        return events
+
+
+class ActionReshowFaRollfColumns(Action):
+    def name(self) -> str:
+        return "action_reshow_fa_rollf_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_fa_rollf_columns_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessFaRollfColumns(Action):
+    def name(self) -> str:
+        return "action_process_fa_rollf_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        required = ("fa_opening_col", "fa_additions_col", "fa_disposals_col")
+        events: list[Any] = []
+        for slot in required:
+            val = str(payload.get(slot) or "").strip()
+            if not val:
+                dispatcher.utter_message(text="Please map opening, additions, and disposals before continuing.")
+                _emit_fa_rollf_columns_card(dispatcher, tracker)
+                return []
+            events.append(SlotSet(slot, val))
+
+        raw_dep = payload.get("fa_depreciation_cols_json", tracker.get_slot("fa_depreciation_cols_json") or "[]")
+        if isinstance(raw_dep, list):
+            dep_cols = [str(c).strip() for c in raw_dep if str(c).strip()]
+        else:
+            try:
+                parsed = json.loads(str(raw_dep or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                parsed = []
+            dep_cols = [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+        if not dep_cols:
+            dispatcher.utter_message(text="Please select at least one depreciation column to sum.")
+            _emit_fa_rollf_columns_card(dispatcher, tracker)
+            return []
+
+        events.append(SlotSet("fa_depreciation_cols_json", json.dumps(dep_cols, ensure_ascii=False)))
+        _emit_fa_rollf_grouping_card(dispatcher, tracker)
+        return events
+
+
+class ActionShowFaRollfGrouping(Action):
+    def name(self) -> str:
+        return "action_show_fa_rollf_grouping"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_fa_rollf_grouping_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessFaRollfGrouping(Action):
+    def name(self) -> str:
+        return "action_process_fa_rollf_grouping"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        events: list[Any] = []
+        for i in range(1, FA_MAX_GROUP_LEVELS + 1):
+            slot = f"fa_group_col_{i}"
+            if slot in payload:
+                events.append(SlotSet(slot, str(payload.get(slot) or "").strip()))
+        group_cols = _fa_group_cols_from_sources(tracker, payload)
+        if len(group_cols) >= 2 and group_cols[0] == group_cols[1]:
+            dispatcher.utter_message(text="Level 1 and level 2 must be different columns.")
+            _emit_fa_rollf_grouping_card(dispatcher, tracker)
+            return events
+        return events + [FollowupAction("action_enter_fa_filter_checkpoint")]
+
+
+def _fa_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
+    disp = (tracker.get_slot("fa_filter_rules_display") or "").strip() or "No active filter rules."
+    return {
+        "type": "adaptive_card",
+        "card": "fa_filter_checkpoint",
+        "title": "Fixed assets — Filter rules",
+        "review_text": disp,
+        "inputs": [
+            {
+                "id": "fa_filter_manage_choice",
+                "type": "radio",
+                "label": "What would you like to do?",
+                "options": [
+                    {"label": "1. Delete current rules", "value": "delete_all"},
+                    {"label": "2. Add a rule", "value": "add_rule"},
+                    {"label": "3. Keep rules as they are", "value": "keep"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+class ActionEnterFaFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_enter_fa_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_fa_filter_checkpoint_card(tracker))
+        return []
+
+
+class ActionProcessFaFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_process_fa_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("fa_filter_manage_choice", "")).lower()
+        if choice == "delete_all":
+            return [
+                SlotSet("fa_filter_rules_json", "[]"),
+                SlotSet("fa_filter_rules_display", ""),
+                FollowupAction("action_enter_fa_filter_checkpoint"),
+            ]
+        if choice == "add_rule":
+            return [SlotSet("active_filter_context", "fa"), FollowupAction("action_start_filter")]
+        if choice == "keep":
+            return [FollowupAction("action_run_fa_rollf")]
+        return [FollowupAction("action_enter_fa_filter_checkpoint")]
+
+
+class ActionRunFaRollf(Action):
+    def name(self) -> str:
+        return "action_run_fa_rollf"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        s = tracker.slots
+        payload = _parse_payload(tracker)
+
+        def pick(key: str, default=None):
+            v = payload.get(key, None)
+            if v is None or v == "":
+                v = s.get(key)
+            return default if v in (None, "") else v
+
+        periods_raw = pick("fa_periods_json", s.get("fa_periods_json") or "[]")
+        if isinstance(periods_raw, str):
+            try:
+                periods = json.loads(periods_raw)
+            except json.JSONDecodeError:
+                periods = []
+        else:
+            periods = list(periods_raw or [])
+        if not periods:
+            dispatcher.utter_message(text="Fixed assets period files missing — please upload register files first.")
+            return [FollowupAction("action_show_fa_rollf_files")]
+
+        raw_dep = pick("fa_depreciation_cols_json", s.get("fa_depreciation_cols_json") or "[]")
+        if isinstance(raw_dep, list):
+            dep_cols = [str(c).strip() for c in raw_dep if str(c).strip()]
+        else:
+            try:
+                parsed = json.loads(str(raw_dep or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                parsed = []
+            dep_cols = [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+        if not dep_cols:
+            dispatcher.utter_message(text="Depreciation columns missing — please map columns first.")
+            return [FollowupAction("action_reshow_fa_rollf_columns")]
+
+        columns = {
+            "opening": pick("fa_opening_col", s.get("fa_opening_col")),
+            "additions": pick("fa_additions_col", s.get("fa_additions_col")),
+            "disposals": pick("fa_disposals_col", s.get("fa_disposals_col")),
+            "depreciation_cols": dep_cols,
+        }
+
+        fy_m, fy_d = _fy_end_month_day_from_tracker({}, tracker)
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "file_id": periods[0].get("file_id") or tracker.get_slot("file_id"),
+            "config": {
+                "title": pick("project_name", s.get("project_name")),
+                "company": pick("group_name", s.get("group_name")),
+                "first_fy": _tracker_first_fy_int(tracker),
+                "fy_end_month": fy_m,
+                "fy_end_day": fy_d,
+                "periods": periods,
+                "header_row": 0,
+                "columns": columns,
+                "group_cols": _fa_group_cols_from_sources(tracker, payload),
+                "filters": _fdd_filters_payload(pick("fa_filter_rules_json", s.get("fa_filter_rules_json"))),
+                "unit_label": "kEUR",
+                "amount_scale": 1000,
+                "output_file_path": s.get("output_folder", ""),
+            },
+        }
+        _start_async_revenue_script(dispatcher, body, "fixed_assets_rollf", "Fixed Assets Rollforward")
+        return [SlotSet("output_type", "fixed_assets_rollforward")]
+
+
 # ─── Apply Filters ────────────────────────────────────────────────────────────
 
 
@@ -5647,6 +6026,7 @@ class ActionFinishFilters(Action):
             "top": "action_enter_top_filter_checkpoint",
             "bs": "action_enter_bs_filter_checkpoint",
             "churn": "action_enter_churn_filter_checkpoint",
+            "fa": "action_enter_fa_filter_checkpoint",
         }
         next_action = follow_map.get(context, "utter_default")
         return [FollowupAction(next_action)]
@@ -5686,6 +6066,7 @@ class ActionProcessNextAction(Action):
                                 {"label": "General Sales Table", "value": "general_sales_table"},
                                 {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
+                                {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
                             ],
                         }
                     ],
@@ -5700,6 +6081,7 @@ class ActionProcessNextAction(Action):
                 "top_report": "top",
                 "bubble_scatter": "bs",
                 "churn": "churn",
+                "fixed_assets_rollforward": "fa",
             }
             ctx = ctx_map.get(desired, "gst")
             checkpoint_map = {
@@ -5708,6 +6090,7 @@ class ActionProcessNextAction(Action):
                 "top": "action_enter_top_filter_checkpoint",
                 "bs": "action_enter_bs_filter_checkpoint",
                 "churn": "action_enter_churn_filter_checkpoint",
+                "fa": "action_enter_fa_filter_checkpoint",
             }
             return [
                 SlotSet("active_filter_context", ctx),
@@ -5722,6 +6105,7 @@ class ActionProcessNextAction(Action):
                 "top_report": "action_show_top_review",
                 "bubble_scatter": "action_show_bs_review",
                 "churn": "action_show_churn_review",
+                "fixed_assets_rollforward": "action_show_fa_rollf_grouping",
             }
             next_act = rerun_map.get(desired, "utter_default")
             return [FollowupAction(next_act)]

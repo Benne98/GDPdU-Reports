@@ -13,6 +13,7 @@ import { Upload, ChevronDown, Check, FileSpreadsheet, Download } from 'lucide-re
 import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
 import SusaColumnMapper, { type SusaColumnMappingPayload } from './SusaColumnMapper'
+import FaRollfColumnMapper from './FaRollfColumnMapper'
 
 interface Props {
   payload: AdaptiveCardPayload
@@ -904,7 +905,42 @@ export default function AdaptiveCard(props: Props) {
   if (props.payload.card === 'databook_susa_column_mapper') {
     return <SusaColumnMapperCard {...props} />
   }
+  if (props.payload.card === 'fa_rollf_columns') {
+    return <FaRollfColumnMapperCard {...props} />
+  }
   return <AdaptiveCardForm {...props} />
+}
+
+function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const meta = payload.mapper_meta ?? {}
+  const sessionId = String(meta.session_id ?? '')
+  const previewFileId = String(meta.preview_file_id ?? '')
+  const sheetName = String(meta.sheet_name ?? '')
+  const headerRow = Number(meta.header_row ?? 0)
+
+  const handleMapping = async (mapping: Record<string, string>) => {
+    await onSubmit(payload.card, mapping)
+  }
+
+  return (
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3 relative"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
+    >
+      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
+        {payload.title}
+      </h3>
+      {payload.subtitle && <p className="text-xs text-slate-500">{payload.subtitle}</p>}
+      <FaRollfColumnMapper
+        sessionId={sessionId}
+        previewFileId={previewFileId}
+        sheetName={sheetName}
+        headerRow={headerRow}
+        disabled={disabled}
+        onSubmit={handleMapping}
+      />
+    </div>
+  )
 }
 
 function normalizeMapperMeta(value: unknown, fallback: string): string {

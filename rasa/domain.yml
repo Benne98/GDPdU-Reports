@@ -284,6 +284,52 @@ slots:
     mappings:
       - type: custom
 
+  # ── Fixed Assets Rollforward ──
+  fa_periods_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_opening_col:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_additions_col:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_disposals_col:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_depreciation_cols_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_group_col_1:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_group_col_2:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
   # ── PVM Analysis ──
   pvm_group_col:
     type: text
@@ -1123,6 +1169,15 @@ actions:
   - action_process_bs_filter_checkpoint
   - action_show_bs_review
   - action_run_bubble
+  - action_show_fa_rollf_files
+  - action_process_fa_rollf_files
+  - action_reshow_fa_rollf_columns
+  - action_process_fa_rollf_columns
+  - action_show_fa_rollf_grouping
+  - action_process_fa_rollf_grouping
+  - action_enter_fa_filter_checkpoint
+  - action_process_fa_filter_checkpoint
+  - action_run_fa_rollf
   - action_start_filter
   - action_process_filter_rule
   - action_finish_filters

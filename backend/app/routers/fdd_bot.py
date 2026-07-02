@@ -78,7 +78,117 @@ SCRIPTS: dict[str, Path] = {
     "bs_bucket": PROJECT_ROOT / "BS_Bucket.py",
     "lead_bs": PROJECT_ROOT / "Lead_BS.py",
     "working_capital": PROJECT_ROOT / "Working_capital.py",
+    "fixed_assets_rollf": PROJECT_ROOT / "fixed_assets_rollf.py",
 }
+
+
+def _workbook_matrix_preview(
+    session_id: str,
+    file_id: str,
+    sheet_name: str = "",
+    sheet_index: int = 0,
+    header_row: int = 0,
+    max_rows: int = 12,
+) -> dict:
+    """Matrix preview for column mappers (header + letter columns + sample rows)."""
+    if not (file_id or "").strip():
+        raise HTTPException(status_code=400, detail="file_id is required for preview.")
+
+    path = _file_path_for_id(session_id, file_id)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found for session_id / file_id.")
+
+    try:
+        from openpyxl.utils import get_column_letter
+
+        if sheet_name:
+            raw = pd.read_excel(
+                path, sheet_name=sheet_name, header=None, engine="openpyxl", nrows=header_row + max_rows + 1
+            )
+        else:
+            raw = pd.read_excel(
+                path, sheet_name=sheet_index, header=None, engine="openpyxl", nrows=header_row + max_rows + 1
+            )
+    except Exception as exc:
+        logger.exception("workbook matrix preview failed")
+        raise HTTPException(status_code=400, detail=f"Could not read workbook: {exc}") from exc
+
+    if raw.empty or header_row >= len(raw):
+        raise HTTPException(status_code=400, detail="header_row out of range")
+
+    headers = [
+        str(v).strip() if v is not None and not (isinstance(v, float) and pd.isna(v)) else ""
+        for v in raw.iloc[header_row]
+    ]
+    columns = []
+    for i, h in enumerate(headers):
+        letter = get_column_letter(i + 1)
+        samples = []
+        for r in range(header_row + 1, min(len(raw), header_row + 1 + 5)):
+            val = raw.iat[r, i]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                samples.append("")
+            else:
+                samples.append(str(val))
+        columns.append({"letter": letter, "header": h, "sample_values": samples})
+
+    body_rows = []
+    for r in range(header_row + 1, min(len(raw), header_row + max_rows)):
+        row = []
+        for c in range(len(headers)):
+            val = raw.iat[r, c]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                row.append("")
+            else:
+                row.append(str(val))
+        body_rows.append(row)
+
+    return {
+        "file_id": file_id,
+        "sheet_index": sheet_index,
+        "sheet_name": sheet_name or None,
+        "header_row_index": header_row,
+        "columns": columns,
+        "rows": body_rows,
+    }
+
+
+def _normalize_fa_rollf_config(config: dict, session_id: str) -> dict:
+    """Resolve period file_ids to paths and infer sheet names."""
+    cfg = dict(config)
+    raw_periods = cfg.get("periods")
+    if not isinstance(raw_periods, list) or not raw_periods:
+        raise ValueError("Fixed assets rollforward config requires periods[]")
+
+    from fixed_assets_rollf import _resolve_sheet_name
+
+    normalized: list[dict] = []
+    for item in raw_periods:
+        if not isinstance(item, dict):
+            continue
+        period = dict(item)
+        label = str(period.get("label") or "").strip()
+        if not label:
+            continue
+        fid = str(period.get("file_id") or "").strip()
+        fp = str(period.get("file_path") or "").strip()
+        if not fp and fid:
+            resolved = _file_path_for_id(session_id, fid)
+            if resolved:
+                fp = str(resolved)
+        if not fp:
+            raise ValueError(f"Fixed assets period '{label}' file not found for session {session_id}")
+        period["file_path"] = fp
+        sheet = str(period.get("sheet_name") or "").strip()
+        period["sheet_name"] = _resolve_sheet_name(fp, sheet)
+        normalized.append(period)
+
+    if not normalized:
+        raise ValueError("Fixed assets rollforward config has no valid periods")
+    cfg["periods"] = normalized
+    cfg["file_path"] = normalized[0]["file_path"]
+    cfg["sheet_name"] = normalized[0]["sheet_name"]
+    return cfg
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1249,6 +1359,39 @@ def susa_preview(
     except Exception as exc:
         logger.exception("susa preview failed")
         raise HTTPException(status_code=400, detail=f"Could not read workbook: {exc}") from exc
+
+
+# ─── Fixed Assets Rollforward preview + run ───────────────────────────────────
+
+
+@router.get("/fa_rollf/preview")
+def fa_rollf_preview(
+    session_id: str = Query(...),
+    file_id: str = Query(...),
+    sheet_name: str = Query(""),
+    sheet_index: int = Query(0, ge=0),
+    header_row: int = Query(0, ge=0),
+    max_rows: int = Query(12, ge=1, le=30),
+):
+    return _workbook_matrix_preview(session_id, file_id, sheet_name, sheet_index, header_row, max_rows)
+
+
+@router.post("/run/fixed_assets_rollf")
+def run_fixed_assets_rollf(req: RunRequest):
+    try:
+        config = _normalize_fa_rollf_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _prepare_and_run(req.session_id, req.file_id, config, "fixed_assets_rollf")
+
+
+@router.post("/run/fixed_assets_rollf/async")
+def run_fixed_assets_rollf_async(req: RunRequest):
+    try:
+        config = _normalize_fa_rollf_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _start_async_script_job(req.session_id, req.file_id, config, "fixed_assets_rollf")
 
 
 # ─── Run: Databook — SuSa step ────────────────────────────────────────────────
