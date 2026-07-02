@@ -14,6 +14,8 @@ import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
 import SusaColumnMapper, { type SusaColumnMappingPayload } from './SusaColumnMapper'
 import FaRollfColumnMapper from './FaRollfColumnMapper'
+import OposColumnMapper from './OposColumnMapper'
+import OposSnapshotsCard from './OposSnapshotsCard'
 
 interface Props {
   payload: AdaptiveCardPayload
@@ -905,10 +907,34 @@ export default function AdaptiveCard(props: Props) {
   if (props.payload.card === 'databook_susa_column_mapper') {
     return <SusaColumnMapperCard {...props} />
   }
+  if (props.payload.card === 'opos_columns') {
+    return <OposColumnMapperCard {...props} />
+  }
+  if (props.payload.card === 'opos_snapshots') {
+    return <OposSnapshotsCardWrapper {...props} />
+  }
   if (props.payload.card === 'fa_rollf_columns') {
     return <FaRollfColumnMapperCard {...props} />
   }
   return <AdaptiveCardForm {...props} />
+}
+
+function OposSnapshotsCardWrapper({ payload, onSubmit, onFileUpload, disabled }: Props) {
+  const handleSubmit = async (
+    snapshots: { as_of: string; file_id: string; file_path: string; sheet_name?: string }[],
+  ) => {
+    await onSubmit(payload.card, { opos_snapshots: snapshots })
+  }
+  return (
+    <OposSnapshotsCard
+      title={payload.title}
+      subtitle={payload.subtitle}
+      submitLabel={payload.submit_label ?? 'Continue'}
+      disabled={disabled}
+      onFileUpload={onFileUpload}
+      onSubmit={handleSubmit}
+    />
+  )
 }
 
 function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
@@ -932,6 +958,38 @@ function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       </h3>
       {payload.subtitle && <p className="text-xs text-slate-500">{payload.subtitle}</p>}
       <FaRollfColumnMapper
+        sessionId={sessionId}
+        previewFileId={previewFileId}
+        sheetName={sheetName}
+        headerRow={headerRow}
+        disabled={disabled}
+        onSubmit={handleMapping}
+      />
+    </div>
+  )
+}
+
+function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const meta = payload.mapper_meta ?? {}
+  const sessionId = String(meta.session_id ?? '')
+  const previewFileId = String(meta.preview_file_id ?? '')
+  const sheetName = String(meta.sheet_name ?? '')
+  const headerRow = Number(meta.header_row ?? 0)
+
+  const handleMapping = async (mapping: Record<string, string>) => {
+    await onSubmit(payload.card, mapping)
+  }
+
+  return (
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3 relative"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
+    >
+      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
+        {payload.title}
+      </h3>
+      {payload.subtitle && <p className="text-xs text-slate-500">{payload.subtitle}</p>}
+      <OposColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
         sheetName={sheetName}

@@ -809,7 +809,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
     chain (Rasa tracker persistence); `desired_output` stays set — use it as fallback.
     """
     raw = tracker.get_slot("active_filter_context")
-    if raw in ("gst", "pvm", "top", "bs", "churn", "fa"):
+    if raw in ("gst", "pvm", "top", "bs", "churn", "fa", "opos"):
         return str(raw)
     desired = str(tracker.get_slot("desired_output") or "").strip()
     return {
@@ -1536,7 +1536,7 @@ def _propagate_shared_filters(tracker: Tracker) -> list:
     """
     template_json = ""
     template_disp = ""
-    for ctx in ("gst", "pvm", "top", "bs", "fa"):
+    for ctx in ("gst", "pvm", "top", "bs", "fa", "opos"):
         raw = tracker.get_slot(f"{ctx}_filter_rules_json") or "[]"
         try:
             rules = json.loads(raw)
@@ -1556,7 +1556,7 @@ def _propagate_shared_filters(tracker: Tracker) -> list:
         return []
     fallback_disp = _build_filter_display(template_rules).strip()
     events = []
-    for ctx in ("gst", "pvm", "top", "bs", "fa"):
+    for ctx in ("gst", "pvm", "top", "bs", "fa", "opos"):
         raw = tracker.get_slot(f"{ctx}_filter_rules_json") or "[]"
         try:
             cur = json.loads(raw)
@@ -1902,6 +1902,14 @@ class ActionDispatchCard(Action):
             "bs_filter_checkpoint": ActionProcessBsFilterCheckpoint(),
             "bs_review": ActionShowBsReview(),
             "bs_proceed": ActionRunBubble(),
+            # OPOS
+            "opos_snapshots": ActionProcessOposSnapshots(),
+            "opos_columns": ActionProcessOposColumns(),
+            "opos_missing_due_date": ActionProcessOposMissingDueDate(),
+            "opos_sort": ActionProcessOposSort(),
+            "opos_buckets": ActionProcessOposBuckets(),
+            "opos_filter_checkpoint": ActionProcessOposFilterCheckpoint(),
+            "opos_proceed": ActionRunOpos(),
             # Fixed assets rollforward
             "fa_rollf_files": ActionProcessFaRollfFiles(),
             "fa_rollf_columns": ActionProcessFaRollfColumns(),
@@ -2062,6 +2070,10 @@ def _undo_redo_handlers() -> dict[str, Any]:
         "action_reshow_fa_rollf_columns": ActionReshowFaRollfColumns(),
         "action_show_fa_rollf_grouping": ActionShowFaRollfGrouping(),
         "action_enter_fa_filter_checkpoint": ActionEnterFaFilterCheckpoint(),
+        "action_show_opos_snapshots": ActionShowOposSnapshots(),
+        "action_reshow_opos_columns": ActionReshowOposColumns(),
+        "action_enter_opos_filter_checkpoint": ActionEnterOposFilterCheckpoint(),
+        "action_show_opos_review": ActionShowOposReview(),
     }
     return _UNDO_REDO_HANDLERS
 
@@ -2273,16 +2285,8 @@ class ActionProcessBuildDatabook(Action):
             events.append(SlotSet("output_type", "revenue_databook"))
             return events
         elif output_type == "creditor_debitor_aging":
-            dispatcher.utter_message(
-                json_message={
-                    "type": "adaptive_card",
-                    "card": "coming_soon",
-                    "title": "Creditor / Debitor Aging",
-                    "subtitle": "This output type is coming soon. Please check back later.",
-                    "inputs": [],
-                    "submit_label": "Back",
-                }
-            )
+            dispatcher.utter_message(text="Great! Let's configure the Creditor / Debitor Aging (OPOS).")
+            dispatcher.utter_message(json_message=_opos_snapshots_card(tracker))
             return [SlotSet("output_type", "creditor_debitor_aging")]
         elif output_type == "fte_development":
             dispatcher.utter_message(
@@ -5889,6 +5893,281 @@ class ActionRunFaRollf(Action):
         }
         _start_async_revenue_script(dispatcher, body, "fixed_assets_rollf", "Fixed Assets Rollforward")
         return [SlotSet("output_type", "fixed_assets_rollforward")]
+
+
+# ─── OPOS (Creditor / Debitor Aging) ───────────────────────────────────────────
+
+OPOS_SORT_BUCKETS: list[tuple[str, str]] = [
+    ("not_yet_due", "Not yet due"),
+    ("overdue_1_30", "Overdue 1–30"),
+    ("overdue_31_60", "Overdue 31–60"),
+    ("overdue_61_90", "Overdue 61–90"),
+    ("overdue_91_180", "Overdue 91–180"),
+    ("overdue_over_180", "Overdue >180"),
+]
+
+
+def _opos_snapshots_card(tracker: Tracker) -> dict[str, Any]:
+    return {
+        "type": "adaptive_card",
+        "card": "opos_snapshots",
+        "title": "OPOS snapshots",
+        "subtitle": "Add one row per stichtag and upload the corresponding open-items file(s).",
+        "inputs": [],
+        "submit_label": "Continue",
+    }
+
+
+def _emit_opos_snapshots_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    dispatcher.utter_message(json_message=_opos_snapshots_card(tracker))
+
+
+def _parse_opos_snapshots_payload(payload: dict) -> list[dict[str, Any]]:
+    raw = payload.get("opos_snapshots")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("opos_snapshots must be a non-empty list")
+    out: list[dict[str, Any]] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        as_of = str(it.get("as_of") or "").strip()
+        file_id = str(it.get("file_id") or "").strip()
+        file_path = str(it.get("file_path") or "").strip()
+        if not as_of or not file_id:
+            continue
+        out.append({"as_of": as_of, "file_id": file_id, "file_path": file_path})
+    if not out:
+        raise ValueError("No valid OPOS snapshots in payload")
+    return out
+
+
+def _emit_opos_columns_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    snaps = json.loads(tracker.get_slot("opos_snapshots_json") or "[]")
+    preview_id = str(snaps[0].get("file_id") or tracker.get_slot("file_id") or "") if snaps else ""
+    preview_sheet = str(snaps[0].get("sheet_name") or tracker.get_slot("sheet_name") or "") if snaps else ""
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "opos_columns",
+            "wide": True,
+            "title": "Map OPOS columns",
+            "subtitle": "Click a column header to assign each role.",
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": preview_id,
+                "sheet_name": preview_sheet,
+                "header_row": 0,
+            },
+            "inputs": [],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _opos_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
+    disp = (tracker.get_slot("opos_filter_rules_display") or "").strip() or "No active filter rules."
+    return {
+        "type": "adaptive_card",
+        "card": "opos_filter_checkpoint",
+        "title": "OPOS — Filter rules",
+        "review_text": disp,
+        "inputs": [
+            {
+                "id": "opos_filter_manage_choice",
+                "type": "radio",
+                "label": "What would you like to do?",
+                "options": [
+                    {"label": "1. Delete current rules", "value": "delete_all"},
+                    {"label": "2. Add a rule", "value": "add_rule"},
+                    {"label": "3. Keep rules as they are", "value": "keep"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+class ActionShowOposSnapshots(Action):
+    def name(self) -> str:
+        return "action_show_opos_snapshots"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_opos_snapshots_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessOposSnapshots(Action):
+    def name(self) -> str:
+        return "action_process_opos_snapshots"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        try:
+            snapshots = _parse_opos_snapshots_payload(payload)
+        except ValueError as exc:
+            dispatcher.utter_message(text=str(exc))
+            _emit_opos_snapshots_card(dispatcher, tracker)
+            return []
+        _emit_opos_columns_card(dispatcher, tracker)
+        return [SlotSet("opos_snapshots_json", json.dumps(snapshots, ensure_ascii=False))]
+
+
+class ActionReshowOposColumns(Action):
+    def name(self) -> str:
+        return "action_reshow_opos_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_opos_columns_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessOposColumns(Action):
+    def name(self) -> str:
+        return "action_process_opos_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        required = ("opos_partner_id_col", "opos_partner_name_col", "opos_amount_col", "opos_due_date_col")
+        events: list[Any] = []
+        for slot in required:
+            val = str(payload.get(slot) or "").strip()
+            if not val:
+                dispatcher.utter_message(text="Please map all four required columns before continuing.")
+                _emit_opos_columns_card(dispatcher, tracker)
+                return []
+            events.append(SlotSet(slot, val))
+        # Defaults that match finssentials behavior
+        events.append(SlotSet("opos_side", str(payload.get("opos_side") or tracker.get_slot("opos_side") or "debitor")))
+        events.append(SlotSet("opos_sort_basis", "most_recent"))
+        events.append(SlotSet("opos_sort_metric", "total"))
+        events.append(SlotSet("opos_sort_bucket_keys_json", json.dumps([k for k, _ in OPOS_SORT_BUCKETS if k != "not_yet_due"])))
+        events.append(SlotSet("opos_top_bucket_enabled", "on"))
+        events.append(SlotSet("opos_top_bucket_numbers", "[10, 20, 50]"))
+        events.append(SlotSet("opos_top_other_bucket", "include"))
+        return events + [FollowupAction("action_enter_opos_filter_checkpoint")]
+
+
+class ActionProcessOposMissingDueDate(Action):
+    def name(self) -> str:
+        return "action_process_opos_missing_due_date"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        return [FollowupAction("action_process_opos_sort")]
+
+
+class ActionProcessOposSort(Action):
+    def name(self) -> str:
+        return "action_process_opos_sort"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        return [FollowupAction("action_process_opos_buckets")]
+
+
+class ActionProcessOposBuckets(Action):
+    def name(self) -> str:
+        return "action_process_opos_buckets"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        return [FollowupAction("action_enter_opos_filter_checkpoint")]
+
+
+class ActionEnterOposFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_enter_opos_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_opos_filter_checkpoint_card(tracker))
+        return []
+
+
+class ActionProcessOposFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_process_opos_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("opos_filter_manage_choice", "")).lower()
+        if choice == "delete_all":
+            return [
+                SlotSet("opos_filter_rules_json", "[]"),
+                SlotSet("opos_filter_rules_display", ""),
+                FollowupAction("action_enter_opos_filter_checkpoint"),
+            ]
+        if choice == "add_rule":
+            return [SlotSet("active_filter_context", "opos"), FollowupAction("action_start_filter")]
+        if choice == "keep":
+            return [FollowupAction("action_show_opos_review")]
+        return [FollowupAction("action_enter_opos_filter_checkpoint")]
+
+
+class ActionShowOposReview(Action):
+    def name(self) -> str:
+        return "action_show_opos_review"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(
+            json_message={
+                "type": "adaptive_card",
+                "card": "opos_proceed",
+                "compact": True,
+                "title": "Review — Creditor / Debitor Aging",
+                "subtitle": f"{tracker.get_slot('project_name') or '—'} · {tracker.get_slot('group_name') or '—'}",
+                "inputs": [],
+                "submit_label": "Create output",
+            }
+        )
+        return []
+
+
+class ActionRunOpos(Action):
+    def name(self) -> str:
+        return "action_run_opos"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        s = tracker.slots
+        payload = _parse_payload(tracker)
+
+        def pick(key: str, default=None):
+            v = payload.get(key, None)
+            return default if v is None or v == "" else v
+
+        raw_snaps = pick("opos_snapshots", None)
+        if raw_snaps is None:
+            raw_snaps = s.get("opos_snapshots_json")
+        if isinstance(raw_snaps, str):
+            try:
+                snapshots = json.loads(raw_snaps)
+            except json.JSONDecodeError:
+                snapshots = []
+        elif isinstance(raw_snaps, list):
+            snapshots = raw_snaps
+        else:
+            snapshots = []
+        if not snapshots:
+            dispatcher.utter_message(text="OPOS snapshots missing — please add stichtag and file(s) first.")
+            return [FollowupAction("action_show_opos_snapshots")]
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "file_id": (snapshots[0] or {}).get("file_id") or tracker.get_slot("file_id"),
+            "config": {
+                "title": tracker.get_slot("project_name") or "",
+                "company": tracker.get_slot("group_name") or "",
+                "snapshots": snapshots,
+                "columns": {
+                    "partner_id": tracker.get_slot("opos_partner_id_col") or "",
+                    "partner_name": tracker.get_slot("opos_partner_name_col") or "",
+                    "amount": tracker.get_slot("opos_amount_col") or "",
+                    "due_date": tracker.get_slot("opos_due_date_col") or "",
+                },
+                "side": tracker.get_slot("opos_side") or "debitor",
+                "output_file_path": tracker.get_slot("output_folder") or "",
+                "filters": _fdd_filters_payload(tracker.get_slot("opos_filter_rules_json") or "[]"),
+            },
+        }
+
+        _start_async_revenue_script(dispatcher, body, "opos", "Creditor / Debitor Aging")
+        return [SlotSet("output_type", "creditor_debitor_aging")]
 
 
 # ─── Apply Filters ────────────────────────────────────────────────────────────

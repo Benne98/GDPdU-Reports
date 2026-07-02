@@ -330,6 +330,77 @@ slots:
     mappings:
       - type: custom
 
+  # ── OPOS (Creditor / Debitor Aging) ──
+  opos_snapshots_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_partner_id_col:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_partner_name_col:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_amount_col:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_due_date_col:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_side:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_sort_basis:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_sort_metric:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_sort_bucket_keys_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_top_bucket_enabled:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_top_bucket_numbers:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_top_other_bucket:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
   # ── PVM Analysis ──
   pvm_group_col:
     type: text
@@ -1178,6 +1249,17 @@ actions:
   - action_enter_fa_filter_checkpoint
   - action_process_fa_filter_checkpoint
   - action_run_fa_rollf
+  - action_show_opos_snapshots
+  - action_process_opos_snapshots
+  - action_reshow_opos_columns
+  - action_process_opos_columns
+  - action_process_opos_missing_due_date
+  - action_process_opos_sort
+  - action_process_opos_buckets
+  - action_enter_opos_filter_checkpoint
+  - action_process_opos_filter_checkpoint
+  - action_show_opos_review
+  - action_run_opos
   - action_start_filter
   - action_process_filter_rule
   - action_finish_filters

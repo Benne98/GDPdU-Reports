@@ -210,12 +210,19 @@ const COLUMN_SLOT_TO_ROLE: Record<string, string> = {
   pvm_group_col: 'dimension',
   gst_group_col_1: 'dimension',
   bs_group_col_1: 'dimension',
+  opos_partner_id_col: 'partner_id',
+  opos_partner_name_col: 'partner_name',
+  opos_amount_col: 'amount',
+  opos_due_date_col: 'due_date',
 }
 
 const COLUMN_CARD_IDS = new Set([
   'gst_columns',
   'pvm_columns',
   'top_columns',
+  'opos_columns',
+  'opos_snapshots',
+  'fa_rollf_columns',
   'bs_value_columns',
   'bs_period_calc',
   'top_labels',

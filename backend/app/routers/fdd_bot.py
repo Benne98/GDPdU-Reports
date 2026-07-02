@@ -79,6 +79,7 @@ SCRIPTS: dict[str, Path] = {
     "lead_bs": PROJECT_ROOT / "Lead_BS.py",
     "working_capital": PROJECT_ROOT / "Working_capital.py",
     "fixed_assets_rollf": PROJECT_ROOT / "fixed_assets_rollf.py",
+    "opos": PROJECT_ROOT / "opos.py",
 }
 
 
@@ -1359,6 +1360,81 @@ def susa_preview(
     except Exception as exc:
         logger.exception("susa preview failed")
         raise HTTPException(status_code=400, detail=f"Could not read workbook: {exc}") from exc
+
+
+# ─── Run: OPOS Aging ───────────────────────────────────────────────────────────
+
+
+def _normalize_opos_config(config: dict, session_id: str) -> dict:
+    """Resolve snapshot file_ids to paths and infer sheet names."""
+    cfg = dict(config)
+    partner_col = str((cfg.get("columns") or {}).get("partner_id") or "").strip()
+    raw_snaps = cfg.get("snapshots")
+    if not isinstance(raw_snaps, list) or not raw_snaps:
+        fp = str(cfg.get("file_path") or "").strip()
+        as_of = str(cfg.get("as_of") or "").strip()
+        if fp and as_of:
+            raw_snaps = [{"as_of": as_of, "file_path": fp, "sheet_name": cfg.get("sheet_name", "")}]
+        else:
+            raise ValueError("OPOS config requires snapshots[] or file_path+as_of")
+
+    from opos import resolve_snapshot_sheet_name
+
+    normalized: list[dict] = []
+    for item in raw_snaps:
+        if not isinstance(item, dict):
+            continue
+        snap = dict(item)
+        fid = str(snap.get("file_id") or "").strip()
+        fp = str(snap.get("file_path") or "").strip()
+        if not fp and fid:
+            resolved = _file_path_for_id(session_id, fid)
+            if resolved:
+                fp = str(resolved)
+        if not fp:
+            raise ValueError(f"OPOS snapshot file not found for session {session_id}")
+        snap["file_path"] = fp
+        if not str(snap.get("sheet_name") or "").strip():
+            snap["sheet_name"] = resolve_snapshot_sheet_name(fp, partner_col, "")
+        normalized.append(snap)
+
+    if not normalized:
+        raise ValueError("OPOS config has no valid snapshots")
+    cfg["snapshots"] = normalized
+    cfg["file_path"] = normalized[0]["file_path"]
+    cfg["sheet_name"] = normalized[0]["sheet_name"]
+    return cfg
+
+
+@router.post("/run/opos")
+def run_opos(req: RunRequest):
+    try:
+        config = _normalize_opos_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _prepare_and_run(req.session_id, req.file_id, config, "opos")
+
+
+@router.post("/run/opos/async")
+def run_opos_async(req: RunRequest):
+    try:
+        config = _normalize_opos_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _start_async_script_job(req.session_id, req.file_id, config, "opos")
+
+
+@router.get("/opos/preview")
+def opos_preview(
+    session_id: str = Query(...),
+    file_id: str = Query(...),
+    sheet_name: str = Query(""),
+    sheet_index: int = Query(0, ge=0),
+    header_row: int = Query(0, ge=0),
+    max_rows: int = Query(12, ge=1, le=30),
+):
+    """Matrix preview for OPOS column mapper (header + letter columns + sample rows)."""
+    return _workbook_matrix_preview(session_id, file_id, sheet_name, sheet_index, header_row, max_rows)
 
 
 # ─── Fixed Assets Rollforward preview + run ───────────────────────────────────
