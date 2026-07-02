@@ -20,6 +20,7 @@ if str(BACKEND_DIR) not in sys.path:
 from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
 from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
 from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
+from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
 
 # ================================================
 # CONFIG (Desktop work defaults)
@@ -30,7 +31,7 @@ PROJECT_NAME = "Desktop Test"
 GROUP_NAME = "Group"
 UNIT_LABEL = "kEUR"
 
-INPUT_FILE = str(DESKTOP_DIR / "BS_Reconciliation_output.xlsx")
+INPUT_FILE = MASTER_WORKBOOK_STR
 MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
 SHEET_MASTER = "Master_BS"
 REPORT_SHEET = "BS_Bucket"

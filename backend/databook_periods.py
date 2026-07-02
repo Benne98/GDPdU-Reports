@@ -164,6 +164,48 @@ def ordered_reporting_columns_from_df(df) -> list[str]:
     return ordered_reporting_columns_from_headers(list(df.columns))
 
 
+def ordered_month_columns_from_headers(headers: list) -> list[str]:
+    """Month columns (Jan-2024) in master header order."""
+    return filter_master_period_columns(headers, "monthly")
+
+
+def ordered_month_columns_from_df(df) -> list[str]:
+    return ordered_month_columns_from_headers(list(df.columns))
+
+
+def parse_month_period_column(header: str) -> tuple[int, int]:
+    """Parse 'Jan-2024' -> (calendar_year, month_num)."""
+    s = str(header or "").strip()
+    if not is_month_period_column(s):
+        raise ValueError(f"Not a month period column: {header!r}")
+    abbr, year_s = s.split("-", 1)
+    month_num = EN_MONTH_ABBR.index(abbr) + 1
+    return int(year_s), month_num
+
+
+def group_month_columns_by_reporting_fy(
+    month_cols: list[str],
+    fy_end_month: int,
+) -> dict[int, list[str]]:
+    """Map reporting FY-end year -> month column labels in input order."""
+    groups: dict[int, list[str]] = {}
+    for col in month_cols:
+        cal_y, cal_m = parse_month_period_column(col)
+        fy = reporting_fy_from_period(cal_y, cal_m, fy_end_month)
+        groups.setdefault(fy, []).append(col)
+    return dict(sorted(groups.items()))
+
+
+def master_fy_label(reporting_fy_end_year: int) -> str:
+    return f"FY{str(int(reporting_fy_end_year))[-2:]}A"
+
+
+def days_in_month_formula(month_header: str) -> str:
+    """Excel formula for calendar days in a month column header."""
+    cal_y, cal_m = parse_month_period_column(month_header)
+    return f"DAY(EOMONTH(DATE({cal_y},{cal_m},1),0))"
+
+
 def split_fy_and_ytd(columns: list[str]) -> tuple[list[str], list[str]]:
     fy = [c for c in columns if is_fy_period_column(c)]
     ytd = [c for c in columns if is_ytd_period_column(c)]

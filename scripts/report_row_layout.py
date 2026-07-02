@@ -11,7 +11,11 @@ _BACKEND = Path(__file__).resolve().parent.parent / "backend"
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from databook_periods import (  # noqa: E402
+    ordered_month_columns_from_df,
+    ordered_reporting_columns_from_df,
+    split_fy_and_ytd,
+)
 
 BLANK_TOKENS = {"", "nan", "none", "null"}
 DEFAULT_REPORTED_VALUE = "reported"
@@ -527,4 +531,208 @@ def build_lead_bs_row_structure(
                 "bucket": bucket,
             }
         )
+    return row_structure
+
+
+WC_BUCKET_ORDER = ["TWC", "OWC"]
+WC_BUCKET_LABELS = {
+    "TWC": "Trade working capital",
+    "OWC": "Other working capital",
+}
+
+
+def compute_monthly_avg_sort_metric(
+    master_df: pd.DataFrame,
+    month_cols: list[str],
+    source_col: str,
+    bucket_col: str,
+    bucket: str,
+    l3: str,
+    l4: str | None = None,
+    *,
+    reported_value: str = DEFAULT_REPORTED_VALUE,
+    normalize_bucket_fn: Callable[[Any], str] | None = None,
+) -> float:
+    """Signed mean of monthly totals for rows matching bucket/L3[/L4]."""
+    if not month_cols:
+        return 0.0
+    norm = normalize_bucket_fn or (lambda x: str(x).strip())
+    rep = reported_mask(master_df, source_col, reported_value)
+    bucket_mask = master_df[bucket_col].apply(norm).eq(str(bucket).strip())
+    l3_mask = master_df["L3"].astype(str).str.strip().eq(str(l3).strip())
+    mask = rep & bucket_mask & l3_mask
+    if l4 is not None:
+        l4_series = master_df["L4"]
+        if is_blank_label(l4):
+            l4_mask = l4_series.isna() | l4_series.astype(str).str.strip().str.lower().isin(BLANK_TOKENS)
+        else:
+            l4_mask = l4_series.astype(str).str.strip().eq(str(l4).strip())
+        mask = mask & l4_mask
+    if not mask.any():
+        return 0.0
+    vals = master_df.loc[mask, month_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    monthly_totals = vals.sum(axis=0)
+    return float(monthly_totals.mean())
+
+
+def sort_by_signed_monthly_avg(labels: list[str], metrics: dict[str, float]) -> list[str]:
+    return sorted(
+        labels,
+        key=lambda lbl: (-float(metrics.get(lbl, 0.0)), str(lbl).lower()),
+    )
+
+
+def _append_wc_l3_block(
+    row_structure: list[dict],
+    bucket: str,
+    l3: str,
+    sorted_l4s: list[str],
+) -> None:
+    l3_label = str(l3).strip()
+    if not sorted_l4s:
+        return
+
+    if len(sorted_l4s) == 1:
+        only_l4 = sorted_l4s[0]
+        if str(only_l4).strip() == l3_label:
+            row_structure.append(
+                {
+                    "type": "detail_single",
+                    "label": l3_label,
+                    "NA": bucket,
+                    "L3": l3_label,
+                    "L4": only_l4,
+                }
+            )
+            return
+        row_structure.append(
+            {
+                "type": "detail",
+                "label": only_l4,
+                "NA": bucket,
+                "L3": l3_label,
+                "L4": only_l4,
+            }
+        )
+        row_structure.append(
+            {
+                "type": "subtotal_l3",
+                "label": l3_label,
+                "NA": bucket,
+                "L3": l3_label,
+                "L4": "",
+            }
+        )
+        return
+
+    for l4 in sorted_l4s:
+        row_structure.append(
+            {
+                "type": "detail",
+                "label": l4,
+                "NA": bucket,
+                "L3": l3_label,
+                "L4": l4,
+            }
+        )
+    row_structure.append(
+        {
+            "type": "subtotal_l3",
+            "label": l3_label,
+            "NA": bucket,
+            "L3": l3_label,
+            "L4": "",
+        }
+    )
+
+
+def build_working_capital_row_structure(
+    master_df: pd.DataFrame,
+    l3_order: list[str],
+    cfg: dict,
+    *,
+    source_col: str,
+    bucket_col: str,
+    normalize_bucket_fn: Callable[[Any], str],
+    reported_value: str = DEFAULT_REPORTED_VALUE,
+) -> list[dict]:
+    """TWC/OWC hierarchy: L4 detail -> L3 subtotal -> NA bucket total; then NWC."""
+    month_cols = ordered_month_columns_from_df(master_df)
+    pairs_by_bucket = discover_l3_l4_pairs_by_bucket(
+        master_df,
+        l3_order,
+        source_col,
+        bucket_col,
+        bucket_order=WC_BUCKET_ORDER,
+        normalize_bucket_fn=normalize_bucket_fn,
+        reported_value=reported_value,
+    )
+
+    row_structure: list[dict] = []
+    for bucket in WC_BUCKET_ORDER:
+        pairs = pairs_by_bucket.get(bucket, [])
+        if not pairs:
+            continue
+
+        l3_to_l4: dict[str, list[str]] = {}
+        for l3, l4 in pairs:
+            l3_to_l4.setdefault(l3, [])
+            if l4 not in l3_to_l4[l3]:
+                l3_to_l4[l3].append(l4)
+
+        l3_metrics = {
+            l3: compute_monthly_avg_sort_metric(
+                master_df,
+                month_cols,
+                source_col,
+                bucket_col,
+                bucket,
+                l3,
+                l4=None,
+                reported_value=reported_value,
+                normalize_bucket_fn=normalize_bucket_fn,
+            )
+            for l3 in l3_to_l4
+        }
+        sorted_l3s = sort_by_signed_monthly_avg(list(l3_to_l4.keys()), l3_metrics)
+
+        for l3 in sorted_l3s:
+            l4_list = l3_to_l4.get(l3, [])
+            l4_metrics = {
+                l4: compute_monthly_avg_sort_metric(
+                    master_df,
+                    month_cols,
+                    source_col,
+                    bucket_col,
+                    bucket,
+                    l3,
+                    l4=l4,
+                    reported_value=reported_value,
+                    normalize_bucket_fn=normalize_bucket_fn,
+                )
+                for l4 in l4_list
+            }
+            sorted_l4s = sort_by_signed_monthly_avg(l4_list, l4_metrics)
+            _append_wc_l3_block(row_structure, bucket, l3, sorted_l4s)
+
+        row_structure.append(
+            {
+                "type": "total_na",
+                "label": WC_BUCKET_LABELS.get(bucket, bucket),
+                "NA": bucket,
+                "L3": "",
+                "L4": "",
+                "bucket": bucket,
+            }
+        )
+
+    row_structure.append(
+        {
+            "type": "total_nwc",
+            "label": "Net working capital",
+            "NA": "",
+            "L3": "",
+            "L4": "",
+        }
+    )
     return row_structure

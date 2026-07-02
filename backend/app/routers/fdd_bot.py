@@ -41,8 +41,8 @@ router = APIRouter(prefix="/api/v1/fdd", tags=["fdd-bot"])
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
-# Repo root (backend/app/routers → four levels up)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+# Root of the project (one level up from backend/)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 BACKEND_ROOT = PROJECT_ROOT / "backend"
 
 # SuSabyYear + susa_column_mapping live at repo root (same as script cwd).
@@ -73,10 +73,11 @@ SCRIPTS: dict[str, Path] = {
     "pdf_adjusted": PROJECT_ROOT / "PDF_Extraction_adjustments.py",
     "pdf_checked": PROJECT_ROOT / "PDF_Extraction_checked.py",
     "lead_is": PROJECT_ROOT / "Lead_IS.py",
-    "lead_bs": PROJECT_ROOT / "Lead_BS.py",
     "recon_pl": PROJECT_ROOT / "Recon_tables_PL_MM.py",
     "recon_bs": PROJECT_ROOT / "Recon_tables_BS.py",
     "bs_bucket": PROJECT_ROOT / "BS_Bucket.py",
+    "lead_bs": PROJECT_ROOT / "Lead_BS.py",
+    "working_capital": PROJECT_ROOT / "Working_capital.py",
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -780,6 +781,8 @@ class DatabookSusaRequest(BaseModel):
     fy_end_month: Optional[int] = None
     fy_end_day: Optional[int] = None
     fiscal_start_month: Optional[int] = None
+    ltm_month: Optional[str] = None
+    first_fy: Optional[int] = None
     bs_mapping_path: Optional[str] = None
     pl_mapping_path: Optional[str] = None
     strict_mapping: bool = False
@@ -1297,6 +1300,12 @@ def run_databook_susa(req: DatabookSusaRequest):
 
     fy_end_month = int(req.fy_end_month or 12)
     fiscal_start_month = int(req.fiscal_start_month or ((fy_end_month % 12) + 1))
+    fy_end_day = int(req.fy_end_day or 31)
+    from databook_periods import _parse_ltm_month, ytd_reporting_fy_end_year
+
+    ltm_month = str(req.ltm_month or "").strip() or None
+    ytd_fy = ytd_reporting_fy_end_year(ltm_month, fy_end_month, fy_end_day)
+    ltm_parsed = _parse_ltm_month(ltm_month)
     from susa_mapping_paths import resolve_susa_kontenmapping_paths
 
     bs_mapping_path, pl_mapping_path = resolve_susa_kontenmapping_paths(
@@ -1319,8 +1328,10 @@ def run_databook_susa(req: DatabookSusaRequest):
         "ap_ar_remove_account_length": req.ap_ar_remove_account_length,
         "column_mapping": column_mapping,
         "fy_end_month": fy_end_month,
-        "fy_end_day": int(req.fy_end_day or 31),
+        "fy_end_day": fy_end_day,
         "fiscal_start_month": fiscal_start_month,
+        "ltm_month": ltm_month,
+        "first_fy": int(req.first_fy) if req.first_fy else None,
         "bs_mapping_path": bs_mapping_path,
         "pl_mapping_path": pl_mapping_path,
         "strict_mapping": bool(req.strict_mapping),
@@ -1330,6 +1341,10 @@ def run_databook_susa(req: DatabookSusaRequest):
         "session_id": req.session_id,
         "case_id": req.session_id,
     }
+    if ytd_fy is not None and ltm_parsed is not None:
+        config["ytd_reporting_fy_end_year"] = ytd_fy
+        config["ytd_ltm_year"] = ltm_parsed[0]
+        config["ytd_ltm_month"] = ltm_parsed[1]
 
     config_path = run_d / "susa_config.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1538,6 +1553,7 @@ class DatabookReconPlRequest(BaseModel):
     display_label_map: dict[str, str] = Field(default_factory=dict)
     fs_review_file_id: str = ""
     show_fs_check: bool = False
+    l4_sort_basis: str = "latest_fy"
 
 
 class DatabookReconPipelineRequest(BaseModel):
@@ -1794,6 +1810,7 @@ def run_databook_pdf_extraction(req: DatabookPdfExtractionRequest):
 @router.post("/run/databook/recon-pl")
 def run_databook_recon_pl(req: DatabookReconPlRequest):
     from databook_helpers import (
+        ensure_pl_mapping_file,
         extract_fs_check_values,
         master_workbook_path,
         prepare_master_pl_for_recon,
@@ -1811,6 +1828,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
     prepare_master_pl_for_recon(master)
+    mapping_file = ensure_pl_mapping_file()
     recon_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
 
     titles = {
@@ -1833,6 +1851,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
         "project_name": req.project_name,
         "company_name": req.company_name,
         "sort_by": "custom",
+        "l4_sort_basis": str(req.l4_sort_basis or "latest_fy").strip().lower(),
         "entity_order": list(req.entity_order),
         "show_fs_check": bool(req.show_fs_check),
         "fs_check_values": fs_check,
@@ -1845,7 +1864,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
             "target_file": str(recon_target),
             "report_sheet": "PL_Reconciliation",
             "audit_master_sheet": "Master_PL",
-            "mapping_source": "db",
+            "mapping_file": str(mapping_file),
             "append_to_master": True,
             "master_file": str(master),
         },
@@ -1861,7 +1880,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
 
 @router.post("/run/databook/recon-pipeline")
 def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
-    """Run PL/BS recon, BS bucket, Lead_IS, Lead_BS on session master (no FS)."""
+    """Run PL/BS recon, BS bucket, Lead_IS, Lead_BS, Working_capital on session master."""
     from databook_helpers import master_workbook_path, prepare_master_pl_for_recon
 
     run_id = _make_run_id("db_recon_pipe_")
@@ -1883,8 +1902,8 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
         "paths": {"mapping_source": "db", "master_file": master_str},
     }
 
-    recon_pl_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
-    recon_bs_target = master.parent / f"{req.session_id}_recon_bs.xlsx"
+    recon_pl_target = master_str
+    recon_bs_target = master_str
 
     steps: list[tuple[str, dict]] = [
         (
@@ -1894,21 +1913,18 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
                 "sort_by": "custom",
                 "show_fs_check": False,
                 "fs_check_values": {"entities": [], "consolidation": []},
-                "display": {
-                    "titles": {
-                        "ic_display_name": "IC eliminations",
-                    }
-                },
+                "display": {"titles": {"ic_display_name": "IC eliminations"}},
                 "pl_config": {"display_label_map": {}},
                 "paths": {
                     **base["paths"],
                     "source_file": master_str,
                     "source_sheet": "Master_PL",
                     "source_engine": "openpyxl",
-                    "target_file": str(recon_pl_target),
+                    "target_file": recon_pl_target,
+                    "master_file": master_str,
                     "report_sheet": "PL_Reconciliation",
                     "audit_master_sheet": "Master_PL",
-                    "append_to_master": True,
+                    "append_to_master": False,
                 },
             },
         ),
@@ -1920,31 +1936,20 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
                 "paths": {
                     **base["paths"],
                     "source_file": master_str,
-                    "target_file": str(recon_bs_target),
+                    "target_file": recon_bs_target,
+                    "master_file": master_str,
                     "report_sheet": "BS_Reconciliation",
-                    "append_to_master": True,
+                    "append_to_master": False,
                 },
             },
         ),
         (
             "bs_bucket",
-            {
-                **base,
-                "paths": {
-                    **base["paths"],
-                    "input_file": master_str,
-                },
-            },
+            {**base, "paths": {**base["paths"], "input_file": master_str}},
         ),
         (
             "lead_is",
-            {
-                **base,
-                "paths": {
-                    **base["paths"],
-                    "input_file": master_str,
-                },
-            },
+            {**base, "paths": {**base["paths"], "input_file": master_str}},
         ),
         (
             "lead_bs",
@@ -1956,6 +1961,10 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
                     "pl_master_file": master_str,
                 },
             },
+        ),
+        (
+            "working_capital",
+            {**base, "paths": {**base["paths"], "input_file": master_str, "master_file": master_str}},
         ),
     ]
 

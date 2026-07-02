@@ -23,11 +23,13 @@ from report_row_layout import build_lead_bs_row_structure, l3_order_from_mapping
 # ================================================
 # DESKTOP DEFAULTS
 # ================================================
+from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 
-INPUT_FILE = str(DESKTOP_DIR / "BS_Reconciliation_output.xlsx")
+INPUT_FILE = MASTER_WORKBOOK_STR
 MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
-PL_LEAD_FILE = DESKTOP_DIR / "PL_Reconciliation_output.xlsx"
+PL_LEAD_FILE = Path(MASTER_WORKBOOK_STR)
 PL_LEAD_FILENAME = PL_LEAD_FILE.name
 
 SHEET_MASTER = "Master_BS"
@@ -260,6 +262,8 @@ def detect_lead_is_proforma_year_cols(ws_is, years: list[str]) -> list[int]:
 
 def lead_is_external_ref(col_idx: int, row_num: int) -> str:
     col_l = col_letter(col_idx)
+    if str(PL_LEAD_FILE.resolve()) == str(Path(INPUT_FILE).resolve()):
+        return f"={LEAD_IS_SHEET}!{col_l}{row_num}"
     return f"='[{PL_LEAD_FILENAME}]{LEAD_IS_SHEET}'!{col_l}{row_num}"
 
 

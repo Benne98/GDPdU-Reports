@@ -16,6 +16,8 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+
 from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
 from report_row_layout import (  # noqa: E402
     build_pl_row_structure,
@@ -27,10 +29,9 @@ from report_row_layout import (  # noqa: E402
 # =============================================
 
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
-
-DEFAULT_SOURCE_FILE = str(DESKTOP_DIR / "BS_PL_Master.xlsx")
+DEFAULT_SOURCE_FILE = MASTER_WORKBOOK_STR
 DEFAULT_SOURCE_SHEET = "Master_PL"
-DEFAULT_TARGET_FILE = str(DESKTOP_DIR / "PL_Reconciliation_output.xlsx")
+DEFAULT_TARGET_FILE = MASTER_WORKBOOK_STR
 DEFAULT_MAPPING_FILE = str(DESKTOP_DIR / "PL_recon_Mapping.xlsx")
 DEFAULT_MAPPING_SHEET_INDEX = 0
 DEFAULT_MAPPING_ENGINE = "openpyxl"
@@ -392,6 +393,7 @@ def build_desktop_default_config() -> dict:
             "mapping_file": DEFAULT_MAPPING_FILE,
             "report_sheet": "PL_Reconciliation",
             "audit_master_sheet": "Master_PL",
+            "master_file": DEFAULT_TARGET_FILE,
             "append_to_master": False,
         },
     }
@@ -880,9 +882,21 @@ def main():
 
     fs_check_value_map = build_fs_check_value_map(cfg["fs_check_values"], individual_entities, YEARS)
 
-    wb       = Workbook()
-    ws       = wb.active
-    ws.title = cfg["paths"]["report_sheet"]
+    target_file = cfg["paths"]["target_file"]
+    target_path = Path(target_file).resolve()
+    report_sheet = cfg["paths"]["report_sheet"]
+    audit_sheet = cfg["paths"]["audit_master_sheet"]
+
+    if target_path.is_file():
+        wb = load_workbook(target_file)
+        for sn in (report_sheet, audit_sheet):
+            if sn in wb.sheetnames:
+                del wb[sn]
+        ws = wb.create_sheet(report_sheet)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = report_sheet
 
     # ---------------------------------------------------
     # PROJECT & REPORT TITLE
@@ -911,7 +925,7 @@ def main():
     # ---------------------------------------------------
     # AUDIT MASTER SHEET
     # ---------------------------------------------------
-    ws_master = wb.create_sheet(cfg["paths"]["audit_master_sheet"])
+    ws_master = wb.create_sheet(audit_sheet)
 
     for c_idx, colname in enumerate(df.columns, start=1):
         ws_master.cell(1, c_idx, colname)
@@ -1364,7 +1378,6 @@ def main():
     # ---------------------------------------------------
     # SAVE
     # ---------------------------------------------------
-    target_file = cfg["paths"]["target_file"]
     wb.save(target_file)
     print(f"Fertig. Datei gespeichert unter: {target_file}")
 
@@ -1372,24 +1385,24 @@ def main():
         from copy import copy
 
         master_file = str(cfg["paths"].get("master_file") or target_file)
-        master_wb = load_workbook(master_file)
-        report_sheet = cfg["paths"]["report_sheet"]
-        if report_sheet in master_wb.sheetnames:
-            del master_wb[report_sheet]
-        recon_wb = load_workbook(target_file)
-        src = recon_wb[report_sheet]
-        dest = master_wb.create_sheet(report_sheet)
-        for row in src.iter_rows():
-            for cell in row:
-                dest[cell.coordinate].value = cell.value
-                if cell.has_style:
-                    dest[cell.coordinate].font = copy(cell.font)
-                    dest[cell.coordinate].fill = copy(cell.fill)
-                    dest[cell.coordinate].border = copy(cell.border)
-                    dest[cell.coordinate].alignment = copy(cell.alignment)
-                    dest[cell.coordinate].number_format = cell.number_format
-        master_wb.save(master_file)
-        print(f"Sheet '{report_sheet}' appended to {master_file}")
+        if Path(master_file).resolve() != target_path:
+            master_wb = load_workbook(master_file)
+            if report_sheet in master_wb.sheetnames:
+                del master_wb[report_sheet]
+            recon_wb = load_workbook(target_file)
+            src = recon_wb[report_sheet]
+            dest = master_wb.create_sheet(report_sheet)
+            for row in src.iter_rows():
+                for cell in row:
+                    dest[cell.coordinate].value = cell.value
+                    if cell.has_style:
+                        dest[cell.coordinate].font = copy(cell.font)
+                        dest[cell.coordinate].fill = copy(cell.fill)
+                        dest[cell.coordinate].border = copy(cell.border)
+                        dest[cell.coordinate].alignment = copy(cell.alignment)
+                        dest[cell.coordinate].number_format = cell.number_format
+            master_wb.save(master_file)
+            print(f"Sheet '{report_sheet}' appended to {master_file}")
 
     print(f"Sortierung erfolgte über: {cfg['sort_by']}")
     print(f"Verwendete Jahre: {YEARS}")

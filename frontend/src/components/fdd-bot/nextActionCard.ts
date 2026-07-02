@@ -13,6 +13,7 @@ const SCRIPT_LABELS: Record<string, string> = {
   top: 'TOP Report',
   churn: 'Churn / ARR Bridge',
   bubble: 'Bubble Scatter Plot',
+  working_capital: 'Working capital',
 }
 
 export function scriptDisplayLabel(scriptKey: string): string {

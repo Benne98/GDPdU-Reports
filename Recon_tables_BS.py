@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.styles import Border, Side
@@ -16,6 +16,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
 from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
+from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
 
 # =============================================
 # CONFIG (BS) — Desktop work defaults
@@ -59,9 +60,9 @@ BS_FS_CHECK_TOTAL_ASSETS = {}
 # =============================================
 # PATHS (BS)
 # =============================================
-SOURCE_FILE     = str(DESKTOP_DIR / "BS_PL_Master.xlsx")
+SOURCE_FILE     = MASTER_WORKBOOK_STR
 MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
-TARGET_FILE     = str(DESKTOP_DIR / "BS_Reconciliation_output.xlsx")
+TARGET_FILE     = MASTER_WORKBOOK_STR
 
 REPORT_SHEET_BS   = "BS_Reconciliation"
 MASTER_SHEET_BS_OUT = "Master_BS"
@@ -314,9 +315,16 @@ if ENTITY_SORT_ORDER:
 # =============================================
 # WORKBOOK + SHEETS
 # =============================================
-wb    = Workbook()
-ws_bs = wb.active
-ws_bs.title = REPORT_SHEET_BS
+if Path(TARGET_FILE).is_file():
+    wb = load_workbook(TARGET_FILE)
+    for sn in (REPORT_SHEET_BS, MASTER_SHEET_BS_OUT):
+        if sn in wb.sheetnames:
+            del wb[sn]
+    ws_bs = wb.create_sheet(REPORT_SHEET_BS)
+else:
+    wb = Workbook()
+    ws_bs = wb.active
+    ws_bs.title = REPORT_SHEET_BS
 
 # Copy Master_BS into output workbook (audit)
 ws_master_bs = wb.create_sheet(MASTER_SHEET_BS_OUT)

@@ -23,9 +23,11 @@ from report_row_layout import build_lead_is_row_structure, l3_order_from_mapping
 # ==================================================
 # DESKTOP DEFAULTS
 # ==================================================
+from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 
-INPUT_FILE = str(DESKTOP_DIR / "PL_Reconciliation_output.xlsx")
+INPUT_FILE = MASTER_WORKBOOK_STR
 MAPPING_FILE = str(DESKTOP_DIR / "PL_recon_Mapping.xlsx")
 SHEET_MASTER = "Master_PL"
 SHEET_OUT = "Lead_IS"
@@ -375,7 +377,11 @@ for t in PL_TOTALS_CONFIG:
         "L4": "",
     }
     if not insert_after_anchor(row_structure, t["insert_after"], new_row):
-        raise RuntimeError(f"Anchor '{t['insert_after']}' für Total '{t['label']}' nicht gefunden.")
+        print(
+            f"Warnung: Anchor '{t['insert_after']}' für Total '{t['label']}' "
+            "nicht gefunden — Total übersprungen."
+        )
+        continue
     existing_labels.add(t["label"])
 
 # Titles
@@ -475,7 +481,12 @@ for i, r in enumerate(row_structure):
 
 TOTAL_OUTPUT_LABEL = norm_pl("Total output")
 if TOTAL_OUTPUT_LABEL not in row_index:
-    raise RuntimeError("Total output row not found in row_structure.")
+    fallback = norm_pl("Net sales")
+    if fallback in row_index:
+        print(f"Warnung: '{TOTAL_OUTPUT_LABEL}' fehlt — KPI-Basis: '{fallback}'.")
+        TOTAL_OUTPUT_LABEL = fallback
+    else:
+        raise RuntimeError("Total output row not found in row_structure.")
 TOTAL_OUTPUT_ROW = row_index[TOTAL_OUTPUT_LABEL]
 
 
@@ -634,7 +645,10 @@ for col in (POS1_COL, POS2_COL):
     cell.font = FONT_KPI_TITLE
     cell.alignment = ALIGN_LEFT
 
-total_output_idx = next(i for i, rr in enumerate(row_structure) if rr["label"] == TOTAL_OUTPUT_LABEL)
+total_output_idx = next(
+    (i for i, rr in enumerate(row_structure) if rr["label"] == TOTAL_OUTPUT_LABEL),
+    0,
+)
 end_label = norm_pl("EBIT")
 kpi_candidates = []
 for rr in row_structure[total_output_idx + 1:]:
