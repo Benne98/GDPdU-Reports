@@ -1746,6 +1746,31 @@ def _revenue_sales_file_upload_card() -> dict[str, Any]:
     }
 
 
+def _build_output_type_card() -> dict[str, Any]:
+    """Main output selector (Databook / Revenue Databook / OPOS / Fixed assets / ...)."""
+    return {
+        "type": "adaptive_card",
+        "card": "build_databook",
+        "title": "Select Output",
+        "subtitle": "What would you like to build?",
+        "inputs": [
+            {
+                "id": "output_type",
+                "type": "radio",
+                "label": "Choose output",
+                "options": [
+                    {"label": "Databook", "value": "databook"},
+                    {"label": "Revenue Databook", "value": "revenue_databook"},
+                    {"label": "Creditor / Debitor Aging", "value": "creditor_debitor_aging"},
+                    {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
+                    {"label": "FTE Development", "value": "fte_development"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
 def _revenue_sales_reuse_card(tracker: Tracker, payload: dict | None = None) -> dict[str, Any]:
     fp = str(tracker.get_slot("file_path") or (payload or {}).get("file_path") or "")
     label = os.path.basename(fp) if fp else "your uploaded workbook"
@@ -2239,7 +2264,7 @@ class ActionProcessDatesCard(Action):
             events.append(SlotSet("gst_first_fy_override", fy_val))
             events.append(SlotSet("pvm_first_fy_override", fy_val))
         # Outputs go to session upload folder; user downloads via file_attachment cards.
-        dispatcher.utter_message(response="utter_ask_build_databook")
+        dispatcher.utter_message(json_message=_build_output_type_card())
         return events
 
 
@@ -2250,7 +2275,7 @@ class ActionNavigateFolders(Action):
         return "action_navigate_folders"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        dispatcher.utter_message(response="utter_ask_build_databook")
+        dispatcher.utter_message(json_message=_build_output_type_card())
         return []
 
 
@@ -2261,7 +2286,7 @@ class ActionProcessFolderSelection(Action):
         return "action_process_folder_selection"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        dispatcher.utter_message(response="utter_ask_build_databook")
+        dispatcher.utter_message(json_message=_build_output_type_card())
         return []
 
 
@@ -2306,7 +2331,7 @@ class ActionProcessBuildDatabook(Action):
             return [SlotSet("output_type", "fte_development")]
         else:
             dispatcher.utter_message(text=f"Unknown output type '{output_type}'. Please try again.")
-            dispatcher.utter_message(response="utter_ask_build_databook")
+            dispatcher.utter_message(json_message=_build_output_type_card())
             return []
 
 
@@ -5945,8 +5970,15 @@ def _parse_opos_snapshots_payload(payload: dict) -> list[dict[str, Any]]:
     return out
 
 
-def _emit_opos_columns_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
-    snaps = json.loads(tracker.get_slot("opos_snapshots_json") or "[]")
+def _emit_opos_columns_card(
+    dispatcher: CollectingDispatcher, tracker: Tracker, snapshots: list[dict[str, Any]] | None = None
+) -> None:
+    snaps = snapshots
+    if snaps is None:
+        try:
+            snaps = json.loads(tracker.get_slot("opos_snapshots_json") or "[]")
+        except Exception:
+            snaps = []
     preview_id = str(snaps[0].get("file_id") or tracker.get_slot("file_id") or "") if snaps else ""
     preview_sheet = str(snaps[0].get("sheet_name") or tracker.get_slot("sheet_name") or "") if snaps else ""
     dispatcher.utter_message(
@@ -6012,7 +6044,7 @@ class ActionProcessOposSnapshots(Action):
             dispatcher.utter_message(text=str(exc))
             _emit_opos_snapshots_card(dispatcher, tracker)
             return []
-        _emit_opos_columns_card(dispatcher, tracker)
+        _emit_opos_columns_card(dispatcher, tracker, snapshots)
         return [SlotSet("opos_snapshots_json", json.dumps(snapshots, ensure_ascii=False))]
 
 
@@ -6406,7 +6438,7 @@ class ActionProcessComingSoon(Action):
         return "action_process_coming_soon"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        dispatcher.utter_message(response="utter_ask_build_databook")
+        dispatcher.utter_message(json_message=_build_output_type_card())
         return []
 
 
