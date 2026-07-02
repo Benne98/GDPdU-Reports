@@ -1,5 +1,5 @@
 /**
- * OPOS stichtag + file upload rows (one snapshot per row).
+ * OPOS snapshot date + file upload rows (one snapshot per row).
  */
 
 import { useCallback, useId, useState } from 'react'
@@ -165,14 +165,14 @@ export default function OposSnapshotsCard({
             <div className="flex gap-3 flex-wrap items-end">
               <div className="flex flex-col gap-1">
                 <label className="text-xs font-medium" style={{ color: '#475569' }}>
-                  Stichtag (YYYY-MM-DD)
+                  Snapshot date
                 </label>
                 <input
                   value={r.as_of}
                   disabled={disabled}
                   onChange={e => setAsOf(r.id, e.target.value)}
                   className="rounded-md border border-slate-200 px-2 py-1 text-xs"
-                  placeholder="2025-12-31"
+                  type="date"
                 />
               </div>
               <SnapshotFileDrop

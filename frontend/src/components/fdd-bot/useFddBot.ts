@@ -611,7 +611,7 @@ export function useFddBot() {
           sheet_names: row.sheet_names,
           headers: row.headers?.length ? row.headers : undefined,
         }
-        addMessage({ role: 'bot', text: `✓ ${file.name} hochgeladen — bereit für den nächsten Schritt.` })
+        addMessage({ role: 'bot', text: `✓ ${file.name} uploaded — ready for the next step.` })
         return row
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Upload error'

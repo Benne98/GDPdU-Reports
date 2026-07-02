@@ -2288,6 +2288,10 @@ class ActionProcessBuildDatabook(Action):
             dispatcher.utter_message(text="Great! Let's configure the Creditor / Debitor Aging (OPOS).")
             dispatcher.utter_message(json_message=_opos_snapshots_card(tracker))
             return [SlotSet("output_type", "creditor_debitor_aging")]
+        elif output_type == "fixed_assets_rollforward":
+            dispatcher.utter_message(text="Great! Let's configure the Fixed Assets Rollforward.")
+            dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
+            return [SlotSet("output_type", "fixed_assets_rollforward")]
         elif output_type == "fte_development":
             dispatcher.utter_message(
                 json_message={
@@ -5912,7 +5916,7 @@ def _opos_snapshots_card(tracker: Tracker) -> dict[str, Any]:
         "type": "adaptive_card",
         "card": "opos_snapshots",
         "title": "OPOS snapshots",
-        "subtitle": "Add one row per stichtag and upload the corresponding open-items file(s).",
+        "subtitle": "Add one row per snapshot date and upload the corresponding open-items file(s).",
         "inputs": [],
         "submit_label": "Continue",
     }
@@ -6144,7 +6148,7 @@ class ActionRunOpos(Action):
         else:
             snapshots = []
         if not snapshots:
-            dispatcher.utter_message(text="OPOS snapshots missing — please add stichtag and file(s) first.")
+            dispatcher.utter_message(text="OPOS snapshots missing — please add a snapshot date and file(s) first.")
             return [FollowupAction("action_show_opos_snapshots")]
 
         body = {

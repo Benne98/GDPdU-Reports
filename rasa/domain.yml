@@ -1121,6 +1121,8 @@ responses:
                 value: "revenue_databook"
               - label: "Creditor / Debitor Aging"
                 value: "creditor_debitor_aging"
+              - label: "Fixed Assets Rollforward"
+                value: "fixed_assets_rollforward"
               - label: "FTE Development"
                 value: "fte_development"
         submit_label: "Continue"
@@ -1260,6 +1262,15 @@ actions:
   - action_process_opos_filter_checkpoint
   - action_show_opos_review
   - action_run_opos
+  - action_show_fa_rollf_files
+  - action_process_fa_rollf_files
+  - action_reshow_fa_rollf_columns
+  - action_process_fa_rollf_columns
+  - action_show_fa_rollf_grouping
+  - action_process_fa_rollf_grouping
+  - action_enter_fa_filter_checkpoint
+  - action_process_fa_filter_checkpoint
+  - action_run_fa_rollf
   - action_start_filter
   - action_process_filter_rule
   - action_finish_filters
