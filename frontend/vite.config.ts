@@ -6,6 +6,7 @@ import react from "@vitejs/plugin-react";
 // Mode "reporting-v2" → 5177 + API :8011 (robust reporting pipeline on cloned DB, parallel to 5176).
 // Mode "reporting-v2-sandbox" → 5179 + API :8013 (independent copy of 5177 for parallel edits).
 // Mode "v4" → 5178 + API :8012 (finssentials_v4 blank DB for GL-entity refactor testing).
+// Mode "merged" → 5180 + API :8014 (unified stack: reporting-v2 + v4 setup + sandbox budget on cloned finssentials_merged).
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const isTest = mode === "test";
@@ -13,13 +14,16 @@ export default defineConfig(({ mode }) => {
   const isReportingV2 = mode === "reporting-v2";
   const isReportingV2Sandbox = mode === "reporting-v2-sandbox";
   const isV4 = mode === "v4";
+  const isMerged = mode === "merged";
   const devPort = Number(
     env.VITE_DEV_PORT ||
-      (isV4 ? 5178 : isReportingV2Sandbox ? 5179 : isReportingV2 ? 5177 : isFddMerge ? 5176 : isTest ? 5175 : 5174),
+      (isMerged ? 5180 : isV4 ? 5178 : isReportingV2Sandbox ? 5179 : isReportingV2 ? 5177 : isFddMerge ? 5176 : isTest ? 5175 : 5174),
   );
   const apiTarget = (
     env.VITE_DEV_API_PROXY ||
-    (isV4
+    (isMerged
+      ? "http://127.0.0.1:8014"
+      : isV4
       ? "http://127.0.0.1:8012"
       : isReportingV2Sandbox
       ? "http://127.0.0.1:8013"

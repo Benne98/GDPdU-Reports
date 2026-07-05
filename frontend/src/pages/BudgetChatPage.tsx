@@ -1042,6 +1042,15 @@ export default function BudgetChatPage() {
   const handleSandboxCommit = useCallback(async () => {
     if (!IS_REPORTING_V2_SANDBOX || sandboxPhase !== 'saved') return;
     setSandboxPhase('committing');
+    if (import.meta.env.MODE === 'merged') {
+      // Merged stack: budget rows are ALREADY persisted by the save loop above
+      // (patchBudgetPosition -> /api/v1/budget -> fact_position_plan) and reporting reads
+      // them live (position_plan_grain_sql, budget->forecast->plan resolution), so they show
+      // in Reporting immediately. No theatrical wait — commit is instant. (This branch is
+      // dead-code-eliminated in the reporting-v2-sandbox bundle, which keeps its 28s path.)
+      setSandboxPhase('committed');
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 28_000));
     setSandboxPhase('committed');
   }, [sandboxPhase]);
