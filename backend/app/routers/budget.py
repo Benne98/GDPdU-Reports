@@ -332,6 +332,10 @@ def get_budget(
     heuristic: Literal["prior_year", "trend_cagr", "run_rate"] = Query("prior_year"),
     growth_pct: float = Query(0.0, description="growth assumption for the suggestion recompute"),
     top_n: int = Query(20, ge=1, le=500),
+    light: bool = Query(
+        False,
+        description="Skip per-position heuristic suggestions (faster blank/manual grids)",
+    ),
 ) -> BudgetGridResponse:
     """Editable budget TREE for a statement + year, seeded with the synthetic plan
     where no budget row exists.  PURE-READ (no writes).
@@ -349,6 +353,7 @@ def get_budget(
             session, statement=stmt, fiscal_year=fiscal_year,
             entity_prefix=ep, top_n=top_n, level=level,
             heuristic=heuristic, growth_pct=growth_pct,
+            light=light,
         )
     except Exception as exc:  # noqa: BLE001
         # M1: never log the full exception (may carry partner names / bound SQL

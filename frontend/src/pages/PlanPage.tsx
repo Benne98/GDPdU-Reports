@@ -1,18 +1,5 @@
 /**
  * PlanPage — Admin-only: generate and view synthetic Plan/Forecast data.
- *
- * POST /api/v1/plan/generate with PlanGenerateRequest payload.
- * GET  /api/v1/plan/summary to display current plan row counts.
- *
- * Request model (from backend/app/routers/plan.py PlanGenerateRequest):
- *   base_fy              int   — last full fiscal year of actuals (e.g. 2024)
- *   current_fy           int   — current/in-progress fiscal year (e.g. 2025)
- *   last_closed_period   int   — 0-12, last closed period of current_fy
- *   horizon_years        int   — plan years after forecast year (default 4)
- *   growth_rate          float — default annual growth rate (default 0.05)
- *   forecast_growth_rate float — extra growth on run-rate for open periods (default 0.0)
- *   group_growth         dict | null — per-group overrides (optional)
- *   group_col            str | null  — GL column for group lookup (optional)
  */
 
 import { useEffect, useState } from "react";
@@ -25,15 +12,11 @@ import {
 } from "../lib/gdpduApi";
 import PageShell from "../components/ui/PageShell";
 
-// ---------------------------------------------------------------------------
-// Summary table
-// ---------------------------------------------------------------------------
-
 function PlanSummaryTable({ summary }: { summary: PlanSummaryResponse }) {
   if (summary.rows.length === 0) {
     return (
       <p className="text-sm text-slate-500 italic">
-        Noch keine Plan-Daten in der Datenbank vorhanden.
+        No plan data in the database yet.
       </p>
     );
   }
@@ -54,13 +37,13 @@ function PlanSummaryTable({ summary }: { summary: PlanSummaryResponse }) {
               <thead>
                 <tr className="border-b border-slate-200">
                   <th className="text-left py-1.5 pr-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                    Szenario
+                    Scenario
                   </th>
                   <th className="text-left py-1.5 pr-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                    Geschäftsjahr
+                    Fiscal year
                   </th>
                   <th className="text-right py-1.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                    Zeilen
+                    Rows
                   </th>
                 </tr>
               </thead>
@@ -83,17 +66,13 @@ function PlanSummaryTable({ summary }: { summary: PlanSummaryResponse }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Main page
-// ---------------------------------------------------------------------------
-
 export default function PlanPage() {
   const currentYear = new Date().getFullYear();
 
   const [formValues, setFormValues] = useState<PlanGenerateRequest>({
     base_fy: currentYear - 1,
     current_fy: currentYear,
-    last_closed_period: new Date().getMonth(), // 0-12; JS months are 0-based so this gives "months elapsed"
+    last_closed_period: new Date().getMonth(),
     horizon_years: 4,
     growth_rate: 0.05,
     forecast_growth_rate: 0.0,
@@ -109,14 +88,13 @@ export default function PlanPage() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(true);
 
-  // Load summary on mount
   useEffect(() => {
     setSummaryLoading(true);
     getPlanSummary()
       .then(setSummary)
-      .catch((e) => setSummaryError(e instanceof Error ? e.message : "Laden fehlgeschlagen"))
+      .catch((e) => setSummaryError(e instanceof Error ? e.message : "Failed to load plan data"))
       .finally(() => setSummaryLoading(false));
-  }, [generateResult]); // Reload after successful generation
+  }, [generateResult]);
 
   function setField<K extends keyof PlanGenerateRequest>(k: K, v: PlanGenerateRequest[K]) {
     setFormValues((prev) => ({ ...prev, [k]: v }));
@@ -131,7 +109,7 @@ export default function PlanPage() {
       const result = await generatePlan(formValues);
       setGenerateResult(result);
     } catch (err) {
-      setGenerateError(err instanceof Error ? err.message : "Plan-Generierung fehlgeschlagen");
+      setGenerateError(err instanceof Error ? err.message : "Plan generation failed");
     } finally {
       setGenerating(false);
     }
@@ -145,27 +123,24 @@ export default function PlanPage() {
     >
     <div>
       <div className="mb-6">
-        <h1 className="text-2xl font-semibold text-slate-900">Plan / Forecast generieren</h1>
+        <h1 className="text-2xl font-semibold text-slate-900">Generate plan / forecast</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Synthetische Plan- und Forecast-Werte auf Basis vorhandener GL-Istdaten erzeugen.
-          Nur Admins.
+          Create synthetic plan and forecast values from existing GL actuals. Admin only.
         </p>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        {/* Generation form */}
         <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="text-lg font-semibold text-slate-900 mb-1">Parameter</h2>
+          <h2 className="text-lg font-semibold text-slate-900 mb-1">Parameters</h2>
           <p className="text-sm text-slate-500 mb-5">
-            Konfigurieren Sie den Planungshorizont und die Wachstumsrate.
+            Configure the planning horizon and growth rate.
           </p>
 
           <form onSubmit={handleGenerate} className="space-y-5">
-            {/* Row 1: base_fy + current_fy */}
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  Basis-GJ (base_fy)
+                  Base FY (base_fy)
                 </label>
                 <input
                   type="number"
@@ -176,12 +151,12 @@ export default function PlanPage() {
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <p className="mt-1 text-xs text-slate-400">
-                  Letztes vollst. Istjahr (z.B. 2024)
+                  Last full actual year (e.g. 2024)
                 </p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  Laufendes GJ (current_fy)
+                  Current FY (current_fy)
                 </label>
                 <input
                   type="number"
@@ -192,15 +167,14 @@ export default function PlanPage() {
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <p className="mt-1 text-xs text-slate-400">
-                  Laufendes Geschäftsjahr (z.B. 2025)
+                  Current fiscal year (e.g. 2025)
                 </p>
               </div>
             </div>
 
-            {/* last_closed_period */}
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">
-                Letzter abgeschlossener Monat (last_closed_period)
+                Last closed period (last_closed_period)
               </label>
               <input
                 type="number"
@@ -211,15 +185,14 @@ export default function PlanPage() {
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
               <p className="mt-1 text-xs text-slate-400">
-                0 = kein Monat abgeschlossen, 12 = vollst. abgeschlossen
+                0 = no month closed, 12 = fully closed
               </p>
             </div>
 
-            {/* Row 2: horizon_years + growth_rate */}
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  Planjahre (horizon_years)
+                  Plan years (horizon_years)
                 </label>
                 <input
                   type="number"
@@ -230,12 +203,12 @@ export default function PlanPage() {
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <p className="mt-1 text-xs text-slate-400">
-                  Jahre nach Forecast-Jahr (1-10)
+                  Years after forecast year (1–10)
                 </p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  Wachstumsrate (growth_rate)
+                  Growth rate (growth_rate)
                 </label>
                 <input
                   type="number"
@@ -246,15 +219,14 @@ export default function PlanPage() {
                   className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <p className="mt-1 text-xs text-slate-400">
-                  Z.B. 0.05 = 5% p.a.
+                  E.g. 0.05 = 5% p.a.
                 </p>
               </div>
             </div>
 
-            {/* forecast_growth_rate */}
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">
-                Forecast-Wachstum (forecast_growth_rate)
+                Forecast growth (forecast_growth_rate)
               </label>
               <input
                 type="number"
@@ -265,35 +237,33 @@ export default function PlanPage() {
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
               <p className="mt-1 text-xs text-slate-400">
-                Zusätzliches Wachstum auf Run-Rate für offene Monate (0 = reiner Run-Rate)
+                Extra growth on run-rate for open months (0 = pure run-rate)
               </p>
             </div>
 
-            {/* Errors */}
             {generateError && (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
                 {generateError}
               </div>
             )}
 
-            {/* Success */}
             {generateResult && (
               <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-3">
                 <p className="text-sm font-semibold text-emerald-800 mb-1">
-                  Plan erfolgreich generiert
+                  Plan generated successfully
                 </p>
                 <p className="text-xs text-emerald-700">{generateResult.message}</p>
                 <div className="mt-2 flex gap-4 text-xs text-emerald-700">
                   <span>
-                    GL-Plan: <strong>{generateResult.gl_plan.toLocaleString("de-DE")}</strong> Zeilen
+                    GL plan: <strong>{generateResult.gl_plan.toLocaleString("de-DE")}</strong> rows
                   </span>
                   <span>
-                    Sales-Plan: <strong>{generateResult.sales_plan.toLocaleString("de-DE")}</strong> Zeilen
+                    Sales plan: <strong>{generateResult.sales_plan.toLocaleString("de-DE")}</strong> rows
                   </span>
                 </div>
                 {generateResult.scenarios.length > 0 && (
                   <p className="mt-1.5 text-xs text-emerald-600">
-                    Szenarien: {generateResult.scenarios.join(", ")}
+                    Scenarios: {generateResult.scenarios.join(", ")}
                   </p>
                 )}
               </div>
@@ -304,21 +274,20 @@ export default function PlanPage() {
               disabled={generating}
               className="w-full rounded-md bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
             >
-              {generating ? "Generierung läuft..." : "Plan generieren"}
+              {generating ? "Generating…" : "Generate plan"}
             </button>
           </form>
         </div>
 
-        {/* Summary */}
         <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="text-lg font-semibold text-slate-900 mb-1">Plan-Übersicht</h2>
+          <h2 className="text-lg font-semibold text-slate-900 mb-1">Plan overview</h2>
           <p className="text-sm text-slate-500 mb-5">
-            Aktuelle Plan-Zeilen in <code className="rounded bg-slate-100 px-1">fact_gl_plan</code>{" "}
-            und <code className="rounded bg-slate-100 px-1">fact_sales_plan</code>.
+            Current plan rows in <code className="rounded bg-slate-100 px-1">fact_gl_plan</code>{" "}
+            and <code className="rounded bg-slate-100 px-1">fact_sales_plan</code>.
           </p>
 
           {summaryLoading && (
-            <p className="text-sm text-slate-500 sr-only">Lade Plan-Daten…</p>
+            <p className="text-sm text-slate-500 sr-only">Loading plan data…</p>
           )}
           {summaryError && !summaryLoading && (
             <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">

@@ -25,7 +25,12 @@ if TYPE_CHECKING:
 BS_SHEET = "Master_BS"
 PL_SHEET = "Master_PL"
 
-ID_COLS = ["Entity", "Account", "Account description"]
+#: Required ID columns on every Master sheet.  ``Entity`` is OPTIONAL now: when the
+#: caller supplies an external entity prefix (new CoA wizard) the template carries no
+#: Entity column.  Backward compat: when an Entity column IS present and no external
+#: prefix is supplied, the legacy entity-resolution path is used unchanged.
+ID_COLS_REQUIRED = ["Account", "Account description"]
+ENTITY_COL = "Entity"
 REQUIRED_LEVEL_COLS = ["L1", "L2", "L3", "L4"]
 OPTIONAL_LEVEL_DB = {5: "level_4", 6: "l4_sub"}
 _LEVEL_COL_RE = re.compile(r"^L(\d+)$", re.IGNORECASE)
@@ -85,27 +90,53 @@ def bs_pl_master_profile(columns: list[str] | None = None) -> AccountMappingProf
     )
 
 
-def read_bs_pl_master(path: Path | str) -> pd.DataFrame:
-    """Load Master_BS + Master_PL, keep hierarchy columns only, concat."""
+def read_bs_pl_master(
+    path: Path | str,
+    *,
+    entity_prefix: str | None = None,
+    statement: str | None = None,
+) -> pd.DataFrame:
+    """Load the Master sheet(s), keep hierarchy columns only, concat.
+
+    ``statement`` selects which sheet to read:
+      * ``'bs'`` -> only Master_BS,
+      * ``'pl'`` -> only Master_PL (its ``L1 - BS/PL`` column is renamed to ``L1``),
+      * ``None`` -> both sheets (backward-compatible two-sheet read).
+
+    ``entity_prefix`` is accepted for caller symmetry with ``build_mapping_frames``
+    (the prefix is injected downstream); reading the file itself does not need it.
+    Templates produced by the new CoA wizard carry no ``Entity`` column.
+    """
     path = Path(path)
-    bs = pd.read_excel(path, sheet_name=BS_SHEET, header=0, dtype=str, na_values=[""])
-    pl = pd.read_excel(path, sheet_name=PL_SHEET, header=0, dtype=str, na_values=[""])
-    if PL_L1_COL in pl.columns:
-        pl = pl.rename(columns={PL_L1_COL: "L1"})
-    bs = _trim_keep_cols(bs)
-    pl = _trim_keep_cols(pl)
-    out = pd.concat([bs, pl], ignore_index=True)
-    out = out.dropna(subset=["Entity", "Account"], how="any")
+    stmt = (statement or "").strip().lower()
+
+    frames: list[pd.DataFrame] = []
+    if stmt in ("", "bs"):
+        bs = pd.read_excel(path, sheet_name=BS_SHEET, header=0, dtype=str, na_values=[""])
+        frames.append(_trim_keep_cols(bs))
+    if stmt in ("", "pl"):
+        pl = pd.read_excel(path, sheet_name=PL_SHEET, header=0, dtype=str, na_values=[""])
+        if PL_L1_COL in pl.columns:
+            pl = pl.rename(columns={PL_L1_COL: "L1"})
+        frames.append(_trim_keep_cols(pl))
+
+    out = pd.concat(frames, ignore_index=True)
+    # Key dropna on Entity only when an Entity column is present (legacy path).
+    subset = [ENTITY_COL, "Account"] if ENTITY_COL in out.columns else ["Account"]
+    out = out.dropna(subset=subset, how="any")
     out = out[out["Account"].astype(str).str.strip() != ""]
     return out.reset_index(drop=True)
 
 
 def _trim_keep_cols(df: pd.DataFrame) -> pd.DataFrame:
-    missing_id = [c for c in ID_COLS if c not in df.columns]
+    missing_id = [c for c in ID_COLS_REQUIRED if c not in df.columns]
     if missing_id:
         raise KeyError(f"BS/PL Master sheet missing columns: {missing_id}")
     level_cols = detect_level_columns(list(df.columns))
-    return df[ID_COLS + level_cols].copy()
+    keep = list(ID_COLS_REQUIRED) + level_cols
+    if ENTITY_COL in df.columns:  # keep legacy Entity column first when present
+        keep = [ENTITY_COL] + keep
+    return df[keep].copy()
 
 
 def _insert_details(
@@ -239,25 +270,47 @@ def build_mapping_frames(
     session: Session,
     fiscal_years: list[int],
     profile: AccountMappingProfile | None = None,
+    *,
+    entity_prefix: str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """Resolve entities, apply profile per fiscal year, return canonical frame + meta."""
+    """Resolve entities, apply profile per fiscal year, return canonical frame + meta.
+
+    When ``entity_prefix`` is supplied (new CoA wizard), entity resolution is skipped
+    entirely and the prefix is injected on every row via ``apply_account_mapping``'s
+    ``entity_prefix`` override (bypassing the Entity column).  Otherwise the legacy
+    Entity-column resolution path runs unchanged.
+    """
     if not fiscal_years:
         raise ValueError("fiscal_years must contain at least one year")
-    lookup = build_entity_lookup(session)
-    resolved, unknown = resolve_entity_prefixes(raw_df, lookup)
-    skipped_entities = sorted(set(unknown))
-    skipped_rows = int(resolved[ENTITY_PREFIX_COL].isna().sum())
-    kept = resolved.dropna(subset=[ENTITY_PREFIX_COL]).reset_index(drop=True)
-    if kept.empty:
-        raise ValueError(
-            "No rows with resolvable entities. "
-            f"Unknown in dim_legal_entity: {skipped_entities}"
-        )
+
+    if entity_prefix is not None:
+        # External-prefix path: no Entity column / no dim_legal_entity lookup.
+        kept = raw_df.reset_index(drop=True)
+        skipped_entities: list[str] = []
+        skipped_rows = 0
+    else:
+        lookup = build_entity_lookup(session)
+        resolved, unknown = resolve_entity_prefixes(raw_df, lookup)
+        skipped_entities = sorted(set(unknown))
+        skipped_rows = int(resolved[ENTITY_PREFIX_COL].isna().sum())
+        kept = resolved.dropna(subset=[ENTITY_PREFIX_COL]).reset_index(drop=True)
+        if kept.empty:
+            raise ValueError(
+                "No rows with resolvable entities. "
+                f"Unknown in dim_legal_entity: {skipped_entities}"
+            )
 
     prof = profile or bs_pl_master_profile(list(kept.columns))
     parts: list[pd.DataFrame] = []
     for fy in fiscal_years:
-        parts.append(apply_account_mapping(kept, prof, fiscal_year=int(fy)))
+        if entity_prefix is not None:
+            parts.append(
+                apply_account_mapping(
+                    kept, prof, entity_prefix=entity_prefix, fiscal_year=int(fy)
+                )
+            )
+        else:
+            parts.append(apply_account_mapping(kept, prof, fiscal_year=int(fy)))
     mapping_df = pd.concat(parts, ignore_index=True)
     l1 = kept["L1"].astype(str).str.strip()
     meta = {

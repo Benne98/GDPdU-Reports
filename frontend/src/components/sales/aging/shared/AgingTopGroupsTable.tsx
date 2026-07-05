@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, type ReceivablesDimensionRowBuckets } from '../../../../lib/api'
-import { fmtAmount } from '../../../../lib/fmt'
+import { FIN_TABLE_CELL_CLASS } from '../../../financials/statement-two-view/finReportLayout'
+import PlExportMenu, { type PlExportKind } from '../../../financials/pl-two-view/PlExportMenu'
+import { L1_ROW_STYLE } from '../../analytics/salesBreakdownRender'
+import { SalesFinHeader, SalesLabelCell, SalesValCell, SALES_TABLE_HEADER_BG } from '../../analytics/salesFinTableCells'
+import { exportAgingTopGroups } from './agingTopGroupsExport'
 
 const RANK_BANDS = [
   { label: 'Top 5', from: 0, to: 5 },
@@ -17,6 +21,13 @@ const BUCKET_COLS: { key: keyof ReceivablesDimensionRowBuckets; label: string }[
   { key: 'overdue_91_180', label: '91–180 days' },
   { key: 'overdue_over_180', label: '>180 days' },
 ]
+
+const MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]
+
+const DETAIL_ROW_STYLE = { background: '#FFFFFF', borderBottom: '1px solid #F8FAFC' } as const
 
 type Props = {
   side: 'receivables' | 'payables'
@@ -119,101 +130,114 @@ export default function AgingTopGroupsTable({ side, year, month, entity }: Props
 
   const partnerCol = side === 'receivables' ? 'Customer' : 'Supplier'
   const title = side === 'receivables' ? 'Trade receivables aging' : 'Trade payables aging'
+  const periodLabel = `${MONTHS[month - 1]} ${year}`
+  const totalColLabel = side === 'receivables' ? 'Trade receivables' : 'Trade payables'
+
+  async function handleExport(kind: PlExportKind) {
+    if (!grouped.sections.length) return
+    await exportAgingTopGroups({
+      kind,
+      side,
+      sections: grouped.sections,
+      grand: grouped.grand,
+      periodLabel,
+    })
+  }
 
   return (
     <section
       className="rounded-xl overflow-hidden"
       style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}
     >
-      <div className="px-5 py-4 border-b" style={{ borderColor: '#F1F5F9' }}>
-        <h3 className="text-sm font-semibold" style={{ color: '#1E3A5F' }}>{title}</h3>
-        <p className="text-xs mt-0.5" style={{ color: '#94A3B8' }}>
-          Clustered by top {partnerCol.toLowerCase()} groups · kEUR
-        </p>
+      <div
+        className="px-5 py-3.5 flex items-center justify-between gap-3 border-b"
+        style={{ borderColor: '#F1F5F9' }}
+      >
+        <div>
+          <h3 className="text-sm font-semibold" style={{ color: '#1E3A5F' }}>{title}</h3>
+          <p className="text-xs mt-0.5" style={{ color: '#94A3B8' }}>
+            Clustered by top {partnerCol.toLowerCase()} groups · kEUR
+          </p>
+        </div>
+        <PlExportMenu
+          formats={['pptx', 'xlsx']}
+          onExport={handleExport}
+          disabled={loading || !!error || !grouped.sections.length}
+        />
       </div>
 
       {error && (
         <p className="px-5 py-3 text-xs" style={{ color: '#DC2626' }}>{error}</p>
       )}
 
-      <div className="overflow-x-auto max-h-[min(70vh,640px)]">
-        <table className="w-full text-xs border-collapse min-w-[960px]">
-          <thead className="sticky top-0 z-[1]" style={{ background: '#F8FAFC' }}>
-            <tr>
-              <th className="text-left px-4 py-2.5 font-semibold" style={{ color: '#64748B' }}>{partnerCol}</th>
-              {BUCKET_COLS.map(c => (
-                <th key={c.key} className="text-right px-3 py-2.5 font-semibold whitespace-nowrap" style={{ color: '#64748B' }}>
-                  {c.label}
+      <div className="p-4">
+        <div className="overflow-auto max-h-[min(70vh,640px)]">
+          <table className="w-full border-collapse">
+            <thead className="sticky top-0 z-[1]" style={{ background: SALES_TABLE_HEADER_BG }}>
+              <tr>
+                <th
+                  className={`${FIN_TABLE_CELL_CLASS} text-left font-semibold text-xs align-bottom`}
+                  style={{ color: '#475569', background: SALES_TABLE_HEADER_BG, verticalAlign: 'bottom', minWidth: 140 }}
+                >
+                  {partnerCol}
                 </th>
-              ))}
-              <th className="text-right px-4 py-2.5 font-semibold whitespace-nowrap" style={{ color: '#64748B' }}>
-                {side === 'receivables' ? 'Trade receivables' : 'Trade payables'}
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <tr>
-                <td colSpan={8} className="px-4 py-10 text-center" style={{ color: '#94A3B8' }}>Loading…</td>
+                {BUCKET_COLS.map(c => (
+                  <SalesFinHeader key={c.key} label={c.label} />
+                ))}
+                <SalesFinHeader label={totalColLabel} />
               </tr>
-            ) : grouped.sections.length === 0 ? (
-              <tr>
-                <td colSpan={8} className="px-4 py-10 text-center" style={{ color: '#94A3B8' }}>No open items</td>
-              </tr>
-            ) : (
-              <>
-                {grouped.sections.flatMap(section => [
-                  <tr
-                    key={`${section.bandLabel}-hdr`}
-                    style={{ background: '#EFF6FF', borderTop: '1px solid #E2E8F0' }}
-                  >
-                    <td className="px-4 py-2 font-bold" style={{ color: '#1E3A5F' }}>{section.bandLabel}</td>
-                    {BUCKET_COLS.map(c => (
-                      <td key={c.key} className="px-3 py-2 text-right tabular-nums font-semibold" style={{ color: '#1E3A5F' }}>
-                        {fmtAmount(section.subtotal[c.key] as number)}
-                      </td>
-                    ))}
-                    <td className="px-4 py-2 text-right tabular-nums font-bold" style={{ color: '#1E3A5F' }}>
-                      {fmtAmount(section.subtotal.total)}
-                    </td>
-                  </tr>,
-                  ...section.items.map(item => (
-                    <tr
-                      key={`${section.bandLabel}-${item.label}`}
-                      className="hover:bg-slate-50/60"
-                      style={{ borderTop: '1px solid #F1F5F9' }}
-                    >
-                      <td className="px-4 py-1.5 max-w-[240px] truncate" style={{ color: '#334155' }} title={item.label}>
-                        {item.label}
-                      </td>
-                      {BUCKET_COLS.map(c => (
-                        <td key={c.key} className="px-3 py-1.5 text-right tabular-nums" style={{ color: '#475569' }}>
-                          {fmtAmount(item[c.key] as number)}
-                        </td>
-                      ))}
-                      <td className="px-4 py-1.5 text-right tabular-nums font-medium" style={{ color: '#334155' }}>
-                        {fmtAmount(item.total)}
-                      </td>
-                    </tr>
-                  )),
-                ])}
-                <tr style={{ background: '#F8FAFC', borderTop: '2px solid #CBD5E1' }}>
-                  <td className="px-4 py-2.5 font-bold" style={{ color: '#0F172A' }}>
-                    {side === 'receivables' ? 'Trade receivables' : 'Trade payables'}
-                  </td>
-                  {BUCKET_COLS.map(c => (
-                    <td key={c.key} className="px-3 py-2.5 text-right tabular-nums font-bold" style={{ color: '#0F172A' }}>
-                      {fmtAmount(grouped.grand[c.key] as number)}
-                    </td>
-                  ))}
-                  <td className="px-4 py-2.5 text-right tabular-nums font-bold" style={{ color: '#0F172A' }}>
-                    {fmtAmount(grouped.grand.total)}
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr>
+                  <td colSpan={8} className={`${FIN_TABLE_CELL_CLASS} py-8 text-center text-xs`} style={{ color: '#94A3B8' }}>
+                    Loading…
                   </td>
                 </tr>
-              </>
-            )}
-          </tbody>
-        </table>
+              ) : grouped.sections.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className={`${FIN_TABLE_CELL_CLASS} py-8 text-center text-xs`} style={{ color: '#94A3B8' }}>
+                    No open items
+                  </td>
+                </tr>
+              ) : (
+                <>
+                  {grouped.sections.flatMap(section => [
+                    <tr key={`${section.bandLabel}-hdr`} style={L1_ROW_STYLE}>
+                      <SalesLabelCell label={section.bandLabel} bold />
+                      {BUCKET_COLS.map(c => (
+                        <SalesValCell key={c.key} value={section.subtotal[c.key] as number} bold />
+                      ))}
+                      <SalesValCell value={section.subtotal.total} bold />
+                    </tr>,
+                    ...section.items.map(item => (
+                      <tr key={`${section.bandLabel}-${item.label}`} style={DETAIL_ROW_STYLE}>
+                        <td
+                          className={`${FIN_TABLE_CELL_CLASS} text-left max-w-[12rem] truncate whitespace-nowrap pl-4`}
+                          style={{ color: '#334155', fontSize: '0.68rem', fontWeight: 500, background: '#FFFFFF' }}
+                          title={item.label}
+                        >
+                          {item.label}
+                        </td>
+                        {BUCKET_COLS.map(c => (
+                          <SalesValCell key={c.key} value={item[c.key] as number} />
+                        ))}
+                        <SalesValCell value={item.total} />
+                      </tr>
+                    )),
+                  ])}
+                  <tr style={L1_ROW_STYLE}>
+                    <SalesLabelCell label={totalColLabel} bold />
+                    {BUCKET_COLS.map(c => (
+                      <SalesValCell key={c.key} value={grouped.grand[c.key] as number} bold />
+                    ))}
+                    <SalesValCell value={grouped.grand.total} bold />
+                  </tr>
+                </>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   )

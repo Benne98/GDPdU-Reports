@@ -112,10 +112,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       );
     }
     if (res.status === 401) {
-      throw new Error("Ungültige E-Mail-Adresse oder Passwort.");
+      throw new Error("Invalid email address or password.");
     }
     if (!res.ok) {
-      throw new Error("Anmeldung fehlgeschlagen. Bitte später erneut versuchen.");
+      throw new Error("Sign-in failed. Please try again later.");
     }
     const data = (await res.json()) as {
       access_token: string;

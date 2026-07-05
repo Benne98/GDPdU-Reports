@@ -1231,6 +1231,9 @@ def position_plan_grain_sql(
     month: int,
     ent_frag: str,
     statement: str = "PL",
+    *,
+    scenario: str = "budget",
+    prefixes: Optional[list[str]] = None,
 ) -> tuple[str, dict]:
     """Aggregate manual-budget plan amounts from ``fact_position_plan`` by line_code.
 
@@ -1265,10 +1268,27 @@ def position_plan_grain_sql(
     every caller falls through to forecast/plan → byte-identical output.  The
     consolidated entity-sum only changes HOW existing budget rows aggregate (Σ
     per-entity vs '' override) — with no budget rows the WHERE still matches nothing.
+
+    ``scenario`` (default 'budget') selects the ``fact_position_plan.scenario`` band
+    to read; every existing caller omits it and gets the unchanged 'budget' behaviour.
+    The single ``amount * -1`` presentation flip is unchanged and applied here ONCE.
+
+    ``prefixes`` (visibility-scoped restriction, default ``None``): when a NON-admin
+    user is granted a SET of ≥2 entity prefixes (e.g. ``{'AA','BB'}``), the caller
+    passes that FULL set here.  We then restrict to EXACTLY those per-entity rows via
+    a BOUND-param ``AND p.entity_prefix = ANY(:eps)`` and SUM them by line_code.  This
+    deliberately does NOT consult the ``''`` consolidated-override row (a group-wide
+    figure that also covers entities the user may NOT see) and never touches any other
+    entity's rows, so a user granted ``{AA,BB}`` sees ONLY AA+BB — never CC.  No double
+    count: the per-entity rows for a line_code (position-level + its partner rows) are
+    each summed exactly once, identical to how the single-entity branch aggregates one
+    entity.  ``prefixes`` are sanitized (2-char, quote-stripped) and BOUND — never
+    string-interpolated.  When ``prefixes is None`` (EVERY existing caller) the SQL and
+    params are byte-identical to before: the single ``ep`` / consolidated branches below.
     """
     params: dict[str, Any] = {
         "year": year,
-        "scenario": "budget",
+        "scenario": scenario,
         "statement": statement,
     }
 
@@ -1285,7 +1305,14 @@ def position_plan_grain_sql(
     sel_ytg = "SUM(CASE WHEN p.fiscal_period > :month THEN p.amount * -1 ELSE 0 END)"
     params["month"] = month
 
-    if ep is None:
+    if prefixes is not None:
+        # Restricted multi-prefix visibility scope: bind the FULL allowed set and sum
+        # ONLY those per-entity rows (no '' consolidated override → no cross-tenant
+        # leak of a non-visible entity's plan).  Sanitize exactly like
+        # ``entities_sql_fragment`` (2-char, quote-stripped) and BIND — no raw SQL.
+        params["eps"] = [str(p).replace("'", "")[:2] for p in prefixes if p]
+        ent_clause = "AND p.entity_prefix = ANY(:eps)"
+    elif ep is None:
         # Consolidated view: the '' row per line_code when it exists (explicit
         # consolidated override), ELSE the SUM of the per-entity rows.  A row
         # participates iff it is a '' row, OR it is a per-entity row and NO '' row

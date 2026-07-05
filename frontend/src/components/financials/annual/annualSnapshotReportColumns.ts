@@ -1,5 +1,5 @@
 import type { ErSnapshotColLabels } from '../../../lib/api'
-import { labelActual, resolveAnnualForecastColumnLabel } from '../../../lib/periodColumnLabels'
+import { labelActual } from '../../../lib/periodColumnLabels'
 
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -15,7 +15,7 @@ export type AnnualSnapshotColDef = {
   isDelta?: boolean
 }
 
-/** Report-view columns: Dec22 … Jul24 | FY25F | Δ FY25F−Jul25 | Jul25 (anchor month). */
+/** Report-view columns: Dec22 … Jul24 | Jul25 (anchor month). Forecast/delta omitted until FY-F is shown. */
 export function buildAnnualSnapshotReportColumns(
   year: number,
   month: number,
@@ -26,15 +26,12 @@ export function buildAnnualSnapshotReportColumns(
   const decPy = lbl?.fy_py ?? labelActual(`Dec${String(year - 2).slice(-2)}`)
   const decCy = lbl?.fy ?? labelActual(`Dec${String(year - 1).slice(-2)}`)
   const cmPy = lbl?.cm_py ?? labelActual(`${abbr}${String(year - 1).slice(-2)}`)
-  const fyF = resolveAnnualForecastColumnLabel(year, lbl?.fy_f)
   const cm = lbl?.cm ?? labelActual(`${abbr}${String(year).slice(-2)}`)
   return [
     { id: 'dec_py2', labelLine1: decPy2 },
     { id: 'fy_py', labelLine1: decPy },
     { id: 'fy', labelLine1: decCy },
     { id: 'cm_py', labelLine1: cmPy },
-    { id: 'fy_f', labelLine1: fyF },
-    { id: 'delta_f', labelLine1: `Δ ${fyF} − ${cm}`, isDelta: true },
     { id: 'cm', labelLine1: cm, highlighted: true },
   ]
 }

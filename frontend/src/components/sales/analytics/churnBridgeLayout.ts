@@ -1,4 +1,4 @@
-import type { SalesChurnBridge, SalesChurnBridgeResponse } from '../../../lib/api'
+import type { SalesChurnBridgeResponse } from '../../../lib/api'
 
 export type ChurnGrain = 'year' | 'quarter' | 'month'
 
@@ -22,37 +22,42 @@ export const CHURN_BRIDGE_COMPONENTS: Array<{ key: ChurnComponentKey; label: str
 ]
 
 export const CHURN_DIM_OPTIONS = [
+  { key: 'end_customer_region', label: 'Region' },
+  { key: 'end_customer_city', label: 'City' },
+  { key: 'end_customer_name', label: 'Customer' },
   { key: 'entity', label: 'Entity' },
-  { key: 'customer_name', label: 'End customer' },
-  { key: 'customer_markets', label: 'Customer markets' },
-  { key: 'distribution_type', label: 'Distribution type' },
-  { key: 'end_customer_country', label: 'Geography' },
-  { key: 'industry_sub_sector', label: 'Industry' },
-  { key: 'product_revenue_model', label: 'Revenue model' },
 ] as const
 
 export function churnDimLabel(key: string): string {
   return CHURN_DIM_OPTIONS.find(d => d.key === key)?.label ?? key
 }
 
+/** Row shape accepted by churnCellValue — matches SalesChurnTableRow from api.ts. */
+export type ChurnRowLike = {
+  dim_value: string
+  from_keur: number
+  to_keur: number
+  new: number
+  upsell: number
+  cross_sell: number
+  downsell: number
+  lost: number
+}
+
 export function buildChurnTableColumns(data: SalesChurnBridgeResponse): ChurnTableColumn[] {
   const cols: ChurnTableColumn[] = [{ key: 'dim', label: 'Dimension', kind: 'dim' }]
   const periods = data.periods ?? []
-  const bridges = data.bridges ?? []
 
-  periods.forEach((label, i) => {
-    cols.push({ key: `p${i}`, label, kind: 'total' })
-    if (i < bridges.length) {
-      CHURN_BRIDGE_COMPONENTS.forEach(c => {
-        cols.push({
-          key: `b${i}_${c.key}`,
-          label: c.label,
-          kind: 'component',
-          component: c.key,
-        })
-      })
-    }
-  })
+  // PM total
+  if (periods[0]) cols.push({ key: 'p0', label: periods[0], kind: 'total' })
+  // One bridge: PM → CM
+  if (data.bridge) {
+    CHURN_BRIDGE_COMPONENTS.forEach(c => {
+      cols.push({ key: `b0_${c.key}`, label: c.label, kind: 'component', component: c.key })
+    })
+  }
+  // CM total
+  if (periods[1]) cols.push({ key: 'p1', label: periods[1], kind: 'total' })
   return cols
 }
 
@@ -75,19 +80,12 @@ export function isChurnCurrentMonthColumn(col: ChurnTableColumn, periodCount: nu
 
 export function churnCellValue(
   col: ChurnTableColumn,
-  dimValue: string,
-  periodTotals: number[],
-  bridges: Array<Pick<SalesChurnBridge, ChurnComponentKey>>,
+  row: ChurnRowLike,
 ): string | number | null {
-  if (col.kind === 'dim') return dimValue
-  const pi = Number(col.key.match(/^p(\d+)$/)?.[1])
-  if (!Number.isNaN(pi)) return periodTotals[pi] ?? null
-  const m = col.key.match(/^b(\d+)_(new|upsell|cross_sell|downsell|lost)$/)
-  if (m) {
-    const bi = Number(m[1])
-    const ck = m[2] as ChurnComponentKey
-    return bridges[bi]?.[ck] ?? null
-  }
+  if (col.kind === 'dim') return row.dim_value
+  if (col.key === 'p0') return row.from_keur
+  if (col.key === 'p1') return row.to_keur
+  if (col.component) return row[col.component]
   return null
 }
 

@@ -145,8 +145,8 @@ SELECT
         ARRAY[]::text[]
     ) AS entity_codes
 FROM dim_role r
-LEFT JOIN role_page_visibility  rpv ON rpv.role_id = r.role_id
-LEFT JOIN role_entity_visibility rev ON rev.role_id = r.role_id
+LEFT JOIN admin_role_page_visibility  rpv ON rpv.role_id = r.role_id
+LEFT JOIN admin_role_entity_visibility rev ON rev.role_id = r.role_id
 """
 
 
@@ -173,28 +173,28 @@ def _replace_role_junctions(
     page_keys: list[str],
     entity_codes: list[str],
 ) -> None:
-    """Delete then re-insert role_page_visibility and role_entity_visibility rows."""
+    """Delete then re-insert admin_role_page_visibility and admin_role_entity_visibility rows."""
     session.execute(
-        text("DELETE FROM role_page_visibility WHERE role_id = :rid"),
+        text("DELETE FROM admin_role_page_visibility WHERE role_id = :rid"),
         {"rid": role_id},
     )
     for key in page_keys:
         session.execute(
             text(
-                "INSERT INTO role_page_visibility (role_id, page_key) "
+                "INSERT INTO admin_role_page_visibility (role_id, page_key) "
                 "VALUES (:rid, :key) ON CONFLICT DO NOTHING"
             ),
             {"rid": role_id, "key": key},
         )
 
     session.execute(
-        text("DELETE FROM role_entity_visibility WHERE role_id = :rid"),
+        text("DELETE FROM admin_role_entity_visibility WHERE role_id = :rid"),
         {"rid": role_id},
     )
     for code in entity_codes:
         session.execute(
             text(
-                "INSERT INTO role_entity_visibility (role_id, legal_entity_code) "
+                "INSERT INTO admin_role_entity_visibility (role_id, legal_entity_code) "
                 "VALUES (:rid, :code) ON CONFLICT DO NOTHING"
             ),
             {"rid": role_id, "code": code},
@@ -306,7 +306,7 @@ def delete_role(
     _: Annotated[User, Depends(require_admin)],
     session: Annotated[Session, Depends(get_session)],
 ) -> Response:
-    """Delete a role. CASCADE removes user_role, role_entity_visibility, role_page_visibility rows."""
+    """Delete a role. CASCADE removes user_role, admin_role_entity_visibility, admin_role_page_visibility rows."""
     result = session.execute(
         text("DELETE FROM dim_role WHERE role_id = :rid"),
         {"rid": role_id},

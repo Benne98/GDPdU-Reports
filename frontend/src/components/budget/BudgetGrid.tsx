@@ -46,18 +46,31 @@ function deltaClass(delta: number): string {
 // ---------------------------------------------------------------------------
 
 /** Mutable override state for one position row. */
+export interface SubRowOverride {
+  annual?: number
+  months?: number[]
+  growthPct?: number
+  rateLocked?: boolean
+  rateEscalations?: Array<{ fromMonth: number; ratePct: number }>
+}
+
 export interface PositionOverride {
   annual?: number
   months?: number[]
+  growthPct?: number
+  rateLocked?: boolean
+  rateEscalations?: Array<{ fromMonth: number; ratePct: number }>
   /** Per-plan-year annual EUR overrides — keyed by fiscal year number. */
   annualByYear?: Record<number, number>
   /** Per-plan-year months arrays (EUR) — keyed by fiscal year number. */
   monthsByYear?: Record<number, number[]>
   /** Per-plan-year rate value — keyed by fiscal year number. */
   rateByYear?: Record<number, number>
-  partners?: Record<string, { annual?: number; months?: number[] }>
+  partners?: Record<string, SubRowOverride>
   /** Per-L4 child overrides, keyed by level_4 value. */
-  l4?: Record<string, { annual?: number; months?: number[] }>
+  l4?: Record<string, SubRowOverride>
+  /** Top-group growth rates for partner planning (sandbox blank). */
+  partnerGroups?: Record<string, SubRowOverride>
 }
 
 export interface BudgetGridProps {

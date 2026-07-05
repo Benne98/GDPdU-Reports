@@ -3,6 +3,7 @@ import type {
   FinancialStatementRow,
   PlNarrativeResponse,
 } from '../../../../lib/api'
+import { IS_OVERVIEW_V2 } from '../../../../lib/overviewV2Mode'
 import { fmtNarrativeEurSigned } from '../../pl-two-view/narrativeFmt'
 import { comparedToPriorPeriod } from '../../pl-two-view/proseStyle'
 import {
@@ -105,7 +106,9 @@ export function buildClientCfNarrative(
       period_label: cm,
       group_label: "the group's",
       net_profit_ytd: 0,
-      coverage_pct: null,
+      coverage_pct: IS_OVERVIEW_V2
+        ? (data.plan?.lines?.find(l => l.coverage_pct != null)?.coverage_pct ?? null)
+        : null,
       cm_month_label: cm,
       cm_vs_plan: 0,
       cm_vs_plan_qualifier: '',

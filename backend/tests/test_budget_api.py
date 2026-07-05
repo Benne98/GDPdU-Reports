@@ -346,7 +346,7 @@ class TestVisibility:
         def _execute(stmt, params=None):
             sql = str(stmt)
             res = MagicMock()
-            if "role_entity_visibility" in sql:
+            if "admin_role_entity_visibility" in sql:
                 res.fetchall.return_value = [(f"LE-{p}",) for p in prefixes]
             elif "dim_legal_entity" in sql:
                 res.fetchall.return_value = [(p,) for p in prefixes]
@@ -393,7 +393,7 @@ class TestEntitiesEndpoint:
         def _execute(stmt, params=None):
             sql = str(stmt)
             res = MagicMock()
-            if "role_entity_visibility" in sql:
+            if "admin_role_entity_visibility" in sql:
                 res.fetchall.return_value = [(c,) for c in (vis_codes or [])]
             elif "FROM dim_legal_entity WHERE legal_entity_code" in sql:
                 # _visible_entity_prefixes resolution

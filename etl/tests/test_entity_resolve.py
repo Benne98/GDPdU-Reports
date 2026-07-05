@@ -7,6 +7,7 @@ import pytest
 from etl.entity_resolve import (
     collect_entity_labels,
     is_numeric_prefix_value,
+    prefix_series_from_entity_config,
     preview_entity_mappings,
     propose_prefixes_for_labels,
     resolve_label_to_prefix,
@@ -65,3 +66,36 @@ def test_preview_entity_mappings_existing_and_proposed():
     assert by_label["Atlas"]["entity_prefix"] == "01"
     assert by_label["NewCo"]["status"] == "proposed"
     assert by_label["NewCo"]["entity_prefix"] == "02"
+
+
+# --------------------------------------------------------------------------- #
+# prefix_series_from_entity_config — drop_unknown kwarg
+# --------------------------------------------------------------------------- #
+
+def test_prefix_series_drop_unknown_true_yields_na_for_unknown():
+    """drop_unknown=True: resolved labels get a prefix; unresolved labels get NA.
+
+    This is the OB-path contract: the caller can then filter NA rows and drop
+    them rather than blocking the whole commit.
+    """
+    df = pd.DataFrame({"E": ["Atlas", "Meridian"]})
+    lookup = {"Atlas": "01"}
+    s = prefix_series_from_entity_config(
+        df, {"mode": "column", "value": "E"}, lookup, drop_unknown=True
+    )
+    assert s.iloc[0] == "01", f"Atlas should resolve to '01'; got {s.iloc[0]!r}"
+    assert pd.isna(s.iloc[1]), f"Meridian (unknown) should be NA; got {s.iloc[1]!r}"
+
+
+def test_prefix_series_drop_unknown_false_raises_on_unknown():
+    """drop_unknown=False (GL default): any unresolved label raises ValueError.
+
+    The error message must match 'Unknown entities' so the router converts it
+    to HTTP 422 with a user-readable message.
+    """
+    df = pd.DataFrame({"E": ["Atlas", "Meridian"]})
+    lookup = {"Atlas": "01"}
+    with pytest.raises(ValueError, match="Unknown entities"):
+        prefix_series_from_entity_config(
+            df, {"mode": "column", "value": "E"}, lookup, drop_unknown=False
+        )

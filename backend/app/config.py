@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     db_password: str = Field(default="", validation_alias="DB_PASSWORD")
     db_name: str = Field(default="Finssentials", validation_alias="DB_NAME")
 
+    # ── Read-report DB safety timeouts (scoped per-request; see db.get_read_session) ──
+    # Per-statement ceiling for heavy report READS (SET LOCAL statement_timeout).
+    read_statement_timeout_ms: int = Field(default=90000, validation_alias="READ_STATEMENT_TIMEOUT_MS")
+    # Global idle-in-transaction reaper ceiling (engine connect_args, see db.py).
+    idle_in_transaction_timeout_ms: int = Field(default=120000, validation_alias="IDLE_IN_TXN_TIMEOUT_MS")
+
     # Full override wins; otherwise assembled from DB_* fields above.
     database_url: str = ""
 
@@ -48,8 +54,9 @@ class Settings(BaseSettings):
 
     # API
     api_port: int = 8001
-    # GL / GoBD reference files can exceed 50 MB in local dev (Decidra export ~190 MB).
-    max_upload_mb: int = Field(default=256, validation_alias="MAX_UPLOAD_MB")
+    # GL / GoBD exports for a single (entity, year) can exceed 1,000,000 rows and run
+    # to several hundred MB; keep a generous default (overridable via MAX_UPLOAD_MB).
+    max_upload_mb: int = Field(default=1024, validation_alias="MAX_UPLOAD_MB")
 
     # Environment indicator — default "dev" so existing tests run unchanged.
     app_env: str = "dev"
@@ -63,6 +70,12 @@ class Settings(BaseSettings):
     opening_balance_mode: str = Field(default="in_data", validation_alias="OPENING_BALANCE_MODE")
     # Run the full deterministic rebuild on every ingest commit (reporting-v2).
     rebuild_on_commit: bool = Field(default=False, validation_alias="REBUILD_ON_COMMIT")
+    # Allow the admin "reset all ingested data" capability (POST /projects/{id}/reset-data).
+    # Default False so the LIVE 5176 stack — which the same frontend can target — can
+    # NEVER reset data even if the endpoint is hit.  A second, independent guard in the
+    # endpoint HARD-refuses whenever the connected DB is the live "Finssentials" DB,
+    # regardless of this flag (belt-and-suspenders).
+    allow_data_reset: bool = Field(default=False, validation_alias="ALLOW_DATA_RESET")
     # Journal Agent (Phase 6): when True, the GL findings (outliers / seasonality /
     # forensic counter-accounts + Other + suspicious texts) are merged into the
     # existing narrative bullets.  Default False = legacy/golden-identical output.
@@ -72,6 +85,42 @@ class Settings(BaseSettings):
     # the deterministic heuristic.  Default False = heuristic-only, no API calls (tests
     # never hit Anthropic).  Fail-closed: any LLM error keeps the row.
     forensic_use_llm: bool = Field(default=False, validation_alias="FORENSIC_USE_LLM")
+
+    # ── Overview v2 batched summary (reporting-v2) ─────────────────────────────
+    # OFF by default: the /financials/overview/summary endpoint always uses the
+    # live builders (correctness source of truth).  When True AND the mart is fresh
+    # (mart_overview.mart_is_fresh) the EBIT/revenue hero is served from the
+    # pre-aggregated mart_overview_period snapshot.  The parent MUST apply migration
+    # 0026 and validate the mart on real data before turning this on.
+    overview_summary_use_mart: bool = Field(
+        default=False, validation_alias="OVERVIEW_SUMMARY_USE_MART"
+    )
+    # Short in-process TTL (seconds) for the batched summary cache (visibility-aware
+    # key). 0 disables caching (tests set 0 for determinism).
+    overview_summary_cache_ttl_s: int = Field(
+        default=45, validation_alias="OVERVIEW_SUMMARY_CACHE_TTL_S"
+    )
+    # Short in-process TTL (seconds) for the OPOS aging _partner_view cache
+    # (visibility-aware key). A single Sales-aging page load fires ~8 aging
+    # endpoints that each recompute the SAME Stichtag _partner_view; this cache
+    # collapses those repeated full-FY OPOS scans to one. 0 disables caching
+    # (tests set 0 for determinism). Same default as the overview summary cache.
+    aging_cache_ttl_s: int = Field(
+        default=45, validation_alias="AGING_CACHE_TTL_S"
+    )
+
+    # ── Dataset viewer (server-paginated "full dataset" preview) ───────────────
+    # Hard memory ceiling for the in-memory projected concat frame built by
+    # POST /api/v1/ingest/dataset/rows.  Above this the request is refused (413)
+    # rather than buffering an unbounded multi-entity frame.  Default 1.5 GB.
+    dataset_viewer_max_bytes: int = Field(
+        default=1_500_000_000, validation_alias="DATASET_VIEWER_MAX_BYTES"
+    )
+    # Upper bound on the page size the dataset viewer will serve; the request
+    # ``limit`` is clamped to this value.  Default 1000 rows.
+    dataset_viewer_max_page: int = Field(
+        default=1000, validation_alias="DATASET_VIEWER_MAX_PAGE"
+    )
 
     @model_validator(mode="after")
     def _assemble_database_url(self) -> "Settings":

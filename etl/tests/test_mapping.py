@@ -20,7 +20,14 @@ from __future__ import annotations
 import pytest
 import pandas as pd
 
-from etl.mapping import MappingProfile, apply_profile, profile_from_dict, profile_to_dict
+from etl.mapping import (
+    MappingProfile,
+    apply_profile,
+    profile_from_dict,
+    profile_to_dict,
+    sniff_decimal_separator,
+)
+from etl import transform as T
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +97,71 @@ def _base_profile(**overrides) -> MappingProfile:
     for k, v in overrides.items():
         setattr(p, k, v)
     return p
+
+
+def test_empty_sign_amount_raises_clear_message():
+    """Regression: an unmapped amount column must raise a CLEAR ValueError, not a
+    cryptic KeyError('') — which surfaced to the user in the wizard as just "''"."""
+    raw = _raw()
+    p = _base_profile(sign={"mode": "signed", "amount": ""})
+    with pytest.raises(ValueError, match="'Amount' column is not mapped"):
+        apply_profile(raw, p)
+
+
+def test_empty_soll_haben_columns_raise_clear_message():
+    raw = _raw(soll=[100.0, 0.0, 50.0], haben=[0.0, 100.0, 0.0])
+    p = _base_profile(sign={"mode": "soll_haben", "soll": "", "haben": "Haben"})
+    with pytest.raises(ValueError, match="'Debit .Soll.' column is not mapped"):
+        apply_profile(raw, p)
+
+
+# --------------------------------------------------------------------------- #
+# sniff_decimal_separator (money-column oriented decimal detection)
+# --------------------------------------------------------------------------- #
+class TestSniffDecimalSeparator:
+    def test_us_single_dot(self):
+        # US amounts: single '.', non-3 trailing digits -> decimal '.'
+        assert sniff_decimal_separator(["52803.84", "10.5", "0.99"]) == (".", ",")
+
+    def test_us_float_artifact(self):
+        # >3 trailing digits still votes decimal '.'
+        assert sniff_decimal_separator(["52803.840000000004"]) == (".", ",")
+
+    def test_german_single_comma(self):
+        assert sniff_decimal_separator(["52803,84", "10,5"]) == (",", ".")
+
+    def test_german_both_separators(self):
+        # '52.803,84' / '1.234.567,89' -> ',' is rightmost -> decimal ','
+        assert sniff_decimal_separator(["52.803,84", "1.234.567,89"]) == (",", ".")
+
+    def test_us_both_separators(self):
+        # '1,234,567.89' -> '.' is rightmost -> decimal '.'
+        assert sniff_decimal_separator(["1,234,567.89"]) == (".", ",")
+
+    def test_ambiguous_three_trailing_digits_abstains(self):
+        # '1,234' could be thousands-grouped 1234 or the decimal 1.234 -> no vote.
+        assert sniff_decimal_separator(["1,234"]) is None
+
+    def test_thousands_grouping_only_no_vote(self):
+        # Multiple '.' => grouping only, no decimal signal -> inconclusive.
+        assert sniff_decimal_separator(["1.234.567"]) is None
+
+    def test_empty_and_none_inconclusive(self):
+        assert sniff_decimal_separator([]) is None
+        assert sniff_decimal_separator([None, "", "   "]) is None
+
+    def test_currency_and_sign_stripped(self):
+        assert sniff_decimal_separator(["-€52803.84", " $10.5 "]) == (".", ",")
+
+    def test_roundtrip_parse_decimal_us(self):
+        dec, thou = sniff_decimal_separator(["52803.84"])
+        out = T.parse_decimal(pd.Series(["52803.84"]), dec, thou)
+        assert out.iloc[0] == pytest.approx(52803.84)
+
+    def test_roundtrip_parse_decimal_german(self):
+        dec, thou = sniff_decimal_separator(["52.803,84"])
+        out = T.parse_decimal(pd.Series(["52.803,84"]), dec, thou)
+        assert out.iloc[0] == pytest.approx(52803.84)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,6 +410,39 @@ class TestLineNumbers:
         out = apply_profile(_raw(), _base_profile())
         assert out["booking_line_id"].nunique() == len(out)
 
+    def test_booking_line_id_distinct_across_separate_entity_files(self):
+        """Two SEPARATE per-entity GL files with identical jen/account/line layout
+        must NOT collide on booking_line_id (Phase-2 multi-file blocker)."""
+        raw = _raw(jen=["1", "1", "2"], acct=["10000", "80000", "30000"])
+        out_01 = apply_profile(raw, _base_profile(entity={"mode": "fixed", "value": "01"}))
+        out_02 = apply_profile(raw, _base_profile(entity={"mode": "fixed", "value": "02"}))
+        ids_01 = set(out_01["booking_line_id"].tolist())
+        ids_02 = set(out_02["booking_line_id"].tolist())
+        # No overlap → committing the second file cannot violate UNIQUE(booking_line_id).
+        assert ids_01.isdisjoint(ids_02)
+
+    def test_booking_line_id_idempotent_on_rerun(self):
+        """Re-running the same file (commit_mode='replace') reproduces identical ids."""
+        raw = _raw(jen=["1", "1", "2"], acct=["10000", "80000", "30000"])
+        first = apply_profile(raw, _base_profile())
+        second = apply_profile(raw, _base_profile())
+        assert first["booking_line_id"].tolist() == second["booking_line_id"].tolist()
+
+    def test_booking_line_id_positive_bigint(self):
+        out = apply_profile(_raw(), _base_profile())
+        # Must fit a positive signed bigint (never negative; within 2**62 headroom).
+        assert (out["booking_line_id"] > 0).all()
+        assert (out["booking_line_id"] < (1 << 62)).all()
+
+    def test_booking_line_id_preserves_source_value(self):
+        """A mapped, present source booking_line_id is PRESERVED (not regenerated)."""
+        raw = _raw(jen=["1", "1", "2"], acct=["10000", "80000", "30000"])
+        raw["SrcBlid"] = [111, 222, 333]
+        p = _base_profile()
+        p.columns["booking_line_id"] = "SrcBlid"
+        out = apply_profile(raw, p)
+        assert out["booking_line_id"].tolist() == [111, 222, 333]
+
 
 # --------------------------------------------------------------------------- #
 # Error handling
@@ -347,21 +452,21 @@ class TestErrors:
         raw = _raw()
         p = _base_profile()
         del p.columns["posting_date"]  # not in columns at all
-        with pytest.raises(KeyError, match="posting_date"):
+        with pytest.raises(KeyError, match="Posting date"):
             apply_profile(raw, p)
 
     def test_missing_journal_entry_number_raises(self):
         raw = _raw()
         p = _base_profile()
         del p.columns["journal_entry_number"]
-        with pytest.raises(KeyError, match="journal_entry_number"):
+        with pytest.raises(KeyError, match="Transaction/journal number"):
             apply_profile(raw, p)
 
     def test_missing_account_number_raises(self):
         raw = _raw()
         p = _base_profile()
         del p.columns["account_number"]
-        with pytest.raises(KeyError, match="account_number"):
+        with pytest.raises(KeyError, match="Account number"):
             apply_profile(raw, p)
 
     def test_unknown_sign_mode_raises(self):
@@ -384,3 +489,162 @@ class TestErrors:
         p.entity = {"mode": "column", "value": "NonExistentCol"}
         with pytest.raises(KeyError, match="entity column"):
             apply_profile(raw, p)
+
+
+# --------------------------------------------------------------------------- #
+# Opening-balance path: posting_date / journal_entry_number optional
+# --------------------------------------------------------------------------- #
+class TestOpeningBalancePath:
+    """OB files carry only account number + amount (no posting date, no txn no.).
+    apply_profile(..., opening_balance=True) must tolerate the missing date/txn
+    columns; GL (opening_balance=False) stays strictly required."""
+
+    def _ob_raw(self) -> pd.DataFrame:
+        # ONLY account_number + amount columns — no posting_date, no txn number.
+        return pd.DataFrame({"Konto": ["10000", "80000", "30000"],
+                             "Betrag": [1190.0, -1000.0, 500.0]})
+
+    def _ob_profile(self, **overrides) -> MappingProfile:
+        p = MappingProfile()
+        p.entity = {"mode": "fixed", "value": "01"}
+        p.fiscal_year = {"mode": "fixed", "value": "2021"}
+        p.sign = {"mode": "signed", "amount": "Betrag"}
+        p.decimal = "."
+        p.thousands = None
+        p.date_dayfirst = True
+        p.columns = {"account_number": "Konto"}  # no posting_date, no jen
+        p.linking_strategy = "none"
+        p.entry_type = "actual"
+        p.source_system = "test"
+        for k, v in overrides.items():
+            setattr(p, k, v)
+        return p
+
+    def test_ob_fixed_fy_no_date_no_txn_succeeds(self):
+        out = apply_profile(self._ob_raw(), self._ob_profile(), opening_balance=True)
+        # posting_date is all-NaT here (Jan-1 synthesis happens later in the router).
+        assert out["posting_date"].isna().all()
+        assert (out["fiscal_year"] == 2021).all()
+        assert out["gl_account_id"].tolist() == ["10000", "80000", "30000"]
+        assert out["amount"].tolist() == [1190.0, -1000.0, 500.0]
+
+    def test_gl_default_still_requires_posting_date(self):
+        # SAME profile, opening_balance=False (GL default) → unchanged KeyError.
+        with pytest.raises(KeyError, match="Posting date"):
+            apply_profile(self._ob_raw(), self._ob_profile(), opening_balance=False)
+
+    def test_ob_from_date_fy_raises_valueerror(self):
+        p = self._ob_profile(fiscal_year={"mode": "from_date", "value": None})
+        with pytest.raises(ValueError, match="fiscal year"):
+            apply_profile(self._ob_raw(), p, opening_balance=True)
+
+
+# --------------------------------------------------------------------------- #
+# drop_unknown_entities — OB drop / GL regression guard
+# --------------------------------------------------------------------------- #
+class TestDropUnknownEntities:
+    """Tests for apply_profile(..., drop_unknown_entities=True/False).
+
+    Spec: when entity mode='column' and drop_unknown_entities=True, rows whose
+    entity label is not in the lookup are silently dropped (the OB path — extra
+    entities not in the project should not block the commit). The dropped labels
+    are exposed on the returned DataFrame via
+    out.attrs["ignored_entity_labels"] (sorted list of original label strings).
+
+    When drop_unknown_entities=False (GL default), the same frame raises
+    ValueError("Unknown entities ...") — this is the byte-identical GL
+    regression guard that must never silently lose rows during GL ingestion.
+    """
+
+    # Known labels map to prefixes "01" / "02"; unknown labels have no entry.
+    _LOOKUP: dict = {"Atlas": "01", "Calypto": "02"}
+
+    def _make_raw(self) -> pd.DataFrame:
+        """Four-row frame: two known entity labels + two unknown ones."""
+        return pd.DataFrame({
+            "Entity": ["Atlas", "Calypto", "Meridian", "Novara"],
+            "Konto":  ["10000", "80000",  "30000",   "40000"],
+            "Betrag": [500.0,   300.0,    999.0,     888.0],
+        })
+
+    def _make_profile(self) -> MappingProfile:
+        """OB-style profile using entity column mode.
+
+        No posting_date / journal_entry_number: those are optional on the OB
+        path (opening_balance=True) and unnecessary for testing entity drop.
+        Entity resolution is the FIRST step in apply_profile, so the ValueError
+        from drop_unknown_entities=False fires before any posting_date check —
+        the same profile works for both the drop=True and drop=False tests.
+        """
+        p = MappingProfile()
+        p.entity = {"mode": "column", "value": "Entity"}
+        p.fiscal_year = {"mode": "fixed", "value": 2022}
+        p.sign = {"mode": "signed", "amount": "Betrag"}
+        p.decimal = "."
+        p.thousands = None
+        p.date_dayfirst = True
+        p.columns = {"account_number": "Konto"}
+        p.linking_strategy = "none"
+        p.entry_type = "actual"
+        p.source_system = "test"
+        return p
+
+    def test_drop_unknown_true_keeps_known_rows_only(self):
+        """Only the resolvable-entity rows survive; unknown rows are filtered out."""
+        out = apply_profile(
+            self._make_raw(),
+            self._make_profile(),
+            entity_lookup=self._LOOKUP,
+            opening_balance=True,
+            drop_unknown_entities=True,
+        )
+        assert len(out) == 2, f"expected 2 rows (Atlas+Calypto); got {len(out)}"
+        assert out["gl_account_id"].tolist() == ["10000", "80000"]
+        assert out["amount"].tolist() == [500.0, 300.0]
+
+    def test_drop_unknown_true_reports_dropped_labels_sorted(self):
+        """ignored_entity_labels attr carries the dropped labels in sorted order."""
+        out = apply_profile(
+            self._make_raw(),
+            self._make_profile(),
+            entity_lookup=self._LOOKUP,
+            opening_balance=True,
+            drop_unknown_entities=True,
+        )
+        ignored = out.attrs.get("ignored_entity_labels", [])
+        assert ignored == ["Meridian", "Novara"], (
+            f"expected ['Meridian', 'Novara']; got {ignored!r}"
+        )
+
+    def test_drop_unknown_false_raises_value_error(self):
+        """drop_unknown_entities=False raises ValueError — GL regression guard.
+
+        Entity resolution is the first step in apply_profile, so this raises
+        before posting_date / journal_entry_number are checked (no need for
+        those columns in the test frame).
+        """
+        with pytest.raises(ValueError, match="Unknown entities"):
+            apply_profile(
+                self._make_raw(),
+                self._make_profile(),
+                entity_lookup=self._LOOKUP,
+                opening_balance=False,
+                drop_unknown_entities=False,
+            )
+
+    def test_drop_unknown_true_all_known_no_rows_dropped(self):
+        """When every entity label resolves, attrs is an empty list (no drops)."""
+        raw = pd.DataFrame({
+            "Entity": ["Atlas", "Calypto"],
+            "Konto":  ["10000", "80000"],
+            "Betrag": [500.0, -200.0],
+        })
+        out = apply_profile(
+            raw,
+            self._make_profile(),
+            entity_lookup=self._LOOKUP,
+            opening_balance=True,
+            drop_unknown_entities=True,
+        )
+        assert len(out) == 2
+        assert out.attrs.get("ignored_entity_labels") == []

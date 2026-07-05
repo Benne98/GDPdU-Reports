@@ -82,6 +82,7 @@ SCRIPTS: dict[str, Path] = {
     "recon_pl": PROJECT_ROOT / "Recon_tables_PL_MM.py",
     "recon_bs": PROJECT_ROOT / "Recon_tables_BS.py",
     "bs_bucket": PROJECT_ROOT / "BS_Bucket.py",
+    "fte": PROJECT_ROOT / "fte_development_verformelt.py",
 }
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -822,6 +823,31 @@ class DatabookSusaRequest(BaseModel):
     strict_mapping: bool = False
 
 
+class FteDevelopmentRequest(BaseModel):
+    session_id: str
+    entity_year_files: list[EntityYearFileGroup] = Field(default_factory=list)
+    entity_names: list[str] = Field(default_factory=list)
+    output_folder: str = ""
+    view_mode: str = "consolidated"
+    upload_mode: str = "per_fy_grid"
+    first_fy: int = 2022
+    last_fy: int = 2025
+    fte_mapping: dict[str, Any] = Field(default_factory=dict)
+    fte_tenure_mode: str = "months_col"
+    payroll_mapping: dict[str, Any] = Field(default_factory=dict)
+    fte_payroll_mode: str = "sum_components"
+    dimensions: list[dict[str, Any]] = Field(default_factory=list)
+    preset_metrics: list[str] = Field(default_factory=list)
+    custom_metrics: list[dict[str, Any]] = Field(default_factory=list)
+    pex_view_mode: str = "consolidated"
+    pex_values: dict[str, Any] = Field(default_factory=dict)
+    fy_end_month: int = 12
+    fy_end_day: int = 31
+    formula_mode: bool = True
+    # legacy
+    department_map: dict[str, str] = Field(default_factory=dict)
+
+
 class DatabookGlMasterRequest(BaseModel):
     """Build Master_BS / Master_PL directly from loaded GDPdU GL data (pipeline path)."""
 
@@ -1225,6 +1251,31 @@ def run_status(
 # ─── SuSa preview (column mapper) ─────────────────────────────────────────────
 
 
+@router.get("/personaltable/preview")
+def personaltable_preview(
+    session_id: str = Query(...),
+    file_id: str = Query(...),
+    sheet_index: int = Query(0, ge=0),
+):
+    """Preview matrix for FTE personaltable column mappers."""
+    if not (file_id or "").strip():
+        raise HTTPException(status_code=400, detail="file_id is required for preview.")
+    path = _file_path_for_id(session_id, file_id)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found for session_id / file_id.")
+    from susa_column_mapping import build_preview
+
+    try:
+        raw = pd.read_excel(path, sheet_name=sheet_index, header=None, engine="openpyxl")
+        preview = build_preview(raw)
+        preview["file_id"] = file_id
+        preview["sheet_index"] = sheet_index
+        return preview
+    except Exception as exc:
+        logger.exception("personaltable preview failed")
+        raise HTTPException(status_code=400, detail=f"Could not read workbook: {exc}") from exc
+
+
 @router.get("/susa/preview")
 def susa_preview(
     session_id: str = Query(...),
@@ -1354,14 +1405,14 @@ def run_databook_susa(req: DatabookSusaRequest):
 #
 # SECURITY NOTE (for review): As of this change there is NO row-level / per-user
 # entity isolation enforced anywhere in the data-read paths of this codebase.
-# The schema DOES model it — ``user_role`` × ``role_entity_visibility`` map a user
+# The schema DOES model it — ``user_role`` × ``admin_role_entity_visibility`` map a user
 # (via their roles) to a set of ``legal_entity_code`` values — but that mapping is
 # currently only WRITTEN/managed by the admin router (``admin.py``); no reporting
 # endpoint (trial balance, GL lines, financials) filters reads by it today.
 #
 # This endpoint pair is the FIRST data path to honour it. ``_visible_entity_codes``
 # resolves the allow-list for the current user:
-#   - admins and users with NO ``role_entity_visibility`` rows at all → ``None``
+#   - admins and users with NO ``admin_role_entity_visibility`` rows at all → ``None``
 #     (= "all entities"), matching the admin contract ("empty list = all entities").
 #   - otherwise → the explicit set of ``legal_entity_code`` the user's roles grant.
 # ``data-status`` only lists allowed entities; ``gl-master`` rejects any requested
@@ -1557,6 +1608,68 @@ def run_databook_gl_master(
     if master.is_file():
         result["output_file"] = out_xlsx
         result["output_filename"] = master.name
+    return result
+
+
+# ─── Run: FTE Development ─────────────────────────────────────────────────────
+
+
+@router.post("/run/fte_development")
+def run_fte_development(req: FteDevelopmentRequest):
+    """Build historical FTE Actuals table from personaltable uploads."""
+    run_id = _make_run_id("fte_")
+    run_d = _run_dir(req.session_id, run_id)
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    groups = list(req.entity_year_files)
+    resolved_cells = _resolve_entity_year_files_for_susa(req.session_id, groups)
+    if not resolved_cells:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolvable personaltable uploads (check file_id and session_id).",
+        )
+
+    config: dict[str, Any] = {
+        "session_id": req.session_id,
+        "case_id": req.session_id,
+        "run_id": run_id,
+        "output_file_path": output_folder,
+        "output_folder": output_folder,
+        "output_filename": f"{req.session_id}_FTE_Development.xlsx",
+        "view_mode": (req.view_mode or "consolidated").strip(),
+        "upload_mode": (req.upload_mode or "per_fy_grid").strip(),
+        "first_fy": int(req.first_fy),
+        "last_fy": int(req.last_fy),
+        "fte_mapping": dict(req.fte_mapping or {}),
+        "fte_tenure_mode": str(req.fte_tenure_mode or "months_col"),
+        "payroll_mapping": dict(req.payroll_mapping or {}),
+        "fte_payroll_mode": str(req.fte_payroll_mode or "sum_components"),
+        "dimensions": list(req.dimensions or []),
+        "preset_metrics": list(req.preset_metrics or ["fte", "payroll"]),
+        "custom_metrics": list(req.custom_metrics or []),
+        "pex_view_mode": str(req.pex_view_mode or "consolidated"),
+        "pex_values": dict(req.pex_values or {}),
+        "fy_end_month": int(req.fy_end_month or 12),
+        "fy_end_day": int(req.fy_end_day or 31),
+        "formula_mode": bool(req.formula_mode),
+        "entity_names": list(req.entity_names),
+        "resolved_entity_year_files": resolved_cells,
+        "department_map": dict(req.department_map or {}),
+        "sheet_name": "Personaltabelle",
+        "base_sheet_name": "FTE Development",
+    }
+
+    config_path = run_d / "fte_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = _run_script(SCRIPTS["fte"], config_path)
+    result["run_id"] = run_id
+    result["session_id"] = req.session_id
+    out_file = str(result.get("output_file") or result.get("output_path") or "")
+    if out_file and Path(out_file).is_file():
+        result["output_file"] = out_file
+        result["output_filename"] = Path(out_file).name
+    result["output_path"] = output_folder
     return result
 
 

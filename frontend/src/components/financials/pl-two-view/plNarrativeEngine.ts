@@ -50,11 +50,12 @@ const NARRATIVE_AGGREGATE_LINE_CODES = new Set([
 
 const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-/** Lowercase first char except ∆/Δ (matches backend prose_label). */
+/** Lowercase first char except ∆/Δ and all-caps acronyms (EBITDA, EBIT, D&A, …). */
 export function proseLabel(label: string | null | undefined): string {
   const s = (label ?? '').trim()
   if (!s) return ''
   if (s[0] === '∆' || s[0] === 'Δ') return s
+  if (s === s.toUpperCase() && /[A-Z]/.test(s)) return s
   if (s.length === 1) return s.toLowerCase()
   return s[0].toLowerCase() + s.slice(1)
 }
@@ -359,21 +360,29 @@ export function buildPlNarrativeIntro(
   )
 }
 
+/** Fix legacy mis-cased acronyms at bullet start (eBITDA → EBITDA). */
+function fixLeadingAcronym(body: string): string {
+  const m = body.match(/^e(BITDA|BIT|BT)\b/)
+  if (m) return `E${m[1]}${body.slice(m[0].length)}`
+  return body
+}
+
 /** Capitalize the first character only when the bullet opens with this line's position label. */
 function capitalizeBulletLeadingLabel(body: string, label: string): string {
-  if (!body.length) return body
-  const first = body[0]
-  if (first === '∆' || first === 'Δ') return body
+  const normalized = fixLeadingAcronym(body)
+  if (!normalized.length) return normalized
+  const first = normalized[0]
+  if (first === '∆' || first === 'Δ') return normalized
 
-  const bodyLower = body.toLowerCase()
+  const bodyLower = normalized.toLowerCase()
   const labelKey = label.trim().toLowerCase()
   const proseKey = proseLabel(label).toLowerCase()
   const opensWithPosition =
     (labelKey.length > 0 && bodyLower.startsWith(labelKey)) ||
     (proseKey.length > 0 && bodyLower.startsWith(proseKey))
-  if (!opensWithPosition) return body
+  if (!opensWithPosition) return normalized
 
-  return first.toUpperCase() + body.slice(1)
+  return first.toUpperCase() + normalized.slice(1)
 }
 
 /** Bullet body for display: no duplicate "Label:" prefix; leading position title-cased once. */

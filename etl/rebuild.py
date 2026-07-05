@@ -49,6 +49,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,45 @@ def _stage_classification_refresh(session: Session, scope: RebuildScope) -> dict
     from etl.project_coa_override import replay_project_overrides
 
     return replay_project_overrides(session, scope)
+
+
+DEFAULT_ACCOUNT_MAPPING_MODE = "library"
+
+
+def _stage_account_library_fill(
+    session: Session, scope: RebuildScope, mode_override: Optional[str] = None
+) -> dict:
+    """Fill MISSING (account, fiscal_year) dim_gl_account rows from the account library.
+
+    When the project's mapping file only covers some fiscal years, the same account
+    in OTHER years has no dim_gl_account row → it is unclassified.  This stage
+    INSERTs a row for every posted (account, fy) that has none, resolved from
+    ``ovr_account_mapping`` (pin) else the most-frequent hierarchy for the account's
+    ``account_name`` in ``lib_account_mapping`` (``etl.account_fill``).
+
+    GATE — ``account_mapping_mode``:
+      'library' (DEFAULT) -> run the fill.
+      'exclusive'         -> SKIP (only the provided per-(account, year) mapping is
+                             used; missing years stay unmapped).
+
+    ADDITIVE / GOLDEN: the fill NEVER mutates an existing dim_gl_account row — it
+    only INSERTs missing ones.  On v2/live (mapping covers every year, FK
+    fact_gl_line->dim_gl_account guarantees no posted key is missing) it inserts 0
+    rows, so ``compare live v2`` stays EQUIVALENT.  The library/override tables
+    being absent (partially-migrated / pure-ETL test schema) is a no-op.
+    """
+    mode = mode_override or DEFAULT_ACCOUNT_MAPPING_MODE
+    if mode == "exclusive":
+        return {"account_mapping_mode": "exclusive", "filled": 0, "skipped": True}
+    try:
+        from etl.account_fill import fill_missing_account_rows
+
+        res = fill_missing_account_rows(session, scope)
+        res["account_mapping_mode"] = mode
+        return res
+    except Exception as exc:  # noqa: BLE001 — absent tables / partial schema => no-op
+        logger.warning("rebuild: account library fill skipped (%s)", exc)
+        return {"account_mapping_mode": mode, "filled": 0, "skipped": True, "error": str(exc)}
 
 
 def _stage_partner_backfill(session: Session, scope: RebuildScope) -> dict:
@@ -276,12 +316,18 @@ def rebuild_project(
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}, got {mode!r}")
 
+    # A legit deterministic rebuild can run long and briefly idle between heavy
+    # stages; raise the idle-in-transaction ceiling LOCALLY (SET LOCAL, scoped to
+    # this txn only) so the global idle reaper (db.engine) never interrupts it.
+    session.execute(text("SELECT set_config('idle_in_transaction_session_timeout', '600000', true)"))
+
     sc = _coerce_scope(scope)
     summary: dict = {"mode": mode, "scope": {"prefixes": sc.prefixes, "years": sc.years}}
 
     # Phase 7: resolve per-project rebuild flags (None => settings.* defaults).
     ob_override: Optional[str] = None
     np_override: Optional[str] = None
+    am_override: Optional[str] = None
     if project_id is not None:
         try:
             from etl.project_config import resolve_rebuild_flags
@@ -289,6 +335,7 @@ def rebuild_project(
             flags = resolve_rebuild_flags(session, project_id)
             ob_override = flags["opening_balance_mode"]
             np_override = flags["net_profit_source"]
+            am_override = flags.get("account_mapping_mode")
             summary["project_id"] = project_id
             summary["resolved_flags"] = flags
         except Exception as exc:  # noqa: BLE001 — config lookup must not break rebuild
@@ -297,6 +344,13 @@ def rebuild_project(
     try:
         if mode == "full":
             summary["classification"] = _stage_classification_refresh(session, sc)
+            # Account library fill: classify (account, fy) the mapping file missed.
+            # Gated by account_mapping_mode ('library' default | 'exclusive' skip).
+            # Additive (only INSERTs missing dim rows) — no-op on v2/live → golden-safe.
+            if am_override is not None:
+                summary["account_library_fill"] = _stage_account_library_fill(session, sc, am_override)
+            else:
+                summary["account_library_fill"] = _stage_account_library_fill(session, sc)
 
         summary["partner_backfill"] = _stage_partner_backfill(session, sc)
         summary["derived_facts"] = _stage_derived_facts(session, sc)

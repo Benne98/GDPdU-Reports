@@ -19,6 +19,9 @@ like ``fact_gl_plan``.  The grid exchanges PRESENTED values with the client; the
 flip happens EXACTLY ONCE on write (and is the inverse of the readers' flip):
 
   PL  : presented = −stored        → stored = −presented        (``amount * -1``)
+  CF  : presented = −stored        → stored = −presented        (IDENTICAL to PL —
+        the CF statement presents ``dim_gl_cf.amount * -1``, the same single flip,
+        so a CF inflow +900 stores as −900 and re-presents as +900; no double flip)
   BS asset  (e.g. AR): presented = +stored → stored = +presented
   BS credit (e.g. AP): presented = −stored → stored = −presented
 
@@ -120,11 +123,21 @@ def present_to_stored(presented: float, statement: str, line_code: str) -> float
     """Convert a PRESENTED grid value to the STORED GL-sign ``amount``.
 
     PL          : stored = −presented              (inverse of ``amount * -1``).
+    CF          : stored = −presented              (identical to PL — see below).
     BS asset    : stored = +presented              (inverse of ``+amount``).
     BS credit   : stored = −presented              (inverse of ``−amount``).
+
+    CF EQUALS PL (proven).  The CF statement presents ``amount * -1`` (inflow +,
+    outflow −), the SAME single flip ``position_plan_grain_sql`` applies.  So a CF
+    plan round-trips exactly like a PL plan: a presented inflow of +900 stores as
+    −900, which ``position_plan_grain_sql`` re-presents as −900 * -1 = +900 — matching
+    the CF ACTUAL sign for the same cf_mapping leaf.  We add an explicit 'CF' branch
+    for clarity (no double flip; identical to the PL fall-through).
     """
     if statement == "BS":
         return -float(presented) if _bs_side_for(line_code) == "credit" else float(presented)
+    if statement == "CF":
+        return -float(presented)  # CF == PL (single flip mirrors dim_gl_cf amount * -1)
     return -float(presented)  # PL
 
 
@@ -132,6 +145,8 @@ def stored_to_present(stored: float, statement: str, line_code: str) -> float:
     """Inverse of :func:`present_to_stored` (STORED amount → PRESENTED grid value)."""
     if statement == "BS":
         return -float(stored) if _bs_side_for(line_code) == "credit" else float(stored)
+    if statement == "CF":
+        return -float(stored)  # CF == PL
     return -float(stored)  # PL
 
 
@@ -555,6 +570,35 @@ def _partner_actual_profiles(
     return out
 
 
+def _partner_actual_profiles_with_fallback(
+    session: Session,
+    *,
+    line_code: str,
+    fiscal_year: int,
+    entity_prefix: Optional[str],
+) -> dict[str, tuple[str, float, dict[int, float]]]:
+    """Partner profiles for the grid — plan year first, then prior FYs / ledger anchor."""
+    from app.services.gl_analysis_common import latest_anchor
+
+    candidates: list[int] = [fiscal_year]
+    for delta in (1, 2, 3):
+        candidates.append(fiscal_year - delta)
+    anchor = latest_anchor(session, entity_prefix or "")
+    if anchor is not None:
+        candidates.append(int(anchor[0]))
+    seen: set[int] = set()
+    for fy in candidates:
+        if fy in seen or fy < 2000:
+            continue
+        seen.add(fy)
+        profiles = _partner_actual_profiles(
+            session, line_code=line_code, fiscal_year=fy, entity_prefix=entity_prefix,
+        )
+        if profiles:
+            return profiles
+    return {}
+
+
 # =========================================================================== #
 # Read existing budget rows (presented), for GET overlay.
 # =========================================================================== #
@@ -718,6 +762,7 @@ def build_grid(
     heuristic: str = "prior_year",
     growth_pct: float = 0.0,
     level: str = "L4",
+    light: bool = False,
 ) -> dict[str, Any]:
     """Read-only budget grid (TREE): the statement's reporting positions (L3 nodes
     in ``dim_pl_structure`` sort order, mirroring the IS/BS), each seeded from
@@ -772,10 +817,21 @@ def build_grid(
             months = {p: round(v, 2) for p, v in seasonalize(seed_annual, seed_weights).items()}
         annual = round(annual_of(months), 2)
 
-        sug = budget_heuristics.suggest(
-            session, line_code=line_code, statement=statement,
-            fiscal_year=fiscal_year, entity_prefix=entity_prefix,
-            method=heuristic, growth_pct=growth_pct,
+        sug = (
+            {
+                "suggestion_annual": 0.0,
+                "weights": {p: 1.0 / 12.0 for p in PERIODS},
+                "explanation": {
+                    "method": "blank",
+                    "note": "Light grid — heuristic suggestions skipped.",
+                },
+            }
+            if light
+            else budget_heuristics.suggest(
+                session, line_code=line_code, statement=statement,
+                fiscal_year=fiscal_year, entity_prefix=entity_prefix,
+                method=heuristic, growth_pct=growth_pct,
+            )
         )
         sug_annual = round(float(sug["suggestion_annual"]), 2)
         sug_months = {p: round(v, 2) for p, v in seasonalize(sug_annual, sug["weights"]).items()}
@@ -803,7 +859,7 @@ def build_grid(
             )
 
         if pd:
-            profiles = _partner_actual_profiles(
+            profiles = _partner_actual_profiles_with_fallback(
                 session, line_code=line_code, fiscal_year=fiscal_year,
                 entity_prefix=entity_prefix,
             )
@@ -928,12 +984,17 @@ def _upsert_rows(
     updated_by: Optional[str],
     is_synthetic: bool,
     source_system: str = BUDGET_SOURCE_SYSTEM,
+    scenario: str = "budget",
 ) -> int:
     """UPSERT a batch of fact_position_plan rows.  ``rows`` carry STORED amounts.
 
     Each row dict: statement, line_code, entity_prefix, partner_id, partner_kind,
     fiscal_year, fiscal_period, amount (stored).  Does NOT commit (caller manages
     the transaction).
+
+    ``scenario`` selects the ``fact_position_plan.scenario`` band written (part of the
+    ON CONFLICT key).  Default ``'budget'`` keeps every existing caller BYTE-IDENTICAL;
+    the forecast seeder passes ``scenario='forecast'`` to materialise the forecast band.
     """
     n = 0
     for row in rows:
@@ -944,7 +1005,7 @@ def _upsert_rows(
                    partner_kind, fiscal_year, fiscal_period, scenario, amount,
                    is_synthetic, source_system, updated_at, updated_by)
                 VALUES
-                  (:stmt, :lc, :ep, :pid, :l4, :pk, :fy, :fp, 'budget', :amt,
+                  (:stmt, :lc, :ep, :pid, :l4, :pk, :fy, :fp, :scenario, :amt,
                    :syn, :ss, NOW(), :ub)
                 ON CONFLICT (statement, line_code, entity_prefix, partner_id,
                              level_4, fiscal_year, fiscal_period, scenario)
@@ -969,6 +1030,7 @@ def _upsert_rows(
                 "syn": bool(is_synthetic),
                 "ss": source_system,
                 "ub": updated_by,
+                "scenario": scenario,
             },
         )
         n += 1

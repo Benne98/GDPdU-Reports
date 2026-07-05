@@ -51,6 +51,7 @@ export interface AdaptiveCardInput {
     | 'file_drop'
     | 'date_picker'
     | 'susa_grid'
+    | 'fte_pex_grid'
     | 'folder_picker'
     | 'folder_drop'
     | 'sortable_list'
@@ -67,6 +68,8 @@ export interface AdaptiveCardInput {
   required?: boolean
   accept?: string
   entity_count?: number
+  /** fte_pex_grid / susa_grid entity row labels */
+  default_entity_names?: string[]
   /** In compact cards: 2 = full width row in 2-column grid */
   span?: 1 | 2
   /** Consecutive inputs with the same key render in one horizontal row */
@@ -105,7 +108,9 @@ export interface AdaptiveCardPayload {
   download_url?: string
   /** Optional footnote under susa_grid */
   susa_grid_note?: string
-  /** databook_susa_column_mapper: session_id, preview_file_id, layout, etc. */
+  /** fte_pex_grid: default entity row names */
+  default_entity_names?: string[]
+  /** databook_susa_column_mapper / fte mappers */
   mapper_meta?: Record<string, unknown>
   /** Secondary action button (e.g. AP/AR not identifiable) */
   secondary_submit_label?: string

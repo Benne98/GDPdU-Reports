@@ -10,6 +10,7 @@ import { computeAutoExpandedIds } from '../statementRowExpansion'
 
 const COMMENT_COL_PCT = 3
 const LABEL_COL_PCT = 30
+const WC_KPI_HEADER_LABEL = 'KPIs — working capital days'
 
 function valueColPct(entityCount: number, hasCommentCol: boolean): number {
   const valueColCount = entityCount + 1
@@ -70,6 +71,24 @@ export default function AnnualConsolidationGridMiniTable({
     onRegisterCheckOpen?.(checkOpen)
   }, [onRegisterCheckOpen, checkOpen, userToggles, autoExpandedIds, checkOpenProp])
 
+  function renderKpiHeaderRow(key: string, label = 'KPIs'): JSX.Element {
+    return (
+      <tr key={key} style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+        <td
+          className="px-2 py-1.5 text-xs font-semibold italic"
+          style={{ color: '#1E3A5F' }}
+        >
+          {label}
+        </td>
+        {renderAnnualCommentCell(undefined, hasCommentCol)}
+        {consol.entities.map(e => (
+          <td key={`${key}-${e.code}`} style={{ background: '#F8FAFC' }} />
+        ))}
+        <td style={{ background: 'rgba(30,58,95,0.04)' }} />
+      </tr>
+    )
+  }
+
   function renderRow(row: ConsolidationRow, depth = 0): JSX.Element[] {
     const nodes: JSX.Element[] = []
     if (!shouldDisplayConsolidationRow(row, entityCodes)) return nodes
@@ -84,24 +103,26 @@ export default function AnnualConsolidationGridMiniTable({
     const showChevron = (row.children?.length ?? 0) > 0
     const isOpen = checkOpen(row.id)
 
-    if (isTitle || isKpiHeader) {
+    if (isTitle) {
       nodes.push(
         <tr
           key={row.id}
           style={{
             background: '#F8FAFC',
-            borderTop: isKpiHeader ? '2px solid #E2E8F0' : '1px solid #E2E8F0',
+            borderTop: '1px solid #E2E8F0',
           }}
         >
           <td
             colSpan={colCount}
             className="px-2 py-1.5 text-xs font-semibold"
-            style={{ color: '#1E3A5F', fontStyle: isKpiHeader ? 'italic' : undefined }}
+            style={{ color: '#1E3A5F' }}
           >
             {row.label}
           </td>
         </tr>,
       )
+    } else if (isKpiHeader) {
+      nodes.push(renderKpiHeaderRow(row.id, row.label))
     } else {
       nodes.push(
         <tr
@@ -113,11 +134,11 @@ export default function AnnualConsolidationGridMiniTable({
           }}
         >
           <td
-            className="py-0.5 text-left truncate"
+            className="py-0.5 text-left"
             style={{ paddingLeft: pad, paddingRight: 4 }}
             title={row.label}
           >
-            <span className="flex items-center gap-0.5 min-w-0">
+            <span className="flex items-start gap-0.5 min-w-0">
               {showChevron ? (
                 <button
                   type="button"
@@ -135,7 +156,7 @@ export default function AnnualConsolidationGridMiniTable({
                 <span className="w-[14px] shrink-0" />
               )}
               <span
-                className="text-xs block truncate"
+                className="text-xs block whitespace-normal break-words"
                 style={{
                   fontWeight: isBold ? 600 : 400,
                   fontStyle: isKpi ? 'italic' : undefined,
@@ -180,7 +201,7 @@ export default function AnnualConsolidationGridMiniTable({
             italic={isKpi}
             compact
             denser
-            highlighted={!isKpi}
+            highlighted
           />
         </tr>,
       )
@@ -190,6 +211,28 @@ export default function AnnualConsolidationGridMiniTable({
       for (const ch of row.children ?? []) {
         nodes.push(...renderRow(ch, depth + 1))
       }
+    }
+    return nodes
+  }
+
+  function renderAllRows(rows: ConsolidationRow[]): JSX.Element[] {
+    const nodes: JSX.Element[] = []
+    let kpiHeaderInserted = false
+    for (const row of rows) {
+      if (row.row_kind === 'kpi_header') {
+        kpiHeaderInserted = true
+        nodes.push(...renderRow(row))
+        continue
+      }
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && consol.statement === 'wc') {
+        kpiHeaderInserted = true
+        nodes.push(renderKpiHeaderRow('wc-consol-kpi-header-fallback', WC_KPI_HEADER_LABEL))
+      }
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && consol.statement === 'bs') {
+        kpiHeaderInserted = true
+        nodes.push(renderKpiHeaderRow('bs-consol-kpi-header-fallback'))
+      }
+      nodes.push(...renderRow(row))
     }
     return nodes
   }
@@ -244,7 +287,7 @@ export default function AnnualConsolidationGridMiniTable({
             </th>
           </tr>
         </thead>
-        <tbody>{consol.rows.flatMap(r => renderRow(r))}</tbody>
+        <tbody>{renderAllRows(consol.rows)}</tbody>
       </table>
     </div>
   )

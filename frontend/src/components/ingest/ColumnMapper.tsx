@@ -9,12 +9,13 @@
  */
 
 import { useState } from "react";
+import { IS_DATA_UPDATE_V4 } from "../../lib/dataUpdateMode";
 
 // ---------------------------------------------------------------------------
 // Target field manifest
 // ---------------------------------------------------------------------------
 
-export type FieldGroup = "Entry" | "Line" | "Partner";
+export type FieldGroup = string;
 
 export interface TargetField {
   key: string;
@@ -44,7 +45,32 @@ export const TARGET_FIELDS: TargetField[] = [
   { key: "source_no", label: "Source No.", group: "Partner", required: false, hint: "Debtor/creditor number" },
 ];
 
-const GROUPS: FieldGroup[] = ["Entry", "Line", "Partner"];
+/**
+ * Returns the GL target field manifest for the current mode.
+ * v4 (port 5178): omits document_type + reference_document_number,
+ *                 relabels journal_entry_number → 'Booking ID'.
+ * non-v4: returns TARGET_FIELDS unchanged (byte-identical reference).
+ * Also serves glGroupTargetFields (change 2).
+ */
+export function glTargetFields(): TargetField[] {
+  if (!IS_DATA_UPDATE_V4) return TARGET_FIELDS;
+  return TARGET_FIELDS
+    .filter(f => f.key !== 'document_type' && f.key !== 'reference_document_number')
+    .map(f => f.key === 'journal_entry_number' ? { ...f, label: 'Booking ID' } : f);
+}
+
+/**
+ * GL group-upload target field manifest: Entity field prepended to glTargetFields().
+ * Used by GlGroupUploadCard (change 1, 2).
+ */
+export function glGroupTargetFields(): TargetField[] {
+  return [
+    { key: 'entity', label: 'Entity', group: 'Entry', required: true, hint: 'Column identifying the entity (name or prefix) per row' },
+    ...glTargetFields(),
+  ];
+}
+
+// Groups are derived dynamically from the active field manifest (see orderedGroups in component).
 
 // ---------------------------------------------------------------------------
 // Props
@@ -58,6 +84,9 @@ export interface ColumnMapperProps {
   /** Current mapping: targetField -> sourceColumn */
   mapping: Record<string, string>;
   onChange: (mapping: Record<string, string>) => void;
+  /** Optional custom field manifest. Defaults to TARGET_FIELDS (GL fields).
+   *  Groups are rendered in first-seen order from the manifest. */
+  fields?: TargetField[];
 }
 
 // ---------------------------------------------------------------------------
@@ -73,9 +102,7 @@ function getSampleValues(col: string, sample: Record<string, unknown>[]): string
   return vals.join(" · ");
 }
 
-function groupFields(group: FieldGroup): TargetField[] {
-  return TARGET_FIELDS.filter((f) => f.group === group);
-}
+// Group-filtering is done inline inside the component against the active field manifest.
 
 // ---------------------------------------------------------------------------
 // Drag-chip component (source column)
@@ -202,7 +229,15 @@ export default function ColumnMapper({
   sample,
   mapping,
   onChange,
+  fields = glTargetFields(),
 }: ColumnMapperProps) {
+  // Derive ordered unique group list from the active manifest (preserves first-seen order).
+  // For the default TARGET_FIELDS this produces exactly: Entry, Line, Partner.
+  const orderedGroups = fields.reduce<string[]>((acc, f) => {
+    if (!acc.includes(f.group)) acc.push(f.group);
+    return acc;
+  }, []);
+
   // Track which source columns are already mapped (may appear in multiple targets, so just detect usage)
   const mappedSources = new Set(Object.values(mapping));
 
@@ -254,7 +289,7 @@ export default function ColumnMapper({
           </span>
         </div>
         <div className="max-h-[520px] overflow-y-auto space-y-5 pr-1">
-          {GROUPS.map((group) => (
+          {orderedGroups.map((group) => (
             <div key={group}>
               <div className="mb-2 flex items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
@@ -263,7 +298,7 @@ export default function ColumnMapper({
                 <div className="flex-1 border-t border-slate-200" />
               </div>
               <div className="space-y-2">
-                {groupFields(group).map((field) => (
+                {fields.filter((f) => f.group === group).map((field) => (
                   <DropZone
                     key={field.key}
                     field={field}
@@ -285,6 +320,41 @@ export default function ColumnMapper({
 // Utility: check required fields
 // ---------------------------------------------------------------------------
 
-export function missingRequiredFields(mapping: Record<string, string>): string[] {
-  return TARGET_FIELDS.filter((f) => f.required && !mapping[f.key]).map((f) => f.label);
+export function missingRequiredFields(
+  mapping: Record<string, string>,
+  fields: TargetField[] = TARGET_FIELDS,
+): string[] {
+  return fields.filter((f) => f.required && !mapping[f.key]).map((f) => f.label);
+}
+
+// ---------------------------------------------------------------------------
+// Required GL column-mapping keys (single source of truth)
+//
+// These are the profile.columns keys that the backend's apply_profile requires.
+// Note: amount/sign source columns live in profile.sign (OptionsStep), NOT here.
+// ---------------------------------------------------------------------------
+
+export const REQUIRED_GL_COLUMN_KEYS = [
+  'posting_date',
+  'journal_entry_number',
+  'account_number',
+] as const
+
+export type RequiredGlColumnKey = typeof REQUIRED_GL_COLUMN_KEYS[number]
+
+/** User-facing labels for required GL column fields — reused in UI messages. */
+export const GL_COLUMN_FRIENDLY_LABELS: Record<RequiredGlColumnKey, string> = {
+  posting_date: 'Posting date',
+  journal_entry_number: 'Transaction/journal number',
+  account_number: 'Account number',
+}
+
+/**
+ * Returns the RequiredGlColumnKey values that are absent from the provided
+ * profile.columns mapping.  Empty array means all required fields are present.
+ */
+export function missingRequiredGlColumns(
+  mapping: Record<string, string>,
+): RequiredGlColumnKey[] {
+  return REQUIRED_GL_COLUMN_KEYS.filter(k => !mapping[k])
 }

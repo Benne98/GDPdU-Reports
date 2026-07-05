@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 520" role="img" aria-label="Architecture diagram">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#475569"/>
+    </marker>
+    <style>
+      .box { fill: #f8fafc; stroke: #334155; stroke-width: 1.5; }
+      .title { font: 600 13px Segoe UI, Arial, sans-serif; fill: #0f172a; }
+      .sub { font: 12px Segoe UI, Arial, sans-serif; fill: #475569; }
+      .line { stroke: #475569; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+      .optional { font: 12px Segoe UI, Arial, sans-serif; fill: #334155; }
+    </style>
+  </defs>
+
+  <!-- Browser -->
+  <rect class="box" x="230" y="10" width="260" height="44" rx="6"/>
+  <text class="title" x="360" y="37" text-anchor="middle">Browser (HTTPS)</text>
+
+  <line class="line" x1="360" y1="54" x2="360" y2="78"/>
+
+  <!-- Reverse Proxy -->
+  <rect class="box" x="170" y="78" width="380" height="52" rx="6"/>
+  <text class="title" x="360" y="100" text-anchor="middle">Reverse Proxy / TLS (443)</text>
+  <text class="sub" x="360" y="118" text-anchor="middle">Routing: /  /api  /rasa  /expert ...</text>
+
+  <line class="line" x1="360" y1="130" x2="360" y2="158"/>
+  <line x1="130" y1="158" x2="590" y2="158" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <line class="line" x1="130" y1="158" x2="130" y2="178"/>
+  <line class="line" x1="360" y1="158" x2="360" y2="178"/>
+  <line class="line" x1="590" y1="158" x2="590" y2="178"/>
+
+  <!-- Frontend -->
+  <rect class="box" x="40" y="178" width="180" height="52" rx="6"/>
+  <text class="title" x="130" y="200" text-anchor="middle">Frontend</text>
+  <text class="sub" x="130" y="218" text-anchor="middle">React SPA</text>
+
+  <!-- API -->
+  <rect class="box" x="270" y="178" width="180" height="52" rx="6"/>
+  <text class="title" x="360" y="200" text-anchor="middle">API</text>
+  <text class="sub" x="360" y="218" text-anchor="middle">FastAPI</text>
+
+  <!-- Rasa -->
+  <rect class="box" x="500" y="178" width="180" height="52" rx="6"/>
+  <text class="title" x="590" y="200" text-anchor="middle">Rasa Bot(s)</text>
+  <text class="sub" x="590" y="218" text-anchor="middle">+ Actions</text>
+
+  <line class="line" x1="360" y1="230" x2="360" y2="268"/>
+  <line class="line" x1="590" y1="230" x2="590" y2="300"/>
+  <line x1="590" y1="300" x2="420" y2="300" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- PostgreSQL -->
+  <rect class="box" x="270" y="268" width="180" height="52" rx="6"/>
+  <text class="title" x="360" y="290" text-anchor="middle">PostgreSQL</text>
+  <text class="sub" x="360" y="308" text-anchor="middle">(GL, KPIs)</text>
+
+  <line class="line" x1="360" y1="320" x2="360" y2="358"/>
+
+  <!-- Object Storage -->
+  <rect class="box" x="250" y="358" width="220" height="52" rx="6"/>
+  <text class="title" x="360" y="380" text-anchor="middle">Object / Blob Storage</text>
+  <text class="sub" x="360" y="398" text-anchor="middle">(Uploads)</text>
+
+  <!-- Optional AI -->
+  <text class="optional" x="360" y="445" text-anchor="middle">Optional: AI Gateway -&gt; Enterprise LLM (Azure OpenAI / Bedrock), EU region</text>
+</svg>

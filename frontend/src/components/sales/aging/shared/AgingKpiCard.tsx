@@ -9,16 +9,19 @@ import {
   YAxis,
 } from 'recharts'
 import type { OperationalKpiMetric } from '../../../../lib/api'
-import { fmtChartKpi, fmtDays, fmtDelta, fmtKpi, fmtPct } from '../../../../lib/fmt'
+import { fmtChartKpi, fmtDays, fmtPct } from '../../../../lib/fmt'
 import type { AgingTrendFormat } from './agingKpiDefs'
 import type { KpiValueVariant } from '../../../cockpit/KpiCard'
 
 const MONTH_LETTER = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'] as const
 
 type TrendPoint = {
-  month: number
+  year?: number
+  month?: number
+  gross_balance?: number
   balance: number
   overdue: number
+  overdue_pct?: number
   dso_days?: number
   dpo_days?: number
   open_documents: number
@@ -33,13 +36,17 @@ function formatMainValue(value: number, variant: KpiValueVariant): string {
     case 'days':
       return `${fmtDays(value)}`
     default:
-      return fmtKpi(value)
+      // aging kpi_metrics currency values are already in kEUR — no ÷1000
+      return fmtChartKpi(value)
   }
 }
 
 function formatTrendTooltip(value: number, format: AgingTrendFormat): string {
-  if (format === 'currency') return `${fmtChartKpi(value / 1000)} kEUR`
+  if (format === 'currency') return `${fmtChartKpi(value)} kEUR`
   if (format === 'days') return `${fmtDays(value)} days`
+  if (format === 'percent') {
+    return `${value.toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`
+  }
   return Math.round(value).toLocaleString('de-DE')
 }
 
@@ -63,10 +70,20 @@ function formatDeltaCompact(delta: number, variant: KpiValueVariant): string {
       const n = Math.round(delta)
       return `${n >= 0 ? '+' : ''}${n.toLocaleString('de-DE')}`
     }
+    case 'percent': {
+      // delta is already in percentage-point units (0..100 scale from backend)
+      const sign = delta >= 0 ? '+' : ''
+      return `${sign}${Math.abs(delta).toFixed(1).replace('.', ',')} pp`
+    }
     case 'days':
       return `${delta >= 0 ? '+' : ''}${delta.toFixed(0)} d`
-    default:
-      return fmtDelta(delta)
+    default: {
+      // delta_pm / delta_smly are also in kEUR — format without ÷1000,
+      // keeping the same accounting-parentheses / sign convention as fmtDelta.
+      const abs = Math.abs(delta)
+      const s = `€ ${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+      return delta < 0 ? `(${s})` : `+${s}`
+    }
   }
 }
 
@@ -138,6 +155,7 @@ export default function AgingKpiCard({
   trendFormat,
   trendPoints,
   trendLoading,
+  footnote,
 }: {
   title: string
   metric?: OperationalKpiMetric | null
@@ -149,14 +167,16 @@ export default function AgingKpiCard({
   trendFormat: AgingTrendFormat
   trendPoints: TrendPoint[]
   trendLoading?: boolean
+  /** Optional sub-label rendered below the delta rows — used for the net/gross bridge. */
+  footnote?: string | null
 }) {
   const gradientId = useId().replace(/:/g, '')
   const value = metric?.value ?? 0
 
   const chartRows = useMemo(
     () =>
-      trendPoints.map(p => ({
-        monthLetter: MONTH_LETTER[p.month - 1] ?? '?',
+      trendPoints.map((p, i) => ({
+        monthLetter: p.month != null ? MONTH_LETTER[p.month - 1] ?? '?' : String(i + 1),
         v: Number((p as Record<string, number>)[trendKey] ?? 0),
       })),
     [trendPoints, trendKey],
@@ -286,6 +306,14 @@ export default function AgingKpiCard({
           invert={invertDelta}
           variant={variant}
         />
+        {footnote && (
+          <p
+            className="text-[10px] leading-snug pt-1.5"
+            style={{ color: '#94A3B8', borderTop: '1px dashed #F1F5F9' }}
+          >
+            {footnote}
+          </p>
+        )}
       </div>
     </div>
   )

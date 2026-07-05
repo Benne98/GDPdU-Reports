@@ -21,14 +21,15 @@ Sign convention (copied from app/services/statements.py, kept here for audit tra
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import User, current_user
-from app.db import get_session
+from app.db import get_read_session, get_session
 # NOTE: ``cache_anomalies`` (DELETE+INSERT on fact_anomaly) is intentionally NOT
 # imported here — the anomalies GET is pure-read so a non-admin user can never
 # trigger a write via GET.  Caching stays available in app.services.anomaly for an
@@ -59,6 +60,7 @@ from app.services.fin_compat_cf import (
 )
 from app.services.fin_compat_narrative import build_pl_narrative
 from app.services.fin_compat_narrative_resolve import resolve_statement_narrative
+from app.services.fin_compat_cash_debt import build_net_debt_table, build_position_bookings
 from app.services.fin_compat_wc import (
     build_wc_consolidation,
     build_wc_l4_trend,
@@ -80,6 +82,7 @@ from app.services.fin_compat_pl import (
     build_pl_plan_response,
     build_pl_statement_compat,
     build_pl_weekly_breakdown,
+    build_statement_plan_response,
 )
 from app.services.fin_compat_sql import (
     entity_sql_fragment,
@@ -98,7 +101,7 @@ router = APIRouter(
 )
 
 _UserDep = Annotated[User, Depends(current_user)]
-_SessionDep = Annotated[Session, Depends(get_session)]
+_SessionDep = Annotated[Session, Depends(get_read_session)]
 
 _NARRATIVE_MISS = (
     "Narrative snapshot not ready — run warm_compat_narrative_snapshots.py after ETL."
@@ -210,11 +213,102 @@ def get_pl_plan(
     Uses fact_gl_plan (scenario 'forecast' preferred, fallback 'plan').
     """
     try:
-        return build_pl_plan_response(session, year, month, entity)
+        allowed_prefixes = _resolve_plan_allowed_prefixes(session, _user, "pl-statement/plan")
+        return build_statement_plan_response(session, "PL", year, month, entity, allowed_prefixes=allowed_prefixes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("pl-statement/plan error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _resolve_plan_allowed_prefixes(session: Session, user: User, label: str):
+    """Fail-closed tenant-visibility resolution for the /plan statement routes.
+
+    Mirrors /overview/summary: ``visible_entity_codes`` → admin ``None``
+    (unrestricted); non-admin granted ``set[str]``; non-admin without grants or on
+    lookup error → ``set()`` (deny-all).  A prefix-mapping failure NEVER widens to
+    None for a non-admin and NEVER raises a 500 — it fails closed to deny-all.
+    """
+    from app.services.overview_summary import map_codes_to_prefixes
+
+    allowed_codes = visible_entity_codes(session, user)
+    try:
+        return map_codes_to_prefixes(session, allowed_codes)
+    except Exception:
+        logger.exception("%s prefix mapping failed — failing closed", label)
+        return None if allowed_codes is None else set()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/balance-sheet/plan
+# ---------------------------------------------------------------------------
+@router.get("/balance-sheet/plan")
+def get_bs_plan(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """Balance-sheet plan overlay (PlPlanResponse shape). Fail-closed tenant scope."""
+    allowed_prefixes = _resolve_plan_allowed_prefixes(session, _user, "balance-sheet/plan")
+    try:
+        return build_statement_plan_response(
+            session, "BS", year, month, entity, allowed_prefixes=allowed_prefixes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("balance-sheet/plan error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/working-capital/plan
+# ---------------------------------------------------------------------------
+@router.get("/working-capital/plan")
+def get_wc_plan(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """Working-capital plan overlay (PlPlanResponse shape). Fail-closed tenant scope."""
+    allowed_prefixes = _resolve_plan_allowed_prefixes(session, _user, "working-capital/plan")
+    try:
+        return build_statement_plan_response(
+            session, "WC", year, month, entity, allowed_prefixes=allowed_prefixes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("working-capital/plan error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/cash-flow/plan
+# ---------------------------------------------------------------------------
+@router.get("/cash-flow/plan")
+def get_cf_plan(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """Cash-flow plan overlay (PlPlanResponse shape). Fail-closed tenant scope."""
+    allowed_prefixes = _resolve_plan_allowed_prefixes(session, _user, "cash-flow/plan")
+    try:
+        return build_statement_plan_response(
+            session, "CF", year, month, entity, allowed_prefixes=allowed_prefixes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("cash-flow/plan error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -924,6 +1018,116 @@ def get_wc_timeline(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/cash-debt/net-debt
+# ---------------------------------------------------------------------------
+@router.get("/cash-debt/net-debt")
+def get_cash_debt_net_debt(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """Net-debt table (Cash flow tab).
+
+    SECURITY (fail-closed tenant isolation, SAME pattern as /overview/*):
+    ``visible_entity_codes()`` is resolved, mapped to the ``entity_prefix`` set and
+    narrowed by the requested ``entity`` via ``_effective_prefixes``.  Admin → None
+    (unrestricted); a restricted caller → only their entities; empty visibility (or
+    an ``entity`` narrow outside it) → a ZEROED table (the empty-render guarantee
+    still emits the Net-financial-debt / Net-debt rows), never cross-entity data.
+    """
+    from app.services.overview_summary import (
+        _effective_prefixes,
+        map_codes_to_prefixes,
+    )
+
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+        eff, builder_entity, _denied = _effective_prefixes(
+            session, entity=entity, allowed_prefixes=allowed_prefixes,
+        )
+    except Exception:
+        # Fail-closed (align with /overview/* + visible_entity_codes): a
+        # dim_legal_entity lookup failure for a non-admin denies all (empty set →
+        # zeroed table), NEVER a 500 and NEVER widened to None/all. Admin stays admin.
+        logger.exception("cash-debt/net-debt visibility mapping failed — failing closed")
+        if allowed_codes is None:
+            eff, builder_entity = None, (entity or None)
+        else:
+            eff, builder_entity = set(), None
+    try:
+        return build_net_debt_table(
+            session, year=year, month=month,
+            entity=builder_entity, allowed_entities=eff,
+        )
+    except Exception as exc:
+        logger.exception("cash-debt/net-debt error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/cash-debt/position-bookings
+# ---------------------------------------------------------------------------
+@router.get("/cash-debt/position-bookings")
+def get_cash_debt_position_bookings(
+    _user: _UserDep,
+    session: _SessionDep,
+    account_number_group: str = Query(...),
+    fiscal_year: int = Query(..., ge=2000, le=2100),
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+    months_back: int = Query(24, ge=6, le=60),
+) -> dict:
+    """Per-account booking series (Cash & Debt drill).
+
+    SECURITY (fail-closed tenant isolation, SAME pattern as /overview/*):
+    ``visible_entity_codes()`` → ``entity_prefix`` set → narrowed by ``entity`` via
+    ``_effective_prefixes``.  Admin → None (unrestricted); a restricted caller may
+    only drill an account whose entity_prefix is within their visibility — otherwise
+    (empty visibility, out-of-scope ``entity``, or an out-of-scope
+    ``account_number_group``) the service returns an EMPTY ``entries`` result, never
+    another tenant's bookings.
+    """
+    from app.services.overview_summary import (
+        _effective_prefixes,
+        map_codes_to_prefixes,
+    )
+
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+        eff, builder_entity, _denied = _effective_prefixes(
+            session, entity=entity, allowed_prefixes=allowed_prefixes,
+        )
+    except Exception:
+        # Fail-closed (align with /overview/* + visible_entity_codes): a
+        # dim_legal_entity lookup failure for a non-admin denies all (empty set →
+        # empty entries), NEVER a 500 and NEVER widened to None/all. Admin stays admin.
+        logger.exception("cash-debt/position-bookings visibility mapping failed — failing closed")
+        if allowed_codes is None:
+            eff, builder_entity = None, (entity or None)
+        else:
+            eff, builder_entity = set(), None
+    try:
+        return build_position_bookings(
+            session,
+            account_number_group=account_number_group,
+            fiscal_year=fiscal_year,
+            year=year,
+            month=month,
+            entity=builder_entity,
+            months_back=months_back,
+            allowed_entities=eff,
+        )
+    except Exception as exc:
+        logger.exception("cash-debt/position-bookings error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 # ===========================================================================
 # Cash-flow compat endpoints (statement='cf', period-FLOW semantics)
 # ===========================================================================
@@ -1296,6 +1500,466 @@ def get_financials_entity_breakdown_narratives(
     except Exception as exc:
         logger.exception("overview/entity-breakdown/narratives error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/overview/summary  (Overview v2 — ONE batched payload)
+# ---------------------------------------------------------------------------
+# Typed response model so the frontend hook can be typed; field names are STABLE.
+# Assembly + security live in app/services/overview_summary.py (fail-closed).
+
+
+class _RevenueKpi(BaseModel):
+    cm: float
+    cm_py: float
+    ytd: float
+    ytd_py: Optional[float]
+    yoy_pct: Optional[float]
+
+
+class _EbitKpi(BaseModel):
+    cm: float
+    ytd: float
+    margin_pct: Optional[float]
+
+
+class _CashKpi(BaseModel):
+    level: float
+    delta_month: float
+    delta_yoy: float
+
+
+class _WcHeroKpi(BaseModel):
+    ccc: float
+    nwc: float
+
+
+class _HeroBlock(BaseModel):
+    revenue: _RevenueKpi
+    ebit: _EbitKpi
+    cash: _CashKpi
+    working_capital: _WcHeroKpi
+
+
+class _WcLevel(BaseModel):
+    key: str
+    label: str
+    level: float
+    delta_month: float
+    delta_fy: float
+
+
+class _WorkingCapitalBlock(BaseModel):
+    dso: float
+    dpo: float
+    dio: float
+    ccc: float
+    nwc: float
+    levels: list[_WcLevel]
+
+
+class _TopEntityDelta(BaseModel):
+    name: Optional[str] = None
+    rank: Optional[int] = None
+    cm: Optional[float] = None
+    delta_cm_py: Optional[float] = None
+    delta_ytd: Optional[float] = None
+
+
+class _PerformanceRevenue(BaseModel):
+    cm: float
+    cm_py: float
+    yoy_pct: Optional[float] = None
+    has_plan: bool = False
+    plan_cm: Optional[float] = None
+    plan_vs_actual: Optional[float] = None
+    var_pct: Optional[float] = None
+    coverage_pct: Optional[float] = None
+
+
+class _PerformanceGrossMargin(BaseModel):
+    pct: Optional[float] = None
+    yoy_pp: Optional[float] = None
+    plan_pct: Optional[float] = None
+    plan_vs_actual_pp: Optional[float] = None
+
+
+class _PerformanceEbit(BaseModel):
+    cm: float
+    margin_pct: Optional[float] = None
+
+
+class _PerformanceBlock(BaseModel):
+    revenue: _PerformanceRevenue
+    gross_margin: _PerformanceGrossMargin
+    ebit: _PerformanceEbit
+
+
+class OverviewSummaryResponse(BaseModel):
+    """Batched Overview summary — hero + WC + cash + top-entities + DuPont + performance + alerts."""
+
+    meta: dict[str, Any]
+    hero: _HeroBlock
+    working_capital: _WorkingCapitalBlock
+    cash: _CashKpi
+    top_customer: Optional[_TopEntityDelta] = None
+    top_supplier: Optional[_TopEntityDelta] = None
+    dupont: Optional[dict[str, Any]] = None
+    performance: _PerformanceBlock
+    alerts: list[dict[str, Any]] = []
+
+
+@router.get("/overview/summary", response_model=OverviewSummaryResponse)
+def get_financials_overview_summary(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """OverviewSummaryResponse — ONE round-trip for the redesigned Overview page.
+
+    Returns hero KPIs (Revenue YoY / EBIT+margin / Cash headline / CCC+NWC),
+    working-capital ratios + the 3 deep-dive level rows (Δmonth, Δfy), the signed
+    cash headline, top customer/supplier deltas, DuPont finding inputs (existing
+    EBIT-based values only) and recent-months alerts — replacing ~6 client calls.
+
+    SECURITY (fail-closed tenant isolation): ``visible_entity_codes()`` is resolved
+    here, mapped to the ``entity_prefix`` set, and injected into EVERY sub-query.
+    Non-admin with empty visibility → a zeroed summary (no cross-entity data, no
+    500); admin → full.  See app/services/overview_summary.py.
+    """
+    from app.services.overview_summary import (
+        build_overview_summary,
+        map_codes_to_prefixes,
+    )
+
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+    except Exception:
+        # Fail-closed (align with visible_entity_codes contract): a dim_legal_entity
+        # lookup failure for a non-admin denies all (empty set → zeroed summary),
+        # NEVER a 500 and NEVER widened to None/all.  Admin (None codes) is resolved
+        # without a query, so it stays None (unrestricted) here.
+        logger.exception("overview/summary prefix mapping failed — failing closed")
+        allowed_prefixes = None if allowed_codes is None else set()
+    try:
+        return build_overview_summary(
+            session,
+            entity=entity,
+            year=year,
+            month=month,
+            allowed_prefixes=allowed_prefixes,
+        )
+    except Exception as exc:
+        logger.exception("overview/summary error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/overview/partners  (Overview v2 — Areas 4 & 5)
+# ---------------------------------------------------------------------------
+# ONE round-trip feeding both the CustomerBlock (Area 4) and SupplierBlock
+# (Area 5).  Math lives in app/services/partner_development.py (fail-closed);
+# this handler only resolves + injects the entity-visibility boundary.
+# Row lists are typed as list[dict] (not strict row models) so the EXACT field
+# names build_customer_development / build_supplier_development return survive to
+# the frontend types (customer/supplier rows differ field-by-field).
+
+
+class _CustomerDevelopment(BaseModel):
+    """build_customer_development shape (Area 4) — biggest / increase / won / lost."""
+
+    period: dict[str, Any]
+    id_field: str
+    biggest: list[dict[str, Any]] = []
+    increase: list[dict[str, Any]] = []
+    won: list[dict[str, Any]] = []
+    lost: list[dict[str, Any]] = []
+
+
+class _SupplierDevelopment(BaseModel):
+    """build_supplier_development shape (Area 5) — biggest / increase / won (no lost)."""
+
+    period: dict[str, Any]
+    id_field: str
+    biggest: list[dict[str, Any]] = []
+    increase: list[dict[str, Any]] = []
+    won: list[dict[str, Any]] = []
+
+
+class OverviewPartnersResponse(BaseModel):
+    """Batched partner development — one payload for the Customer + Supplier blocks."""
+
+    customers: _CustomerDevelopment
+    suppliers: _SupplierDevelopment
+
+
+@router.get("/overview/partners", response_model=OverviewPartnersResponse)
+def get_financials_overview_partners(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+    top_n: int = Query(10, ge=1, le=100),
+) -> dict:
+    """OverviewPartnersResponse — ONE round-trip for the Customer + Supplier blocks.
+
+    Returns ``{customers: build_customer_development, suppliers:
+    build_supplier_development}`` (see app/services/partner_development.py for the
+    exact per-row shapes and sign/period conventions).
+
+    SECURITY (fail-closed tenant isolation, SAME pattern as /overview/summary):
+    ``visible_entity_codes()`` is resolved, mapped to the ``entity_prefix`` set
+    (:func:`overview_summary.map_codes_to_prefixes`), intersected with the requested
+    ``entity`` (:func:`overview_summary._effective_prefixes`) and injected as
+    ``allowed_entities`` into BOTH service calls.  Non-admin with empty/unmappable
+    visibility (or an ``entity`` narrow outside it) → a zeroed partners payload (no
+    cross-entity data, no 500, no service DB run); admin → unrestricted (None).
+    """
+    from app.services.overview_summary import (
+        _effective_prefixes,
+        map_codes_to_prefixes,
+    )
+    from app.services.partner_development import (
+        _empty_development,
+        build_customer_development,
+        build_supplier_development,
+    )
+
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+        eff, builder_entity, denied = _effective_prefixes(
+            session, entity=entity, allowed_prefixes=allowed_prefixes,
+        )
+    except Exception:
+        # Fail-closed (align with /overview/summary + visible_entity_codes): a
+        # dim_legal_entity lookup failure for a non-admin denies all → zeroed 200,
+        # NEVER a 500 and NEVER widened to None/all.  Admin (None codes) stays admin.
+        logger.exception("overview/partners visibility mapping failed — failing closed")
+        if allowed_codes is None:
+            eff, builder_entity, denied = None, (entity or None), False
+        else:
+            eff, builder_entity, denied = set(), None, True
+
+    if denied:
+        # Deny-all short-circuits BEFORE any service call → no cross-entity data,
+        # no service DB run; reuse the builders' own zeroed shape (period + empties).
+        return {
+            "customers": _empty_development(year, month, "customer_id", with_lost=True),
+            "suppliers": _empty_development(year, month, "supplier_id", with_lost=False),
+        }
+
+    try:
+        customers = build_customer_development(
+            session, entity=builder_entity, year=year, month=month,
+            allowed_entities=eff, top_n=top_n,
+        )
+        suppliers = build_supplier_development(
+            session, entity=builder_entity, year=year, month=month,
+            allowed_entities=eff, top_n=top_n,
+        )
+    except Exception as exc:
+        logger.exception("overview/partners error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {"customers": customers, "suppliers": suppliers}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/overview/liquidity  (Overview v2 — Area 2)
+# ---------------------------------------------------------------------------
+# Cash + AR collectibility haircut ("Zeitverkauf") + liquidity, feeding the P5
+# Cash & Liquidity block.  Math + fail-closed intersection live in
+# app/services/liquidity.py; this handler only resolves + injects the
+# entity-visibility boundary, exactly like /overview/summary.
+
+
+class OverviewLiquidityResponse(BaseModel):
+    """build_liquidity_available shape (Area 2) — cash + collectible AR − AP.
+
+    ``meta`` and ``ar_bands`` are loose dict/list[dict] so the EXACT field names
+    the service returns (incl. the per-band ``credit_flag`` and the differing
+    happy-path vs fail-closed ``meta`` keys) survive to the frontend types.
+    """
+
+    meta: dict[str, Any]
+    cash: float
+    ar_bands: list[dict[str, Any]] = []
+    raw_ar: float
+    collectible_ar: float
+    outstanding_ap: float
+    liquidity_available: float
+
+
+@router.get("/overview/liquidity", response_model=OverviewLiquidityResponse)
+def get_financials_overview_liquidity(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+) -> dict:
+    """OverviewLiquidityResponse — Area-2 cash & liquidity ("Zeitverkauf").
+
+    Returns ``build_liquidity_available`` (kEUR): the signed period-end cash level,
+    the per-band AR collectibility breakdown, the aggregate collectible AR, the
+    outstanding AP magnitude and ``liquidity_available = cash + collectible_ar −
+    outstanding_ap`` (see app/services/liquidity.py for the signed-off formula,
+    worked example and edge cases).
+
+    SECURITY (fail-closed tenant isolation, SAME pattern as /overview/summary):
+    ``visible_entity_codes()`` is resolved, mapped to the ``entity_prefix`` set
+    (:func:`overview_summary.map_codes_to_prefixes`) and passed as
+    ``allowed_entities``.  The service applies the ``entity`` intersection ONCE via
+    its own ``_effective_prefixes`` (the endpoint passes the RAW mapped prefix set,
+    NOT a pre-narrowed one, so the boundary is never double-applied).  A non-admin
+    with empty/unmappable visibility (or an ``entity`` narrow outside it) → a zeroed
+    liquidity payload (no cross-entity data, no 500); admin → unrestricted (None).
+    """
+    from app.config import settings
+    from app.services.liquidity import build_liquidity_available
+    from app.services.overview_summary import map_codes_to_prefixes
+
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+    except Exception:
+        # Fail-closed (align with /overview/summary + visible_entity_codes): a
+        # dim_legal_entity lookup failure for a non-admin denies all (empty set →
+        # the service's zeroed payload), NEVER a 500 and NEVER widened to None/all.
+        # Admin (None codes) is resolved without a query, so it stays None.
+        logger.exception("overview/liquidity prefix mapping failed — failing closed")
+        allowed_prefixes = None if allowed_codes is None else set()
+    try:
+        return build_liquidity_available(
+            session,
+            entity=entity,
+            year=year,
+            month=month,
+            allowed_entities=allowed_prefixes,
+            use_mart=settings.overview_summary_use_mart,
+        )
+    except Exception as exc:
+        logger.exception("overview/liquidity error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/financials/overview/bundle  (Overview v2 — Item 1 / Lever C)
+# ---------------------------------------------------------------------------
+# Collapses /overview/{summary,partners,liquidity} into ONE round-trip on ONE
+# get_read_session — one visibility resolution, one txn — removing 2 network
+# round-trips and repeated auth/visibility overhead.  REUSES the SAME builders
+# the three granular endpoints call (no forked logic); the granular endpoints
+# stay for the accordion lazy-loads.  Additive (reporting-v2 / :8011).
+
+
+class OverviewBundleResponse(BaseModel):
+    """Batched Overview bundle — summary + partners + liquidity in ONE payload."""
+
+    summary: OverviewSummaryResponse
+    partners: OverviewPartnersResponse
+    liquidity: OverviewLiquidityResponse
+
+
+@router.get("/overview/bundle", response_model=OverviewBundleResponse)
+def get_financials_overview_bundle(
+    _user: _UserDep,
+    session: _SessionDep,
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    entity: Optional[str] = Query(None),
+    top_n: int = Query(10, ge=1, le=100),
+) -> dict:
+    """OverviewBundleResponse — summary + partners + liquidity in ONE round-trip.
+
+    Computed on ONE ``get_read_session`` with ONE visibility resolution (one txn),
+    delegating to the EXACT builders behind the three granular endpoints:
+    ``build_overview_summary`` / ``build_customer_development`` +
+    ``build_supplier_development`` / ``build_liquidity_available``.  The granular
+    endpoints remain for the accordion lazy-loads.
+
+    SECURITY (fail-closed tenant isolation, SAME pattern as the three granular
+    endpoints): ``visible_entity_codes()`` is resolved ONCE, mapped to the
+    ``entity_prefix`` set and threaded into every slice.  summary + liquidity take
+    the RAW mapped prefixes (each applies its own ``entity`` intersection once);
+    partners is narrowed here via ``_effective_prefixes`` exactly like
+    /overview/partners.  A non-admin with empty/unmappable visibility (or an
+    ``entity`` narrow outside it) → a zeroed bundle (no cross-entity data, no 500);
+    admin → unrestricted (None).  The summary slice keeps its own visibility-aware
+    TTL cache (keyed incl. the allowed-prefix hash); no additional bundle-level
+    cache is introduced, so no cache key can cross tenants.
+    """
+    from app.services.overview_summary import (
+        _effective_prefixes,
+        build_overview_summary,
+        map_codes_to_prefixes,
+    )
+    from app.services.partner_development import (
+        _empty_development,
+        build_customer_development,
+        build_supplier_development,
+    )
+    from app.services.liquidity import build_liquidity_available
+    from app.config import settings
+
+    # ── ONE visibility resolution, reused by all three slices ─────────────────
+    allowed_codes = visible_entity_codes(session, _user)
+    try:
+        allowed_prefixes = map_codes_to_prefixes(session, allowed_codes)
+        eff, builder_entity, denied = _effective_prefixes(
+            session, entity=entity, allowed_prefixes=allowed_prefixes,
+        )
+    except Exception:
+        # Fail-closed (align with the granular endpoints + visible_entity_codes): a
+        # dim_legal_entity lookup failure for a non-admin denies all → zeroed 200,
+        # NEVER a 500 and NEVER widened to None/all.  Admin (None codes) stays admin.
+        logger.exception("overview/bundle visibility mapping failed — failing closed")
+        allowed_prefixes = None if allowed_codes is None else set()
+        if allowed_codes is None:
+            eff, builder_entity, denied = None, (entity or None), False
+        else:
+            eff, builder_entity, denied = set(), None, True
+
+    try:
+        # summary + liquidity take the RAW mapped prefixes; each fails closed on an
+        # empty set / an out-of-visibility entity narrow via its own resolution.
+        summary = build_overview_summary(
+            session, entity=entity, year=year, month=month,
+            allowed_prefixes=allowed_prefixes,
+        )
+        liquidity = build_liquidity_available(
+            session, entity=entity, year=year, month=month,
+            allowed_entities=allowed_prefixes,
+            use_mart=settings.overview_summary_use_mart,
+        )
+        # partners: deny-all short-circuits BEFORE any service call (reuse the
+        # builders' own zeroed shape) — identical to /overview/partners.
+        if denied:
+            partners = {
+                "customers": _empty_development(year, month, "customer_id", with_lost=True),
+                "suppliers": _empty_development(year, month, "supplier_id", with_lost=False),
+            }
+        else:
+            partners = {
+                "customers": build_customer_development(
+                    session, entity=builder_entity, year=year, month=month,
+                    allowed_entities=eff, top_n=top_n,
+                ),
+                "suppliers": build_supplier_development(
+                    session, entity=builder_entity, year=year, month=month,
+                    allowed_entities=eff, top_n=top_n,
+                ),
+            }
+    except Exception as exc:
+        logger.exception("overview/bundle error")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {"summary": summary, "partners": partners, "liquidity": liquidity}
 
 
 # ===========================================================================

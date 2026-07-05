@@ -255,7 +255,7 @@ Minimaler Case = nur GL **oder** nur Sales. Module teilen gemeinsame Dims, keine
 ### 8.2 Frontend-Verfügbarkeit (Capability-Modell)
 - `/api/v1/capabilities` liefert je Projekt/Entity, welche Module Daten haben.
 - Frontend rendert datengetrieben (vorhandene Module aktiv, fehlende ausgeblendet).
-- Quelle: `meta_dataset_load` (welcher Datensatz wann je Entity/Jahr geladen).
+- Quelle: `org_meta_dataset_load` (welcher Datensatz wann je Entity/Jahr geladen).
 
 ### 8.3 Upload-Pipeline (Drag & Drop + Spalten-Mapping)
 1. **Typisierte Dropzones:** „GL Entries & Lines" (csv/parquet/xlsx), „Account Mapping je Entity/Jahr", „Mapping konsolidierte Gruppe".
@@ -270,7 +270,7 @@ Post-Commit-Kopien des betroffenen Scopes, PK enthält `load_id`:
 - `snap_fact_gl_entry`, `snap_fact_gl_line`
 - `snap_dim_gl_account`, `snap_dim_gl_na`, `snap_dim_gl_cf`
 
-`meta_dataset_load` erweitert um `scope_entity_prefixes`, `scope_fiscal_years`, `commit_mode`, `snapshot_captured`, `restored_from_load_id`. Abgeleitete Facts werden **nicht** snapshotiert — bei Restore aus GL-Snapshots neu abgeleitet.
+`org_meta_dataset_load` erweitert um `scope_entity_prefixes`, `scope_fiscal_years`, `commit_mode`, `snapshot_captured`, `restored_from_load_id`. Abgeleitete Facts werden **nicht** snapshotiert — bei Restore aus GL-Snapshots neu abgeleitet.
 
 ### 8.4 Mapping je Entity **und** Jahr — gelöst (Entscheidung 2)
 `dim_gl_account`/`dim_gl_na`/`dim_gl_cf` haben **`fiscal_year` im PK**. Damit ist das Mapping pro (Entity, Konto, Jahr) nativ abbildbar; Joins binden `fiscal_year` mit ein (§5.1). Versionierung läuft **allein über `fiscal_year`** — kein `valid_from/valid_to`. Mild redundant, falls Hierarchie über Jahre konstant — akzeptiert zugunsten Einfachheit & Flexibilität.

@@ -1,7 +1,7 @@
 """Per-user entity (Mandanten) visibility — the single source of truth.
 
 The schema models row-level tenant isolation via ``user_role`` ×
-``role_entity_visibility`` (a user, through their roles, is granted a set of
+``admin_role_entity_visibility`` (a user, through their roles, is granted a set of
 ``legal_entity_code`` values).  This module resolves that allow-list for a user
 so every data-read path can apply ONE identical, fail-closed rule:
 
@@ -46,7 +46,7 @@ def visible_entity_codes(session: Session, user: User) -> Optional[set[str]]:
             text(
                 "SELECT DISTINCT rev.legal_entity_code "
                 "FROM user_role ur "
-                "JOIN role_entity_visibility rev ON rev.role_id = ur.role_id "
+                "JOIN admin_role_entity_visibility rev ON rev.role_id = ur.role_id "
                 "WHERE ur.user_id = :uid"
             ),
             {"uid": user.user_id},

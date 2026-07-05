@@ -1,10 +1,11 @@
 import { useMemo } from 'react'
-import type { SalesChurnBridge, SalesChurnBridgeResponse } from '../../../lib/api'
+import type { SalesChurnBridgeResponse, SalesChurnTableRow } from '../../../lib/api'
 import { fmtChartKpi } from '../../../lib/fmt'
 import {
   buildChurnTableColumns,
   churnCellValue,
   churnGridTemplate,
+  type ChurnRowLike,
   type ChurnTableColumn,
 } from './churnBridgeLayout'
 
@@ -36,17 +37,13 @@ function ChurnGridRow({
   columns,
   gridTemplate,
   periodCount: _periodCount,
-  dimValue,
-  periodTotals,
-  bridges,
+  row,
   bold,
 }: {
   columns: ChurnTableColumn[]
   gridTemplate: string
   periodCount: number
-  dimValue: string
-  periodTotals: number[]
-  bridges: Array<Pick<SalesChurnBridge, 'new' | 'upsell' | 'cross_sell' | 'downsell' | 'lost'>>
+  row: ChurnRowLike
   bold?: boolean
 }) {
   return (
@@ -55,7 +52,7 @@ function ChurnGridRow({
       style={{ gridTemplateColumns: gridTemplate, borderColor: '#F1F5F9' }}
     >
       {columns.map(col => {
-        const raw = churnCellValue(col, dimValue, periodTotals, bridges)
+        const raw = churnCellValue(col, row)
         const bg = cellBg(col)
         if (col.kind === 'dim') {
           return (
@@ -151,24 +148,29 @@ export default function SalesChurnDimensionTable({ data, dimLabel, loading }: Pr
             </div>
           ))}
         </div>
-        {rows.map(row => (
+        {(rows as SalesChurnTableRow[]).map(row => (
           <ChurnGridRow
             key={row.dim_value}
             columns={columns}
             gridTemplate={gridTemplate}
             periodCount={periodCount}
-            dimValue={row.dim_value}
-            periodTotals={row.period_totals}
-            bridges={row.bridges}
+            row={row}
           />
         ))}
         <ChurnGridRow
           columns={columns}
           gridTemplate={gridTemplate}
           periodCount={periodCount}
-          dimValue="Total"
-          periodTotals={data.period_totals}
-          bridges={data.bridges}
+          row={{
+            dim_value: 'Total',
+            from_keur: data.period_totals[0] ?? 0,
+            to_keur: data.period_totals[1] ?? 0,
+            new: data.bridge?.new ?? 0,
+            upsell: data.bridge?.upsell ?? 0,
+            cross_sell: data.bridge?.cross_sell ?? 0,
+            downsell: data.bridge?.downsell ?? 0,
+            lost: data.bridge?.lost ?? 0,
+          }}
           bold
         />
       </div>

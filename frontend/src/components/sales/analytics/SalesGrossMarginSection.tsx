@@ -24,23 +24,9 @@ interface Props {
   filters: SalesFilters
 }
 
-function matrixCellValue(
-  metric: SalesDimensionPerformanceMetric,
-  cell: {
-    gross_sales_keur: number
-    gross_profit_keur: number
-    units_sold: number
-    gross_margin_pct: number
-  } | undefined,
-): string {
-  if (!cell) return '—'
-  if (metric === 'units_sold') {
-    return cell.units_sold.toLocaleString('de-DE')
-  }
-  if (metric === 'gross_profit') {
-    return fmtChartKpi(cell.gross_profit_keur)
-  }
-  return fmtChartKpi(cell.gross_sales_keur)
+function matrixCellValue(v: number | undefined): string {
+  if (v == null) return '—'
+  return fmtChartKpi(v)
 }
 
 export default function SalesGrossMarginSection({ period, filters }: Props) {
@@ -97,10 +83,10 @@ export default function SalesGrossMarginSection({ period, filters }: Props) {
     if (!data?.matrix.rows.length) return
     const headers = [dimLabel, ...data.matrix.columns.map(c => c.label)]
     const xlsxRows = data.matrix.rows.map(r => ({
-      label: r.dim_value,
+      label: r.name,
       values: [
-        r.dim_value,
-        ...data.matrix.columns.map(c => matrixCellValue(metric, r.periods[c.key])),
+        r.name,
+        ...r.values.map(v => matrixCellValue(v)),
       ],
       kind: 'data' as const,
     }))
@@ -194,20 +180,20 @@ export default function SalesGrossMarginSection({ period, filters }: Props) {
               </thead>
               <tbody>
                 {data.matrix.rows.map(row => (
-                  <tr key={row.dim_value} style={{ borderBottom: '1px solid #F8FAFC' }}>
+                  <tr key={row.name} style={{ borderBottom: '1px solid #F8FAFC' }}>
                     <td
                       className="px-3 py-2 font-medium sticky left-0"
                       style={{ color: '#334155', background: '#FFFFFF' }}
                     >
-                      {row.dim_value}
+                      {row.name}
                     </td>
-                    {data.matrix.columns.map(c => (
+                    {data.matrix.columns.map((c, ci) => (
                       <td
                         key={c.key}
                         className="px-3 py-2 text-right tabular-nums"
                         style={{ color: '#1E3A5F' }}
                       >
-                        {matrixCellValue(metric, row.periods[c.key])}
+                        {matrixCellValue(row.values[ci])}
                       </td>
                     ))}
                   </tr>

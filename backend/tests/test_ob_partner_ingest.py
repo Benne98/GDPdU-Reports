@@ -217,6 +217,16 @@ class TestUploadSecurity:
         )
         assert resp.status_code == 415
 
+    def test_partner_upload_rejects_txt_extension(self):
+        """Analog of test_ob_upload_rejects_wrong_extension for the partner upload path.
+        OB_PARTNER_ALLOWED_EXTENSIONS excludes .txt; partner upload must reject it."""
+        client = _client_as(_ADMIN)
+        resp = client.post(
+            "/api/v1/ingest/partner-master/upload",
+            files={"file": ("partners.txt", b"No.,Name\n100,Acme", "text/plain")},
+        )
+        assert resp.status_code == 415
+
     def test_ob_upload_rejects_oversized(self, monkeypatch):
         # H2: the staging upload now enforces the OB/partner-specific cap WHILE
         # reading (chunked), aborting before the whole body is buffered.
@@ -472,7 +482,7 @@ class TestRoundTripV2:
             "DELETE FROM fact_gl_entry WHERE SUBSTR(journal_entry_group_number,1,2)=:p"
         ), {"p": self._PFX})
         session.execute(text(
-            "DELETE FROM meta_dataset_load WHERE dataset='opening_balance' "
+            "DELETE FROM org_meta_dataset_load WHERE dataset='opening_balance' "
             "AND :p = ANY(scope_entity_prefixes)"
         ), {"p": self._PFX})
         session.execute(text(
@@ -675,3 +685,408 @@ class TestRoundTripV2:
             ), {"p": self._PFX})
             session.commit()
             session.close()
+
+    # ------------------------------------------------------------------ #
+    # Parametric helpers for per-prefix tests
+    # ------------------------------------------------------------------ #
+
+    def _seed_account_pfx(self, session, pfx: str) -> None:
+        """Seed dim_gl_account for *pfx* (account 1200, FY 2022 + 2023)."""
+        from sqlalchemy import text
+        ang = f"{pfx}001200"
+        for fy in (2022, 2023):
+            session.execute(text(
+                "INSERT INTO dim_gl_account "
+                "(account_number_group, fiscal_year, gl_account_id, account_name, "
+                " level_0, level_1, level_2, level_3, source_system) "
+                "VALUES (:ang,:fy,'1200','Bank','BS','Assets','Cash','Bank','ob_test') "
+                "ON CONFLICT (account_number_group, fiscal_year) DO NOTHING"
+            ), {"ang": ang, "fy": fy})
+        session.commit()
+
+    def _clean_pfx(self, session, pfx: str) -> None:
+        """Remove all OB-related test rows for *pfx* (mirrors _clean_ob but parametric)."""
+        from sqlalchemy import text
+        session.execute(text(
+            "DELETE FROM fact_gl_line WHERE SUBSTR(journal_entry_group_number,1,2)=:p"
+        ), {"p": pfx})
+        session.execute(text(
+            "DELETE FROM fact_gl_entry WHERE SUBSTR(journal_entry_group_number,1,2)=:p"
+        ), {"p": pfx})
+        session.execute(text(
+            "DELETE FROM org_meta_dataset_load WHERE dataset='opening_balance' "
+            "AND :p = ANY(scope_entity_prefixes)"
+        ), {"p": pfx})
+        session.execute(text(
+            "DELETE FROM dim_gl_account WHERE SUBSTR(account_number_group,1,2)=:p"
+        ), {"p": pfx})
+        session.commit()
+
+    # ------------------------------------------------------------------ #
+    # D2) Partner per-entity: same staged file committed as two prefixes
+    # ------------------------------------------------------------------ #
+
+    def test_partner_per_entity_two_commits(self):
+        """Same staged partner file committed twice with different fixed entity prefixes.
+        Assert customer IDs carry both prefixes (01<key> / 02<key> pattern)."""
+        from sqlalchemy import text
+        import app.routers.ingest as ing
+
+        _PFX1, _PFX2 = "91", "92"
+        session = _v2_session_or_skip()
+        client = _client_as(_ADMIN, session=session)
+        try:
+            for pfx in (_PFX1, _PFX2):
+                session.execute(text(
+                    "DELETE FROM dim_customer WHERE SUBSTR(customer_id,1,2)=:p"
+                ), {"p": pfx})
+            session.commit()
+
+            raw = _xlsx_bytes([
+                {"No.": "100", "Name": "Acme GmbH", "Ctry": "DE", "City": "Berlin"},
+                {"No.": "200", "Name": "Beta AG",   "Ctry": "AT", "City": "Wien"},
+            ])
+            # Upload once; staged file stays on disk for both commits.
+            up = client.post(
+                "/api/v1/ingest/partner-master/upload",
+                files={"file": ("p.xlsx", raw, "application/octet-stream")},
+            )
+            assert up.status_code == 200, up.text
+            fid = up.json()["file_id"]
+
+            _base_prof = {
+                "join_key": {"column": "No."},
+                "columns": {"name_line_1": "Name", "country_code": "Ctry", "city": "City"},
+                "source_system": "partner_per_entity_test",
+            }
+
+            # First commit — entity prefix _PFX1.
+            body1 = ing.PartnerMasterCommitRequest(
+                file_id=fid,
+                profile={**_base_prof, "side": "customer",
+                         "entity": {"mode": "fixed", "value": _PFX1}},
+            )
+            res1 = ing.partner_master_commit(body1, session=session, _admin=_ADMIN)
+            assert res1.side == "customer" and res1.upserted == 2
+
+            # Second commit — same staged file, different prefix _PFX2.
+            body2 = ing.PartnerMasterCommitRequest(
+                file_id=fid,
+                profile={**_base_prof, "side": "customer",
+                         "entity": {"mode": "fixed", "value": _PFX2}},
+            )
+            res2 = ing.partner_master_commit(body2, session=session, _admin=_ADMIN)
+            assert res2.side == "customer" and res2.upserted == 2
+
+            # Both sets of IDs must exist: 91100, 91200, 92100, 92200.
+            got = session.execute(text(
+                "SELECT customer_id FROM dim_customer "
+                "WHERE SUBSTR(customer_id,1,2)=ANY(:pfxs) ORDER BY customer_id"
+            ), {"pfxs": [_PFX1, _PFX2]}).fetchall()
+            ids = {r[0] for r in got}
+            assert ids == {
+                f"{_PFX1}100", f"{_PFX1}200",
+                f"{_PFX2}100", f"{_PFX2}200",
+            }
+        finally:
+            for pfx in (_PFX1, _PFX2):
+                session.execute(text(
+                    "DELETE FROM dim_customer WHERE SUBSTR(customer_id,1,2)=:p"
+                ), {"p": pfx})
+            session.commit()
+            session.close()
+
+    # ------------------------------------------------------------------ #
+    # D2b) OB ignored entities: extra labels dropped, reported in response
+    # ------------------------------------------------------------------ #
+
+    def test_ob_commit_ignores_extra_entities(self, monkeypatch):
+        """OB commit with mixed known/unknown entity labels in column mode.
+
+        Known entity: numeric prefix "98" → resolves directly without lookup.
+        Unknown entities: "Meridian", "Novara", "Venturo" → not in lookup.
+
+        Expected:
+        - Only the prefix-"98" rows are committed (2 lines).
+        - Unknown labels appear in response.ignored_entities (sorted).
+        - Commit succeeds (unknown entities are non-blocking for OB).
+
+        entity_lookup is monkeypatched to {} so only numeric labels resolve,
+        making Meridian/Novara/Venturo unknown regardless of live DB state.
+        """
+        import etl.entity_resolve as er
+        import app.routers.ingest as ing
+
+        # Empty lookup → only numeric labels resolve; names are all unknown.
+        monkeypatch.setattr(er, "build_entity_lookup", lambda _s: {})
+
+        _PFX = "98"
+        session = _v2_session_or_skip()
+        client = _client_as(_ADMIN, session=session)
+
+        prof = _gl_profile()
+        prof["entity"] = {"mode": "column", "value": "Entity"}
+        # OB path requires a deterministic fiscal_year (from_date not allowed).
+        prof["fiscal_year"] = {"mode": "fixed", "value": 2022}
+
+        try:
+            self._clean_pfx(session, _PFX)
+            self._seed_account_pfx(session, _PFX)
+
+            # 2 rows for the project entity (numeric "98"), 3 extra name labels.
+            rows = [
+                {"Entity": _PFX,       "Doc": "1", "Account": "1200", "Date": "01.01.2022", "Amount": "500"},
+                {"Entity": _PFX,       "Doc": "2", "Account": "1200", "Date": "01.01.2022", "Amount": "300"},
+                {"Entity": "Meridian", "Doc": "3", "Account": "1200", "Date": "01.01.2022", "Amount": "999"},
+                {"Entity": "Novara",   "Doc": "4", "Account": "1200", "Date": "01.01.2022", "Amount": "888"},
+                {"Entity": "Venturo",  "Doc": "5", "Account": "1200", "Date": "01.01.2022", "Amount": "777"},
+            ]
+            fid = self._stage_ob(client, rows)
+
+            body = ing.OpeningBalanceCommitRequest(
+                file_id=fid, profile=prof, scope="all"
+            )
+            res = ing.opening_balance_commit(body, session=session, _admin=_ADMIN)
+
+            # Only the two prefix-"98" rows were loaded.
+            assert res.lines == 2, (
+                f"expected 2 committed lines (entity {_PFX!r} only); got {res.lines}"
+            )
+            assert res.fiscal_years == [2022]
+
+            # Three unknown labels must be reported, in sorted order.
+            assert res.ignored_entities == ["Meridian", "Novara", "Venturo"], (
+                f"unexpected ignored_entities: {res.ignored_entities!r}"
+            )
+        finally:
+            self._clean_pfx(session, _PFX)
+            session.close()
+
+    # ------------------------------------------------------------------ #
+    # D3) OB combined: entity column mode resolves two numeric prefixes
+    # ------------------------------------------------------------------ #
+
+    def test_ob_combined_entity_column(self):
+        """OB commit with entity.mode='column' (numeric values in source file) writes
+        opening-balance rows tagged for each entity prefix found in the column."""
+        from sqlalchemy import text
+        import app.routers.ingest as ing
+
+        _PFX1, _PFX2 = "93", "94"
+        session = _v2_session_or_skip()
+        client = _client_as(_ADMIN, session=session)
+
+        prof = _gl_profile()
+        prof["entity"] = {"mode": "column", "value": "Entity"}
+
+        try:
+            for pfx in (_PFX1, _PFX2):
+                self._clean_pfx(session, pfx)
+                self._seed_account_pfx(session, pfx)
+
+            # File has an 'Entity' column with numeric prefix values (2-digit
+            # numerics resolve directly without a dim_legal_entity lookup).
+            rows = [
+                {"Doc": "1", "Account": "1200", "Date": "01.01.2022",
+                 "Amount": "500", "Entity": _PFX1},
+                {"Doc": "2", "Account": "1200", "Date": "01.01.2022",
+                 "Amount": "300", "Entity": _PFX2},
+            ]
+            fid = self._stage_ob(client, rows)
+            body = ing.OpeningBalanceCommitRequest(file_id=fid, profile=prof, scope="all")
+            res = ing.opening_balance_commit(body, session=session, _admin=_ADMIN)
+
+            assert sorted(res.fiscal_years) == [2022]
+            assert res.lines == 2  # one OB line per entity prefix
+
+            # Both prefixes must have an OB entry tagged 'opening_balance'.
+            tagged = session.execute(text(
+                "SELECT SUBSTR(journal_entry_group_number,1,2) AS pfx, entry_type "
+                "FROM fact_gl_entry "
+                "WHERE SUBSTR(journal_entry_group_number,1,2)=ANY(:pfxs)"
+            ), {"pfxs": [_PFX1, _PFX2]}).fetchall()
+            pfx_found = {r[0] for r in tagged}
+            assert pfx_found == {_PFX1, _PFX2}, (
+                f"expected OB entries for {_PFX1!r} and {_PFX2!r}, got {pfx_found}"
+            )
+            for pfx, et in tagged:
+                assert et == "opening_balance"
+        finally:
+            for pfx in (_PFX1, _PFX2):
+                self._clean_pfx(session, pfx)
+            session.close()
+
+    # ------------------------------------------------------------------ #
+    # D4) OB per-entity: two staged files committed with distinct fixed prefixes
+    # ------------------------------------------------------------------ #
+
+    def test_ob_per_entity_two_commits(self):
+        """Two OB files committed with different fixed entity prefixes; each commit
+        tags its rows with the '9' JEGN discriminator and the correct scope."""
+        from sqlalchemy import text
+        import app.routers.ingest as ing
+
+        _PFX1, _PFX2 = "95", "96"
+        session = _v2_session_or_skip()
+        client = _client_as(_ADMIN, session=session)
+        rows = [{"Doc": "1", "Account": "1200", "Date": "01.01.2022", "Amount": "500"}]
+
+        try:
+            for pfx in (_PFX1, _PFX2):
+                self._clean_pfx(session, pfx)
+                self._seed_account_pfx(session, pfx)
+
+            # Commit _PFX1 with scope='first_year'.
+            prof1 = _gl_profile()
+            prof1["entity"] = {"mode": "fixed", "value": _PFX1}
+            fid1 = self._stage_ob(client, rows)
+            body1 = ing.OpeningBalanceCommitRequest(
+                file_id=fid1, profile=prof1, scope="first_year"
+            )
+            res1 = ing.opening_balance_commit(body1, session=session, _admin=_ADMIN)
+            assert res1.fiscal_years == [2022] and res1.lines == 1
+
+            # Commit _PFX2 with scope='all' (same single-row file → same result).
+            prof2 = _gl_profile()
+            prof2["entity"] = {"mode": "fixed", "value": _PFX2}
+            fid2 = self._stage_ob(client, rows)
+            body2 = ing.OpeningBalanceCommitRequest(
+                file_id=fid2, profile=prof2, scope="all"
+            )
+            res2 = ing.opening_balance_commit(body2, session=session, _admin=_ADMIN)
+            assert res2.fiscal_years == [2022] and res2.lines == 1
+
+            # Both prefixes must have OB rows with the '9' JEGN discriminator at char 3.
+            for pfx in (_PFX1, _PFX2):
+                tagged = session.execute(text(
+                    "SELECT entry_type, SUBSTR(journal_entry_group_number,3,1) AS disc "
+                    "FROM fact_gl_entry WHERE SUBSTR(journal_entry_group_number,1,2)=:p"
+                ), {"p": pfx}).fetchall()
+                assert tagged, f"no OB rows found for entity prefix {pfx!r}"
+                for et, disc in tagged:
+                    assert et == "opening_balance", (
+                        f"entry_type wrong for prefix {pfx!r}: got {et!r}"
+                    )
+                    assert disc == "9", (
+                        f"JEGN char-3 must be '9' (file-OB sentinel) for prefix {pfx!r}"
+                    )
+        finally:
+            for pfx in (_PFX1, _PFX2):
+                self._clean_pfx(session, pfx)
+            session.close()
+
+
+# =========================================================================== #
+# E) Extension acceptance — .csv / .xlsx accepted; .txt rejected (partner path)
+# =========================================================================== #
+class TestExtensionAcceptance:
+    """OB_PARTNER_ALLOWED_EXTENSIONS = {.csv, .xlsx, .xls}; .txt is excluded.
+
+    Complements the .txt OB rejection in TestUploadSecurity and the partner
+    .txt test added there; provides positive coverage for .csv on both paths.
+    """
+
+    def test_ob_upload_accepts_csv(self):
+        """.csv OB upload must reach the preview (200), not be rejected (415)."""
+        client = _client_as(_ADMIN)
+        csv_bytes = b"Doc,Account,Date,Amount\n1,1200,01.01.2023,500"
+        resp = client.post(
+            "/api/v1/ingest/opening-balance/upload",
+            files={"file": ("ob.csv", csv_bytes, "text/csv")},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["file_id"]
+        assert "Account" in body["columns"]
+
+    def test_partner_upload_accepts_csv(self):
+        """.csv partner upload must reach the preview (200), not be rejected (415)."""
+        client = _client_as(_ADMIN)
+        csv_bytes = b"No.,Name,Ctry\n100,Acme,DE"
+        resp = client.post(
+            "/api/v1/ingest/partner-master/upload",
+            files={"file": ("partners.csv", csv_bytes, "text/csv")},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["file_id"]
+        assert {"No.", "Name", "Ctry"} <= set(body["columns"])
+
+    def test_ob_upload_accepts_xlsx(self):
+        """.xlsx OB upload (belt-and-suspenders over the existing preview test)."""
+        client = _client_as(_ADMIN)
+        raw = _xlsx_bytes([
+            {"Doc": "1", "Account": "1200", "Date": "01.01.2023", "Amount": "500"},
+        ])
+        resp = client.post(
+            "/api/v1/ingest/opening-balance/upload",
+            files={"file": ("ob.xlsx", raw, "application/octet-stream")},
+        )
+        assert resp.status_code == 200, resp.text
+
+
+# =========================================================================== #
+# F) OB required-column gating (DB-free, ETL layer)
+# =========================================================================== #
+class TestOBRequiredColumns:
+    """OB mapping raises KeyError / ValueError when required columns are absent.
+
+    These are the underlying conditions that produce HTTP 422 when invoked via
+    the opening_balance_commit router.  Tested at the ETL layer so no DB or
+    MagicMock session is needed.
+
+    The additional HTTP-layer test (entity column missing → 422) uses monkeypatch
+    to stub build_entity_lookup so the commit router can reach the column check.
+    """
+
+    def test_ob_missing_account_column_raises(self):
+        """profile.columns['account_number'] maps to 'Account'; absent → KeyError."""
+        from etl.mapping import apply_profile, profile_from_dict
+
+        raw = pd.DataFrame({
+            "Doc": ["1"], "Date": ["01.01.2023"], "Amount": ["500"],
+        })
+        prof = profile_from_dict(_gl_profile())
+        with pytest.raises((KeyError, ValueError)):
+            apply_profile(raw, prof)
+
+    def test_ob_missing_amount_column_raises(self):
+        """profile.sign.amount maps to 'Amount'; absent → ValueError."""
+        from etl.mapping import apply_profile, profile_from_dict
+
+        raw = pd.DataFrame({
+            "Doc": ["1"], "Account": ["1200"], "Date": ["01.01.2023"],
+        })
+        prof = profile_from_dict(_gl_profile())
+        with pytest.raises((KeyError, ValueError)):
+            apply_profile(raw, prof)
+
+    def test_ob_entity_column_mode_missing_col_422(self, monkeypatch):
+        """entity.mode='column' but the named column is absent from the file → HTTP 422.
+
+        monkeypatch stubs build_entity_lookup so the commit router uses an empty
+        lookup (no DB call) and the column-check in prefix_series_from_entity_config
+        raises KeyError, which _load_and_apply converts to 422.
+        """
+        import etl.entity_resolve as er
+        monkeypatch.setattr(er, "build_entity_lookup", lambda _s: {})
+
+        client = _client_as(_ADMIN)
+        # Stage a file WITHOUT an 'Entity' column.
+        raw = _xlsx_bytes([
+            {"Doc": "1", "Account": "1200", "Date": "01.01.2023", "Amount": "500"},
+        ])
+        up = client.post(
+            "/api/v1/ingest/opening-balance/upload",
+            files={"file": ("ob.xlsx", raw, "application/octet-stream")},
+        )
+        assert up.status_code == 200, up.text
+        fid = up.json()["file_id"]
+
+        prof = _gl_profile()
+        prof["entity"] = {"mode": "column", "value": "Entity"}  # 'Entity' col absent
+        resp = client.post(
+            "/api/v1/ingest/opening-balance/commit",
+            json={"file_id": fid, "profile": prof, "scope": "all"},
+        )
+        assert resp.status_code == 422, resp.text

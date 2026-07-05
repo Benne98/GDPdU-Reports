@@ -57,7 +57,7 @@ def get_load_meta(session: Session, load_id: int) -> dict[str, Any] | None:
             """
             SELECT load_id, dataset, scope_entity_prefixes, scope_fiscal_years,
                    commit_mode, snapshot_captured, row_count, loaded_at, loaded_by
-            FROM meta_dataset_load WHERE load_id = :id
+            FROM org_meta_dataset_load WHERE load_id = :id
             """
         ),
         {"id": load_id},
@@ -75,6 +75,92 @@ def get_load_meta(session: Session, load_id: int) -> dict[str, Any] | None:
         "loaded_at": row[7],
         "loaded_by": row[8],
     }
+
+
+def replace_skip_ok(
+    session: Session,
+    dataset: str,
+    scope_pfx: list[str],
+    scope_fys: list[int],
+    skip_hash: str,
+) -> int | None:
+    """Idempotency guard for a REPLACE commit — return the owning load_id when the
+    re-commit would be a provable no-op, else ``None``.
+
+    A ``commit_mode='replace'`` load deletes its rectangle and re-inserts. That is a
+    pure no-op IFF the live rectangle we are about to overwrite is ALREADY owned by a
+    prior *completed* replace load whose stored ``content_hash`` equals the hash of the
+    exact frame we would persist. In that case we can safely short-circuit the
+    delete + re-insert (nothing changes).
+
+    Returns the matched owner ``load_id`` when a load row L (same ``dataset``) satisfies
+    ALL of the following, else ``None`` (fall through to the normal full replace — a
+    FALSE skip must be impossible):
+
+      1. ``L.commit_mode == 'replace'``.
+      2. ``set(L.scope_entity_prefixes) == set(scope_pfx)`` AND
+         ``set(L.scope_fiscal_years) == set(scope_fys)`` — the EXACT rectangle,
+         order-independent.
+      3. ``L.content_hash == skip_hash`` — identical data to what we would store.
+      4. ``L.snapshot_captured`` is TRUE — L fully completed (snapshot written).
+      5. ``L.load_id == MAX(load_id)`` over ALL loads M (same dataset) whose rectangle
+         OVERLAPS ours (``set(M.prefixes) & scope_pfx`` non-empty AND
+         ``set(M.years) & scope_fys`` non-empty). i.e. NO later overlapping load
+         (append, wider/narrower replace, partial/first-ever load) has touched our
+         rectangle since L.
+
+    Read-only: SELECTs ``org_meta_dataset_load`` (a small audit log) only; never writes.
+    Deliberately does NOT reuse :func:`etl.load.dedup_check` (that lacks the
+    scope / commit_mode / latest-owner guards and could false-skip).
+    """
+    if not scope_pfx or not scope_fys:
+        return None
+
+    want_pfx = set(scope_pfx)
+    want_fys = {int(y) for y in scope_fys}
+
+    rows = session.execute(
+        text(
+            """
+            SELECT load_id, scope_entity_prefixes, scope_fiscal_years,
+                   commit_mode, content_hash, snapshot_captured
+            FROM org_meta_dataset_load
+            WHERE dataset = :ds
+            ORDER BY load_id DESC
+            """
+        ),
+        {"ds": dataset},
+    ).fetchall()
+
+    latest_overlap_id: int | None = None
+    for r in rows:
+        load_id = int(r[0])
+        row_pfx = set(r[1] or [])
+        row_fys = {int(y) for y in (r[2] or [])}
+        commit_mode = r[3]
+        content_hash_val = r[4]
+        snapshot_captured = bool(r[5])
+
+        overlaps = bool(row_pfx & want_pfx) and bool(row_fys & want_fys)
+        # Rows arrive load_id DESC, so the FIRST overlapping row is the MAX-load_id
+        # owner of (part of) our rectangle (clause 5).
+        if overlaps and latest_overlap_id is None:
+            latest_overlap_id = load_id
+
+        is_exact_replace = (
+            commit_mode == "replace"
+            and row_pfx == want_pfx
+            and row_fys == want_fys
+            and content_hash_val == skip_hash
+            and snapshot_captured
+        )
+        if is_exact_replace:
+            # An exact-rectangle match always overlaps, so latest_overlap_id is set by
+            # now. Skip ONLY when this matching load is itself the latest overlap owner
+            # (no intervening overlapping load since it).
+            return load_id if load_id == latest_overlap_id else None
+
+    return None
 
 
 def delete_gl_scope(session: Session, prefixes: list[str], years: list[int]) -> dict[str, int]:

@@ -165,6 +165,7 @@ def _load_partner_plan_cm(
     month: int,
     is_customer: bool,
     ent_prefix: Optional[str],
+    allowed_entities: Optional[set[str]] = None,
 ) -> tuple[dict[Any, float], str]:
     """Return ({partner_id: plan_cm in kEUR for the anchor month}, plan_mix).
 
@@ -181,7 +182,33 @@ def _load_partner_plan_cm(
       * fact_position_plan supplier rows are cost (debit, stored +) → no flip.
       * fact_sales_plan.gross_sales_plan / fact_com_plan.cost_of_materials_plan are
         already positive magnitudes (mirror fact_sales / fact_com) → no flip.
+
+    ``allowed_entities`` (fail-closed tenant isolation): set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  ``None`` (the
+    default) applies NO visibility filter → byte-identical to legacy behaviour.  A
+    non-``None`` set scopes BOTH the ``fact_position_plan`` scan
+    (``AND p.entity_prefix IN (...)``) and the ``fact_sales_plan`` /
+    ``fact_com_plan`` fallbacks (``AND LEFT(<id>, 2) IN (...)``) to those prefixes;
+    an EMPTY set fails closed (no rows), so no consolidated cross-entity plan can
+    leak.
     """
+    # Visibility scoping fragments (empty strings = legacy/unfiltered path).
+    vis_pos = ""
+    vis_inner: Optional[str] = None
+    vis_deny = False
+    if allowed_entities is not None:
+        if allowed_entities:
+            safe = sorted({str(p).replace("'", "")[:2] for p in allowed_entities if p})
+            if safe:
+                vis_inner = ", ".join(f"'{p}'" for p in safe)
+                vis_pos = f"AND p.entity_prefix IN ({vis_inner})"
+            else:
+                vis_deny = True
+        else:
+            vis_deny = True
+    if vis_deny:
+        vis_pos = "AND 1 = 0"
+
     params: dict[str, Any] = {"year": year, "month": month}
     # entity scope for fact_position_plan: prefer the entity's rows; '' = consolidated.
     if ent_prefix:
@@ -213,6 +240,7 @@ def _load_partner_plan_cm(
           AND p.partner_id <> ''
           AND p.fiscal_year = :year
           {pos_ent}
+          {vis_pos}
         GROUP BY p.partner_id
     """)
     pos_rows = session.execute(pos_sql, params).fetchall()
@@ -226,6 +254,14 @@ def _load_partner_plan_cm(
     else:
         fact, id_col, val_col = "fact_com_plan", "supplier_id", "cost_of_materials_plan"
 
+    # Scope the fallback to the visible prefixes (empty string = legacy/unfiltered).
+    if vis_deny:
+        vis_fb = "AND 1 = 0"
+    elif vis_inner is not None:
+        vis_fb = f"AND LEFT({id_col}, 2) IN ({vis_inner})"
+    else:
+        vis_fb = ""
+
     for scenario in ("budget", "forecast", "plan"):
         sp = dict(params)
         sp["scenario"] = scenario
@@ -235,6 +271,7 @@ def _load_partner_plan_cm(
                                 THEN {val_col} ELSE 0 END), 0) / 1000.0 AS plan_cm
             FROM {fact}
             WHERE fiscal_year = :year AND scenario = :scenario
+              {vis_fb}
             GROUP BY {id_col}
         """)
         rows = session.execute(sql, sp).fetchall()
@@ -259,12 +296,19 @@ def build_top_entities(
     period_grain: str = "month",
     limit: int = 5000,
     entity: Optional[str] = None,
+    allowed_entities: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     """SalesTopEntitiesResponse — top customers (revenue) or suppliers (spend).
 
     Month-grain windows over posting_date; values in kEUR.  ``period_grain`` is
     echoed back; the windows are always month-based (the FE always supplies
     year+month, and the slim port computes monthly windows).
+
+    ``allowed_entities`` (fail-closed tenant isolation): set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  When provided it
+    is the ONLY entity filter (``entity`` ignored — caller has already intersected
+    it) applied to the fact scan via ``LEFT(account_number_group, 2) IN (...)``; an
+    EMPTY set fails closed (matches nothing).  ``None`` preserves legacy behaviour.
     """
     is_customer = type != "supplier"
     if rank_by not in ("cm", "ytd"):
@@ -277,11 +321,21 @@ def build_top_entities(
         fact, dim = "fact_com", "dim_supplier"
         value_col, id_col = "cost_of_materials", "supplier_id"
 
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = ""
-    if ep is not None:
-        safe = str(ep).replace("'", "")[:2]
-        ent_frag = f"AND LEFT(f.account_number_group, 2) = '{safe}'"
+    if allowed_entities is not None:
+        # Fail-closed visibility: filter the fact scan to the visible prefixes.
+        ep = None  # plan scope stays consolidated (secondary field, no leak path)
+        if allowed_entities:
+            safe = sorted({str(p).replace("'", "")[:2] for p in allowed_entities if p})
+            inner = ", ".join(f"'{p}'" for p in safe)
+            ent_frag = f"AND LEFT(f.account_number_group, 2) IN ({inner})"
+        else:
+            ent_frag = "AND 1 = 0"
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = ""
+        if ep is not None:
+            safe = str(ep).replace("'", "")[:2]
+            ent_frag = f"AND LEFT(f.account_number_group, 2) = '{safe}'"
 
     cm_f, cm_t = _month_bounds(year, month)
     pm_y, pm_m = _pm(year, month)
@@ -340,7 +394,8 @@ def build_top_entities(
         })
 
     plan_by_id, plan_mix = _load_partner_plan_cm(
-        session, year=year, month=month, is_customer=is_customer, ent_prefix=ep
+        session, year=year, month=month, is_customer=is_customer, ent_prefix=ep,
+        allowed_entities=allowed_entities,
     )
 
     rows = rank_top_entities(

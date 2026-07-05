@@ -20,7 +20,7 @@ import {
 const EMPTY_CHURN: SalesChurnBridgeResponse = {
   periods: [],
   period_totals: [],
-  bridges: [],
+  bridge: { new: 0, upsell: 0, cross_sell: 0, downsell: 0, lost: 0 },
   table_rows: [],
 }
 
@@ -89,15 +89,14 @@ export default function SalesChurnSection({ period, filters }: Props) {
     return `${churnGrainLabel(grain)} · ${dimLabel} · ${range} · kEUR`
   }, [grain, dimLabel, first, last])
 
-  const handleDrill = useCallback(async (component: string, bridgeIdx: number) => {
+  const handleDrill = useCallback(async (component: string, _bridgeIdx: number) => {
     if (!data) return
-    const b = data.bridges[bridgeIdx]
-    if (!b) return
-    setDrillTitle(`${component}: ${b.from} → ${b.to}`)
+    // Single PM→CM transition; use the last two date ranges from buildChurnBridgePeriods.
+    const builtPeriods = buildChurnBridgePeriods(year, month, grain)
+    const pFrom = builtPeriods[builtPeriods.length - 2]
+    const pTo = builtPeriods[builtPeriods.length - 1]
+    setDrillTitle(`${component}: ${data.periods[0] ?? ''} → ${data.periods[1] ?? ''}`)
     setDrillOpen(true)
-    const periods = buildChurnBridgePeriods(year, month, grain)
-    const pFrom = periods[bridgeIdx]
-    const pTo = periods[bridgeIdx + 1]
     try {
       const rows = await api.salesChurnDrilldown(
         pFrom.ja, pFrom.je, pTo.ja, pTo.je, component, 'invoiced', filters,

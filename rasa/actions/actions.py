@@ -1447,10 +1447,39 @@ def _bs_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
     }
 
 
-def _fdd_post(path: str, body: dict, timeout: int = FDD_SCRIPT_RUN_TIMEOUT_SEC) -> dict:
-    """POST to the FastAPI fdd_bot router. Returns parsed JSON."""
+def _auth_token(tracker: Tracker) -> str | None:
+    """Safely read the user's raw JWT from the inbound message metadata.
+
+    Contract (matches the frontend): the token arrives at
+    ``tracker.latest_message["metadata"]["auth_token"]`` as a RAW string
+    (no "Bearer " prefix), or is absent/None. Guards against missing
+    ``latest_message`` / ``metadata`` so callers never raise.
+    """
     try:
-        resp = requests.post(f"{FASTAPI_BASE_URL}{path}", json=body, timeout=timeout)
+        metadata = (tracker.latest_message or {}).get("metadata") or {}
+    except AttributeError:
+        return None
+    token = metadata.get("auth_token") if isinstance(metadata, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
+def _fdd_post(
+    path: str,
+    body: dict,
+    timeout: int = FDD_SCRIPT_RUN_TIMEOUT_SEC,
+    auth_token: str | None = None,
+) -> dict:
+    """POST to the FastAPI fdd_bot router. Returns parsed JSON.
+
+    When ``auth_token`` is provided it is sent as an ``Authorization: Bearer``
+    header (for the auth-required GL endpoints). Without it the request is
+    byte-for-byte identical to the original unauthenticated call.
+    """
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
+    try:
+        resp = requests.post(
+            f"{FASTAPI_BASE_URL}{path}", json=body, timeout=timeout, headers=headers
+        )
         resp.raise_for_status()
         return resp.json()
     except requests.HTTPError as exc:
@@ -1473,10 +1502,22 @@ def _fdd_post(path: str, body: dict, timeout: int = FDD_SCRIPT_RUN_TIMEOUT_SEC) 
         return {"success": False, "message": str(exc)}
 
 
-def _fdd_get(path: str, params: dict | None = None) -> dict:
-    """GET from the FastAPI fdd_bot router. Non-2xx responses return JSON fields for UI/debug."""
+def _fdd_get(
+    path: str,
+    params: dict | None = None,
+    auth_token: str | None = None,
+) -> dict:
+    """GET from the FastAPI fdd_bot router. Non-2xx responses return JSON fields for UI/debug.
+
+    When ``auth_token`` is provided it is sent as an ``Authorization: Bearer``
+    header (for the auth-required GL endpoints). Without it the request is
+    byte-for-byte identical to the original unauthenticated call.
+    """
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
     try:
-        resp = requests.get(f"{FASTAPI_BASE_URL}{path}", params=params, timeout=30)
+        resp = requests.get(
+            f"{FASTAPI_BASE_URL}{path}", params=params, timeout=30, headers=headers
+        )
         if resp.status_code < 400:
             return resp.json()
         merged: dict[str, Any] = {"success": False, "status_code": resp.status_code, "headers": []}
@@ -1580,11 +1621,35 @@ def _slot_events_for_preloaded_file(tracker: Tracker, payload: dict | None) -> l
     return events
 
 
+def _sales_loaded_from_data_status(auth_token: str | None = None) -> bool:
+    """True when real sales data (fact_sales) is already loaded in the reporting DB.
+
+    Detection is server-side via /gl/data-status; failures are treated as "not
+    loaded" so the existing upload flow stays the safe default. ``auth_token``
+    is forwarded to the auth-required GL endpoint when present.
+    """
+    try:
+        status = _fdd_get("/api/v1/fdd/gl/data-status", auth_token=auth_token)
+    except Exception:  # noqa: BLE001 — never block the upload flow on a status probe
+        return False
+    return isinstance(status, dict) and bool(status.get("sales_loaded"))
+
+
 def _emit_sales_upload_or_reuse(
     dispatcher: CollectingDispatcher,
     tracker: Tracker,
     payload: dict | None = None,
 ) -> list:
+    # Phase 6: if real sales data is already loaded (fact_sales), skip the upload
+    # step entirely and proceed with the same continuation the upload path uses
+    # after a file is provided. The existing reuse-previous-file logic below is
+    # unchanged and still applies when no sales data is loaded.
+    if _sales_loaded_from_data_status(_auth_token(tracker)):
+        dispatcher.utter_message(
+            text="Found sales data already loaded in the pipeline — no upload needed."
+        )
+        return [FollowupAction("action_ask_sheet_name")]
+
     events = _slot_events_for_preloaded_file(tracker, payload)
     fid = _file_id_from_sources(tracker, payload)
     if fid:
@@ -1676,6 +1741,7 @@ class ActionDispatchCard(Action):
             # Coming soon stubs
             "coming_soon": ActionProcessComingSoon(),
             # Databook
+            "gl_databook_scope": ActionProcessGlDatabookScope(),
             "databook_susa_format": ActionProcessDatabookSusaFormat(),
             "databook_entity_count": ActionProcessDatabookEntityCount(),
             "databook_entities": ActionProcessDatabookEntities(),
@@ -1696,6 +1762,37 @@ class ActionDispatchCard(Action):
             "databook_sort": ActionProcessDatabookSort(),
             "databook_proceed": ActionRunDatabookFinal(),
         }
+        from actions.fte_flow import (
+            ActionProcessFteDimensions,
+            ActionProcessFteEntityCount,
+            ActionProcessFteEntityMode,
+            ActionProcessFteFiles,
+            ActionProcessFteFteMapping,
+            ActionProcessFteMetrics,
+            ActionProcessFtePayrollMapping,
+            ActionProcessFtePexGrid,
+            ActionProcessFteSingleFile,
+            ActionRunFteDevelopmentFinal,
+            ActionShowFteReview,
+        )
+
+        fte_entity = ActionProcessFteEntityMode()
+        instances.update(
+            {
+                "fte_entity_mode": fte_entity,
+                "fte_scope": fte_entity,
+                "fte_entity_count": ActionProcessFteEntityCount(),
+                "fte_files": ActionProcessFteFiles(),
+                "fte_single_file": ActionProcessFteSingleFile(),
+                "fte_fte_mapping": ActionProcessFteFteMapping(),
+                "fte_payroll_mapping": ActionProcessFtePayrollMapping(),
+                "fte_dimensions": ActionProcessFteDimensions(),
+                "fte_metrics": ActionProcessFteMetrics(),
+                "fte_pex_grid": ActionProcessFtePexGrid(),
+                "fte_review": ActionShowFteReview(),
+                "fte_proceed": ActionRunFteDevelopmentFinal(),
+            }
+        )
         cls._handlers = instances
         return instances
 
@@ -1761,6 +1858,43 @@ class ActionNluFallbackDispatch(Action):
 # ─── Session ──────────────────────────────────────────────────────────────────
 
 
+def _data_source_mode_from_greet(tracker: Tracker) -> str:
+    """Read the data source mode the frontend sends with /greet.
+
+    Looks (in order) at the greet message metadata, a parsed /greet{...} text
+    payload, and any extracted entities. Accepts "pipeline" or "upload";
+    anything else (or absent) falls back to "upload" so existing behaviour is
+    unchanged. Robust to a missing/unstructured greet.
+    """
+    lm = getattr(tracker, "latest_message", None)
+    if not isinstance(lm, dict):
+        lm = {}
+
+    candidates: list[Any] = []
+
+    metadata = lm.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get("data_source_mode"))
+        candidates.append(metadata.get("data_source"))
+
+    # Parsed payload covers /greet{"data_source": "pipeline"} or the
+    # /submit_card{"card_payload": {...}} shape via _parse_payload.
+    payload = _parse_payload(tracker)
+    if isinstance(payload, dict):
+        candidates.append(payload.get("data_source_mode"))
+        candidates.append(payload.get("data_source"))
+
+    for ent in lm.get("entities", []) or []:
+        if isinstance(ent, dict) and ent.get("entity") in ("data_source_mode", "data_source"):
+            candidates.append(ent.get("value"))
+
+    for raw in candidates:
+        val = str(raw or "").strip().lower()
+        if val in ("pipeline", "upload"):
+            return val
+    return "upload"
+
+
 class ActionSetSessionId(Action):
     def name(self) -> str:
         return "action_set_session_id"
@@ -1768,10 +1902,19 @@ class ActionSetSessionId(Action):
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         # Align with the REST channel sender_id — the frontend uses it as session_id on /fdd/upload.
         desired = (tracker.sender_id or "").strip() or str(uuid.uuid4())[:8]
+        events: list[Any] = []
+
         existing = tracker.get_slot("session_id")
-        if existing == desired:
-            return []
-        return [SlotSet("session_id", desired)]
+        if existing != desired:
+            events.append(SlotSet("session_id", desired))
+
+        # Data source for the databook build, sent by the frontend at greet time.
+        # Default "upload" keeps the existing upload flow unchanged.
+        mode = _data_source_mode_from_greet(tracker)
+        if tracker.get_slot("data_source_mode") != mode:
+            events.append(SlotSet("data_source_mode", mode))
+
+        return events
 
 
 class ActionResetAllSlots(Action):
@@ -2104,6 +2247,13 @@ class ActionProcessBuildDatabook(Action):
         output_type = payload.get("output_type", "databook")
 
         if output_type == "databook":
+            data_source_mode = str(tracker.get_slot("data_source_mode") or "upload").strip().lower()
+            if data_source_mode == "pipeline":
+                dispatcher.utter_message(text="Let's build the Databook from your loaded GL data.")
+                return [
+                    SlotSet("output_type", "databook"),
+                    FollowupAction("action_run_gl_databook"),
+                ]
             dispatcher.utter_message(text="Let's build the Databook.")
             return [
                 SlotSet("output_type", "databook"),
@@ -2127,16 +2277,9 @@ class ActionProcessBuildDatabook(Action):
             )
             return [SlotSet("output_type", "creditor_debitor_aging")]
         elif output_type == "fte_development":
-            dispatcher.utter_message(
-                json_message={
-                    "type": "adaptive_card",
-                    "card": "coming_soon",
-                    "title": "FTE Development",
-                    "subtitle": "This output type is coming soon. Please check back later.",
-                    "inputs": [],
-                    "submit_label": "Back",
-                }
-            )
+            from actions.fte_flow import utter_fte_start
+
+            utter_fte_start(dispatcher, tracker)
             return [SlotSet("output_type", "fte_development")]
         else:
             dispatcher.utter_message(text=f"Unknown output type '{output_type}'. Please try again.")
@@ -5001,6 +5144,209 @@ class ActionRunDatabook(Action):
         return []
 
 
+# ─── GL-based Databook (pipeline data source) ─────────────────────────────────
+
+
+def _gl_scope_card(entities: list[dict], fiscal_years: list[int]) -> dict[str, Any]:
+    """Adaptive card to confirm the GL databook scope (entities + fiscal years).
+
+    Entities and fiscal years are pre-selected (all) for the frontend that
+    supports multi_select defaults. As a robustness measure the processing
+    action also defaults to "all available" when the submission comes back
+    empty, so prefilled values never depend on hidden inputs (Gap I4).
+    """
+    entity_values = [str(e.get("code")) for e in entities if e.get("code") not in (None, "")]
+    year_values = [str(y) for y in fiscal_years]
+    return {
+        "type": "adaptive_card",
+        "card": "gl_databook_scope",
+        "title": "Databook — Scope from loaded GL data",
+        "subtitle": (
+            "Select the entities and fiscal years to include. Everything is "
+            "pre-selected by default — adjust if you only need a subset."
+        ),
+        "inputs": [
+            {
+                "id": "gl_entity_codes",
+                "type": "multi_select",
+                "label": "Entities",
+                "required": True,
+                "default": entity_values,
+                "options": [
+                    {
+                        "label": f"{e.get('name')} ({e.get('code')})" if e.get("name") else str(e.get("code")),
+                        "value": str(e.get("code")),
+                    }
+                    for e in entities
+                    if e.get("code") not in (None, "")
+                ],
+            },
+            {
+                "id": "gl_fiscal_years",
+                "type": "multi_select",
+                "label": "Fiscal years",
+                "required": True,
+                "default": year_values,
+                "options": [{"label": str(y), "value": str(y)} for y in fiscal_years],
+            },
+        ],
+        "submit_label": "Build Databook",
+    }
+
+
+class ActionRunGlDatabook(Action):
+    """Entry point for the GL-based (pipeline) databook: confirm scope only."""
+
+    def name(self) -> str:
+        return "action_run_gl_databook"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        session_id = _fdd_session_id(tracker)
+        status = _fdd_get(
+            "/api/v1/fdd/gl/data-status",
+            {"session_id": session_id},
+            auth_token=_auth_token(tracker),
+        )
+
+        if not isinstance(status, dict) or not status.get("gl_loaded"):
+            msg = ""
+            if isinstance(status, dict):
+                msg = str(status.get("message") or "")
+            dispatcher.utter_message(
+                text=(
+                    "No GL data is loaded for this workspace yet, so I can't build a "
+                    "Databook from the pipeline. Please load GDPdU GL data first, or "
+                    "use the upload flow instead."
+                    + (f" ({msg})" if msg else "")
+                )
+            )
+            return []
+
+        entities = [e for e in (status.get("entities") or []) if isinstance(e, dict)]
+        fiscal_years_raw = status.get("fiscal_years") or []
+        fiscal_years: list[int] = []
+        for y in fiscal_years_raw:
+            try:
+                fiscal_years.append(int(y))
+            except (ValueError, TypeError):
+                continue
+        fiscal_years = sorted(set(fiscal_years))
+
+        if not entities or not fiscal_years:
+            dispatcher.utter_message(
+                text=(
+                    "GL data is loaded but I couldn't determine any entities or fiscal "
+                    "years to build a Databook from. Please check the loaded data."
+                )
+            )
+            return []
+
+        dispatcher.utter_message(
+            text="Confirm the scope for your Databook — it will be built from the loaded GL data."
+        )
+        dispatcher.utter_message(json_message=_gl_scope_card(entities, fiscal_years))
+
+        entity_codes = [str(e.get("code")) for e in entities if e.get("code") not in (None, "")]
+        return [
+            SlotSet("output_type", "databook"),
+            SlotSet("db_gl_entities_json", json.dumps(entities, ensure_ascii=False)),
+            SlotSet("db_gl_fiscal_years_json", json.dumps(fiscal_years)),
+            SlotSet("db_entity_names", [str(e.get("name") or e.get("code")) for e in entities]),
+            SlotSet("db_entity_count", float(len(entity_codes))),
+        ]
+
+
+class ActionProcessGlDatabookScope(Action):
+    """Build the GL-master databook from the confirmed scope, then reuse the
+    shared post-SuSa flow (consolidation / adjustments / recon / final)."""
+
+    def name(self) -> str:
+        return "action_process_gl_databook_scope"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+
+        # Available scope captured when the card was emitted (used to default to
+        # "all" when the multi_select comes back empty — frontend cannot yet
+        # pre-select multi_select values).
+        try:
+            avail_entities = json.loads(tracker.get_slot("db_gl_entities_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            avail_entities = []
+        try:
+            avail_years = json.loads(tracker.get_slot("db_gl_fiscal_years_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            avail_years = []
+        avail_entity_codes = [
+            str(e.get("code")) for e in avail_entities if isinstance(e, dict) and e.get("code") not in (None, "")
+        ]
+        avail_year_ints: list[int] = []
+        for y in avail_years:
+            try:
+                avail_year_ints.append(int(y))
+            except (ValueError, TypeError):
+                continue
+
+        # Parse selected entity codes.
+        raw_entities = payload.get("gl_entity_codes")
+        if isinstance(raw_entities, str):
+            raw_entities = [raw_entities] if raw_entities else []
+        entity_codes = [str(c) for c in (raw_entities or []) if str(c).strip()]
+        if not entity_codes:
+            entity_codes = list(avail_entity_codes)
+
+        # Parse selected fiscal years.
+        raw_years = payload.get("gl_fiscal_years")
+        if isinstance(raw_years, (str, int)):
+            raw_years = [raw_years] if raw_years not in (None, "") else []
+        fiscal_years: list[int] = []
+        for y in raw_years or []:
+            try:
+                fiscal_years.append(int(y))
+            except (ValueError, TypeError):
+                continue
+        if not fiscal_years:
+            fiscal_years = list(avail_year_ints)
+
+        if not entity_codes or not fiscal_years:
+            dispatcher.utter_message(
+                text="Please select at least one entity and one fiscal year to build the Databook."
+            )
+            return []
+
+        # Map selected codes back to names for downstream slots / display.
+        name_by_code = {
+            str(e.get("code")): str(e.get("name") or e.get("code"))
+            for e in avail_entities
+            if isinstance(e, dict) and e.get("code") not in (None, "")
+        }
+        entity_names = [name_by_code.get(c, c) for c in entity_codes]
+
+        fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
+        fiscal_start_month = (fy_end_m % 12) + 1
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "entity_codes": entity_codes,
+            "fiscal_years": sorted(set(fiscal_years)),
+            "fy_end_month": fy_end_m,
+            "fiscal_start_month": fiscal_start_month,
+            "output_folder": tracker.get_slot("output_folder") or "",
+        }
+        result = _fdd_post(
+            "/api/v1/fdd/run/databook/gl-master",
+            body,
+            auth_token=_auth_token(tracker),
+        )
+
+        events = [
+            SlotSet("db_entity_count", float(len(entity_codes))),
+            SlotSet("db_entity_names", entity_names),
+            *_databook_after_susa_run(dispatcher, tracker, result),
+        ]
+        return events
+
+
 def _utter_databook_entity_count_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
     default_count = tracker.get_slot("db_entity_count")
     try:
@@ -6387,4 +6733,46 @@ class ActionRunDatabookFinal(Action):
             dispatcher.utter_message(
                 text=f"Databook error:\n{result.get('message', 'Unknown error')}"
             )
+        return []
+
+
+# FTE Development v2 — register action classes from fte_flow for the Rasa action server.
+from actions.fte_flow import (  # noqa: E402, F401
+    ActionProcessFteDimensions,
+    ActionProcessFteEntityCount,
+    ActionProcessFteEntityMode,
+    ActionProcessFteFiles,
+    ActionProcessFteFteMapping,
+    ActionProcessFteMetrics,
+    ActionProcessFtePayrollMapping,
+    ActionProcessFtePexGrid,
+    ActionProcessFteSingleFile,
+    ActionRunFteDevelopmentFinal,
+    ActionShowFteReview,
+)
+
+
+class ActionRunFteDevelopment(Action):
+    """Legacy entry action — emits intro + first wizard card inline."""
+
+    def name(self) -> str:
+        return "action_run_fte_development"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        from actions.fte_flow import utter_fte_start
+
+        utter_fte_start(dispatcher, tracker)
+        return [SlotSet("output_type", "fte_development")]
+
+
+class ActionProcessFteScope(Action):
+    """Legacy alias for entity-mode card (fte_scope card id)."""
+
+    def name(self) -> str:
+        return "action_process_fte_scope"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        from actions.fte_flow import _utter_fte_entity_mode_card
+
+        _utter_fte_entity_mode_card(dispatcher, tracker)
         return []

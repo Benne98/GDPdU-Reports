@@ -318,6 +318,15 @@ export function resolveCellValue(
   monthly?: MonthlyResponse | null,
 ): number | null {
   const isKpi = row.row_kind === 'kpi'
+  const isAccount = row.row_kind === 'account'
+  const isPlanCol =
+    col.kind === 'plan_cm' ||
+    col.kind === 'plan_vs_actual' ||
+    col.kind === 'ytd_plan' ||
+    col.kind === 'ytd_vs_plan' ||
+    col.kind === 'ytg' ||
+    col.kind === 'coverage'
+  if (isAccount && isPlanCol) return null
   if (isKpi && !KPI_TABLE_COLUMN_KINDS.has(col.kind)) return null
 
   const am = row.amounts

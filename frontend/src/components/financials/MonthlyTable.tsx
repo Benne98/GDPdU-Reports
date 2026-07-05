@@ -612,7 +612,59 @@ export default function MonthlyTable({
 
   function walkRows(rows: MonthlyRow[], depth: number): JSX.Element[] {
     const nodes: JSX.Element[] = []
+    let kpiHeaderInserted = depth > 0
     for (const row of rows) {
+      if (row.row_kind === 'kpi_header') {
+        kpiHeaderInserted = true
+        nodes.push(renderRow(row, depth))
+        continue
+      }
+      if (
+        row.row_kind === 'kpi'
+        && !kpiHeaderInserted
+        && data?.statement === 'bs'
+      ) {
+        kpiHeaderInserted = true
+        nodes.push(
+          <tr key="monthly-bs-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+            <td
+              className="px-3 py-2 text-xs font-semibold"
+              style={{ color: '#1E3A5F', fontStyle: 'italic', paddingLeft: 12 }}
+            >
+              KPIs
+            </td>
+            {displayCols.map(dc => {
+              if (dc.type === 'period') {
+                const pk = monthlyPeriodKey(dc.period.year, dc.period.month)
+                const highlight = isPeriodColumnHighlighted(dc.period.year, dc.period.month, pk)
+                return (
+                  <td
+                    key={pk}
+                    style={{
+                      background: highlight ? 'rgba(30,58,95,0.04)' : '#F8FAFC',
+                      borderLeft: highlight ? '1px solid rgba(30,58,95,0.12)' : undefined,
+                      borderRight: highlight ? '1px solid rgba(30,58,95,0.12)' : undefined,
+                    }}
+                  />
+                )
+              }
+              const fyTotal = isCfFyTotalColumn(dc.total)
+              return (
+                <td
+                  key={`kpihdr-total-${dc.total.key}`}
+                  style={{
+                    background: totalColumnBackground(dc.total) ?? '#F8FAFC',
+                    borderLeft: fyTotal ? '2px solid rgba(30,58,95,0.15)' : '1px solid rgba(30,58,95,0.08)',
+                  }}
+                />
+              )
+            })}
+            {reconciledExtras.map(c => (
+              <td key={`kpi-hdr-${c.id}`} style={{ background: '#F8FAFC', borderLeft: '1px solid rgba(30,58,95,0.08)' }} />
+            ))}
+          </tr>,
+        )
+      }
       nodes.push(renderRow(row, depth))
       if (!checkOpen(row.id)) continue
       if (row.children?.length) {

@@ -13,6 +13,7 @@ from sqlalchemy import text
 from app.db import engine
 from app.routers import admin as admin_router
 from app.routers import action_notes as action_notes_router
+from app.routers import anlagen as anlagen_router
 from app.routers import auth as auth_router
 from app.routers import budget as budget_router
 from app.routers import directory as directory_router
@@ -22,8 +23,12 @@ from app.routers import financials_compat as financials_compat_router
 from app.routers import gl_lines_compat as gl_lines_compat_router
 from app.routers import ingest as ingest_router
 from app.routers import mapping_editor as mapping_editor_router
+from app.routers import masters as masters_router
 from app.routers import meta_compat as meta_compat_router
 from app.routers import metrics_compat as metrics_compat_router
+from app.routers import opos as opos_router
+from app.routers import personnel as personnel_router
+from app.routers import fixed_assets as fixed_assets_router
 from app.routers import plan as plan_router
 from app.routers import projects as projects_router
 from app.routers import sales_compat as sales_compat_router
@@ -43,9 +48,15 @@ app.add_middleware(
         "http://localhost:5174",
         "http://localhost:5175",
         "http://localhost:5176",
+        "http://localhost:5177",
+        "http://localhost:5178",
+        "http://localhost:5179",
         "http://127.0.0.1:5174",
         "http://127.0.0.1:5175",
         "http://127.0.0.1:5176",
+        "http://127.0.0.1:5177",
+        "http://127.0.0.1:5178",
+        "http://127.0.0.1:5179",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -59,6 +70,13 @@ app.include_router(admin_router.router)
 # P1 ingestion
 app.include_router(ingest_router.router)
 app.include_router(mapping_editor_router.router)
+# Customer / Supplier master editor (list/search + single-row add/edit)
+app.include_router(masters_router.router)
+# D3/D4 DRAFT — fixed-asset register + OPOS pass-through ingest (no computed math)
+app.include_router(anlagen_router.router)
+app.include_router(opos_router.router)
+app.include_router(personnel_router.router)
+app.include_router(fixed_assets_router.router)
 # DF5 plan / forecast
 app.include_router(plan_router.router)
 # Manual budget (Plan/Forecast extension, Phase 4) — position + partner grain

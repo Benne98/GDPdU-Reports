@@ -12,7 +12,7 @@
  * Extracted from IngestionPage.tsx so it can be mounted in any parent wizard.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   commitIngest,
   previewEntityAssignments,
@@ -25,6 +25,16 @@ import {
 } from "../../lib/gdpduApi";
 import { StepCard } from "./IngestStepCard";
 import ValidationReport from "./ValidationReport";
+
+// ---------------------------------------------------------------------------
+// Required GL column keys — must be mapped before a validate request can fire.
+// Mirrors REQUIRED_GL_COLUMN_KEYS in ColumnMapper.tsx (kept inline so this
+// component stays self-contained without a new import).
+const REQUIRED_GL_VALIDATE_COLS: Array<[key: string, label: string]> = [
+  ["posting_date", "Posting date"],
+  ["journal_entry_number", "Transaction/journal number"],
+  ["account_number", "Account number"],
+];
 
 // ---------------------------------------------------------------------------
 // Props
@@ -42,6 +52,12 @@ export interface ValidierungStepProps {
    * actual commit happens later in a separate Finish step.
    */
   stagingMode?: boolean;
+  /**
+   * Optional stage gate forwarded to POST /ingest/validate.
+   * When 'gl': only S1, S2, B1, B2, B3, Q2 checks run — no reconciliation / chart mapping.
+   * Omit (undefined) for the full catalog — protects the Data Update flow in IngestionPage.
+   */
+  stage?: 'gl' | 'coa' | 'partner' | 'all';
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +71,7 @@ export default function ValidierungStep({
   onEntityAssignmentsChange,
   onImportSuccess,
   stagingMode = false,
+  stage,
 }: ValidierungStepProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,18 +81,36 @@ export default function ValidierungStep({
   const [entityLoading, setEntityLoading] = useState(true);
   const [entityReady, setEntityReady] = useState(false);
   const [entityPreviewTick, setEntityPreviewTick] = useState(0);
-  const [excludedLineIds, setExcludedLineIds] = useState<number[]>([]);
+  const [excludedLineIds, setExcludedLineIds] = useState<string[]>([]);
   const [excluding, setExcluding] = useState(false);
 
-  async function runValidationWithExclusions(lineIds: number[] = excludedLineIds) {
+  // Always-current ref so runValidation never closes over a stale profile prop.
+  // IMPORTANT: updated via direct render-time assignment, NOT via useEffect.
+  // useEffect fires after the browser paints, which leaves a one-render window
+  // where profileRef.current is stale — the root of the "posting_date not mapped"
+  // flaky error when the user clicks Run checks immediately after header
+  // confirmation. Direct assignment during render is the established React
+  // pattern for keeping a ref synchronised with a prop without lag.
+  const profileRef = useRef<Profile>(profile);
+  profileRef.current = profile;
+
+  // Derive which required GL columns are absent from the current profile.
+  // Computed from the prop directly (not the ref) so the guard reflects the
+  // latest render even before runValidation is called.
+  const missingValidateCols = REQUIRED_GL_VALIDATE_COLS
+    .filter(([key]) => !profile.columns[key])
+    .map(([, label]) => label);
+
+  async function runValidationWithExclusions(lineIds: string[] = excludedLineIds) {
     setLoading(true);
     setError(null);
     try {
       const r = await validateIngest({
         file_id: uploadResult.file_id,
         sheet: uploadResult.sheets[0],
-        profile,
+        profile: profileRef.current,
         exclude_line_ids: lineIds,
+        ...(stage !== undefined ? { stage } : {}),
       });
       setResult(r);
       onResult(r);
@@ -86,7 +121,7 @@ export default function ValidierungStep({
     }
   }
 
-  async function applyExclusions(addIds: number[]) {
+  async function applyExclusions(addIds: string[]) {
     const next = [...new Set([...excludedLineIds, ...addIds])];
     setExcludedLineIds(next);
     setExcluding(true);
@@ -122,13 +157,18 @@ export default function ValidierungStep({
       .then((preview) => {
         if (cancelled) return;
         setEntityPreview(preview);
-        if (!preview.needs_confirmation) {
-          const auto = Object.fromEntries(
-            preview.mappings.map((m) => [m.source_label, m.entity_prefix])
-          );
-          onEntityAssignmentsChange(auto);
-          setEntityReady(true);
-        }
+        // Always auto-apply the proposed assignments keyed by source_label.
+        // For existing entities (needs_confirmation=false) this was already the
+        // behaviour. For NEW entities on a blank project (needs_confirmation=true)
+        // we also auto-apply so the parent profile gets entity_assignments before
+        // "Run checks" fires. The proposed prefix table is still shown so the
+        // user can review; the old manual-confirm button is repurposed as an
+        // optional "looks good" acknowledgement rather than a hard gate.
+        const auto = Object.fromEntries(
+          preview.mappings.map((m) => [m.source_label, m.entity_prefix])
+        );
+        onEntityAssignmentsChange(auto);
+        setEntityReady(true);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -148,15 +188,6 @@ export default function ValidierungStep({
     onEntityAssignmentsChange,
     entityPreviewTick,
   ]);
-
-  function confirmEntityAssignments() {
-    if (!entityPreview) return;
-    const assignments = Object.fromEntries(
-      entityPreview.mappings.map((m) => [m.source_label, m.entity_prefix])
-    );
-    onEntityAssignmentsChange(assignments);
-    setEntityReady(true);
-  }
 
   async function runValidation() {
     await runValidationWithExclusions(excludedLineIds);
@@ -224,17 +255,13 @@ export default function ValidierungStep({
                   ))}
                 </tbody>
               </table>
-              {entityPreview.needs_confirmation && !entityReady && (
-                <button
-                  type="button"
-                  onClick={confirmEntityAssignments}
-                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
-                >
-                  Confirm prefix assignment
-                </button>
-              )}
-              {entityReady && entityPreview.needs_confirmation && (
-                <p className="text-xs text-emerald-700">Prefix assignment confirmed.</p>
+              {entityPreview.needs_confirmation && (
+                <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+                  New entity — prefix auto-assigned from the proposed mapping above.
+                  The assignment will be confirmed when you run checks. To use a
+                  different prefix, contact your administrator to pre-register the
+                  entity in the database.
+                </p>
               )}
               {!entityPreview.needs_confirmation && (
                 <p className="text-xs text-slate-500">
@@ -247,13 +274,24 @@ export default function ValidierungStep({
             <div className="rounded-md border border-slate-200 bg-white p-4 text-xs text-slate-600 space-y-1">
               <p className="font-semibold text-slate-800 text-sm">What "Run checks" validates</p>
               <p>Staging only — nothing is written to the database until commit.</p>
-              <ul className="list-disc pl-4 space-y-0.5">
-                <li><strong>B1</strong> — each booking should balance (warning only for GoBD — can be ignored on import)</li>
-                <li><strong>B2</strong> — whole ledger per entity must balance</li>
-                <li><strong>B3</strong> — monthly movements per entity must balance</li>
-                <li><strong>S1</strong> — required fields filled; account key built from entity + account number</li>
-                <li>Posting dates, unique row numbers, reconciliation, chart mapping</li>
-              </ul>
+              {stage === 'gl' ? (
+                <ul className="list-disc pl-4 space-y-0.5">
+                  <li><strong>S1</strong> — required fields filled; account key built from entity + account number</li>
+                  <li><strong>S2</strong> — posting year matches booking date</li>
+                  <li><strong>B1</strong> — each booking should balance (warning only for GoBD — can be ignored on import)</li>
+                  <li><strong>B2</strong> — whole ledger per entity must balance</li>
+                  <li><strong>B3</strong> — monthly movements per entity must balance</li>
+                  <li><strong>Q2</strong> — row numbers are unique</li>
+                </ul>
+              ) : (
+                <ul className="list-disc pl-4 space-y-0.5">
+                  <li><strong>B1</strong> — each booking should balance (warning only for GoBD — can be ignored on import)</li>
+                  <li><strong>B2</strong> — whole ledger per entity must balance</li>
+                  <li><strong>B3</strong> — monthly movements per entity must balance</li>
+                  <li><strong>S1</strong> — required fields filled; account key built from entity + account number</li>
+                  <li>Posting dates, unique row numbers, reconciliation, chart mapping</li>
+                </ul>
+              )}
             </div>
           )}
           <div className="flex flex-col items-center py-6 gap-4">
@@ -262,9 +300,11 @@ export default function ValidierungStep({
                 ? "Resolving entity prefixes…"
                 : error && !entityPreview
                   ? "Entity prefix preview could not be loaded."
-                  : entityReady
-                    ? "Click “Run checks” to execute the validation catalog."
-                    : "Confirm entity prefix assignment to continue."}
+                  : missingValidateCols.length > 0
+                    ? "Column mapping is incomplete — see the note below."
+                    : entityReady
+                      ? "Click “Run checks” to execute the validation catalog."
+                      : "Confirm entity prefix assignment to continue."}
             </p>
             {error && !entityPreview && !entityLoading && (
               <button
@@ -275,10 +315,20 @@ export default function ValidierungStep({
                 Retry entity preview
               </button>
             )}
+            {missingValidateCols.length > 0 && (
+              <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-4 py-2.5 text-center max-w-md">
+                {`${missingValidateCols.join(', ')} ${missingValidateCols.length === 1 ? 'is' : 'are'} not mapped. Go back to the header step, assign ${missingValidateCols.length === 1 ? 'this column' : 'these columns'}, then return here.`}
+              </p>
+            )}
             <button
               type="button"
               onClick={runValidation}
-              disabled={!entityReady || entityLoading || (!!error && !entityPreview)}
+              disabled={
+                !entityReady ||
+                entityLoading ||
+                (!!error && !entityPreview) ||
+                missingValidateCols.length > 0
+              }
               className="rounded-md bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40"
             >
               Run checks

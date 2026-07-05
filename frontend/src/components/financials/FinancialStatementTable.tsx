@@ -519,7 +519,7 @@ export default function FinancialStatementTable({
   if (!data?.rows.length) {
     return (
       <div className="rounded-xl p-8 text-center text-sm" style={{ background: '#FFF', border: '1px solid #E2E8F0', color: '#64748B' }}>
-        Keine Zeilen für diesen Zeitraum / diese Entity. Prüfe, ob die Demo-Daten geladen sind (setup_db) und ob der Zeitraum in der Datenbank existiert.
+        No rows for this period or entity. Check that demo data is loaded (setup_db) and that the period exists in the database.
       </div>
     )
   }

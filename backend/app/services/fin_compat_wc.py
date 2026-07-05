@@ -81,14 +81,24 @@ from app.services.fin_compat_bs import (
     _apply_snapshot_fy_forecast_amounts,
     _snap_deltas,
     _snapshot_net_profit_ytg_plan,
+    _sort_children_by_label,
     col_labels_bs_snapshot,
 )
-from app.services.fin_compat_pl import _deltas, _round_am
+from app.services.fin_compat_pl import (
+    _apply_plan_data,
+    _deltas,
+    _round_am,
+    _statement_structure_rows,
+    attach_hierarchy_plan_to_rows,
+    load_position_plan_map,
+    load_position_plan_map_pref,
+)
 from app.services.fin_compat_sql import (
     _last_12_periods,
     col_labels_annual,
     col_labels_month,
     col_labels_week,
+    entities_sql_fragment,
     entity_sql_fragment,
     iso_week_bounds,
     last_day,
@@ -131,6 +141,14 @@ WC_ORDER = {"TWC": 0, "OWC": 1}
 # Grouping hierarchy (outer → inner). KPIs key off level_3 (Inventories / Trade
 # receivables / Trade payables), so level_3 is the second grouping level.
 WC_HIER_KEYS = ["l6_na_mapping", "level_3", "level_4"]
+
+# Trade WC mapping-line presentation order (level_3 under TWC).
+WC_TWC_L3_ORDER = [
+    WC_INV_L3,
+    WC_REC_L3,
+    WC_PAY_L3,
+    "Advance payments received",
+]
 
 _AM_KEYS = list(_WC_KEYS_MONTH)  # py_cm, pm, cm, ytd, ytd_py
 
@@ -205,6 +223,31 @@ def _keep_wc(grains: list[dict]) -> list[dict]:
     return [g for g in grains if (g.get("l6_na_mapping") or "").strip() in WC_MAPPINGS]
 
 
+def _wc_account_label(gid: str, ang: str, name: str) -> str:
+    """Display label for GL account rows: ``{id} | {name}`` (consolidated WC style)."""
+    disp_id = (gid or ang or "").strip()
+    disp_name = (name or "").strip() or "—"
+    if disp_id:
+        return f"{disp_id} | {disp_name}"
+    return disp_name if disp_name != "—" else "—"
+
+
+def _wc_group_labels(path: dict[str, str], key: str, grouped: dict[str, list[dict]]) -> list[str]:
+    """Child-group iteration order at this hierarchy level."""
+    if key == "level_3" and (path.get("l6_na_mapping") or "").strip() == "TWC":
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for lbl in WC_TWC_L3_ORDER:
+            if lbl in grouped:
+                ordered.append(lbl)
+                seen.add(lbl)
+        for lbl in sorted(grouped.keys()):
+            if lbl not in seen:
+                ordered.append(lbl)
+        return ordered
+    return sorted(grouped.keys())
+
+
 # ---------------------------------------------------------------------------
 # Generic recursive hierarchy builder (shared by statement / consolidation /
 # monthly).  ``get_am`` extracts a {key: value} dict from a grain row; ``node``
@@ -242,8 +285,8 @@ def _wc_tree(
         out: list[dict[str, Any]] = []
         for akey in order:
             v = by_acc[akey]
-            gid = v["gid"] or v["ang"]
-            label = f"{gid} | {v['name']}" if (gid and v["name"]) else (v["name"] or gid or "—")
+            gid = (v["gid"] or v["ang"] or "").strip()
+            label = _wc_account_label(v["gid"], v["ang"], v["name"])
             out.append(leaf(akey, label, v["am"], path, gid or None, v["grs"]))
         out.sort(key=lambda r: r["label"])
         return out
@@ -260,7 +303,7 @@ def _wc_tree(
                         get_am=get_am, node=node, leaf=leaf, id_prefix=id_prefix)
 
     out = []
-    for label in sorted(grouped.keys()):
+    for label in _wc_group_labels(path, key, grouped):
         grs = grouped[label]
         new_path = {**path, key: label}
         total = _zero(keys)
@@ -318,6 +361,60 @@ def _rename_and_sort_sections(rows: list[dict[str, Any]]) -> None:
             row["label"] = mapped
 
 
+def _sort_wc_display_order(rows: list[dict[str, Any]]) -> None:
+    """TWC mapping-line order: Inventories → Receivables → Payables → Advance payments."""
+
+    def _walk(node_rows: list[dict[str, Any]], parent_label: str = "") -> None:
+        if not node_rows:
+            return
+        parent = (parent_label or "").strip()
+        if parent in ("TWC", "Trade Working Capital"):
+            _sort_children_by_label(node_rows, WC_TWC_L3_ORDER)
+        for row in node_rows:
+            label = (row.get("label") or "").strip()
+            children = row.get("children") or []
+            if children:
+                _walk(children, label)
+
+    _walk(rows)
+
+
+def _wc_kpi_header_row(*, id_prefix: str = "wc") -> dict[str, Any]:
+    return {
+        "id": f"{id_prefix}-kpi-header",
+        "line_code": "WC_KPI_HEADER",
+        "row_kind": "kpi_header",
+        "label": "KPIs — working capital days",
+        "is_bold": False,
+        "has_children": False,
+        "children": [],
+    }
+
+
+def _wc_consl_kpi_header_row(
+    entity_codes: list[str],
+    *,
+    zero_periods: Optional[dict[str, float]] = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": "wc-kpi-header",
+        "label": "KPIs — working capital days",
+        "row_kind": "kpi_header",
+        "is_bold": False,
+        "entity_amounts": {ec: 0.0 for ec in entity_codes},
+        "aggregated": 0.0,
+        "ic_eliminations": 0.0,
+        "consolidation": 0.0,
+        "has_children": False,
+        "children": [],
+    }
+    if zero_periods is not None:
+        row["entity_periods"] = {ec: dict(zero_periods) for ec in entity_codes}
+        row["aggregated_periods"] = dict(zero_periods)
+        row["consolidation_periods"] = dict(zero_periods)
+    return row
+
+
 def _wc_drill(path: dict[str, str], gid: Optional[str] = None) -> dict[str, Any]:
     drill: dict[str, Any] = {"statement_type": "BS"}
     l6 = (path.get("l6_na_mapping") or "").strip()
@@ -367,7 +464,7 @@ def _kpi_rows(
         )
         for kk in kpi_am:
             kpi_am[kk][col] = vals[kk]
-    out: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = [_wc_kpi_header_row()]
     for rid, label, kk in _WC_KPI_ROWS:
         out.append({
             "id": rid, "line_code": f"WC_{kk}", "row_kind": "kpi", "label": label,
@@ -419,15 +516,28 @@ def build_wc_statement_compat(
     iso_year: Optional[int] = None,
     iso_week: Optional[int] = None,
     entity: Optional[str] = None,
+    allowed_entities: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     """Legacy FinancialStatementResponse for working capital (statement='wc').
 
     Raw cumulative balances grouped TWC/OWC → level_3 → level_4 → account; a Net
     working capital subtotal (Σ TWC+OWC); DSO/DIO/DPO/CCC days KPIs per column.
     See module docstring for FORMULA / WORKED EXAMPLE / EDGE CASES.
+
+    ``allowed_entities`` (fail-closed tenant isolation): set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  When provided it
+    is the ONLY entity filter (``entity`` ignored — caller has already intersected
+    it) and threads through the grain and the LTM denominators; an EMPTY set fails
+    closed (matches nothing).  ``None`` preserves the exact legacy behaviour.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if allowed_entities is not None:
+        ent_frag = (
+            entities_sql_fragment(sorted(allowed_entities))
+            if allowed_entities else "AND 1 = 0"
+        )
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
 
     is_week = period_grain == "week"
     if is_week:
@@ -467,14 +577,28 @@ def build_wc_statement_compat(
     rows = _wc_tree(grains, 0, {}, 0, keys=keys, get_am=lambda g: _grain_am(g, keys),
                     node=_node, leaf=_leaf)
     _rename_and_sort_sections(rows)
+    _sort_wc_display_order(rows)
     _wc_normalize_row_kinds(rows)
     _wc_apply_aggregate_bold_only(rows)
 
+    wc_plan_map = load_position_plan_map_pref(session, "BS", yr, mo, ent_frag)
+    if wc_plan_map:
+        attach_hierarchy_plan_to_rows(
+            rows, wc_plan_map, _statement_structure_rows(session, "BS"),
+        )
+
     # Net working capital subtotal (Σ all TWC+OWC).
     nwc = _nwc_total(grains, keys)
+    nwc_am = _round_am(nwc)
+    if wc_plan_map:
+        nwc_plan = sum(
+            float((r.get("amounts") or {}).get("plan_cm") or 0.0) for r in rows
+        )
+        if abs(nwc_plan) > 1e-6:
+            nwc_am = _round_am(_apply_plan_data(nwc_am, {"plan_cm": nwc_plan}))
     rows.append({
         "id": "wc-net-total", "line_code": "NWC", "row_kind": "subtotal",
-        "label": "Net working capital", "amounts": _round_am(nwc),
+        "label": "Net working capital", "amounts": nwc_am,
         "deltas": _round_am(_deltas(nwc, invert=False)), "invert_delta": False,
         "is_bold": True, "drill": None, "has_children": False, "children": [],
     })
@@ -536,6 +660,100 @@ def _am_multi_from_grains(
         for k in snap_keys:
             sums[code][k] += float(g.get(k) or 0.0)
     return sums
+
+
+def _wc_balances_by_entity_l3(
+    grains: list[dict],
+    l3: str,
+    ep_to_code: dict[str, str],
+    col: str,
+) -> dict[str, float]:
+    """Per-entity Σ raw balances for ``l3`` at snapshot column ``col``."""
+    out: dict[str, float] = {}
+    for g in grains:
+        if (g.get("level_3") or "").strip() != l3:
+            continue
+        code = ep_to_code.get((g.get("entity_prefix") or "").strip())
+        if not code:
+            continue
+        out[code] = out.get(code, 0.0) + float(g.get(col) or 0.0)
+    return out
+
+
+def _wc_consl_annual_kpi_rows(
+    session: Session,
+    grains: list[dict],
+    entity_codes: list[str],
+    ep_to_code: dict[str, str],
+    snap_keys: list[str],
+    *,
+    year: int,
+    month: int,
+) -> list[dict[str, Any]]:
+    """Annual consolidation DAYS KPIs — one value per snapshot column (like snapshot builder)."""
+    col_dates = {
+        "dec_py2": last_day(year - 3, 12),
+        "fy_py": last_day(year - 2, 12),
+        "fy": last_day(year - 1, 12),
+        "cm_py": last_day(year - 1, month),
+        "cm": last_day(year, month),
+    }
+    col_ltm_all = {col: _ltm_through(session, col_dates[col], "") for col in snap_keys}
+    code_to_ep = {v: k for k, v in ep_to_code.items()}
+    ent_ltm: dict[str, dict[str, tuple[float, float]]] = {}
+    for ec in entity_codes:
+        ep = code_to_ep.get(ec, "")
+        frag = entity_sql_fragment(ep) if ep else ""
+        ent_ltm[ec] = {col: _ltm_through(session, col_dates[col], frag) for col in snap_keys}
+
+    kpi_entity_periods: dict[str, dict[str, dict[str, float]]] = {
+        kk: {ec: {} for ec in entity_codes} for kk in ("DIO", "DSO", "DPO", "CCC")
+    }
+    kpi_consl_periods: dict[str, dict[str, float]] = {kk: {} for kk in ("DIO", "DSO", "DPO", "CCC")}
+
+    for col in snap_keys:
+        inv_ec = _wc_balances_by_entity_l3(grains, WC_INV_L3, ep_to_code, col)
+        rec_ec = _wc_balances_by_entity_l3(grains, WC_REC_L3, ep_to_code, col)
+        pay_ec = _wc_balances_by_entity_l3(grains, WC_PAY_L3, ep_to_code, col)
+        rev_l, cogs_l = col_ltm_all[col]
+        consl_vals = compute_wc_kpis(
+            abs(sum(inv_ec.values())), abs(sum(rec_ec.values())), abs(sum(pay_ec.values())),
+            rev_l, cogs_l,
+        )
+        for ec in entity_codes:
+            rev_e, cogs_e = ent_ltm[ec][col]
+            ent_vals = compute_wc_kpis(
+                abs(inv_ec.get(ec, 0.0)), abs(rec_ec.get(ec, 0.0)), abs(pay_ec.get(ec, 0.0)),
+                rev_e, cogs_e,
+            )
+            for kk in kpi_entity_periods:
+                kpi_entity_periods[kk][ec][col] = ent_vals[kk]
+        for kk in kpi_consl_periods:
+            kpi_consl_periods[kk][col] = consl_vals[kk]
+
+    zero_periods = {k: 0.0 for k in snap_keys}
+    rows_out: list[dict[str, Any]] = [
+        _wc_consl_kpi_header_row(entity_codes, zero_periods=zero_periods),
+    ]
+    for rid, label, kk in _WC_KPI_ROWS:
+        consl_periods = {k: round(kpi_consl_periods[kk].get(k, 0.0), 1) for k in snap_keys}
+        rows_out.append({
+            "id": rid, "label": label, "row_kind": "kpi", "is_bold": False,
+            "entity_amounts": {
+                ec: round(kpi_entity_periods[kk][ec].get("cm", 0.0), 1) for ec in entity_codes
+            },
+            "entity_periods": {
+                ec: {k: round(kpi_entity_periods[kk][ec].get(k, 0.0), 1) for k in snap_keys}
+                for ec in entity_codes
+            },
+            "aggregated": 0.0,
+            "aggregated_periods": dict(consl_periods),
+            "ic_eliminations": 0.0,
+            "consolidation": consl_periods.get("cm", 0.0),
+            "consolidation_periods": consl_periods,
+            "has_children": False, "children": [],
+        })
+    return rows_out
 
 
 def _consl_row_annual_wc(
@@ -640,6 +858,7 @@ def build_wc_consolidation(
             node=_node_annual, leaf=_leaf_annual,
         )
         _rename_and_sort_sections(rows)
+        _sort_wc_display_order(rows)
         _wc_normalize_row_kinds(rows)
         _wc_apply_aggregate_bold_only(rows)
 
@@ -649,64 +868,9 @@ def build_wc_consolidation(
             nwc_multi, entity_codes, snap_keys,
         ))
 
-        l3_ec: dict[str, dict[str, float]] = {}
-        for g in grains:
-            l3 = (g.get("level_3") or "").strip()
-            code = ep_to_code.get((g.get("entity_prefix") or "").strip())
-            if not code:
-                continue
-            l3_ec.setdefault(l3, {})
-            l3_ec[l3][code] = l3_ec[l3].get(code, 0.0) + float(g.get("cm") or 0.0)
-        inv_ec = l3_ec.get(WC_INV_L3, {})
-        rec_ec = l3_ec.get(WC_REC_L3, {})
-        pay_ec = l3_ec.get(WC_PAY_L3, {})
-
-        start, _ = ltm_window(d_cm)
-        pl_sql, pl_params = wc_pl_window_sql(start, d_cm, "", by_entity=True)
-        ltm_by_ep: dict[str, tuple[float, float]] = {}
-        for r in session.execute(text(pl_sql), pl_params).fetchall():
-            d = dict(r._mapping)
-            ltm_by_ep[(d.get("entity_prefix") or "").strip()] = (
-                float(d.get("revenue") or 0.0), float(d.get("cogs") or 0.0))
-        code_to_ep = {v: k for k, v in ep_to_code.items()}
-        ltm_by_ec = {ec: ltm_by_ep.get(code_to_ep.get(ec, ""), (0.0, 0.0)) for ec in entity_codes}
-
-        rev_total = sum(v[0] for v in ltm_by_ec.values())
-        cogs_total = sum(v[1] for v in ltm_by_ec.values())
-        kpis_consl = compute_wc_kpis(
-            abs(sum(inv_ec.values())), abs(sum(rec_ec.values())), abs(sum(pay_ec.values())),
-            rev_total, cogs_total)
-
-        ent_kpi: dict[str, dict[str, float]] = {k: {} for k in ("DIO", "DSO", "DPO", "CCC")}
-        for ec in entity_codes:
-            rev_l, cogs_l = ltm_by_ec.get(ec, (0.0, 0.0))
-            vals = compute_wc_kpis(abs(inv_ec.get(ec, 0.0)), abs(rec_ec.get(ec, 0.0)),
-                                   abs(pay_ec.get(ec, 0.0)), rev_l, cogs_l)
-            for kk in ent_kpi:
-                ent_kpi[kk][ec] = vals[kk]
-
-        zero_periods = {k: 0.0 for k in snap_keys}
-        rows.append({
-            "id": "wc-kpi-header", "label": "KPIs — working capital days",
-            "row_kind": "kpi_header", "is_bold": False,
-            "entity_amounts": {ec: 0.0 for ec in entity_codes},
-            "entity_periods": {ec: dict(zero_periods) for ec in entity_codes},
-            "aggregated": 0.0, "aggregated_periods": dict(zero_periods),
-            "ic_eliminations": 0.0, "consolidation": 0.0,
-            "consolidation_periods": dict(zero_periods),
-            "has_children": False, "children": [],
-        })
-        for rid, label, kk in _WC_KPI_ROWS:
-            consl_val = kpis_consl[kk]
-            rows.append({
-                "id": rid, "label": label, "row_kind": "kpi", "is_bold": False,
-                "entity_amounts": {ec: round(ent_kpi[kk].get(ec, 0.0), 1) for ec in entity_codes},
-                "entity_periods": {ec: dict(zero_periods) for ec in entity_codes},
-                "aggregated": 0.0, "aggregated_periods": dict(zero_periods),
-                "ic_eliminations": 0.0, "consolidation": consl_val,
-                "consolidation_periods": {**dict(zero_periods), "cm": consl_val},
-                "has_children": False, "children": [],
-            })
+        rows.extend(_wc_consl_annual_kpi_rows(
+            session, grains, entity_codes, ep_to_code, snap_keys, year=yr, month=mo,
+        ))
 
         col_label = labels.get("cm", period_label(yr, mo))
         out: dict[str, Any] = {
@@ -732,6 +896,7 @@ def build_wc_consolidation(
     rows = _wc_tree(grains, 0, {}, 0, keys=entity_codes, get_am=_get_am,
                     node=_node, leaf=_leaf)
     _rename_and_sort_sections(rows)
+    _sort_wc_display_order(rows)
     _wc_normalize_row_kinds(rows)
     _wc_apply_aggregate_bold_only(rows)
 
@@ -780,13 +945,7 @@ def build_wc_consolidation(
         for kk in ent_kpi:
             ent_kpi[kk][ec] = vals[kk]
 
-    rows.append({
-        "id": "wc-kpi-header", "label": "KPIs — working capital days",
-        "row_kind": "kpi_header", "is_bold": False,
-        "entity_amounts": {ec: 0.0 for ec in entity_codes},
-        "aggregated": 0.0, "ic_eliminations": 0.0, "consolidation": 0.0,
-        "has_children": False, "children": [],
-    })
+    rows.append(_wc_consl_kpi_header_row(entity_codes))
     for rid, label, kk in _WC_KPI_ROWS:
         rows.append({
             "id": rid, "label": label, "row_kind": "kpi", "is_bold": False,
@@ -865,6 +1024,7 @@ def build_wc_monthly(
     rows = _wc_tree(grains, 0, {}, 0, keys=all_keys,
                     get_am=lambda g: _grain_am(g, all_keys), node=_node, leaf=_leaf)
     _rename_and_sort_sections(rows)
+    _sort_wc_display_order(rows)
     _wc_normalize_row_kinds(rows)
     _wc_apply_aggregate_bold_only(rows)
 
@@ -962,12 +1122,26 @@ def build_wc_snapshot_annual(
     year: int,
     month: int,
     entity: Optional[str] = None,
+    allowed_entities: Optional[set[str]] = None,
 ) -> dict[str, Any]:
     """ErSnapshotResponse for working capital — raw cumulative balances at 4 dates
     (fy_py / fy / cm_py / cm) with snapshot deltas (delta_fy, delta_cm), an NWC
-    subtotal and DAYS KPIs (LTM ending at each column's period date)."""
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    subtotal and DAYS KPIs (LTM ending at each column's period date).
+
+    ``allowed_entities`` (fail-closed tenant isolation): set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  When provided it
+    is the ONLY entity filter (``entity`` ignored — caller has already intersected
+    it) and threads through both the balance grain and the LTM denominators; an
+    EMPTY set fails closed (matches nothing).  ``None`` preserves legacy behaviour.
+    """
+    if allowed_entities is not None:
+        ent_frag = (
+            entities_sql_fragment(sorted(allowed_entities))
+            if allowed_entities else "AND 1 = 0"
+        )
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
 
     sql, params = wc_snapshot_grain_sql(year, month, ent_frag)
     grains = _keep_wc([dict(r._mapping) for r in session.execute(text(sql), params).fetchall()])
@@ -995,6 +1169,7 @@ def build_wc_snapshot_annual(
     rows = _wc_tree(grains, 0, {}, 0, keys=keys, get_am=lambda g: _grain_am(g, keys),
                     node=_node, leaf=_leaf)
     _rename_and_sort_sections(rows)
+    _sort_wc_display_order(rows)
     _wc_normalize_row_kinds(rows)
     _wc_apply_aggregate_bold_only(rows)
 

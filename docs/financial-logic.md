@@ -176,6 +176,84 @@ the `800_000_000_000` band with JEGN `<EE>9<acct>`; **carry_forward** uses the
 `900_000_000_000` band (`etl.opening_balance._SYNTHETIC_BID_BASE`) with JEGN
 `<EE>8<YY><acct>`.
 
+### File-OB fiscal year & posting date (no formula/sign change)
+
+A file-OB upload carries only **account number + amount** — no posting date and no
+transaction number. So `apply_profile(..., opening_balance=True)` makes those two
+columns optional **for the OB path only** (GL stays strictly required). The fiscal
+year is sourced **explicitly**, never derived from a (missing) date:
+
+- **first-year mode** → `fiscal_year` is **fixed** to the project's first GL year.
+- **all-years mode** → `fiscal_year` comes from a mapped **fiscal-year column**.
+
+`from_date` fiscal-year mode is rejected for OB (there is no date to derive from).
+The `posting_date` is then **synthesized as Jan 1 of that fiscal year** in
+`opening_balance_commit` (the opening stock is read via `MIN(posting_date)` per
+account). Opening stock belongs to the **first year only**; later years are **not**
+re-loaded from a file — they carry forward from the prior year's GL closings
+(`carry_forward` mode below). No sign or formula change.
+
+### File-OB number-format parse rule + magnitude guard (no sign change)
+
+A file-OB upload's amount column may arrive in **US** (`52803.84`) or **German**
+(`52.803,84`) number format. Parsing US amounts with a German profile (strip `.` as a
+thousands separator) silently inflates them by orders of magnitude (`52803.84` →
+`5280384` → with more digits ~`5.3e16`), which overflows `fact_gl_line.amount`
+`NUMERIC(18,6)` and used to surface as a generic 500. Two layers protect the
+committed amount:
+
+**1. Decimal-separator sniff (correctness).**
+`etl/mapping.py::sniff_decimal_separator(values) -> (decimal, thousands) | None` votes
+on a sample of amount-column strings (currency/sign stripped). Per value:
+
+- both `.` and `,` present → the separator whose **last occurrence is rightmost** is
+  the decimal, the other is thousands;
+- only one separator, occurring **>1×** → thousands grouping only (no vote);
+- only one separator, **exactly once**, trailing-digit count **≠ 3** → that char is the
+  decimal;
+- only one separator, exactly once, **exactly 3 trailing digits** → **ambiguous**,
+  abstain (e.g. `1,234` could be grouped `1234` or decimal `1.234`);
+- no separator → no vote.
+
+Strict majority wins; a tie or all-abstain sample → `None`. In `opening_balance_commit`'s
+loader (OB path only) the resolution is **layered**: a confident amount-column sniff
+wins, else the delimiter/dialect guess, else `.`. GL and German DATEV parsing are
+byte-identical to before (sniff is wired on the `opening_balance=True` path only).
+
+Worked examples (input → resolved `(decimal, thousands)` → committed `amount`):
+
+| input                | sniff        | committed amount |
+|----------------------|--------------|------------------|
+| `52803.84` (US)      | `('.', ',')` | `52803.84`       |
+| `52803.840000000004` | `('.', ',')` | `52803.84`       |
+| `52.803,84` (DE)     | `(',', '.')` | `52803.84`       |
+| `1.234.567,89` (DE)  | `(',', '.')` | `1234567.89`     |
+| `1,234,567.89` (US)  | `('.', ',')` | `1234567.89`     |
+| `1,234` (ambiguous)  | `None` (abstain) | — falls to layered default |
+
+**Edge cases:** empty/`None`/whitespace → abstain; pure thousands grouping
+(`1.234.567`, `123,456,789`) → abstain (no false decimal vote); mixed sample → majority.
+Known limitation: an **all-abstain** column (every value single-separator with exactly
+3 trailing digits, e.g. only `52.803`-style whole-thousands German integers) cannot be
+disambiguated from the amount column alone and falls through to the layered default —
+by design, and backstopped by the magnitude guard below.
+
+**2. Magnitude guard (defensive, `ingest.py::_assert_amount_magnitude`).**
+Immediately after `_assert_finite_amounts`, before the DB insert, every parsed OB amount
+must satisfy `|amount| < 1e12` (`_OB_AMOUNT_ABS_LIMIT`). Rationale: `NUMERIC(18,6)` =
+18 total / 6 fractional digits → **12 integer digits**, so Postgres rejects `|amount| >=
+1e12`. The largest amount in the real reference OB file is ~`5.29e7`, so the `1e12` bound
+sits **>4 orders of magnitude** above any legitimate figure — it rejects nothing real and
+turns a future mis-parse into a clear **422**: *"An opening-balance amount looks mis-scaled
+and is too large to store (check the file's number format / decimal separator). Example
+value(s): …"* (plain English, passes the frontend humanizer through unchanged instead of
+the generic "Something went wrong"). The happy path for in-range amounts is untouched. No
+sign convention or formula changes.
+
+Regression tests: `etl/tests/test_mapping.py::TestSniffDecimalSeparator` (sniff + parse
+roundtrip); `backend/tests/test_ob_amount_magnitude.py` (guard returns 422, not 500;
+in-range US/German amounts pass).
+
 ### Formula (carry_forward)
 
 For a **balance-sheet** account `a` of entity `e` (`dim_gl_account.level_0='BS'`)
@@ -1013,7 +1091,8 @@ The indirect-method Cash Flow reads GL movements grouped by `dim_gl_cf.cf_mappin
 asset increase −, liability increase +). `dim_gl_cf` is **derived reference data**
 (one row per `account_number_group, fiscal_year`); when empty the CF join matched
 nothing and the whole statement fell to 0. It is repopulated from a reusable,
-accumulating **`cf_mapping_library`** (migration `0017`, PK `(key_kind, key_1,
+accumulating **`lib_cf_mapping`** (migration `0017`, renamed from `cf_mapping_library`
+in `0019`; PK `(key_kind, key_1,
 key_2)`) keyed by the *classification* (not the account number), so any project
 whose accounts carry the same classification auto-matches.
 
@@ -1092,6 +1171,528 @@ reference data is shared, so `dim_gl_cf` is byte-identical across both DBs
 EBITDA + Taxes`; Net cash flow non-zero == Σ all mapped leaves; year-grain EBITDA
 non-zero. (Recommended add: a negative assertion locking `Other taxes` exclusion.)
 
+## NA mapping library — name-keyed classification + totals-guard re-derive
+
+The Net-asset / Working-capital classification `dim_gl_na (l6_na_mapping,
+l7_na_description)` was per-account; it is now a reusable LIBRARY keyed by
+`dim_gl_account.account_name`, resolved by MOST-FREQUENT, with a per-account
+`ovr_na_mapping` pin (precedence). Migration `0018_na_mapping_library` (single head
+after 0017) creates the library + override tables EMPTY (no-op, golden
+unaffected); migration `0019` renames them to `lib_na_mapping` + `ovr_na_mapping`. Seed: `backend/scripts/load_na_mapping_library.py`; re-derive:
+`backend/scripts/populate_dim_gl_na.py` (then re-runs `populate_dim_gl_cf.py`).
+
+This is **classification/presentation only** — no new KPI/sign/period formula.
+Its safety property is *roll-up totals unchanged*: sub-line reclassification is
+allowed, but NWC + every WC/CF subtotal & grandtotal stay identical.
+
+### Resolver (`etl/mapping_library/resolve.py::resolve_most_frequent`)
+
+```
+winner = argmax_over_rows( occurrences )       # most-frequent (name, mapping)
+ties broken by  min (na_mapping, na_description)  lexicographic   # 50/50 stable
+```
+
+Pure, deterministic, order-independent → a 50/50 loan split never flips between
+runs. Worked: `[(OWC,Other assets,8),(ND,Loan to employees,4)] → OWC/Other
+assets`; tie `[(OWC,Liab. due to affiliates,4),(ND,Loan to BSG Seifersbach,4)] →
+ND/Loan to BSG Seifersbach` (ND < OWC).
+
+### Totals-guard (`populate_dim_gl_na.changes_total`)
+
+For each account: final = `ovr_na_mapping` if present, else most-frequent(library).
+A resolution that would CHANGE a total is auto-pinned to the account's CURRENT
+mapping (`ovr_na_mapping`, `source='totals_guard'`). A total changes iff:
+
+```
+WC membership flips:  (cur_l6 ∈ {TWC,OWC}) != (new_l6 ∈ {TWC,OWC})   # NWC + WC subtotals
+   OR CF band differs: cf_lib[cur_l6,cur_l7].(l1,l2) != cf_lib[new].(l1,l2)  # CF subtotals
+```
+
+(`NWC = Σ TWC + Σ OWC`, `fin_compat_wc_sql` filters `l6 IN ('TWC','OWC')`; CF
+subtotals group on the `lib_cf_mapping` band `(l1,l2)`.)
+
+**Worked example (real data).** Account `03026135` "Darlehen Arbeitnehm." is
+currently ND/"Loan to employees" (NOT in WC). Its name's most-frequent mapping is
+OWC/"Other assets" (occ 8 > 4). Blind resolution ND→OWC would pull it INTO working
+capital → NWC changes. The guard detects the WC-membership flip, writes an
+`ovr_na_mapping` pinning `03026135` to ND/"Loan to employees" → NWC unchanged.
+
+### Verified result (v2 + live, FY2025/Jul, 5 entities + consolidated)
+
+331 distinct names; 20 ambiguous; 8 names guarded (the 3 known loans
+`Darl. Bet. GmbH an RC HS`, `Darl. RC BR an BSG Seifersbach`, `Darlehen
+Arbeitnehm.` + `Delcredere`, `MwSt-Zahllast`, `unreal. MWSt AR 19 %`,
+`Gewerbesteuerrückst`, `KöSt. Rückstellung`). Per account: 2900 unchanged, 68
+safe-reshuffled, 40 totals-guard pinned, 0 no-library. **164 WC/CF
+subtotal/grandtotal rows compared BEFORE vs AFTER on v2 → IDENTICAL to the cent;
+live-vs-v2 → EQUIVALENT** (both DBs re-derived by the identical pipeline). CF
+`[unmatched NA]=0` on both.
+
+### Edge cases
+
+* identical mapping → never changes a total (short-circuit, no override).
+* within-WC reshuffle, same CF band (e.g. TWC Inventories ↔ TWC Advance payments)
+  → safe, applied.
+* within-WC reshuffle, different CF band → CF total would change → pinned.
+* no library precedent for a name → keep current (cannot change a total).
+* idempotent: re-running re-counts the library and re-resolves; guard overrides
+  persist (UPSERT), so a second run is a no-op on totals.
+
+### Regression test
+
+`etl/tests/test_na_mapping_library.py` (DB-free, synthetic): `resolve_most_frequent`
+(argmax + lexicographic tiebreaker + order-independence + dict/NamedTuple/missing
+counts), `changes_total` (identity, WC-flip, within-WC same-band safe, within-WC
+different-band, the 3 loan crossers), override precedence, and NWC-membership
+identity on a small fixture (guarded crosser stays out of WC; safe name reshuffles).
+Plus the DB-backed `backend/tests/test_compat_cf.py::TestCfReconciliationV2`
+(green on the re-derived v2) and `test_compat_wc.py`.
+
+## Account mapping library — fill missing (account, year) + exclusive mode (migration 0021)
+
+Classification/presentation only — sets `dim_gl_account.level_*` hierarchy + sorts
+for fiscal years a project's mapping file never covered.  Introduces NO new KPI /
+sign / period formula.  Safety property: **additive no-op equivalence** (only
+INSERTs missing rows, never mutates an existing one), locked by the golden gate.
+
+### Tables (mirror the NA library, migration 0018/0019)
+
+* `lib_account_mapping` — one row per OBSERVED `(account_name, level_0..4, l4_sub,
+  sorts, is_ic)` with an `occurrences` COUNT, PK `(account_name, level_0, level_2,
+  level_3, level_4)`.  Seeded by `backend/scripts/load_account_mapping_library.py`
+  (GROUP BY over the current `dim_gl_account`).  Name-keyed because the hierarchy
+  is a property of the business account, recurring across entities/years.
+* `ovr_account_mapping` — per-account PIN `(account_number_group, fiscal_year)`,
+  PRECEDENCE over the library (the future Project-Setup reclassification writes here).
+
+### Resolver (pure) + fill
+
+`etl.mapping_library.resolve.resolve_account_most_frequent` — `winner =
+argmax(occurrences)`, deterministic tiebreaker on the smallest `(level_0, level_2,
+level_3, level_4)` (the library PK), so the winner is stable regardless of row order.
+
+`etl.account_fill.fill_missing_account_rows` — for every `(account, fy)` posted in
+`fact_gl_line` with NO `dim_gl_account` row: `ovr_account_mapping` pin else the
+resolver over `lib_account_mapping[account_name]`.  The `account_name` is borrowed
+from any existing dim row of the SAME `account_number_group` (latest year); no name
+or no library precedent → skipped + logged (never mis-classified).  Wired as
+`rebuild.py` stage 1b (after the CoA-override replay, before partner backfill).
+
+### Exclusive mode (the gate)
+
+`admin_project_config.config -> account_mapping_mode ∈ {'library','exclusive'}`
+(default `'library'`, resolved by `project_config.resolve_rebuild_flags`).  When
+`'exclusive'` the fill stage is SKIPPED — only the provided per-(account, year)
+mapping is used; missing years stay unmapped.
+
+### Worked example
+
+Account `01001200` "Trade receivables" is mapped `BS/Assets/Current assets/
+Receivables` in FY2023 only, but has GL postings in FY2024 too.  Library mode fills
+FY2024 with the SAME hierarchy (most-frequent by name, occurrences 9).  An
+`ovr_account_mapping` pin to `Non-current assets/Loans` would win instead.  In
+exclusive mode FY2024 is left unmapped.
+
+### No-op / golden guarantee
+
+On v2/live the mapping already covers every year and the FK `fact_gl_line ->
+dim_gl_account` guarantees every posted `(account, fy)` already has a dim row, so
+the "missing" set is EMPTY → the fill INSERTs 0 rows → `dim_gl_account` byte-
+identical → `compare live v2` EQUIVALENT.  Verified: seed loads 1214 rows
+identically on v2 and live (1155 names, 57 ambiguous); the fill dry-run reports 0
+missing keys on both; `dim_gl_account` stays 11 328 rows with 0 `account_library_fill`
+rows.  Idempotent (a second run finds nothing missing).
+
+### Regression test
+
+`backend/tests/test_account_mapping_library.py` (DB-free pure resolver + SQLite
+synthetic fill): resolver argmax/tiebreaker/coercion; FY1-only → FY2 filled from
+the library (worked example); override precedence; exclusive gate leaves FY2
+unmapped (asserted against `rebuild._stage_account_library_fill`); additive (existing
+row never mutated) + idempotent re-run fills 0; no-name / no-precedent skipped.
+
+## AR/AP OPOS As-of Aging (F3/F4) — 2026-07-01
+
+> **Authoritative spec for the OPOS subledger as-of (Stichtag) aging rebuild.**
+> Supersedes the deferred F3/F4 draft stubs below. Method pinned + reconciled by
+> the architect; formulas + worked example + edge cases + tests below satisfy the
+> iron rule. Backend SQL is Phase 2 — it MUST match the executable reference in
+> `backend/tests/test_opos_aging_financial.py`.
+
+Source: `fact_opos` (debitor = AR, kreditor = AP), one row per subledger line with
+`entity, partner_key (Debitor/Kreditor), konto, satzart, belegart, buchungsdatum,
+nettofaelligkeit, betrag (amount_hauswaehrung), fy_label`. **Sign convention
+(unchanged, matches the source ledger):** AR open item is a DEBIT → stored
+**positive**; AP open item is a CREDIT → stored **negative**. Scope = **trade LuL
+only**: AR konto `24xxx` family, AP konto `36xxx` family.
+
+`Satzart ∈ {Vortrag (opening carry), Bewegung (RV invoice / ZA payment / SA / RG),
+Fact-Ergaenzung (fact-linkage tie to net sales), Bilanzabstimmung (balance plug)}`.
+`Belegart`: `RV`/`RG` = invoice, `ZA` = payment, `SV` = Saldovortrag.
+
+### F1 — As-of open balance (Method A)
+
+Open balance at Stichtag `S`, at `(entity, partner_key, konto)` grain:
+
+```
+net_open[e, p, k] = Σ betrag  over fact_opos rows
+                    WHERE fy_label = year(S) AND buchungsdatum <= S
+                    summing ALL Satzart (Vortrag + Bewegung + Fact-Ergaenzung + Bilanzabstimmung)
+```
+
+**Fiscal-year-anchored — never sum across years.** Each year's file carries its own
+`Vortrag` = the prior-year close, so the within-year sum already includes the
+opening stock. The two naive alternatives are WRONG:
+
+- **Sum all years `<= S`** double-counts: year N's `Vortrag` re-includes year N-1's
+  close, so adding both books the opening stock twice.
+- **Sum only `Bewegung`** drops both the `Vortrag` opening and the `Fact-Ergaenzung`
+  tie rows → understates the balance.
+
+**Worked example (real data — Atlas AR 2024, konto `24xxx`, `S = 2024-12-31`):**
+
+| Satzart          | Σ betrag (EUR)   |
+|------------------|------------------|
+| Vortrag          | +6,047,183.63    |
+| Bewegung         | −4,114,067.13    |
+| Fact-Ergaenzung  | +5,850,743.68    |
+| **Method A total** | **+7,783,860.18** |
+
+Ties to the reconciliation `Bilanz_AR_AP` GoBD balance (konto `24000` = +7,796,548.22;
+`24905` other-AR = −12,688.04; family = 7,783,860.18). Naive "Bewegung only" =
+−4,114,067.13 (wrong); "sum years ≤ S" = 5,897,923.10 (2023 close) + 7,783,860.18 =
+13,681,783.28 (double-counts). Atlas AP 2024 (konto `36xxx`) Method A ties to
+`Verbindlichkeiten LuL` = −15,683,208.09 (credit, stored negative).
+
+### F2 — FIFO aging attach
+
+The ledger is a running balance with **no invoice↔payment clearing key**, so aging
+attaches by FIFO. Per partner group, allocate the Method-A net-open **magnitude**
+(`+net_open` for AR, `−net_open` for AP) across that group's **invoice-type rows**
+(`Belegart ∈ {RV, RG}`, this FY, `<= S`) ordered OLDEST-first by
+`due = COALESCE(nettofaelligkeit, buchungsdatum + terms)`, `terms = 30d AR / 45d AP`.
+Each residual slice buckets via the existing `gl_aging.AR_BANDS` boundaries
+(`_band_case_sql`: `not_yet_due`, `1–30`, `31–60`, `61–90`, `91–180`, `>180`;
+`due == S` falls to `>180` — mirrored from the SQL). **By construction Σ buckets =
+total_open and overdue_open ≤ total_open.**
+
+- **Assumption A4 (flagged):** the alternative pro-rata split (spread net-open across
+  invoices by amount share) is NOT used; FIFO oldest-first is the pinned method.
+- **Assumption A5 (flagged):** net-open that current-FY `RV/RG` invoices cannot cover
+  is the carried-forward opening (`Vortrag`, `Belegart SV` — outside the FIFO pool).
+  It predates the fiscal year, so the uncovered residual buckets into
+  **`overdue_over_180`**. Keeps Σ buckets = total_open.
+
+**Worked example (synthetic partner P1, AR, `S = 2024-12-31`):** net-open 600
+(= Vortrag 100 + RV 500 + RV 300 − ZA 350 + Fact 50). Oldest invoice RV 500
+(due 2024-07-01, 183d overdue) → 500 to `>180`; next RV 300 (due 2025-01-14) absorbs
+the remaining 100 → `not_yet_due`. `total_open = 600, overdue_open = 500`.
+
+### F3 — Overdue % (per customer AND page-level) — the 237% fix
+
+```
+overdue_pct = clamp( 100 × overdue_open / total_open , 0, 100 )     # total_open > 0
+overdue_pct = 0                                                     # total_open <= 0
+```
+
+Both numerator and denominator come from the **same FIFO-allocated as-of base**
+(F2), so the ratio is ALWAYS in `[0, 100]`. **Root cause of the old 237%**
+(0.13k overdue / 0.05k open): overdue and total were computed on *different* bases —
+overdue counted whole overdue invoices while total was the shrunken net-open (after a
+payment / credit note / advance), so a positive overdue divided a small or negative
+denominator and blew past 100%. **Fix, three layers:**
+
+1. both figures from the same FIFO base (F2);
+2. a partner whose net-open is a **CREDIT** (negative for AR / positive for AP —
+   overpayment, advance, or net credit note) gets `total_open = 0, overdue_open = 0,
+   credit_balance = true`, and is **EXCLUDED from the risk-matrix scatter**
+   (`in_scatter = false`);
+3. `clamp(…, 0, 100)` in the builder output — belt-and-suspenders. The frontend
+   consumes an already-bounded value.
+
+**Worked example (synthetic P3, the 237%-class case):** RV 130 overdue, ZA −80 →
+net-open 50. OLD broken: 130 / 50 = **260 %**. NEW: FIFO allocates 50 against the
+overdue invoice → 50 overdue / 50 total = **100.0 %** (bounded).
+
+### F4 — DSO / DPO
+
+```
+DSO = total_AR_open / gross_sales_period × days_in_period
+DPO = total_AP_open / purchases_period   × days_in_period
+```
+
+Gross sales / purchases come from the GoBD linkage (`Referenz` /
+`GoBD_Transaktionsnr` → GDPdU journal). **Assumption A2:** if that journal table is
+absent in `finssentials_v4`, fall back to a **payment-term proxy** = README terms:
+**AR 30d, AP 45d**. ⚠️ **Regression — current inversion:** `gl_aging.py`
+`build_receivables_aging` hardcodes `dso_days = 45.0` and `build_payables_aging`
+`dpo_days = 30.0` — **inverted** (README is customer 30d / supplier 45d). Phase 2
+must swap to AR 30 / AP 45. Locked by `test_current_gl_aging_proxy_is_inverted_BUG`
+(strict `xfail` today → flips green when fixed).
+
+### F5 — Total AR / AP KPI
+
+```
+Total_AR (kEUR) = ( Σ net_open over AR trade accounts ) / 1000      # positive
+Total_AP (kEUR) = ( Σ net_open over AP trade accounts ) / 1000      # negative (credit)
+```
+
+Σ of both positive and negative net-open per partner (a partner-level credit balance
+nets DOWN the total — it is NOT floored at 0 for the KPI; the floor-to-0 is only for
+the per-partner overdue_pct / scatter of F3). Ties to reconciliation.xlsx
+`Bilanz_AR_AP` "Subledger Saldo" per `(entity, year, Position)`.
+
+### Edge cases (tested)
+
+- **Credit balance** (customer overpaid / advance): net-open < 0 (AR) → `total_open =
+  overdue_open = overdue_pct = 0`, `credit_balance = true`, excluded from scatter.
+- **Missing `nettofaelligkeit`**: `due = buchungsdatum + terms` (30 AR / 45 AP).
+- **Partial YTD Stichtag** (e.g. `S = 2025-07-31`): only rows with `buchungsdatum <=
+  S` AND `fy_label = 2025` enter — an August invoice is excluded.
+- **`not_yet_due`-only partner**: `overdue_open = 0`, `overdue_pct = 0` (no div-by-0).
+- **Uncovered carried-forward residual (A5)**: → `overdue_over_180`; Σ buckets =
+  total_open preserved.
+- **Cross-year contamination**: a `fy_label = 2023` row never enters a 2024 as-of
+  balance (fiscal-year anchor).
+- **Zero denominator**: `overdue_pct = 0`, never raises.
+
+### Regression test
+
+`backend/tests/test_opos_aging_financial.py` (DB-free, synthetic OPOS fixture +
+executable reference helper): Method A per-group (all-Satzart, FY-anchored,
+Bewegung-only understatement), FIFO (Σ buckets = total_open, overdue ≤ total,
+oldest-first spill, A5 residual), credit-balance zeroing + scatter exclusion,
+the 237% bound + clamp helper, DSO/DPO proxy not-inverted (+ strict `xfail`
+documenting the current `gl_aging.py` inversion), missing-due / partial-YTD /
+not-yet-due-only edges, AP credit-magnitude. `test_phase2_backend_helper_contract`
+(`importorskip`) pins the target interface `app.services.opos_aging.compute_opos_aging(
+rows, as_of, side) -> {partner: {total_open, overdue_open, overdue_pct, credit_balance,
+in_scatter, buckets}}` — skips until Phase 2, then is the acceptance gate.
+
+## Overview Page v2 — KPI sign-offs (Areas 1, 2, 4, 5, 7, 8) — 2026-07-02
+
+> **Owner sign-off (financial-calculation-engineer) for the reporting-v2 Overview
+> redesign** (`docs/overview-v2-redesign-plan.md` §2). Documentation + test spec
+> only — no service/router code changes here; the math lands in later phases
+> (P3/P4/P5) behind the `IS_OVERVIEW_V2` flag. Every formula below reuses an
+> EXISTING sign convention (cited per area) or is an approved net-new decision.
+> **Area 3 (Fixed Assets) is OUT of scope** and intentionally omitted.
+>
+> **FAV convention (unchanged, from the plan §2):** `FAV+` = larger-positive is
+> favourable (revenue, profit, margin, growth, ROE, DPO); `FAV−` = smaller is
+> favourable (cost, DSO, DIO, CCC, days-overdue, lost customers). `FAV−` metrics
+> are displayed with `invert_delta=True` at the **findings/colouring layer** so a
+> shrinking bad number reads green. NOTE: the existing WC KPI rows
+> (`fin_compat_wc._kpi_rows`) and top-entity delta rows emit `invert_delta=False`
+> in the raw payload — the FAV direction is applied by the v2 findings layer, NOT
+> by mutating those existing rows (keeps legacy payloads byte-identical).
+
+### Area 1 — YoY + vs-Plan performance
+
+**Revenue by entity/region/customer** (source `overview_top_entities` /
+`sales_analytics_compat`, sign per `fact_sales.gross_sales = −amount` → positive,
+kEUR = Σ/1000). `Rev[dim,w] = Σ gross_sales/1000` over posting_date window `w`;
+dims: entity = `LEFT(account_number_group,2)`, region = `sql_end_customer_region_expr`,
+customer = `dim_customer.name_line_1`. **`FAV+`, `invert_delta=False`.** Missing
+customer → `'Unknown'`/`'(no partner)'` bucket (matches `build_top_entities` L331).
+- *Worked (Jun-2026):* A=500, B=120, C=0 kEUR → C dropped (`|Rev|<1e-6`).
+
+**Margin.** Two grains, never blended:
+- Gross margin (customer/region grain, from `fact_sales`/`fact_com`, both stored
+  positive): `GrossProfit = Rev − COM`; `GrossMargin% = 100·GP/Rev`, `None` if
+  `|Rev|<1e-6`. *Worked:* Rev 1000, COM 620 → GP 380, GM **38.0%** ✓.
+- EBIT margin (entity grain, from `overview_metrics.build_ebit_table`,
+  presented `amount*-1`): `EBITMargin% = 100·EBIT_ytd/|to_ytd|` where `to` = the
+  EBIT table "Total output" column = Σ `level_3='Net sales'` (`_ebit_filters`,
+  overview_metrics.py L396-403). `None` if `|to|<1e-6`. `FAV+`.
+  *Worked (code-faithful):* EBIT 90 / Net sales 1000 = **9.0%**.
+  - ⚠️ **PLAN DISAGREEMENT (flagged, not silently changed):** the plan's example
+    uses "EBIT 90 / output 1050 → 8.57%", i.e. a *broader* Total-output base
+    (Net sales + Δ FG/WIP + own-work-capitalised). The **code today uses Net sales
+    only.** Sign-off is for the Net-sales denominator (matches
+    `build_ebit_table`). Widening the base to true "total output" is a **formula
+    change requiring its own sign-off** — do NOT implement without it.
+
+**YoY % (YTD-aligned).** month → `cm` vs `py_cm`; YTD → `ytd` vs `ytd_py` (equal
+month count). `YoY% = 100·(cur−py)/|py|`, `None` if `|py|<1e-6`. Revenue `FAV+`;
+cost `FAV−` (`invert_delta=True` at findings layer). Sign-change (`py<0, cur>0`) →
+annotate `"sign change"`, do not colour. *Worked:* 500 vs 400 → **+25.0%** ✓.
+
+**vs-Plan.** plan from `fact_position_plan`/`fact_gl_plan`, scenario
+`budget→forecast→plan` (same resolution as `_load_partner_plan_cm`,
+overview_top_entities.py L161). `Var_abs = actual−plan`; `Var_pct =
+100·(actual−plan)/|plan|`; `Coverage% = 100·actual/|plan|` — all `None`+flag
+`"no plan"` when `|plan|<1e-6` (never render −100%). Revenue `FAV+`; cost `FAV−`.
+*Worked:* 500 vs 450 → **+50, +11.1%, 111.1%** ✓.
+
+**Recent-months 3-trigger alert** (approved defaults: N=3 months, per entity ×
+{revenue, gross margin}). Flag month `m` if any fires:
+- **T1 (YoY)** `|x_m − x_py| / |x_py| ≥ 0.20`
+- **T2 (plan)** `|x_m − plan_m| / |plan_m| ≥ 0.10`
+- **T3 (z-score)** `|z| ≥ 2.0`, `z = (x_m − μ)/σ̂`, `μ,σ̂` over trailing-12
+  **excluding m**, sample std `ddof=1` (reuses `gl_outliers` convention).
+
+  `severity = #triggers` (≤3); `direction = sign(x_m − ref)`. Skip any trigger
+  whose denominator/σ is 0 (no div-by-zero). Alert strip ≤5 items (approved).
+  *Worked:* x=60, μ=100, σ̂=10, py=95, plan=90 → T1 35/95=0.368✓, T2 30/90=0.333✓,
+  T3 |z|=4.0✓ → **severity 3, "down"**.
+- **Test:** `backend/tests/test_overview_yoy.py` (YoY/variance/coverage + None
+  guards), `backend/tests/test_recent_month_alerts.py` (3-trigger severity +
+  denominator-skip).
+
+### Area 2 — Cash development & liquidity
+
+**Cash level (period-end BS stock).** `Cash[t] = Σ amount WHERE account ∈ CASH_SET
+AND posting_date ≤ month_end(t)`, CASH_SET = `dim_gl_account.level_3='Cash & cash
+equivalents'` (NO hardcoded konto list — same filter as
+`overview_metrics._DUPONT_BS_FILTERS['cash']`, L81). RAW stored sign, **no `*-1`,
+no ABS** (an overdraft is legitimately negative). `FAV+`, `invert_delta=False`.
+*Worked (cumulative):* Jan 100, Feb 70, Mar 120 kEUR.
+
+**Liquidity available incl. "Zeitverkauf"** (APPROVED net-new monetary logic —
+decision #1). Interpret Zeitverkauf as AR realizable over time = AR net of an
+aging-based collectibility haircut. Haircut is a **config table** (NOT inline
+constants), keyed by the canonical `gl_aging.AR_BANDS` bucket ids:
+
+```
+AR_HAIRCUT_LADDER = {         # collectibility haircut per aging band (approved)
+    "not_yet_due":      0.00,
+    "overdue_1_30":     0.00,
+    "overdue_31_60":    0.10,
+    "overdue_61_90":    0.25,
+    "overdue_91_180":   0.50,
+    "overdue_over_180": 1.00,
+}
+CollectibleAR       = Σ_band AR_band · (1 − AR_HAIRCUT_LADDER[band])
+LiquidityAvailable  = Cash + CollectibleAR − OutstandingAP
+```
+
+AR bands come from the F2 FIFO as-of aging (`opos_aging.compute_opos_aging`,
+`buckets`); a partner whose net-open is a CREDIT is `total_open=0` (already
+excluded, `credit_balance=True`) so it never adds negative "collectible". Cash is
+the BS stock above; OutstandingAP = Σ AP net-open magnitude (F5). `FAV+`,
+`invert_delta=False`.
+- *Worked:* AR bands 400/100/50/40/20/10 (not_due…>180) → CollectibleAR =
+  400 + 100 + 45 + 30 + 10 + 0 = **585**; Cash 120, AP 300 → LiquidityAvailable =
+  120 + 585 − 300 = **405 kEUR** ✓.
+- **Edge cases:** empty AR → CollectibleAR 0; all >180 → 0 collectible (100%
+  haircut); negative Cash (overdraft) flows through raw (can make liquidity
+  negative — surface, do not floor); missing AP → treat as 0; a band id absent
+  from the ladder → **raise** (never default a haircut silently). Units kEUR
+  throughout.
+- **Test:** `backend/tests/test_liquidity_available.py` (worked example to the
+  cent, per-band haircut, credit-balance partner excluded, empty/all->180/negative
+  cash edges, unknown-band raises).
+
+### Area 4 — Customer development
+
+Source `fact_sales` + `dim_customer`; reuses `rank_top_entities`
+(overview_top_entities.py L59) delta formulas verbatim.
+- **Biggest customers** — `Rev[cust, ytd|cm]` desc, top-N, drop all-zero
+  (`|metric|>1e-6`). `FAV+`.
+- **Largest YoY increase** — `ΔYoY = Rev[cur] − Rev[py]` desc (= `delta_cm_py` /
+  `delta_ytd` of `rank_top_entities`). New customer (`py=0`) → `Δ=+cur`, reported
+  separately as **"won"**. `FAV+`.
+- **Lost customers** (APPROVED windows #3): `Rev[prior] ≥ T_material AND
+  Rev[current] ≤ ε`; prior `[-24..-13]` mo, current `[-12..-1]` mo,
+  `T_material=5 kEUR`, `ε = max(1 kEUR, 0.10·Rev[prior])`. `FAV−`. Aligns with
+  `build_churn_bridge` lost = `pm NOT NULL AND cm NULL` (sales_analytics_compat.py
+  L733) but with material/ε thresholds. *Worked:* prior 40, current 0 →
+  ε=max(1,4)=4, 0≤4 → **lost**; prior 3 (<5) → immaterial; prior 40, current 6
+  (>4) → **declining, not lost**.
+- **Invoice count / order size** — `InvoiceCount = COUNT(DISTINCT
+  journal_entry_group_number)` on `fact_sales` (jegn confirmed present,
+  `derive_facts_sql.derive_fact_sales` L47; revenue already isolated by
+  `level_3='Net sales'`); `AvgPerInvoice = Rev/InvoiceCount`, `None` if 0. `FAV+`.
+  *Worked:* 500 kEUR over 4 distinct jegn → **125 kEUR/invoice** ✓.
+- **Test:** `backend/tests/test_customer_development.py` (biggest/increase/won via
+  `rank_top_entities`, lost-customer window classification, avg-per-invoice + zero
+  guard).
+
+### Area 5 — Supplier development (symmetric, AP side)
+
+Source `fact_com` + `dim_supplier`; `cost_of_materials = +amount` (positive),
+kEUR = Σ/1000 (overview_top_entities.py L14). Reuses `rank_top_entities`.
+- **Most-delivering suppliers** — `Cost[supplier, ytd] = Σ cost/1000` desc.
+- **Biggest cost increase** — `ΔYoY = Cost[cur] − Cost[py]` desc. **`FAV−`
+  (`invert_delta=True` at findings layer)** — a rising cost reads unfavourable.
+  New supplier (`py=0`) → **"new spend"**.
+- **Purchase txns / order size** — `PurchaseTxns = COUNT(DISTINCT
+  journal_entry_group_number)` on `fact_com` (**CONFIRMED present**,
+  `derive_facts_sql.derive_fact_com` L85; migration `0001_initial_schema`);
+  `AvgPerPurchase = Cost/PurchaseTxns`, `None` if 0.
+  *Worked:* 620 kEUR over 4 distinct jegn → **155 kEUR/purchase**.
+- **Test:** `backend/tests/test_supplier_development.py` (Σcost ranking, cost
+  increase `FAV−` invert flag, avg-per-purchase + zero guard).
+
+### Area 7 — Driver / DuPont (findings re-route only)
+
+**Confirmed: `buildDuPontFindings` re-routes EXISTING computed values — no Python
+formula change.** It is a frontend selector (`cockpit/dupontNarrativeEngine.ts`)
+that turns the already-computed `dupont_period_kpis` metric map
+(`overview_metrics.py` L110) into ≤3 finding one-liners with deep-link routes; it
+does NOT recompute any KPI. The values it consumes are the **EBIT-based** DuPont
+the code already ships:
+
+```
+ROS(EBIT margin)   = EBIT / Net sales            (overview_metrics L124, _safe_div)
+AssetTurnover      = ann_ns / Total assets       (ann_ns = ns·12/ann_month)
+EquityMultiplier   = Total assets / Equity       (leverage — NEUTRAL, not FAV±)
+ROE                = EBIT / Equity
+ROI                = EBIT / Total assets
+```
+
+**Reconciliation the code actually satisfies (LOCKED in test):** at `ann_month=12`
+(`ann_ns = ns`), `ROE ≡ ROS · AssetTurnover · EquityMultiplier` exactly (algebraic
+identity on unrounded inputs, within 1e-6). *Worked:* EBIT 150, NS 1000, Assets
+1250, Equity 500 → ROS 15%, AT 0.80, EM 2.5 → 0.15·0.80·2.5 = 0.30 = ROE
+150/500 = **30%** ✓. **`FAV+`** for ROE/ROS/ROI; EquityMultiplier neutral.
+Denominator `<1e-6` → that KPI `None` (`_safe_div`).
+
+- ⚠️ **PLAN DISAGREEMENT (flagged, do NOT silently implement):** the plan's Area 7
+  specifies a **net-income-based** DuPont — `NetMargin = NI/Rev`, `ROE = NI/Equity`
+  (worked NI 90 → ROE 11.25%) — and a new **`ROCE = EBIT/(Assets − CurrentLiab)`
+  = 8.0%**. Neither exists in the code: `dupont_period_kpis` has **no net income**,
+  its "ROS" is an **EBIT** margin, and `_DUPONT_BS_FILTERS` has **no
+  current-liabilities aggregate** (only `total_assets`, `equity`, `trade_payables`,
+  …). Introducing NetMargin/NI-ROE and ROCE is **net-new monetary logic** →
+  **stop-and-ask / separate sign-off** (needs a `current_liabilities` BS filter +
+  a net-income figure). Until then the DuPont findings block re-routes the
+  **existing EBIT-based** values and locks the EBIT identity above.
+- **Test:** `backend/tests/test_dupont_drivers.py` (EBIT identity reconciliation
+  within 1e-6 on `dupont_period_kpis`; findings re-route uses only existing metric
+  keys, ≤3, no recompute — `importorskip` gate for the future finding builder).
+
+### Area 8 — Working Capital
+
+Restated to **match `fin_compat_wc.compute_wc_kpis` EXACTLY** (fin_compat_wc.py
+L162-178) — raw stored sign for stocks, ABS magnitude for days, 365 basis, LTM
+denominator:
+
+```
+DSO = |TradeRec| · 365 / Rev_LTM      (0 when Rev_LTM  ≤ 1e-6)   FAV−
+DIO = |Inv|      · 365 / COGS_LTM     (0 when COGS_LTM ≤ 1e-6)   FAV−
+DPO = |TradePay| · 365 / COGS_LTM     (0 when COGS_LTM ≤ 1e-6)   FAV+
+NWC = Σ raw-signed TWC + OWC balances                            (context)
+CCC = DSO + DIO − DPO                                            FAV−
+```
+
+*Worked (matches the module docstring to the decimal):* rec 5.0m, inv 4.0m, pay
+3.0m, owc 0.5m, Rev_LTM 20m, COGS_LTM 12m → NWC **+6.5m**, DSO **91.2**, DIO
+**121.7**, DPO **91.2**, CCC **121.7** days ✓.
+- **Deep-dives:** `Level[l3, cm]` = raw cumulative stock per `level_3`
+  (Inventories / Trade receivables / Trade payables) + `Δmonth = cm − pm`,
+  `Δfy = fy − fy_py` (raw signed, `_snap_deltas` convention). Trend basis = last 12
+  month-ends (`_last_12_periods`).
+- **Edge cases:** denominator `≤1e-6 → 0.0` (no div-by-zero); negative stored
+  balance feeds NWC raw, days take ABS → positive day counts.
+- ⚠️ **Presentation note (not a formula change):** the existing WC KPI rows carry
+  `invert_delta=False`; the v2 hero/findings layer applies the FAV− colouring for
+  DSO/DIO/CCC and FAV+ for DPO **without** mutating those rows (legacy payload
+  stays byte-identical).
+- **Test:** `backend/tests/test_wc_overview_kpis.py` (worked example on
+  `compute_wc_kpis`, zero-denominator → 0.0, ABS sign-agnosticism, CCC identity).
+
 ## Checklist before approving a financial change
 
 - [ ] Formula written out and matches FDD intent
@@ -1101,3 +1702,243 @@ non-zero. (Recommended add: a negative assertion locking `Other taxes` exclusion
 - [ ] Regression/golden test added and passing
 - [ ] Reuses `funktionssammlung` helpers instead of re-deriving
 - [ ] Units (EUR vs kEUR) consistent in the output
+
+---
+
+## ⚠️ DRAFT / FLAGGED — DEFERRED formulas (D3 Anlagen + D4 OPOS)
+
+> **NOT YET IMPLEMENTED. These do NOT ship in this epic and NO value is computed.**
+> The D3/D4 backend (migrations `0022_draft_fixed_asset_register`,
+> `0023_draft_opos_aging`; routers `app/routers/anlagen.py`, `app/routers/opos.py`)
+> only stores **pass-through** source rows. Every derived/analytic column is created
+> **NULLABLE and left NULL/empty**. Implementing any formula below is a separate,
+> approved financial-calculation-engineer task (formula + worked example + edge
+> cases + regression/golden test — per the checklist above) and a follow-up
+> migration that adds the derived columns.
+
+### F1 — Fixed-asset roll-forward: closing cost (AHK)
+
+```
+closing_cost_ahk = opening_cost_ahk + additions_zugang − disposals_abgang ± transfers_umbuchung
+```
+
+- **Status:** NOT computed. `fact_fixed_asset` stores the inputs
+  (`opening_cost_ahk`, `additions_zugang`, `disposals_abgang`,
+  `transfers_umbuchung`) as pass-through; there is **no** `closing_cost_ahk`
+  column yet.
+- Sign convention for `transfers_umbuchung` (±) and the netting rule must be
+  fixed with a worked example before implementation.
+
+### F2 — Accumulated depreciation & net book value (NBV)
+
+- `depreciation` and `nbv` are stored **pass-through only**.
+- Accumulated depreciation and a *derived* NBV
+  (`closing_cost_ahk − accumulated_depreciation`) are **NOT computed**;
+  depreciation **method is TBD** (linear / declining-balance / per asset class).
+
+> **F3/F4 UPDATE (2026-07-01):** the aging method is now formally specified in
+> **"AR/AP OPOS As-of Aging (F3/F4)"** above (Method A as-of open balance + FIFO
+> attach + bounded overdue% + DSO/DPO), with worked example, edge cases, and
+> `backend/tests/test_opos_aging_financial.py`. The stubs below are historical.
+
+### F3 — OPOS open-item determination (`is_open`)
+
+- Determine whether an OPOS line is still open via **settlement matching**:
+  invoice (RV) vs payment (ZA) by `beleg_no` / `referenz` — **TBD**.
+- `fact_opos_debitor.is_open` / `fact_opos_kreditor.is_open` are created NULLABLE
+  and **left NULL** by ingest. The derivation surface
+  (`opos.derive_aging()` / `POST /api/v1/opos/{side}/derive-aging`) is an explicit
+  stub (`NotImplementedError` / HTTP 501).
+
+### F4 — AR/AP aging bucketing (`aging_band`)
+
+- `aging_band` is created NULLABLE and **left NULL**. When implemented it **MUST
+  reuse** `app/services/gl_aging.py` `AR_BANDS` + `_band_case_sql` (do **NOT**
+  invent new buckets) and match the golden shape
+  `backend/golden/v2/sales__{receivables,payables}-aging__*.json`.
+
+---
+
+## Personnel / Payroll (Income Statement sub-tab)
+
+Source: `fact_personnel_employee` snapshots (`as_of_date`, v1 year-end `YYYY-12-31`).
+
+### FTE per employee row
+
+```
+FTE_row = months_active × beschaeftigungsgrad / 100 / 12
+FTE_display = ROUND(SUM(FTE_row), 0)   per Bereich × snapshot
+```
+
+**Worked example.** `months_active=12`, `beschäftigungsgrad=100` → `FTE_row=1.0`.
+`months_active=6`, `beschäftigungsgrad=50` → `FTE_row=0.25`. Two rows → `ROUND(1.25)=1`.
+
+### Payroll accounting (EURk)
+
+```
+Payroll_row = gesamtsumme  (or sum of Grundgehalt + Prämie + Sozialversicherung + …)
+Payroll_EURk = −SUM(Payroll_row) / 1000     (costs shown negative)
+Avg_cost_per_FTE = Payroll_EURk / FTE       (0 when FTE=0)
+Personnel_expenses = Payroll + Social Security blocks (footer)
+```
+
+### KPI — personnel % of total output
+
+```
+personnel_pct_output = |personnel_expenses| / |TOTAL_OUTPUT| × 100
+```
+
+`TOTAL_OUTPUT` from `build_pl_annual_compat` (`line_code=TOTAL_OUTPUT`, `amounts.ytd` / 1000).
+
+### Edge cases
+
+- **FTE=0** (Leihpersonal-only row, zero months): avg cost/FTE → 0 (no divide-by-zero).
+- **Part-time**: FTE scales with `beschäftigungsgrad`; payroll still sums full row amounts.
+- **Leihpersonal**: included in payroll sums; FTE may be 0 if `months_active=0`.
+- **Entity filter**: restricts rows by `entity_prefix` before aggregation.
+
+Regression: `backend/tests/test_personnel_accounting.py`, `test_personnel_movements.py`.
+
+---
+
+## Fixed assets rollforward (Balance Sheet sub-tab)
+
+Source: `fact_fixed_asset` snapshots (`as_of_date`, v1 year-end `YYYY-12-31`) from `anlagengitter.xlsx`.
+
+### Per-asset pass-through (EUR)
+
+Values stored as in the Anlagenregister; rollforward aggregates in **kEUR** (`value / 1000`, one decimal).
+
+| Field | Source column |
+|-------|----------------|
+| `opening_nbv` | Buchwert GJ-Beg |
+| `additions_zugang` | Zugang |
+| `disposals_abgang` | Abgang |
+| `depreciation` | \|Afa des Jahres\| |
+| `nbv` (closing) | Lfd Buchwert |
+
+### Rollforward bridge (grouped)
+
+```
+closing_nbv_kEUR = Σ nbv / 1000
+additions_kEUR   = Σ additions_zugang / 1000
+disposals_kEUR   = Σ disposals_abgang / 1000
+depreciation_kEUR = Σ |depreciation| / 1000
+opening_nbv_kEUR  = Σ opening_nbv / 1000   (from anchor-year file)
+```
+
+**Worked example.** One asset: opening 100 kEUR, add 20, disp 5, D&A 10 → closing 105 kEUR.
+
+### Hierarchy
+
+- **flat** (report view): group by `bilanzposition`
+- **two_level** (table view, optional): `segment` (Geschäftsbereich) → category sub-rows + segment subtotal
+
+### Edge cases
+
+- Missing snapshot year → column omitted; partial year range still renders.
+- Entity filter via `entity_prefix` before aggregation.
+- Disposal year: `disposals_abgang` may equal remaining NBV on retired assets.
+
+Regression: `backend/tests/test_fixed_asset_rollforward.py`.
+
+## Cash & debt — net debt table (Cash flow tab)
+
+**Scope:** Month-end cumulative BS balances (kEUR), entity-filtered.
+
+**Sections:**
+1. Cash & cash equivalents (`dim_gl_account.level_3`) → cash on hand / cash at banks
+2. Bank liabilities — `l6_na_mapping='ND'` and/or `level_3='Liabilities due to banks'`, grouped by bank label from account name
+3. Shareholder loan — ND / affiliate liabilities, grouped by counterparty
+4. **Net financial debt** = Σ cash + Σ bank + Σ shareholder (signed)
+5. **Debt-like items** (optional) — remaining ND accounts (e.g. severances); omit sections 5–6 when empty
+6. **Net debt** = net financial debt + debt-like
+
+**Worked example (kEUR):** cash 264 + bank (−4,299) + shareholder (−357) = net financial (−4,392); + severances (−210) → net debt (−4,602).
+
+Regression: `backend/tests/test_fin_compat_cash_debt.py`.
+
+## BS / WC / CF plan overlay — statement-generic position plan (reporting-v2 plan layer, Phase 1)
+
+Generalizes the P&L plan seam to Balance Sheet, Working Capital and Cash Flow. The
+manual budget lives once in `fact_position_plan` (`scenario='budget'`, per
+`statement`); the statement bodies overlay `plan_cm` / `plan_vs_actual` **only when a
+plan map has signal** — with no budget rows every existing response is byte-identical.
+
+Services: `fin_compat_sql.position_plan_grain_sql` (added `scenario` param),
+`fin_compat_pl.load_position_plan_map` / `build_statement_plan_response`,
+`budget_service.present_to_stored` / `stored_to_present` (CF branch).
+
+### The single sign flip (do NOT re-flip)
+
+`position_plan_grain_sql` applies **exactly one** `amount * -1` presentation flip
+(stored GL sign → presented). Overlay code must never flip again.
+
+- **PL / CF** — the SQL `* -1` output IS the correct presented value. CF presents via
+  `dim_gl_cf.amount * -1`, the same single flip, so the CF plan sign matches the CF
+  actual sign for the same `cf_mapping` leaf.
+- **BS** — presented convention is asset(+) / credit(−), not a uniform `* -1`. So we
+  recover the stored amount (`stored = -sql_value`) and re-present it through the
+  centralized `budget_service.stored_to_present` helper. No new sign literal is
+  introduced; only the sanctioned BS helper (`_bs_side_for`: SUPPLIER→credit else asset).
+
+### CF sign branch — `present_to_stored`/`stored_to_present` (DECISION: `-x`, == PL)
+
+CF uses the **same** flip as PL: `stored = −presented`, `presented = −stored`. Proven
+(no double flip):
+
+| line | presented (plan) | `present_to_stored` → stored | `position_plan_grain_sql` (`stored*-1`) | matches CF actual sign? |
+|------|------|------|------|------|
+| inflow (e.g. EBITDA) | **+900** | −900 | −900·(−1) = **+900** | yes — inflow + |
+| outflow (e.g. Δ Fixed assets) | **−300** | +300 | +300·(−1) = **−300** | yes — outflow − |
+
+Round-trip `stored_to_present(present_to_stored(p,"CF",lc),"CF",lc) == p`. The explicit
+`"CF"` branch is added for clarity and documents that it equals the PL path.
+
+### WC-derived-from-BS (TWC/OWC subset)
+
+There is **no separate WC plan store.** WC is the TWC/OWC subset of the balance sheet
+(`l6_na_mapping IN ('TWC','OWC')`, `level_0='BS'`), so `build_statement_plan_response`
+routes `statement="WC"` to the **BS** position plan (`effstmt="BS"`); the caller/frontend
+projects the returned BS-keyed lines onto the WC nodes (same subset the actual WC body
+uses). Net working capital plan = Σ plan of the TWC/OWC BS positions (e.g. AR + Inventory
+− AP in presented terms).
+
+### `plan_vs_actual = actual − plan` (PRESENTED terms) — worked micro-examples
+
+Per line: `plan_vs_actual = actual_cm − plan_cm`; `coverage_pct = actual_cm / |plan_cm| ·
+100` (None when `|plan_cm| ≤ 1e-6`). Actual is presented in the SAME convention as plan
+(PL/CF: the `cm` grain column; BS: `stored_to_present(Σ raw balance)`), so they reconcile
+with no re-flip.
+
+- **PL** (Net sales): plan_cm = +1000, actual_cm = +1200 → `plan_vs_actual = +200`,
+  coverage = 120%.
+- **CF** (Net cash flow): plan_cm = +610, actual_cm = +550 → `plan_vs_actual = −60`,
+  coverage = 90.16%.
+- **BS** (AR asset): user plans AR = +500 (presented) → stored +500 → SQL `*-1` = −500 →
+  `stored_to_present(−(−500),"BS","AR") = +500`; actual AR balance +540 →
+  `plan_vs_actual = +40`. (AP credit reconciles the same way via `stored_to_present`.)
+
+### Golden-safety (empty-plan fall-through)
+
+`load_position_plan_map` returns `{}` unless `has_signal` (any `|plan_cm| > 1e-6`). On the
+shared backend (no budget rows) every touch point keeps its prior output: `_attach_plan`
+adds no keys for a missing line_code, and the BS/CF narrative `cm_vs_plan` stays `0.0`.
+`build_statement_plan_response` with an empty `allowed_prefixes` set fails **closed**
+(`has_plan_data=False, lines=[]`).
+
+**Pinned signatures** (backend-engineer codes against these verbatim):
+`load_position_plan_map(session, statement, year, month, ent_frag, *, scenario="budget") -> dict[str, dict[str, float]]`
+and `build_statement_plan_response(session, statement, year, month, entity, *, allowed_prefixes=None) -> dict`.
+
+**Regression (test-engineer to encode):** CF sign round-trip; PL byte-identical
+(`build_pl_plan_response == build_statement_plan_response(...,"PL",...)`); empty-plan
+byte-identical for `/balance-sheet`, `/cash-flow`, `/working-capital`; BS asset/credit
+`plan_vs_actual`; `allowed_prefixes=set()` deny-all.
+
+> ⚠️ **Deferred / needs_review:** (1) WC narrative `cm_vs_plan` (`fin_compat_wc.py:1392`)
+> stays `0.0` pending the TWC/OWC→BS-line_code projection map (shipping a guessed NWC-plan
+> number was declined). (2) BS `_bs_side_for` only classifies AR (asset) / AP (credit)
+> precisely; equity and other non-partner credit positions default to `asset` — a
+> pre-existing budget_service limitation that carries into the BS plan sign. Confirm the
+> BS comparison convention against seeded v2 data before enabling BS plan columns.

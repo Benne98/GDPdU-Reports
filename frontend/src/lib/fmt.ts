@@ -12,6 +12,7 @@
  *        -11 436 000 → "(11.436)"
  */
 export function fmtKpi(v: number): string {
+  if (!Number.isFinite(v)) return ''
   const thousands = v / 1_000
   const abs = Math.abs(thousands)
   const s = abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
@@ -25,7 +26,7 @@ export function fmtKpi(v: number): string {
 export function fmtDelta(v: number): string {
   const thousands = v / 1_000
   const abs = Math.abs(thousands)
-  const s = `€\u00a0${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+  const s = `€ ${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
   return v < 0 ? `(${s})` : `+${s}`
 }
 
@@ -64,7 +65,7 @@ export function fmtDays(v: number): string {
 export function fmtAmount(v: number): string {
   const thousands = v / 1_000
   const abs = Math.abs(thousands)
-  const s = `€\u00a0${abs.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}k`
+  const s = `€ ${abs.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}k`
   return v < 0 ? `(${s})` : s
 }
 
@@ -72,6 +73,22 @@ export function fmtAmount(v: number): string {
 export function fmtAmountWhole(v: number): string {
   const thousands = v / 1_000
   const abs = Math.abs(thousands)
-  const s = `€\u00a0${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}k`
+  const s = `€ ${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}k`
   return v < 0 ? `(${s})` : s
+}
+
+/**
+ * Per-partner / per-document amounts — takes a value already in kEUR and returns
+ * the equivalent in FULL EUR (× 1 000), formatted with de-DE thousands separators.
+ * Use this wherever the aging API emits kEUR but the UI should show whole EUR.
+ * Do NOT apply on top of fmtAmountWhole (different input unit).
+ *
+ * e.g.  125.75 kEUR → "€ 125.750"
+ *        -3.2 kEUR   → "(€ 3.200)"
+ */
+export function fmtEurWhole(vKEur: number): string {
+  const eur = vKEur * 1_000
+  const abs = Math.abs(eur)
+  const s = `€ ${abs.toLocaleString('de-DE', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+  return vKEur < 0 ? `(${s})` : s
 }

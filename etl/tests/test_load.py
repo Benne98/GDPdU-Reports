@@ -4,13 +4,18 @@ Coverage:
   - content_hash: stable across reorderings, changes on data mutation
   - split_entry_line: correct dedup of entries, correct line projection,
     column availability, handles missing optional columns gracefully
-  - _bulk_insert_entries / _bulk_insert_lines: param list shape, BATCH_SIZE chunking
+  - _copy_field: NULL/empty-string/string/int/float/bool/date serialization
+  - _bulk_insert_entries / _bulk_insert_lines: COPY-based contract —
+    single copy_expert call (no BATCH_SIZE chunking), correct ON CONFLICT
+    targets, NULL coalescing visible in the streamed CSV
   - vectorized entry filter: composite-key isin dedup
   - _filter_by_account_coverage: drops unmapped rows, prints report
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call, patch
+import csv
+import io
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -19,8 +24,10 @@ from etl.load import (
     BATCH_SIZE,
     _bulk_insert_entries,
     _bulk_insert_lines,
+    _copy_field,
     _filter_by_account_coverage_pure,
     content_hash,
+    content_hash_with_strategy,
     split_entry_line,
 )
 from etl.tests.fixtures import canonical_lines
@@ -65,6 +72,96 @@ class TestContentHash:
         h2 = content_hash(df.copy())
         assert h1 == h2
         assert len(h1) == 64
+
+
+# --------------------------------------------------------------------------- #
+# content_hash_with_strategy
+# --------------------------------------------------------------------------- #
+
+class TestContentHashWithStrategy:
+    """Regression tests for the strategy-salted idempotency hash.
+
+    Guards the fix for the false-skip bug: re-committing the SAME file with a
+    DIFFERENT linking_strategy must produce a DIFFERENT hash so that
+    replace_skip_ok (Clause 3) correctly refuses to skip the replace.
+    """
+
+    _STRATEGIES = ("txn", "gegenkonto", "none")
+
+    def _df(self) -> pd.DataFrame:
+        """Small synthetic GL frame — no DB required."""
+        return pd.DataFrame({
+            "journal_entry_group_number": ["010000000001", "010000000001", "010000000002"],
+            "fiscal_year": [2024, 2024, 2024],
+            "line_number": [1, 2, 1],
+            "amount": [1000.0, -1000.0, 500.0],
+        })
+
+    def test_txn_differs_from_gegenkonto(self):
+        """Core regression: 'txn' and 'gegenkonto' must never collide on the same df."""
+        df = self._df()
+        assert content_hash_with_strategy(df, "txn") != content_hash_with_strategy(df, "gegenkonto")
+
+    def test_txn_differs_from_none(self):
+        df = self._df()
+        assert content_hash_with_strategy(df, "txn") != content_hash_with_strategy(df, "none")
+
+    def test_gegenkonto_differs_from_none(self):
+        df = self._df()
+        assert content_hash_with_strategy(df, "gegenkonto") != content_hash_with_strategy(df, "none")
+
+    def test_all_three_strategies_are_mutually_distinct(self):
+        """All three valid strategies produce mutually distinct hashes."""
+        df = self._df()
+        hashes = [content_hash_with_strategy(df, s) for s in self._STRATEGIES]
+        assert len(set(hashes)) == 3, (
+            f"Expected 3 distinct hashes for strategies {self._STRATEGIES!r}, got {hashes}"
+        )
+
+    def test_same_strategy_is_deterministic(self):
+        """Calling with the same (df, strategy) twice must return the identical hash."""
+        df = self._df()
+        for strategy in self._STRATEGIES:
+            h1 = content_hash_with_strategy(df, strategy)
+            h2 = content_hash_with_strategy(df, strategy)
+            assert h1 == h2, f"Non-deterministic hash for strategy={strategy!r}"
+
+    def test_differs_from_base_content_hash(self):
+        """The strategy-salted hash must differ from the plain content_hash for all strategies.
+
+        If this fails, the NUL-byte salt is broken and the false-skip bug is back.
+        """
+        df = self._df()
+        base = content_hash(df)
+        for strategy in self._STRATEGIES:
+            h = content_hash_with_strategy(df, strategy)
+            assert h != base, (
+                f"content_hash_with_strategy(df, {strategy!r}) == content_hash(df): "
+                "the NUL-byte salt is missing or broken — false-skip bug not fixed."
+            )
+
+    def test_hash_is_64_hex_chars(self):
+        """Output is a 64-char lowercase hex string (SHA-256)."""
+        df = self._df()
+        h = content_hash_with_strategy(df, "txn")
+        assert isinstance(h, str)
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
+
+    def test_row_order_independent(self):
+        """Row order must not affect the salted hash (same as base content_hash)."""
+        df = self._df()
+        shuffled = df.sample(frac=1, random_state=7).reset_index(drop=True)
+        for strategy in self._STRATEGIES:
+            assert content_hash_with_strategy(df, strategy) == content_hash_with_strategy(shuffled, strategy)
+
+    def test_data_mutation_changes_hash(self):
+        """A change to the underlying data must also change the strategy-salted hash."""
+        df = self._df()
+        df2 = df.copy()
+        df2.loc[0, "amount"] = df2.loc[0, "amount"] + 0.01
+        for strategy in self._STRATEGIES:
+            assert content_hash_with_strategy(df, strategy) != content_hash_with_strategy(df2, strategy)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,11 +230,95 @@ class TestSplitEntryLine:
 
 
 # --------------------------------------------------------------------------- #
-# Bulk insert helpers — shape and batching (mock session, no DB)
+# _copy_field serialization — unit tests (no DB, no mock)
 # --------------------------------------------------------------------------- #
 
+class TestCopyField:
+    """_copy_field renders Python scalars as COPY FORMAT csv NULL '\\N' tokens.
+
+    Postgres COPY with FORMAT csv treats an *unquoted* \\N as NULL and a
+    *quoted* "" (empty) as an empty string, never NULL — which is exactly the
+    distinction between None and '' that the old executemany path preserved.
+    """
+
+    def test_none_is_null_marker(self):
+        assert _copy_field(None) == "\\N"
+
+    def test_empty_string_is_double_quoted_not_null(self):
+        # '""' in the CSV is an empty string; unquoted \\N would be NULL.
+        assert _copy_field("") == '""'
+
+    def test_plain_string_is_double_quoted(self):
+        assert _copy_field("EUR") == '"EUR"'
+
+    def test_embedded_comma_is_quoted(self):
+        # A comma inside a quoted field is NOT a delimiter.
+        assert _copy_field("a,b") == '"a,b"'
+
+    def test_embedded_double_quote_escaped_as_double_double(self):
+        # RFC-4180: " inside a quoted field → "".
+        assert _copy_field('say "hi"') == '"say ""hi"""'
+
+    def test_embedded_newline_stays_inside_quoted_field(self):
+        assert _copy_field("line\nbreak") == '"line\nbreak"'
+
+    def test_int_no_quotes(self):
+        assert _copy_field(0) == "0"
+        assert _copy_field(1) == "1"
+        assert _copy_field(-42) == "-42"
+
+    def test_float_full_precision_via_repr(self):
+        v = 1.2345678901234567
+        assert _copy_field(v) == repr(v)
+
+    def test_bool_true_rendered_before_int_branch(self):
+        # bool is a subclass of int; must be dispatched before int so that
+        # True → "true" not "1".
+        assert _copy_field(True) == "true"
+
+    def test_bool_false(self):
+        assert _copy_field(False) == "false"
+
+    def test_date_is_isoformat_quoted(self):
+        import datetime
+        d = datetime.date(2024, 3, 15)
+        assert _copy_field(d) == '"2024-03-15"'
+
+    def test_pandas_timestamp_is_isoformat_quoted(self):
+        import pandas as pd
+        ts = pd.Timestamp("2024-03-15 09:30:00")
+        assert _copy_field(ts) == '"' + ts.isoformat() + '"'
+
+
+# --------------------------------------------------------------------------- #
+# Bulk insert helpers — COPY-path contract (mock session, no DB)
+# --------------------------------------------------------------------------- #
+#
+# The new bulk-insert path calls psycopg2 copy_expert ONCE per table (no
+# BATCH_SIZE chunking) and then runs INSERT … SELECT … ON CONFLICT DO NOTHING
+# to apply the dedup constraint.  The old session.execute(sql, params_list)
+# executemany pattern is gone.  Tests verify:
+#   - exactly 1 copy_expert call regardless of row count
+#   - CSV row count == input rows
+#   - NULL coalescing visible as \\N in the streamed CSV
+#   - ON CONFLICT target matches the table's unique constraint
+
+
+def _make_copy_session():
+    """Return (session, captured) where captured['calls'] collects
+    each {sql, csv} dict recorded from copy_expert invocations."""
+    session = MagicMock()
+    captured: dict = {"calls": []}
+
+    def _on_copy(sql, buf):
+        captured["calls"].append({"sql": sql, "csv": buf.read()})
+
+    session.connection.return_value.connection.cursor.return_value.copy_expert.side_effect = _on_copy
+    return session, captured
+
+
 class TestBulkInsertEntries:
-    """_bulk_insert_entries builds the right param list and respects BATCH_SIZE."""
+    """_bulk_insert_entries: single COPY call, correct ON CONFLICT, NULL coalescing."""
 
     def _make_entries(self, n: int) -> pd.DataFrame:
         return pd.DataFrame({
@@ -154,56 +335,61 @@ class TestBulkInsertEntries:
             "source_system": ["test"] * n,
         })
 
-    def test_single_batch_calls_execute_once(self):
-        """When n <= BATCH_SIZE, session.execute is called exactly once."""
-        session = MagicMock()
-        df = self._make_entries(3)
-        _bulk_insert_entries(session, df)
-        assert session.execute.call_count == 1
+    def test_copy_expert_called_once_no_batching(self):
+        """All rows stream in one copy_expert call — BATCH_SIZE chunking is gone."""
+        session, captured = _make_copy_session()
+        _bulk_insert_entries(session, self._make_entries(BATCH_SIZE + 1))
+        assert len(captured["calls"]) == 1, (
+            f"Expected 1 copy_expert call (COPY streams once), got {len(captured['calls'])}"
+        )
 
-    def test_multi_batch_calls_execute_multiple_times(self):
-        """With n = BATCH_SIZE + 1, session.execute is called twice."""
-        session = MagicMock()
-        df = self._make_entries(BATCH_SIZE + 1)
-        _bulk_insert_entries(session, df)
-        assert session.execute.call_count == 2
-
-    def test_param_list_has_correct_length(self):
-        """The param list passed to execute in a single-batch call has n items."""
-        session = MagicMock()
+    def test_csv_row_count_matches_entry_count(self):
+        """Streamed CSV has exactly n data rows (no header line in COPY CSV)."""
         n = 5
-        df = self._make_entries(n)
-        _bulk_insert_entries(session, df)
-        # The second argument to execute is the param list
-        _, call_params = session.execute.call_args
-        # session.execute(sql, params) — positional call
-        args = session.execute.call_args[0]
-        assert len(args[1]) == n
+        session, captured = _make_copy_session()
+        _bulk_insert_entries(session, self._make_entries(n))
+        csv_text = captured["calls"][0]["csv"]
+        rows = [line for line in csv_text.splitlines() if line]
+        assert len(rows) == n
 
-    def test_null_coalescing_fiscal_period_none(self):
-        """fiscal_period=NaN -> None in the param dict (not int(NaN))."""
-        import math
-        session = MagicMock()
+    def test_nan_fiscal_period_renders_null_marker_in_csv(self):
+        """NaN fiscal_period → NULL token \\N in the streamed CSV (field index 2)."""
+        session, captured = _make_copy_session()
         df = self._make_entries(1)
         df.loc[0, "fiscal_period"] = float("nan")
         _bulk_insert_entries(session, df)
-        args = session.execute.call_args[0]
-        param = args[1][0]
-        assert param["fp"] is None, f"Expected None for NaN fiscal_period, got {param['fp']!r}"
+        csv_text = captured["calls"][0]["csv"]
+        # param_keys order: jegn(0) fy(1) fp(2) et(3) pd(4) dd(5) dtc(6) rdn(7) cc(8) hn(9) ss(10)
+        row = next(csv.reader(io.StringIO(csv_text)))
+        assert row[2] == "\\N", f"Expected \\N for NaN fiscal_period, got {row[2]!r}"
 
-    def test_currency_code_defaults_to_eur(self):
-        """currency_code=None/NaN -> 'EUR' default."""
-        session = MagicMock()
+    def test_none_currency_code_defaults_to_eur_in_csv(self):
+        """None currency_code → 'EUR' default in the streamed CSV (field index 8)."""
+        session, captured = _make_copy_session()
         df = self._make_entries(1)
         df.loc[0, "currency_code"] = None
         _bulk_insert_entries(session, df)
-        args = session.execute.call_args[0]
-        param = args[1][0]
-        assert param["cc"] == "EUR", f"Expected 'EUR', got {param['cc']!r}"
+        csv_text = captured["calls"][0]["csv"]
+        row = next(csv.reader(io.StringIO(csv_text)))
+        assert row[8] == "EUR", f"Expected EUR default, got {row[8]!r}"
+
+    def test_on_conflict_target_is_jegn_fiscal_year(self):
+        """INSERT SELECT ON CONFLICT must target (journal_entry_group_number, fiscal_year)."""
+        session, _ = _make_copy_session()
+        _bulk_insert_entries(session, self._make_entries(2))
+        insert_sqls = [
+            str(c.args[0])
+            for c in session.execute.call_args_list
+            if "ON CONFLICT" in str(c.args[0])
+        ]
+        assert insert_sqls, "No INSERT ... ON CONFLICT SQL was executed"
+        assert "(journal_entry_group_number, fiscal_year)" in insert_sqls[0], (
+            f"ON CONFLICT target missing from: {insert_sqls[0][:300]}"
+        )
 
 
 class TestBulkInsertLines:
-    """_bulk_insert_lines builds the right param list and preserves None coalescing."""
+    """_bulk_insert_lines: single COPY call, correct ON CONFLICT, NULL coalescing."""
 
     def _make_lines(self, n: int) -> pd.DataFrame:
         return pd.DataFrame({
@@ -221,33 +407,43 @@ class TestBulkInsertLines:
             "source_system": ["test"] * n,
         })
 
-    def test_single_batch(self):
-        session = MagicMock()
-        df = self._make_lines(4)
-        _bulk_insert_lines(session, df)
-        assert session.execute.call_count == 1
+    def test_copy_expert_called_once_no_chunking(self):
+        """All rows stream in one copy_expert call regardless of row count."""
+        session, captured = _make_copy_session()
+        _bulk_insert_lines(session, self._make_lines(BATCH_SIZE + 2))
+        assert len(captured["calls"]) == 1
 
-    def test_param_count_matches_rows(self):
-        session = MagicMock()
+    def test_csv_row_count_matches_line_count(self):
+        """Streamed CSV has exactly n data rows."""
         n = 7
-        df = self._make_lines(n)
-        _bulk_insert_lines(session, df)
-        args = session.execute.call_args[0]
-        assert len(args[1]) == n
+        session, captured = _make_copy_session()
+        _bulk_insert_lines(session, self._make_lines(n))
+        csv_text = captured["calls"][0]["csv"]
+        rows = [line for line in csv_text.splitlines() if line]
+        assert len(rows) == n
 
-    def test_vat_amount_none_stays_none(self):
-        """vat_amount=None -> None in params (not float(None))."""
-        session = MagicMock()
-        df = self._make_lines(1)
-        _bulk_insert_lines(session, df)
-        args = session.execute.call_args[0]
-        assert args[1][0]["vat"] is None
+    def test_none_vat_amount_renders_null_marker_in_csv(self):
+        """None vat_amount → NULL token \\N in the streamed CSV (field index 6)."""
+        session, captured = _make_copy_session()
+        _bulk_insert_lines(session, self._make_lines(1))
+        csv_text = captured["calls"][0]["csv"]
+        # param_keys order: jegn(0) fy(1) ln(2) bid(3) ang(4) amt(5) vat(6) ...
+        row = next(csv.reader(io.StringIO(csv_text)))
+        assert row[6] == "\\N", f"Expected \\N for None vat_amount, got {row[6]!r}"
 
-    def test_multi_batch(self):
-        session = MagicMock()
-        df = self._make_lines(BATCH_SIZE + 2)
-        _bulk_insert_lines(session, df)
-        assert session.execute.call_count == 2
+    def test_on_conflict_target_is_jegn_fy_line_number(self):
+        """INSERT SELECT ON CONFLICT must target (journal_entry_group_number, fiscal_year, line_number)."""
+        session, _ = _make_copy_session()
+        _bulk_insert_lines(session, self._make_lines(2))
+        insert_sqls = [
+            str(c.args[0])
+            for c in session.execute.call_args_list
+            if "ON CONFLICT" in str(c.args[0])
+        ]
+        assert insert_sqls, "No INSERT ... ON CONFLICT SQL was executed"
+        assert "(journal_entry_group_number, fiscal_year, line_number)" in insert_sqls[0], (
+            f"ON CONFLICT target missing from: {insert_sqls[0][:300]}"
+        )
 
 
 # --------------------------------------------------------------------------- #

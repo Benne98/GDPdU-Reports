@@ -1,32 +1,32 @@
-import { AlertTriangle, Clock, FileText, Wallet } from 'lucide-react'
+import { Clock, FileText, Percent, Wallet } from 'lucide-react'
 import type { KpiDef } from '../../operational/OperationalKpiGrid'
 
-export type AgingTrendFormat = 'currency' | 'days' | 'count'
+export type AgingTrendFormat = 'currency' | 'days' | 'count' | 'percent'
 
 export type AgingKpiDef = KpiDef & {
-  trendKey: 'balance' | 'overdue' | 'dso_days' | 'dpo_days' | 'open_documents'
+  trendKey: 'gross_balance' | 'balance' | 'overdue' | 'overdue_pct' | 'dso_days' | 'dpo_days' | 'open_documents'
   trendFormat: AgingTrendFormat
 }
 
 export const RECEIVABLES_AGING_KPI_DEFS: AgingKpiDef[] = [
   {
-    key: 'total_receivables',
+    key: 'total_open_gross',
     title: 'Total receivables',
     format: 'currency',
     icon: Wallet,
     accentColor: '#1E3A5F',
-    trendKey: 'balance',
+    trendKey: 'gross_balance',
     trendFormat: 'currency',
   },
   {
-    key: 'overdue',
-    title: 'Overdue',
-    format: 'currency',
-    icon: AlertTriangle,
-    accentColor: '#F59E0B',
+    key: 'overdue_pct',
+    title: 'Overdue %',
+    format: 'percent',
+    icon: Percent,
+    accentColor: '#D97706',
     invertDelta: true,
-    trendKey: 'overdue',
-    trendFormat: 'currency',
+    trendKey: 'overdue_pct',
+    trendFormat: 'percent',
   },
   {
     key: 'dso_days',
@@ -51,23 +51,23 @@ export const RECEIVABLES_AGING_KPI_DEFS: AgingKpiDef[] = [
 
 export const PAYABLES_AGING_KPI_DEFS: AgingKpiDef[] = [
   {
-    key: 'total_payables',
+    key: 'total_open_gross',
     title: 'Total payables',
     format: 'currency',
     icon: Wallet,
     accentColor: '#14532D',
-    trendKey: 'balance',
+    trendKey: 'gross_balance',
     trendFormat: 'currency',
   },
   {
-    key: 'overdue',
-    title: 'Overdue',
-    format: 'currency',
-    icon: AlertTriangle,
-    accentColor: '#F59E0B',
+    key: 'overdue_pct',
+    title: 'Overdue %',
+    format: 'percent',
+    icon: Percent,
+    accentColor: '#D97706',
     invertDelta: true,
-    trendKey: 'overdue',
-    trendFormat: 'currency',
+    trendKey: 'overdue_pct',
+    trendFormat: 'percent',
   },
   {
     key: 'dpo_days',
@@ -81,7 +81,7 @@ export const PAYABLES_AGING_KPI_DEFS: AgingKpiDef[] = [
   },
   {
     key: 'open_documents',
-    title: 'Open invoices',
+    title: 'Open bills',
     format: 'count',
     icon: FileText,
     accentColor: '#475569',

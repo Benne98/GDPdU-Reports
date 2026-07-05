@@ -13,6 +13,9 @@ import { Upload, ChevronDown, Check, FileSpreadsheet, Download } from 'lucide-re
 import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
 import SusaColumnMapper, { type SusaColumnMappingPayload } from './SusaColumnMapper'
+import FteColumnMapper, { type FteMappingPayload } from './FteColumnMapper'
+import FteDimensionPicker from './FteDimensionPicker'
+import FtePexGrid from './FtePexGrid'
 
 interface Props {
   payload: AdaptiveCardPayload
@@ -837,12 +840,91 @@ export default function AdaptiveCard(props: Props) {
   if (props.payload.card === 'databook_susa_column_mapper') {
     return <SusaColumnMapperCard {...props} />
   }
+  if (
+    props.payload.card === 'fte_fte_mapping' ||
+    props.payload.card === 'fte_payroll_mapping'
+  ) {
+    return <FteMapperCard {...props} />
+  }
+  if (props.payload.card === 'fte_dimensions') {
+    return <FteDimensionsCard {...props} />
+  }
   return <AdaptiveCardForm {...props} />
 }
 
 function normalizeMapperMeta(value: unknown, fallback: string): string {
   const trimmed = String(value ?? '').trim()
   return trimmed || fallback
+}
+
+function FteMapperCard({ payload, onSubmit, disabled }: Props) {
+  const meta = payload.mapper_meta ?? {}
+  const sessionId = String(meta.session_id ?? '')
+  const previewFileId = String(meta.preview_file_id ?? '')
+  const uploadMode = String(meta.upload_mode ?? 'per_fy_grid')
+  const mode = payload.card === 'fte_payroll_mapping' ? 'payroll' : 'fte'
+
+  const handleMapping = async (mapping: FteMappingPayload) => {
+    if (mode === 'payroll') {
+      await onSubmit(payload.card, { fte_payroll_mapping: mapping, mapping })
+    } else {
+      await onSubmit(payload.card, {
+        fte_mapping: mapping,
+        mapping,
+        fte_tenure_mode: mapping.tenure_mode,
+      })
+    }
+  }
+
+  return (
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3 relative"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
+    >
+      <h3 className="text-sm font-semibold" style={{ color: '#1E293B' }}>
+        {payload.title}
+      </h3>
+      {payload.subtitle && (
+        <p className="text-xs text-slate-500">{payload.subtitle}</p>
+      )}
+      <FteColumnMapper
+        sessionId={sessionId}
+        previewFileId={previewFileId}
+        mode={mode}
+        uploadMode={uploadMode}
+        disabled={disabled}
+        onSubmit={handleMapping}
+      />
+    </div>
+  )
+}
+
+function FteDimensionsCard({ payload, onSubmit, disabled }: Props) {
+  const meta = payload.mapper_meta ?? {}
+  const sessionId = String(meta.session_id ?? '')
+  const previewFileId = String(meta.preview_file_id ?? '')
+
+  return (
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
+    >
+      <h3 className="text-sm font-semibold" style={{ color: '#1E293B' }}>
+        {payload.title}
+      </h3>
+      {payload.subtitle && (
+        <p className="text-xs text-slate-500">{payload.subtitle}</p>
+      )}
+      <FteDimensionPicker
+        sessionId={sessionId}
+        previewFileId={previewFileId}
+        disabled={disabled}
+        onSubmit={async dimensions => {
+          await onSubmit(payload.card, { fte_dimensions: dimensions, dimensions })
+        }}
+      />
+    </div>
+  )
 }
 
 function SusaColumnMapperCard({ payload, onSubmit, disabled }: Props) {
@@ -1234,12 +1316,22 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             onEntityNameChange={(entityIdx, name) => handleSusaEntityName(inp.id, entityIdx, name)}
           />
         )
+      case 'fte_pex_grid':
+        return (
+          <FtePexGrid
+            key={inp.id}
+            input={inp}
+            values={values}
+            disabled={disabled}
+            onChange={v => set(inp.id, v)}
+          />
+        )
       default:
         return null
     }
   }
 
-  const hasSusaGrid = inputs.some(i => i.type === 'susa_grid')
+  const hasSusaGrid = inputs.some(i => i.type === 'susa_grid' || i.type === 'fte_pex_grid')
   const compact = Boolean(payload.compact)
   const visibleInputs = inputs.filter(inp => inputVisible(inp, values))
   const cardMax = hasSusaGrid ? 720 : compact ? 440 : 380

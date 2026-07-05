@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, type PayablesSupplierRegisterDocument, type PayablesSupplierRegisterRow } from '../../../../lib/api'
-import { fmtAmountWhole } from '../../../../lib/fmt'
+import { fmtEurWhole } from '../../../../lib/fmt'
 import PlExportMenu, { type PlExportKind } from '../../../financials/pl-two-view/PlExportMenu'
 import { BRAND } from '../../analytics/salesChartTheme'
 import FilterableDataTable, { FilterableColumn } from '../../operational/FilterableDataTable'
@@ -37,7 +37,7 @@ function DocumentLinesTable({ docs }: { docs: PayablesSupplierRegisterDocument[]
               {formatDocDate(doc.due_date)}
             </td>
             <td className="px-2 py-1.5 text-right tabular-nums font-medium" style={{ color: BRAND.navy }}>
-              {fmtAmountWhole(doc.amount)}
+              {fmtEurWhole(doc.amount)}
             </td>
             <td className="px-2 py-1.5 text-right tabular-nums" style={{ color: BRAND.textSecondary }}>
               {Math.round(doc.days_outstanding)}
@@ -152,12 +152,23 @@ export default function PayablesSupplierRegister({
   const columns = useMemo((): FilterableColumn<PayablesSupplierRegisterRow>[] => [
     { id: 'name', label: 'Supplier', getValue: r => r.supplier_name, sortValue: r => r.supplier_name },
     {
+      id: 'contact',
+      label: 'Contact',
+      getValue: r => r.contact ?? '',
+      sortValue: r => r.contact ?? '',
+      render: r => (
+        <span style={{ color: r.contact ? BRAND.text : BRAND.textMuted }}>
+          {r.contact ?? '—'}
+        </span>
+      ),
+    },
+    {
       id: 'balance',
       label: 'Balance',
       align: 'right',
       getValue: r => String(r.balance),
       sortValue: r => r.balance,
-      render: r => fmtAmountWhole(r.balance),
+      render: r => fmtEurWhole(r.balance),
     },
     {
       id: 'overdue_pct',
@@ -199,8 +210,16 @@ export default function PayablesSupplierRegister({
       sortValue: r => r.cost_of_materials ?? r.procurement_spend ?? 0,
       render: r => {
         const v = r.cost_of_materials ?? r.procurement_spend ?? 0
-        return v > 0 ? fmtAmountWhole(v) : '—'
+        return v > 0 ? fmtEurWhole(v) : '—'
       },
+    },
+    {
+      id: 'gross_spend',
+      label: 'Gross spend',
+      align: 'right',
+      getValue: r => String(r.gross_spend ?? 0),
+      sortValue: r => r.gross_spend ?? 0,
+      render: r => (r.gross_spend ?? 0) > 0 ? fmtEurWhole(r.gross_spend!) : '—',
     },
   ], [])
 

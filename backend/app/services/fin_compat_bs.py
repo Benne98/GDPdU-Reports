@@ -101,6 +101,10 @@ from app.services.fin_compat_pl import (
     _row_amounts,
     _row_dict,
     _sort_key_cm,
+    _statement_structure_rows,
+    attach_hierarchy_plan_to_rows,
+    load_position_plan_map,
+    load_position_plan_map_pref,
 )
 
 _BS_HIER_KEYS = ["level_1", "level_2", "level_3", "level_4"]
@@ -567,10 +571,16 @@ def build_bs_statement_compat(
     )
     apply_bs_display_signs(rows_out)
     _inject_net_profit(rows_out, net_profit)
+    _sort_bs_display_order(rows_out)
 
     kpi = equity_ratio_row_from_grains(grains, keys)
-    if kpi is not None:
-        rows_out.append(kpi)
+    _append_bs_statement_kpi_rows(rows_out, kpi)
+
+    bs_plan_map = load_position_plan_map_pref(session, "BS", yr, mo, ent_frag)
+    if bs_plan_map:
+        attach_hierarchy_plan_to_rows(
+            rows_out, bs_plan_map, _statement_structure_rows(session, "BS"),
+        )
 
     out: dict[str, Any] = {
         "statement": "bs",
@@ -654,10 +664,10 @@ def build_bs_monthly(
         net_profit,
         deltas_fn=lambda am, invert=False: {},
     )
+    _sort_bs_display_order(rows_out)
 
     kpi = equity_ratio_monthly_row(grains, all_keys)
-    if kpi is not None:
-        rows_out.append(kpi)
+    _append_bs_statement_kpi_rows(rows_out, kpi)
 
     out: dict[str, Any] = {
         "statement": "bs",
@@ -818,21 +828,98 @@ _BS_LEVEL_2_ORDER = [
     "Deferred tax assets",
 ]
 
+_BS_LEVEL_2_EQL_ORDER = [
+    "Equity",
+    "Liabilities",
+    "Provisions & accruals",
+]
+
+_BS_FIXED_L3_ORDER = [
+    "Tangible assets",
+    "Intangible assets",
+    "Financial assets",
+]
+
+_BS_CURRENT_L3_ORDER = [
+    "Inventories",
+    "Trade receivables",
+    "Receivables from affiliates",
+    "Cash & cash equivalents",
+    "Other assets",
+]
+
+
+def _label_order_index(label: str, order: list[str]) -> int:
+    """Stable display order; tolerates minor label variants (e.g. Cash)."""
+    lbl = (label or "").strip()
+    low = lbl.lower()
+    for i, token in enumerate(order):
+        if lbl == token or low == token.lower():
+            return i
+    if "cash" in low:
+        for i, token in enumerate(order):
+            if "cash" in token.lower():
+                return i
+    return 999
+
+
+def _sort_children_by_label(children: list[dict[str, Any]], order: list[str]) -> None:
+    children.sort(
+        key=lambda r: (_label_order_index(r.get("label") or "", order), (r.get("label") or "")),
+    )
+
+
+def _sort_bs_display_order(rows: list[dict[str, Any]]) -> None:
+    """German BS presentation order (display only; amounts unchanged)."""
+
+    def _walk(node_rows: list[dict[str, Any]], parent_label: str = "") -> None:
+        if not node_rows:
+            return
+        parent = (parent_label or "").strip()
+        if parent == "Assets":
+            _sort_children_by_label(node_rows, _BS_LEVEL_2_ORDER)
+        elif parent.lower().startswith("equity") and "liab" in parent.lower():
+            _sort_children_by_label(node_rows, _BS_LEVEL_2_EQL_ORDER)
+        elif parent == "Fixed assets":
+            _sort_children_by_label(node_rows, _BS_FIXED_L3_ORDER)
+        elif parent == "Current assets":
+            _sort_children_by_label(node_rows, _BS_CURRENT_L3_ORDER)
+        for row in node_rows:
+            label = (row.get("label") or "").strip()
+            children = row.get("children") or []
+            if children:
+                _walk(children, label)
+
+    _walk(rows)
+
 
 def _sort_bs_asset_level2(rows: list[dict[str, Any]]) -> None:
-    """Fixed assets before current assets under Assets (German BS convention)."""
-    for row in rows:
-        children = row.get("children")
-        if children and (row.get("label") or "").strip() == "Assets":
-            def _l2_key(r: dict[str, Any]) -> tuple[int, str]:
-                lbl = (r.get("label") or "").strip()
-                try:
-                    return (_BS_LEVEL_2_ORDER.index(lbl), lbl)
-                except ValueError:
-                    return (999, lbl)
-            row["children"] = sorted(children, key=_l2_key)
-        for ch in row.get("children") or []:
-            _sort_bs_asset_level2([ch])
+    """Backward-compatible alias — full BS display order."""
+    _sort_bs_display_order(rows)
+
+
+def _bs_kpi_header_row(*, id_prefix: str = "bs") -> dict[str, Any]:
+    return {
+        "id": f"{id_prefix}-kpi-header",
+        "line_code": "KPI_HEADER",
+        "row_kind": "kpi_header",
+        "label": "KPIs",
+        "is_bold": False,
+        "has_children": False,
+        "children": [],
+    }
+
+
+def _append_bs_statement_kpi_rows(
+    rows_out: list[dict[str, Any]],
+    kpi: Optional[dict[str, Any]],
+    *,
+    id_prefix: str = "bs",
+) -> None:
+    if kpi is None:
+        return
+    rows_out.append(_bs_kpi_header_row(id_prefix=id_prefix))
+    rows_out.append(kpi)
 
 
 def col_labels_bs_snapshot(year: int, month: int) -> dict[str, str]:
@@ -843,7 +930,10 @@ def col_labels_bs_snapshot(year: int, month: int) -> dict[str, str]:
         "fy_py": label_actual(f"Dec{str(year - 2)[-2:]}"),
         "fy": label_actual(f"Dec{str(year - 1)[-2:]}"),
         "cm_py": label_actual(f"{abbr}{str(year - 1)[-2:]}"),
-        "fy_f": label_forecast_fy(year),
+        # Balance-sheet positions are point-in-time (Stichtag), so a full-year "FY..F"
+        # forecast label is semantically wrong — use the anchor-month forecast label
+        # (e.g. "Jul25F"). Kept ending in "F" so the frontend passes it through.
+        "fy_f": f"{abbr}{str(year)[-2:]}F",
         "cm": label_actual(f"{abbr}{str(year)[-2:]}"),
     }
 
@@ -853,6 +943,13 @@ _BS_FY_F_BUMP_CODES = (
     "BS_TOTAL_EQUITY",
     "BS_GRANDTOTAL_EQ_LIAB",
     "BS_GRANDTOTAL_ASSETS",
+    # ER (exit-readiness) consolidated view uses label-derived line_codes for the
+    # grand totals; bump both sides + the equity subtotal by the same net-profit YTG
+    # so the forecast balance sheet stays balanced (Assets == Equity+Liab). A code
+    # that is absent in a given dataset simply no-ops (safe). Quick best-effort.
+    "er-bs-d0-Assets",
+    "er-bs-d0-Equity___liabilities",
+    "er-bs-d1-Equity___liabilities-Equity",
 )
 
 
@@ -862,12 +959,28 @@ def _snapshot_net_profit_ytg_plan(
     month: int,
     ent_frag: str,
 ) -> float:
-    """Plan YTG on the net-profit line (full-year forecast increment after anchor month)."""
-    plan_map = _load_plan_map(session, year, month, ent_frag)
-    for code in ("NET_PROFIT", "NET_INCOME", "NET_RESULT"):
-        pm = plan_map.get(code)
-        if pm is not None:
-            return float(pm.get("ytg") or 0.0)
+    """Plan YTG on the net-profit line (full-year forecast increment after anchor month).
+
+    The BS FY-forecast bump is the projected remaining-year NET INCOME, which lives
+    in the **P&L** plan — NOT the BS position plan (a balance-sheet stock has no
+    meaningful year-to-go). Prefer the ``forecast`` scenario (open-period run-rate);
+    fall back to ``budget``. Sign convention: a positive YTG grows equity (retained
+    earnings) and total assets. NOTE: quick best-effort — pending financial review.
+    """
+    # Local import avoids a circular import between the BS and PL compat modules.
+    from app.services.fin_compat_pl import load_position_plan_map as _pl_plan_map
+
+    for scenario in ("forecast", "budget"):
+        try:
+            plan_map = _pl_plan_map(session, "PL", year, month, ent_frag, scenario=scenario)
+        except Exception:  # noqa: BLE001 — a missing plan must not break the statement
+            continue
+        for code in ("NET_PROFIT", "NET_INCOME", "NET_RESULT"):
+            pm = plan_map.get(code)
+            if pm is not None:
+                ytg = float(pm.get("ytg") or 0.0)
+                if abs(ytg) > 1e-6:
+                    return ytg
     return 0.0
 
 
@@ -988,7 +1101,7 @@ def build_bs_snapshot_annual(
         sum_amounts_fn=_snap_sum,
     )
     apply_bs_display_signs(rows_out)
-    _sort_bs_asset_level2(rows_out)
+    _sort_bs_display_order(rows_out)
     _inject_net_profit(rows_out, net_profit, deltas_fn=_snap_deltas)
 
     ytg_np = _snapshot_net_profit_ytg_plan(session, year, month, ent_frag)
@@ -999,7 +1112,7 @@ def build_bs_snapshot_annual(
     )
     if kpi is not None:
         kpi["deltas"] = _round_am(_snap_deltas(kpi["amounts"], invert=False))
-        rows_out.append(kpi)
+    _append_bs_statement_kpi_rows(rows_out, kpi, id_prefix="er-bs")
 
     return {
         "statement": "bs",
@@ -1325,7 +1438,7 @@ def build_bs_consolidation(
         sort_key_map=_BS_SORT_MAP,
     )
     apply_bs_consl_display_signs(rows_out)
-    _sort_bs_asset_level2(rows_out)
+    _sort_bs_display_order(rows_out)
 
     net_profit = _equity_bridge_by_entity_from_grains(
         grains, entity_codes, ep_to_code, keys,
@@ -1851,6 +1964,24 @@ def build_bs_narrative(
         period_grain=period_grain,
     )
 
+    # Plan overlay (golden-safe): cm_vs_plan on the headline 'Total assets' line =
+    # actual ta_cm − plan_cm.  ONLY populated when the manual BS budget has signal;
+    # with no budget rows load_position_plan_map returns {} → cm_vs_plan stays 0.0 →
+    # byte-identical.  BS plan_cm is presented via the centralized stored_to_present
+    # helper (asset +/credit −), matching the displayed BS actual convention.
+    cm_vs_plan = 0.0
+    try:
+        bs_plan_map = load_position_plan_map_pref(
+            session, "BS", yr, mo,
+            entity_sql_fragment(resolve_entity_prefix(session, entity)),
+        )
+        if bs_plan_map and ta_row is not None:
+            tpm = bs_plan_map.get(ta_row.get("line_code"))
+            if tpm:
+                cm_vs_plan = round(ta_cm - float(tpm.get("plan_cm") or 0.0), 2)
+    except Exception:
+        cm_vs_plan = 0.0  # graceful — never break the narrative on a plan-read error
+
     llm_used = False
     if use_llm and os.environ.get("ANTHROPIC_API_KEY"):
         try:
@@ -1868,7 +1999,7 @@ def build_bs_narrative(
         "intro_facts": {
             "period_label": cm_label, "group_label": group_label,
             "net_profit_ytd": 0.0, "coverage_pct": None,
-            "cm_month_label": cm_label, "cm_vs_plan": 0.0, "cm_vs_plan_qualifier": "",
+            "cm_month_label": cm_label, "cm_vs_plan": cm_vs_plan, "cm_vs_plan_qualifier": "",
             "primary_drivers": primary_drivers, "entity_split": None,
         },
         "bullets": bullets,

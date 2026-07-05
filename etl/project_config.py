@@ -33,9 +33,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROJECT_ID = "default"
 
-#: Allowed values for the two flags that drive the rebuild.
+#: Allowed values for the flags that drive the rebuild.
 VALID_OPENING_BALANCE_MODES = frozenset({"in_data", "file", "carry_forward"})
 VALID_NET_PROFIT_SOURCES = frozenset({"report_inject", "gl_rows"})
+#: 'library'   -> fill MISSING (account, fiscal_year) dim_gl_account rows from the
+#:               account mapping library (most-frequent by account_name) — DEFAULT.
+#: 'exclusive' -> use ONLY the project's provided per-(account, year) mapping; the
+#:               library fill is SKIPPED, so years the mapping file never covered
+#:               stay unmapped.
+VALID_ACCOUNT_MAPPING_MODES = frozenset({"library", "exclusive"})
 
 #: Canonical config shape returned to the frontend wizard.  Values here are the
 #: LEGACY defaults (must equal the settings.* defaults to keep golden equivalence).
@@ -45,6 +51,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "opening_balance_mode": "in_data",
     "net_profit_source": "report_inject",
     "mapping_source": "library",  # 'library' | 'client_coa'
+    "account_mapping_mode": "library",  # 'library' (fill missing years) | 'exclusive'
     "partner_master_source": "files",  # 'files' | 'gdpdu'
     "sales_label": "Sales",
     "cost_label": "Cost of materials",
@@ -108,7 +115,7 @@ def read_project_config(
         "fy_start_month": int(DEFAULT_CONFIG["fy_start_month"]),
         "config": dict(DEFAULT_CONFIG),
     }
-    if not _table_exists(session, "project_config"):
+    if not _table_exists(session, "admin_project_config"):
         return fallback
 
     row = session.execute(
@@ -116,7 +123,7 @@ def read_project_config(
             """
             SELECT p.project_id, p.name, p.fy_start_month, c.config
             FROM dim_project AS p
-            LEFT JOIN project_config AS c ON c.project_id = p.project_id
+            LEFT JOIN admin_project_config AS c ON c.project_id = p.project_id
             WHERE p.project_id = :pid
             """
         ),
@@ -152,8 +159,8 @@ def upsert_project_config(
     blob carries the full canonical shape.  ``fy_start_month`` is mirrored from
     the config onto ``dim_project`` (the column is the FY-start source of truth).
     """
-    if not _table_exists(session, "project_config"):
-        raise RuntimeError("project_config table missing — run migration 0011_project_config")
+    if not _table_exists(session, "admin_project_config"):
+        raise RuntimeError("admin_project_config table missing — run migration 0011_project_config")
 
     merged = _coerce_config(config or {})
     fy_start = int(merged["fy_start_month"])
@@ -175,7 +182,7 @@ def upsert_project_config(
     session.execute(
         text(
             """
-            INSERT INTO project_config (project_id, config, updated_at)
+            INSERT INTO admin_project_config (project_id, config, updated_at)
             VALUES (:pid, CAST(:cfg AS JSONB), NOW())
             ON CONFLICT (project_id) DO UPDATE SET
                 config = EXCLUDED.config,
@@ -190,15 +197,69 @@ def upsert_project_config(
     return read_project_config(session, project_id)
 
 
+def upsert_project_entities(
+    session: Session,
+    entities: list[dict[str, Any]] | None,
+    *,
+    source_system: str = "project_setup",
+) -> list[str]:
+    """UPSERT the wizard's project entities into ``dim_legal_entity`` up front.
+
+    Phase-2 ordering fix: the Project Setup Finish now commits the account mapping
+    (``bs_pl_master``) BEFORE the GL data, but the CoA commit resolves/validates
+    entity references against ``dim_legal_entity`` (``build_entity_lookup``).  On a
+    fresh DB those rows did not yet exist (they were created only at GL-commit time),
+    so the CoA commit 422'd.  Creating the entities here — driven by the wizard's
+    known entity list (``{code, prefix, name}``) — lets the CoA commit resolve them.
+
+    Idempotent: re-runs upsert the same ``legal_entity_code`` rows (no duplicates).
+    Uses ``load_legal_entity`` so ``legal_entity_code == entity_prefix`` and both the
+    code and name become lookup keys (``build_entity_lookup`` keys on both).
+
+    The caller owns the transaction; this function does not commit.  Returns the
+    list of normalised 2-char prefixes that were upserted.
+    """
+    if not entities:
+        return []
+
+    # Imported lazily so etl.project_config stays importable without etl.load's deps.
+    from etl.load import load_legal_entity
+    from etl.transform import normalize_prefix
+
+    upserted: list[str] = []
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        raw_prefix = str(ent.get("prefix") or ent.get("code") or "").strip()
+        if not raw_prefix:
+            continue
+        try:
+            prefix = normalize_prefix(raw_prefix)
+        except (ValueError, TypeError):
+            logger.warning("upsert_project_entities: skipping non-numeric entity %r", ent)
+            continue
+        name = str(ent.get("name") or ent.get("code") or prefix).strip() or prefix
+        load_legal_entity(
+            session,
+            entity_prefix=prefix,
+            entity_name=name,
+            source_system=source_system,
+        )
+        upserted.append(prefix)
+
+    logger.info("upsert_project_entities: %d entity row(s) upserted", len(upserted))
+    return upserted
+
+
 def resolve_rebuild_flags(
     session: Session, project_id: str = DEFAULT_PROJECT_ID
 ) -> dict[str, str]:
     """Resolve the rebuild flags for *project_id*.
 
-    Returns ``{"opening_balance_mode": ..., "net_profit_source": ...}``.  The
-    per-project config drives these so a wizard setup persists and is reused on
-    every update.  Values are validated; an unknown stored value falls back to the
-    settings default for that flag (and thus LEGACY behaviour).
+    Returns ``{"opening_balance_mode": ..., "net_profit_source": ...,
+    "account_mapping_mode": ...}``.  The per-project config drives these so a
+    wizard setup persists and is reused on every update.  Values are validated; an
+    unknown stored value falls back to the settings/legacy default for that flag.
     """
     settings_ob, settings_np = _settings_defaults()
     record = read_project_config(session, project_id)
@@ -216,7 +277,17 @@ def resolve_rebuild_flags(
                        project_id, np, settings_np)
         np = settings_np
 
-    return {"opening_balance_mode": ob, "net_profit_source": np}
+    am = cfg.get("account_mapping_mode") or DEFAULT_CONFIG["account_mapping_mode"]
+    if am not in VALID_ACCOUNT_MAPPING_MODES:
+        logger.warning("project %s: invalid account_mapping_mode %r; using %s",
+                       project_id, am, DEFAULT_CONFIG["account_mapping_mode"])
+        am = DEFAULT_CONFIG["account_mapping_mode"]
+
+    return {
+        "opening_balance_mode": ob,
+        "net_profit_source": np,
+        "account_mapping_mode": am,
+    }
 
 
 def _settings_defaults() -> tuple[str, str]:

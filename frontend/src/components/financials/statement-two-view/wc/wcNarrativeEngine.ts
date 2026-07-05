@@ -3,6 +3,7 @@ import type {
   FinancialStatementRow,
   PlNarrativeResponse,
 } from '../../../../lib/api'
+import { IS_OVERVIEW_V2 } from '../../../../lib/overviewV2Mode'
 import { fmtNarrativeEurSigned } from '../../pl-two-view/narrativeFmt'
 import {
   proseLabel,
@@ -242,7 +243,11 @@ export function buildClientWcNarrative(
       period_label: cmLabel,
       group_label: "the group's",
       net_profit_ytd: 0,
-      coverage_pct: null,
+      coverage_pct: IS_OVERVIEW_V2
+        ? (data.plan?.lines?.find(l => l.line_code === 'NWC' && l.coverage_pct != null)?.coverage_pct
+            ?? data.plan?.lines?.find(l => l.coverage_pct != null)?.coverage_pct
+            ?? null)
+        : null,
       cm_month_label: cmLabel,
       cm_vs_plan: 0,
       cm_vs_plan_qualifier: '',

@@ -12,6 +12,16 @@ export function sortAnnualChildRows(rows: ErStatementRow[], amountKey: string): 
   )
 }
 
+/** BS/WC use backend display order; other snapshot statements keep magnitude sort. */
+export function annualChildRows(
+  statement: string | undefined,
+  rows: ErStatementRow[],
+  amountKey: string,
+): ErStatementRow[] {
+  if (statement === 'bs' || statement === 'wc') return rows
+  return sortAnnualChildRows(rows, amountKey)
+}
+
 export function annualCommentColSpan(valueCols: number, hasCommentCol: boolean): number {
   return valueCols + 1 + (hasCommentCol ? 1 : 0)
 }

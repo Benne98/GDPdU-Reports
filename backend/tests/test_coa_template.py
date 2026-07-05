@@ -40,7 +40,9 @@ class TestWorkbookShape(unittest.TestCase):
         wb = coa_template.build_coa_template_workbook(
             coa_template.empty_template_rows("Acme GmbH")
         )
-        self.assertEqual(set(wb.sheetnames), {BS_SHEET, PL_SHEET})
+        # Both Master sheets present (a hidden "Lists" sheet for the dropdowns may
+        # also be appended — the importer gate tolerates it).
+        self.assertTrue({BS_SHEET, PL_SHEET}.issubset(wb.sheetnames))
         # is_bs_pl_master_workbook is the importer's own gate.
         self.assertTrue(is_bs_pl_master_workbook(wb.sheetnames))
 
@@ -56,9 +58,31 @@ class TestWorkbookShape(unittest.TestCase):
         wb = coa_template.build_coa_template_workbook(
             coa_template.empty_template_rows(""), style=False
         )
-        # One BS + one PL example data row beyond the header.
-        self.assertEqual(self._data_account_count(wb[BS_SHEET]), 1)
-        self.assertEqual(self._data_account_count(wb[PL_SHEET]), 1)
+        # A few clearly-marked example rows per sheet beyond the header.
+        self.assertEqual(self._data_account_count(wb[BS_SHEET]), 2)
+        self.assertEqual(self._data_account_count(wb[PL_SHEET]), 2)
+        # Examples are flagged as such (EXAMPLE-prefixed account number).
+        for sheet in (BS_SHEET, PL_SHEET):
+            # Account is now index 0 (col A) — no Entity column prepended.
+            accounts = [c[0].value for c in wb[sheet].iter_rows(min_row=2)
+                        if c[0].value]
+            self.assertTrue(all(str(a).startswith("EXAMPLE") for a in accounts))
+
+
+    def test_hierarchy_dropdowns_present(self):
+        wb = coa_template.build_coa_template_workbook(
+            coa_template.empty_template_rows("Acme GmbH")
+        )
+        # Hidden lookup sheet with our canonical labels.
+        self.assertIn("Lists", wb.sheetnames)
+        self.assertEqual(wb["Lists"].sheet_state, "hidden")
+        # L2/L3/L4 columns (E/F/G) carry list data validations on both Master sheets.
+        for sheet in (BS_SHEET, PL_SHEET):
+            dvs = wb[sheet].data_validations.dataValidation
+            cols = {str(dv.sqref).split(":")[0][:1] for dv in dvs}
+            # D/E/F (level_1/level_2/level_3) — shifted one left with no Entity col.
+            self.assertTrue({"D", "E", "F"}.issubset(cols))
+            self.assertTrue(all(dv.type == "list" for dv in dvs))
 
     def test_pl_rows_route_to_pl_sheet(self):
         rows = [
@@ -73,10 +97,13 @@ class TestWorkbookShape(unittest.TestCase):
 
     @staticmethod
     def _data_account_count(ws) -> int:
-        """Count data rows (non-empty Account col) below the header row."""
+        """Count data rows (non-empty Account col) below the header row.
+
+        No Entity column in new templates: Account is the first column (col A, index 0).
+        """
         count = 0
-        for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
-            if row[1] not in (None, ""):  # Account column
+        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+            if row[0] not in (None, ""):  # Account is first col (no Entity)
                 count += 1
         return count
 
@@ -108,7 +135,9 @@ class TestRoundTripIntoImporter(unittest.TestCase):
             df = read_bs_pl_master(path)
         # Both rows survived; ID + level columns present.
         self.assertEqual(len(df), 2)
-        for col in ("Entity", "Account", "Account description", "L1", "L2", "L3", "L4"):
+        # New templates have no Entity column — prefix injected externally at commit.
+        self.assertNotIn("Entity", df.columns)
+        for col in ("Account", "Account description", "L1", "L2", "L3", "L4"):
             self.assertIn(col, df.columns)
         self.assertEqual(set(df["L1"]), {"BS", "PL"})
 
@@ -148,7 +177,10 @@ class TestRoundTripIntoImporter(unittest.TestCase):
         wb.save(path)
         df = read_bs_pl_master(path)
         self.assertEqual(len(df), 2)
-        self.assertEqual(set(df["Entity"]), {"Acme GmbH"})
+        # No Entity column in new templates: prefix is supplied externally at commit.
+        self.assertNotIn("Entity", df.columns)
+        self.assertEqual(set(df["Account"]), {"10000", "80000"})
+        self.assertEqual(set(df["L1"]), {"BS", "PL"})
 
     # -- tmp dir helper --------------------------------------------------- #
     def setUp(self):
@@ -213,6 +245,54 @@ class TestDimGlAccountPrefill(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertNotIn("pfx", sess.last_params)
         self.assertEqual(sess.last_params.get("fy"), 2023)
+
+
+class TestWorkbookSchema(unittest.TestCase):
+    """New entity-less header contract and statement-filter behaviour."""
+
+    def test_bs_headers_contain_no_entity(self):
+        """BS_HEADERS must not include 'Entity' — prefix supplied externally."""
+        self.assertNotIn("Entity", coa_template.BS_HEADERS)
+        self.assertEqual(coa_template.BS_HEADERS[0], "Account")
+
+    def test_pl_headers_contain_no_entity_and_use_l1_bs_pl(self):
+        """PL_HEADERS must not include 'Entity'; first level col is 'L1 - BS/PL'."""
+        self.assertNotIn("Entity", coa_template.PL_HEADERS)
+        self.assertEqual(coa_template.PL_HEADERS[0], "Account")
+        self.assertIn("L1 - BS/PL", coa_template.PL_HEADERS)
+        # Plain "L1" must NOT appear — importer renames the PL col on read.
+        self.assertNotIn("L1", coa_template.PL_HEADERS)
+
+    def test_statement_bs_yields_only_master_bs(self):
+        """build_coa_template_workbook(statement='bs') emits only Master_BS."""
+        rows = [
+            coa_template.CoaRow(account="100", level_0="BS",
+                                level_1="Assets", level_2="Fixed", level_3="Intang"),
+            coa_template.CoaRow(account="800", level_0="PL",
+                                level_1="Revenue", level_2="Sales", level_3="Dom"),
+        ]
+        wb = coa_template.build_coa_template_workbook(rows, style=False, statement="bs")
+        self.assertIn(BS_SHEET, wb.sheetnames)
+        self.assertNotIn(PL_SHEET, wb.sheetnames)
+
+    def test_statement_pl_yields_only_master_pl(self):
+        """build_coa_template_workbook(statement='pl') emits only Master_PL."""
+        rows = [
+            coa_template.CoaRow(account="100", level_0="BS",
+                                level_1="Assets", level_2="Fixed", level_3="Intang"),
+            coa_template.CoaRow(account="800", level_0="PL",
+                                level_1="Revenue", level_2="Sales", level_3="Dom"),
+        ]
+        wb = coa_template.build_coa_template_workbook(rows, style=False, statement="pl")
+        self.assertIn(PL_SHEET, wb.sheetnames)
+        self.assertNotIn(BS_SHEET, wb.sheetnames)
+
+    def test_statement_none_yields_both_sheets(self):
+        """build_coa_template_workbook(statement=None) emits both sheets."""
+        rows = coa_template.empty_template_rows("X")
+        wb = coa_template.build_coa_template_workbook(rows, style=False, statement=None)
+        self.assertIn(BS_SHEET, wb.sheetnames)
+        self.assertIn(PL_SHEET, wb.sheetnames)
 
 
 if __name__ == "__main__":

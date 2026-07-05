@@ -50,7 +50,7 @@ export default function FddProjectSidebar({
       <div className="flex-1 overflow-y-auto px-2 pb-3">
         {projects.length === 0 ? (
           <p className="px-2 text-xs" style={{ color: '#94A3B8' }}>
-            Noch keine Projekte gespeichert.
+            No saved projects yet.
           </p>
         ) : (
           <ul className="flex flex-col gap-0.5">
@@ -79,7 +79,7 @@ export default function FddProjectSidebar({
                     }}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
                     style={{ color: '#94A3B8' }}
-                    aria-label="Projekt löschen"
+                    aria-label="Delete project"
                   >
                     <X size={14} />
                   </button>

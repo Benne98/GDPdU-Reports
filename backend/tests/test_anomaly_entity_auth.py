@@ -58,14 +58,14 @@ def _make_session(
     visibility_codes: list[str] | None = None,
     code_to_prefix: dict[str, str] | None = None,
 ) -> MagicMock:
-    """MagicMock session: role_entity_visibility → codes; dim_legal_entity → prefixes."""
+    """MagicMock session: admin_role_entity_visibility → codes; dim_legal_entity → prefixes."""
     code_to_prefix = code_to_prefix or {}
     session = MagicMock()
 
     def _execute(stmt, params=None):
         sql = str(stmt)
         result = MagicMock()
-        if "role_entity_visibility" in sql:
+        if "admin_role_entity_visibility" in sql:
             rows = [_DictRow((c,)) for c in (visibility_codes or [])]
         elif "dim_legal_entity" in sql:
             codes = (params or {}).get("codes", [])

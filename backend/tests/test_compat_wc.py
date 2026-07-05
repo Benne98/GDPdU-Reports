@@ -228,12 +228,38 @@ class TestWcStatement:
         assert nwc["is_bold"] is True
 
     def test_kpi_rows(self):
-        _, by_code, _ = self._build()
+        _, by_code, out = self._build()
         assert by_code["WC_DSO"]["amounts"]["cm"] == 91.2
         assert by_code["WC_DIO"]["amounts"]["cm"] == 121.7
         assert by_code["WC_DPO"]["amounts"]["cm"] == 91.2
         assert by_code["WC_CCC"]["amounts"]["cm"] == 121.7
         assert by_code["WC_DSO"]["row_kind"] == "kpi"
+        hdr = next(r for r in out["rows"] if r.get("row_kind") == "kpi_header")
+        assert hdr["label"] == "KPIs — working capital days"
+
+    def test_twc_mapping_line_order(self):
+        grains = [
+            _wc_grain("TWC", "Trade payables", "AT3300", "AT3300", "Payables", cm=-1.0),
+            _wc_grain("TWC", "Advance payments received", "AT3400", "AT3400", "Advances", cm=-0.5),
+            _wc_grain("TWC", "Trade receivables", "AT1200", "AT1200", "Receivables", cm=2.0),
+            _wc_grain("TWC", "Inventories", "AT1400", "AT1400", "Inventory", cm=1.0),
+        ]
+        from app.services.fin_compat_wc import build_wc_statement_compat
+        session = _mock_session(grain_rows=grains)
+        out = build_wc_statement_compat(session, year=2025, month=7)
+        twc = next(r for r in out["rows"] if r["label"] == "Trade Working Capital")
+        assert [c["label"] for c in twc["children"]] == [
+            "Inventories",
+            "Trade receivables",
+            "Trade payables",
+            "Advance payments received",
+        ]
+
+    def test_account_label_pipe_format(self):
+        from app.services.fin_compat_wc import _wc_account_label
+        assert _wc_account_label("38154", "38154", "Baustoffe") == "38154 | Baustoffe"
+        assert _wc_account_label("", "20200", "Baustoffe") == "20200 | Baustoffe"
+        assert _wc_account_label("38154", "", "") == "38154 | —"
 
     def test_section_order_twc_first(self):
         _, _, out = self._build()
@@ -310,19 +336,25 @@ class TestWcSnapshot:
 # ---------------------------------------------------------------------------
 # (f) Consolidation end-to-end (per-entity raw cm balance + NWC)
 # ---------------------------------------------------------------------------
-def _wc_consl_grain(l6, l3, ang, entity_prefix, cm):
-    return {
+def _wc_consl_grain(l6, l3, ang, entity_prefix, cm, *, gid=None, name=None, **snap_cols):
+    row = {
         "l6_na_mapping": l6, "l7_na_description": l3,
         "level_2": "Working capital", "level_3": l3, "level_4": None,
-        "account_number_group": ang, "entity_prefix": entity_prefix, "cm": float(cm),
+        "account_number_group": ang,
+        "gl_account_id": gid or ang,
+        "account_name": name or l3,
+        "entity_prefix": entity_prefix, "cm": float(cm),
+        "dec_py2": 0.0, "fy_py": 0.0, "fy": 0.0, "cm_py": 0.0,
     }
+    row.update({k: float(v) for k, v in snap_cols.items()})
+    return row
 
 
 _CONSL_GRAIN = [
-    _wc_consl_grain("TWC", "Trade receivables", "AT1200", "AT", 5_000_000),
-    _wc_consl_grain("TWC", "Trade payables", "AT3300", "AT", -3_000_000),
-    _wc_consl_grain("TWC", "Trade receivables", "DE1200", "DE", 2_000_000),
-    _wc_consl_grain("OWC", "Other working capital", "DE1900", "DE", 300_000),
+    _wc_consl_grain("TWC", "Trade receivables", "AT1200", "AT", 5_000_000, name="Receivables"),
+    _wc_consl_grain("TWC", "Trade payables", "AT3300", "AT", -3_000_000, name="Payables"),
+    _wc_consl_grain("TWC", "Trade receivables", "DE1200", "DE", 2_000_000, name="DE Receivables"),
+    _wc_consl_grain("OWC", "Other working capital", "DE1900", "DE", 300_000, name="Other WC"),
 ]
 _CONSL_ENTS = [
     _dict_row({"legal_entity_code": "AT", "entity_prefix": "AT", "entity_name": "Austria GmbH"}),
@@ -354,9 +386,20 @@ class TestWcConsolidation:
 
     def test_kpi_rows_present(self):
         rows, _ = self._build()
+        assert "wc-kpi-header" in rows
+        assert rows["wc-kpi-header"]["row_kind"] == "kpi_header"
+        assert rows["wc-kpi-header"]["label"] == "KPIs — working capital days"
         assert "wc-kpi-ccc" in rows
         # consolidated DSO = |rec 7m| * 365 / rev 15m = 170.3
         assert rows["wc-kpi-dso"]["consolidation"] == round(7_000_000 * 365 / 15_000_000, 1)
+
+    def test_consol_account_labels_include_name(self):
+        _, out = self._build()
+        twc = next(r for r in out["rows"] if r.get("label") == "Trade Working Capital")
+        rec = next(c for c in twc["children"] if c["label"] == "Trade receivables")
+        labels = {a["label"] for a in rec.get("children", [])}
+        assert "AT1200 | Receivables" in labels
+        assert "DE1200 | DE Receivables" in labels
 
     def test_annual_col_label_ytd(self):
         from app.services.fin_compat_wc import build_wc_consolidation
@@ -369,6 +412,29 @@ class TestWcConsolidation:
         twc = next(r for r in out["rows"] if r["label"] == "Trade Working Capital")
         assert twc["has_children"]
         assert twc["consolidation_periods"]["cm"] == 4_000_000
+
+    def test_annual_kpi_periods_all_snapshot_columns(self):
+        annual_grains = [
+            _wc_consl_grain(
+                "TWC", "Trade receivables", "AT1200", "AT", 7_000_000,
+                fy=6_000_000, fy_py=5_000_000, name="Receivables",
+            ),
+            _wc_consl_grain(
+                "TWC", "Trade payables", "AT3300", "AT", -3_000_000,
+                fy=-2_500_000, fy_py=-2_000_000, name="Payables",
+            ),
+        ]
+        session = _mock_session(
+            grain_rows=annual_grains,
+            entity_rows=_CONSL_ENTS[:1],
+            ltm={"revenue": 20_000_000.0, "cogs": 12_000_000.0},
+        )
+        from app.services.fin_compat_wc import build_wc_consolidation
+        out = build_wc_consolidation(session, period_grain="year", year=2025, month=7)
+        dso = next(r for r in out["rows"] if r["id"] == "wc-kpi-dso")
+        assert dso["consolidation_periods"]["fy"] == round(6_000_000 * 365 / 20_000_000, 1)
+        assert dso["consolidation_periods"]["cm"] == round(7_000_000 * 365 / 20_000_000, 1)
+        assert dso["consolidation_periods"]["fy"] != dso["consolidation_periods"]["cm"]
 
 
 class TestWcMonthlyFy3:

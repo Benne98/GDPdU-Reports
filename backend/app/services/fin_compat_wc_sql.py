@@ -110,6 +110,17 @@ _WC_GRAIN_DIMS = """
             l.account_number_group,
             MAX(a.account_name)         AS account_name"""
 
+_WC_CONSL_GRAIN_DIMS = """
+            na.l6_na_mapping            AS l6_na_mapping,
+            na.l7_na_description        AS l7_na_description,
+            a.level_2,
+            a.level_3,
+            NULLIF(TRIM(a.level_4), '') AS level_4,
+            l.account_number_group,
+            l.entity_prefix,
+            MAX(a.gl_account_id)        AS gl_account_id,
+            MAX(a.account_name)         AS account_name"""
+
 _WC_FROM = """
         FROM fact_gl_line l
         JOIN fact_gl_entry e
@@ -215,13 +226,7 @@ def wc_consl_grain_sql_annual(year: int, month: int) -> tuple[str, dict[str, Any
     cases = _bs_snapshot_bal_cases(year, month)
     sql = f"""
         SELECT
-            na.l6_na_mapping            AS l6_na_mapping,
-            na.l7_na_description        AS l7_na_description,
-            a.level_2,
-            a.level_3,
-            NULLIF(TRIM(a.level_4), '') AS level_4,
-            l.account_number_group,
-            l.entity_prefix,
+            {_WC_CONSL_GRAIN_DIMS},
             {cases}
         {_WC_FROM}
         {_WC_WHERE}
@@ -237,13 +242,7 @@ def wc_consl_grain_sql_month(year: int, month: int) -> tuple[str, dict[str, Any]
     d_cm = last_day(year, month)
     sql = f"""
         SELECT
-            na.l6_na_mapping            AS l6_na_mapping,
-            na.l7_na_description        AS l7_na_description,
-            a.level_2,
-            a.level_3,
-            NULLIF(TRIM(a.level_4), '') AS level_4,
-            l.account_number_group,
-            l.entity_prefix,
+            {_WC_CONSL_GRAIN_DIMS},
             {_bal_case_fy(year, d_cm, 'cm')}
         {_WC_FROM}
         {_WC_WHERE}
@@ -260,13 +259,7 @@ def wc_consl_grain_sql_week(iso_year: int, iso_week: int) -> tuple[str, dict[str
     _, d_cm = iso_week_bounds(iso_year, iso_week)
     sql = f"""
         SELECT
-            na.l6_na_mapping            AS l6_na_mapping,
-            na.l7_na_description        AS l7_na_description,
-            a.level_2,
-            a.level_3,
-            NULLIF(TRIM(a.level_4), '') AS level_4,
-            l.account_number_group,
-            l.entity_prefix,
+            {_WC_CONSL_GRAIN_DIMS},
             {_bal_case_fy(yr, d_cm, 'cm')}
         {_WC_FROM}
         {_WC_WHERE}

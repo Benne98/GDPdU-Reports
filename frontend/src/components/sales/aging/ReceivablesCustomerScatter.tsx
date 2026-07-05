@@ -351,6 +351,12 @@ export default function ReceivablesCustomerScatter({
     return m
   }, [matrix?.points])
 
+  // Count credit-balance partners excluded from the chart (backend omits them from scatter).
+  const creditBalanceCount = useMemo(() => {
+    const rows = context === 'payables' ? payablesRegisterRows : registerRows
+    return (rows ?? []).filter(r => r.credit_balance).length
+  }, [context, registerRows, payablesRegisterRows])
+
   if (!data.length) {
     return (
       <div className="h-[360px] flex items-center justify-center text-sm" style={{ color: BRAND.textMuted }}>
@@ -588,6 +594,14 @@ export default function ReceivablesCustomerScatter({
             entity={entity}
             periodLabel={periodLabel}
           />
+        )}
+        {creditBalanceCount > 0 && (
+          <p className="text-[10px] mt-2 px-1" style={{ color: '#94A3B8' }}>
+            Note: {creditBalanceCount}{' '}
+            {context === 'payables' ? 'supplier' : 'customer'}
+            {creditBalanceCount === 1 ? '' : 's'} with a net credit balance{' '}
+            {creditBalanceCount === 1 ? 'is' : 'are'} not shown in the chart above.
+          </p>
         )}
       </div>
     </div>

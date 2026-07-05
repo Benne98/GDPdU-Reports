@@ -16,9 +16,16 @@ import React from "react";
 export function Stepper({
   current,
   steps,
+  onStepClick,
 }: {
   current: number;
   steps: readonly string[];
+  /**
+   * Optional handler called when the user clicks a completed (done) step.
+   * When provided, done steps become clickable navigation targets.
+   * Future / active steps remain non-interactive regardless.
+   */
+  onStepClick?: (idx: number) => void;
 }) {
   return (
     <nav aria-label="Wizard steps" className="mb-8">
@@ -26,13 +33,32 @@ export function Stepper({
         {steps.map((label, idx) => {
           const done = idx < current;
           const active = idx === current;
+          const clickable = done && !!onStepClick;
           return (
             <li key={label} className="flex items-center">
-              <div className="flex flex-col items-center">
+              <div
+                className={`flex flex-col items-center${clickable ? " cursor-pointer group" : ""}`}
+                onClick={clickable ? () => onStepClick!(idx) : undefined}
+                role={clickable ? "button" : undefined}
+                tabIndex={clickable ? 0 : undefined}
+                onKeyDown={
+                  clickable
+                    ? (e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onStepClick!(idx);
+                        }
+                      }
+                    : undefined
+                }
+                aria-label={clickable ? `Go to step ${idx + 1}: ${label}` : undefined}
+              >
                 <span
                   className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold border-2 transition ${
                     done
-                      ? "border-blue-600 bg-blue-600 text-white"
+                      ? `border-blue-600 bg-blue-600 text-white${
+                          clickable ? " group-hover:bg-blue-700 group-hover:border-blue-700" : ""
+                        }`
                       : active
                       ? "border-blue-600 bg-white text-blue-600"
                       : "border-slate-300 bg-white text-slate-400"
@@ -46,7 +72,13 @@ export function Stepper({
                 </span>
                 <span
                   className={`mt-1 text-xs font-medium whitespace-nowrap ${
-                    active ? "text-blue-700" : done ? "text-slate-600" : "text-slate-400"
+                    active
+                      ? "text-blue-700"
+                      : done
+                      ? `text-slate-600${
+                          clickable ? " group-hover:text-blue-700 group-hover:underline" : ""
+                        }`
+                      : "text-slate-400"
                   }`}
                 >
                   {label}

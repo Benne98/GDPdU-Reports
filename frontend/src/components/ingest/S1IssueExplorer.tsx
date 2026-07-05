@@ -2,7 +2,7 @@
  * S1IssueExplorer — one line per issue type, flat source table with stats + row exclusion.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   CheckOffender,
   CheckResult,
@@ -16,11 +16,27 @@ export interface ValidateContext {
   file_id: string;
   sheet?: string;
   profile: Profile;
-  exclude_line_ids: number[];
+  exclude_line_ids: string[];
 }
 
 function fmt(n: number): string {
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(n);
+}
+
+/**
+ * Render a single cell value.
+ * Only the "amount" column gets thousands-separator formatting.
+ * All other columns (ids, account numbers, document codes, dates, text) render
+ * as plain strings to avoid formatting 19-digit booking_line_id values.
+ */
+function renderCell(col: string, value: string | number | boolean | null) {
+  if (value == null || value === "") {
+    return <span className="text-slate-400 italic">empty</span>;
+  }
+  if (col === "amount" && typeof value === "number") {
+    return fmt(value);
+  }
+  return String(value);
 }
 
 function describeIssueGroup(group: S1IssueGroup): string {
@@ -83,10 +99,34 @@ function IssueRowTable({
 }: {
   data: IssueRowsResponse;
   filter: string;
-  selected: Set<number>;
-  onToggle: (lineId: number) => void;
-  onToggleAll: (lineIds: number[], checked: boolean) => void;
+  selected: Set<string>;
+  onToggle: (lineId: string) => void;
+  onToggleAll: (lineIds: string[], checked: boolean) => void;
 }) {
+  // booking_line_id is the internal checkbox key — never display it as a column.
+  // The human-readable "reference" column (e.g. "01B200 #1") is shown instead.
+  // When data.columns contains no usable columns (stale/degenerate API response)
+  // but rows are present, fall back to deriving display columns from the union of
+  // keys found across the row objects, preserving first-seen order.
+  const { displayCols, isDegenerate } = useMemo(() => {
+    const fromColumns = data.columns.filter((c) => c !== "booking_line_id");
+    if (fromColumns.length > 0 || data.rows.length === 0) {
+      return { displayCols: fromColumns, isDegenerate: false };
+    }
+    // Stale/degenerate response: derive columns from the union of row keys.
+    const seen = new Set<string>();
+    const derived: string[] = [];
+    for (const row of data.rows) {
+      for (const key of Object.keys(row)) {
+        if (key !== "booking_line_id" && !seen.has(key)) {
+          seen.add(key);
+          derived.push(key);
+        }
+      }
+    }
+    return { displayCols: derived, isDegenerate: true };
+  }, [data.columns, data.rows]);
+
   const rows = useMemo(() => {
     const q = filter.trim().toLowerCase();
     if (!q) return data.rows;
@@ -99,15 +139,22 @@ function IssueRowTable({
 
   const lineIds = rows
     .map((r) => r.booking_line_id)
-    .filter((id): id is number => typeof id === "number");
+    .filter((id): id is string => typeof id === "string");
   const allSelected = lineIds.length > 0 && lineIds.every((id) => selected.has(id));
 
-  if (data.columns.length === 0) {
+  if (data.rows.length === 0) {
     return <p className="text-sm text-slate-500">No rows to display.</p>;
   }
 
   return (
-    <div className="overflow-x-auto rounded border border-slate-200 bg-white max-h-96 overflow-y-auto">
+    <>
+      {isDegenerate && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
+          This validation result looks out of date (the backend returned only an internal id
+          column). Restart the API / refresh to see full row details.
+        </p>
+      )}
+      <div className="overflow-x-auto rounded border border-slate-200 bg-white max-h-96 overflow-y-auto">
       <table className="w-full text-xs">
         <thead className="sticky top-0 z-10 bg-slate-50 border-b border-slate-200">
           <tr>
@@ -119,18 +166,30 @@ function IssueRowTable({
                 aria-label="Select all visible rows"
               />
             </th>
-            {data.columns.map((c) => (
-              <th key={c} className="py-1.5 px-2 text-left font-semibold text-slate-600 whitespace-nowrap">
-                {c === "booking_line_id" ? "Line" : c}
-              </th>
-            ))}
+            {displayCols.map((c) => {
+              const isFailing = c === data.failing_field;
+              return (
+                <th
+                  key={c}
+                  className={`py-1.5 px-2 text-left font-semibold whitespace-nowrap ${
+                    isFailing ? "bg-amber-50 text-amber-800" : "text-slate-600"
+                  }`}
+                >
+                  {data.column_labels?.[c] ?? c}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
           {rows.map((row, i) => {
-            const lineId = typeof row.booking_line_id === "number" ? row.booking_line_id : null;
+            const lineId =
+              typeof row.booking_line_id === "string" ? row.booking_line_id : null;
             return (
-              <tr key={lineId ?? i} className="border-b border-slate-100 last:border-0 hover:bg-slate-50/80">
+              <tr
+                key={lineId ?? i}
+                className="border-b border-slate-100 last:border-0 hover:bg-slate-50/80"
+              >
                 <td className="py-1.5 px-2">
                   {lineId != null && (
                     <input
@@ -141,17 +200,19 @@ function IssueRowTable({
                     />
                   )}
                 </td>
-                {data.columns.map((c) => (
-                  <td key={c} className="py-1.5 px-2 font-mono text-slate-700 whitespace-nowrap">
-                    {row[c] == null || row[c] === "" ? (
-                      <span className="text-slate-400 italic">empty</span>
-                    ) : typeof row[c] === "number" ? (
-                      fmt(row[c] as number)
-                    ) : (
-                      String(row[c])
-                    )}
-                  </td>
-                ))}
+                {displayCols.map((c) => {
+                  const isFailing = c === data.failing_field;
+                  return (
+                    <td
+                      key={c}
+                      className={`py-1.5 px-2 font-mono whitespace-nowrap ${
+                        isFailing ? "bg-amber-50/60 text-amber-900" : "text-slate-700"
+                      }`}
+                    >
+                      {renderCell(c, row[c] as string | number | boolean | null)}
+                    </td>
+                  );
+                })}
               </tr>
             );
           })}
@@ -161,6 +222,7 @@ function IssueRowTable({
         <p className="px-3 py-4 text-sm text-slate-500">No rows match your filter.</p>
       )}
     </div>
+    </>
   );
 }
 
@@ -173,14 +235,25 @@ function IssueGroupPanel({
   group: S1IssueGroup;
   context: ValidateContext;
   excluding?: boolean;
-  onExcludeLines?: (lineIds: number[]) => void | Promise<void>;
+  onExcludeLines?: (lineIds: string[]) => void | Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<IssueRowsResponse | null>(null);
   const [filter, setFilter] = useState("");
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // F-2: Reset loaded data + checkbox selection whenever the exclude_line_ids context
+  // changes (i.e. after an exclusion round-trip).  The existing open+!data effect then
+  // re-fetches automatically.  isFirstExclude skips the reset on initial mount.
+  const isFirstExclude = useRef(true);
+  const excludeKey = context.exclude_line_ids.join(",");
+  useEffect(() => {
+    if (isFirstExclude.current) { isFirstExclude.current = false; return; }
+    setData(null);
+    setSelected(new Set());
+  }, [excludeKey]); // excludeKey is a primitive string — stable comparison
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -209,7 +282,7 @@ function IssueGroupPanel({
     }
   }, [open, data, loading, load]);
 
-  function toggleLine(lineId: number) {
+  function toggleLine(lineId: string) {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(lineId)) next.delete(lineId);
@@ -218,7 +291,7 @@ function IssueGroupPanel({
     });
   }
 
-  function toggleAll(lineIds: number[], checked: boolean) {
+  function toggleAll(lineIds: string[], checked: boolean) {
     setSelected((prev) => {
       const next = new Set(prev);
       for (const id of lineIds) {
@@ -309,7 +382,98 @@ function IssueGroupPanel({
                       : `Exclude selected (${selected.size.toLocaleString("en-US")})`}
                   </button>
                 )}
+                {onExcludeLines && (data.offender_ids?.length ?? 0) > 0 && (
+                  <button
+                    type="button"
+                    disabled={excluding}
+                    onClick={() => void onExcludeLines(data.offender_ids!)}
+                    className="rounded-md border border-red-300 bg-red-100 px-3 py-1.5 text-sm font-medium text-red-900 hover:bg-red-200 disabled:opacity-50"
+                  >
+                    {excluding
+                      ? "Updating…"
+                      : `Exclude all ${(data.total_offenders ?? data.offender_ids!.length).toLocaleString("en-US")} offending rows`}
+                  </button>
+                )}
               </div>
+
+              {/* F-5: Reference rows — always-visible block ABOVE the failing-rows
+                  scroll container so they are never hidden inside the 384px clip.
+                  Label is driven by reference_kind so the user understands provenance.
+                  Uses the same display columns (booking_line_id excluded) so columns
+                  line up column-for-column with the failing-rows table below. */}
+              {(data.reference_rows?.length ?? 0) > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold text-emerald-700">
+                    {data.reference_kind === "same_field"
+                      ? "Valid examples for this field"
+                      : data.reference_kind === "overall"
+                      ? "Valid example rows (for comparison)"
+                      : "Reference rows (valid examples)"}
+                  </p>
+                  <div className="overflow-x-auto rounded border border-emerald-200">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-emerald-50 border-b border-emerald-200">
+                          <th className="py-1 px-2 w-8" />
+                          {data.columns
+                            .filter((c) => c !== "booking_line_id")
+                            .map((c) => {
+                              const isFailing = c === data.failing_field;
+                              return (
+                                <th
+                                  key={c}
+                                  className={`py-1.5 px-2 text-left font-semibold whitespace-nowrap ${
+                                    isFailing
+                                      ? "bg-amber-50 text-amber-800"
+                                      : "text-emerald-700"
+                                  }`}
+                                >
+                                  {data.column_labels?.[c] ?? c}
+                                </th>
+                              );
+                            })}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.reference_rows!.slice(0, 5).map((row, i) => (
+                          <tr
+                            key={`ref-${i}`}
+                            className="border-b border-emerald-100 last:border-0 bg-emerald-50/60"
+                          >
+                            <td className="py-1.5 px-2" />
+                            {data.columns
+                              .filter((c) => c !== "booking_line_id")
+                              .map((c) => {
+                                const isFailing = c === data.failing_field;
+                                return (
+                                  <td
+                                    key={c}
+                                    className={`py-1.5 px-2 font-mono whitespace-nowrap ${
+                                      isFailing
+                                        ? "bg-amber-50/60 text-amber-700"
+                                        : "text-emerald-700"
+                                    }`}
+                                  >
+                                    {renderCell(
+                                      c,
+                                      row[c] as string | number | boolean | null
+                                    )}
+                                  </td>
+                                );
+                              })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {(data.reference_kind === "none" ||
+                (data.reference_kind === undefined && data.reference_available === false)) && (
+                <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
+                  No valid rows to compare — every row fails this field.
+                </p>
+              )}
 
               <IssueRowTable
                 data={data}
@@ -339,7 +503,7 @@ export default function S1IssueExplorer({
   check: CheckResult;
   context: ValidateContext;
   excluding?: boolean;
-  onExcludeLines?: (lineIds: number[]) => void | Promise<void>;
+  onExcludeLines?: (lineIds: string[]) => void | Promise<void>;
 }) {
   const groups = fallbackIssueGroups(check);
   if (groups.length === 0) return null;

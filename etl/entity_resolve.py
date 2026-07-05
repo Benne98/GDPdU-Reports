@@ -1,6 +1,7 @@
 """Resolve entity labels (names or numeric prefixes) to 2-char entity_prefix values."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +12,8 @@ from etl.transform import PREFIX_WIDTH, normalize_prefix
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 _TRAILING_DOT_ZERO = re.compile(r"\.0$")
 
@@ -180,8 +183,18 @@ def prefix_series_from_entity_config(
     entity_cfg: dict,
     lookup: dict[str, str],
     assignments: dict[str, str] | None = None,
+    *,
+    drop_unknown: bool = False,
 ) -> pd.Series:
-    """Resolve entity column/fixed value to a prefix Series aligned with raw_df."""
+    """Resolve entity column/fixed value to a prefix Series aligned with raw_df.
+
+    ``drop_unknown`` only affects 'column' mode: when True, unresolved rows are
+    left as NA in the returned Series (instead of raising) so the caller can drop
+    them. This is used by the opening-balance path, where entities in the file
+    that are not part of the project should be ignored rather than blocking the
+    commit. 'fixed' mode and the GL default (drop_unknown=False) still raise, so
+    GL ingestion stays byte-identical.
+    """
     mode = entity_cfg.get("mode", "fixed")
     assign = {
         normalize_entity_label(k): str(v).zfill(PREFIX_WIDTH)
@@ -216,10 +229,15 @@ def prefix_series_from_entity_config(
             if prefix is None:
                 unknown.append(key)
             prefixes.append(prefix)
-        if unknown:
+        if unknown and not drop_unknown:
             raise ValueError(
                 "Unknown entities in file; confirm prefix assignment: "
                 + ", ".join(sorted(set(unknown)))
+            )
+        if unknown and drop_unknown:
+            logger.warning(
+                "Dropping rows for entities not in the project: %s",
+                ", ".join(sorted(set(unknown))),
             )
         return pd.Series(prefixes, index=raw_df.index, dtype="string")
     raise ValueError(f"unknown entity mode {mode!r}")

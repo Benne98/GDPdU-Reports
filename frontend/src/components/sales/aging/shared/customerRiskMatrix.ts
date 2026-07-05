@@ -13,6 +13,7 @@ export type CustomerRiskQuadrantMeta = {
   badgeBg: string
 }
 
+// Restrained palette: muted quadrant fills, single risk-accent for critical.
 export const CUSTOMER_RISK_QUADRANTS: CustomerRiskQuadrantMeta[] = [
   {
     id: 'core',
@@ -20,9 +21,9 @@ export const CUSTOMER_RISK_QUADRANTS: CustomerRiskQuadrantMeta[] = [
     shortLabel: 'Core',
     hint: 'High volume · low overdue',
     action: 'Protect & grow',
-    fill: 'rgba(37, 99, 235, 0.20)',
-    stroke: '#1D4ED8',
-    badgeBg: 'rgba(37, 99, 235, 0.14)',
+    fill: 'rgba(30,58,95,0.05)',
+    stroke: '#336699',
+    badgeBg: 'rgba(30,58,95,0.07)',
   },
   {
     id: 'critical',
@@ -30,9 +31,9 @@ export const CUSTOMER_RISK_QUADRANTS: CustomerRiskQuadrantMeta[] = [
     shortLabel: 'Critical',
     hint: 'High volume · high overdue',
     action: 'Collect now',
-    fill: 'rgba(220, 38, 38, 0.18)',
+    fill: 'rgba(185,28,28,0.08)',
     stroke: '#B91C1C',
-    badgeBg: 'rgba(220, 38, 38, 0.14)',
+    badgeBg: 'rgba(185,28,28,0.07)',
   },
   {
     id: 'stable',
@@ -40,9 +41,9 @@ export const CUSTOMER_RISK_QUADRANTS: CustomerRiskQuadrantMeta[] = [
     shortLabel: 'Stable',
     hint: 'Lower volume · low overdue',
     action: 'Monitor',
-    fill: 'rgba(16, 185, 129, 0.18)',
-    stroke: '#059669',
-    badgeBg: 'rgba(16, 185, 129, 0.14)',
+    fill: 'rgba(148,163,184,0.07)',
+    stroke: '#64748B',
+    badgeBg: 'rgba(148,163,184,0.10)',
   },
   {
     id: 'watch',
@@ -50,9 +51,9 @@ export const CUSTOMER_RISK_QUADRANTS: CustomerRiskQuadrantMeta[] = [
     shortLabel: 'Watch',
     hint: 'Lower volume · elevated overdue',
     action: 'Early follow-up',
-    fill: 'rgba(245, 158, 11, 0.22)',
+    fill: 'rgba(217,119,6,0.07)',
     stroke: '#D97706',
-    badgeBg: 'rgba(245, 158, 11, 0.16)',
+    badgeBg: 'rgba(217,119,6,0.09)',
   },
 ]
 
@@ -214,10 +215,9 @@ export function buildCustomerRiskMatrix(rows: ReceivablesCustomerScatterRow[]) {
   }
 
   const maxBalanceKeur = Math.max(...points.map(p => p.balanceKeur), midBalanceKeur * 1.2, 1)
-  const maxOverduePct = Math.min(
-    100,
-    Math.max(...points.map(p => p.overdue_pct), midOverduePct * 1.35, 15),
-  )
+  // overdue_pct arrives pre-clamped [0,100] from backend — no client-side Math.min(100,…) needed.
+  // Y-axis domain is maxOverduePct + yPad; since values are ≤100 this stays within 100 + small pad.
+  const maxOverduePct = Math.max(...points.map(p => p.overdue_pct), midOverduePct * 1.35, 15)
 
   const counts = CUSTOMER_RISK_QUADRANTS.reduce(
     (acc, q) => {

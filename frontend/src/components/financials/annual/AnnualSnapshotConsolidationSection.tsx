@@ -227,7 +227,7 @@ export default function AnnualSnapshotConsolidationSection({
 
   return (
     <div
-      className="rounded-xl mt-4 overflow-hidden"
+      className="rounded-xl mt-4"
       style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
     >
       <div

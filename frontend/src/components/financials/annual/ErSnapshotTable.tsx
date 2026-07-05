@@ -21,6 +21,7 @@ import {
 import type { PeriodSelection } from '../../../lib/periodSelection'
 import { buildAnnualSnapshotNarrativeResponse } from './erAnnualNarrative'
 import ErSnapshotReportView from './ErSnapshotReportView'
+import { computeAutoExpandedIds } from '../statementRowExpansion'
 
 // ─── Period ranges for drill-down ────────────────────────────────────────────
 
@@ -148,33 +149,10 @@ export default function ErSnapshotTable({
     saveStatementViewMode(statementKey, viewMode)
   }, [statementKey, viewMode])
 
-  const autoExpandedIds = useMemo(() => {
-    if (!data?.rows) return new Set<string>()
-    if (data.statement === 'bs') {
-      const BS_KEEP_CLOSED = new Set(['Deferred tax assets', 'Prepaid expenses'])
-      function collectIds(rows: ErStatementRow[], depth: number): string[] {
-        if (depth >= 2) return []
-        const ids: string[] = []
-        for (const row of rows) {
-          if ((row.children?.length ?? 0) > 0) {
-            if (BS_KEEP_CLOSED.has(row.label)) continue
-            ids.push(row.id)
-            ids.push(...collectIds(row.children ?? [], depth + 1))
-          }
-        }
-        return ids
-      }
-      return new Set(collectIds(data.rows, 0))
-    }
-    if (data.statement === 'wc') {
-      const ids: string[] = []
-      for (const r of data.rows) {
-        if ((r.children?.length ?? 0) > 0) ids.push(r.id)
-      }
-      return new Set(ids)
-    }
-    return new Set<string>()
-  }, [data])
+  const autoExpandedIds = useMemo(
+    () => computeAutoExpandedIds(data?.rows, data?.statement),
+    [data?.rows, data?.statement],
+  )
 
   function checkOpen(id: string): boolean {
     return autoExpandedIds.has(id) !== userToggles.has(id)
@@ -289,6 +267,7 @@ export default function ErSnapshotTable({
           isWc ? (
             /* WC KPIs — days */
             <>
+              <ValCell value={get('dec_py2')} isDays italic />
               <ValCell value={get('fy_py')} isDays italic />
               <ValCell value={get('fy')}    isDays italic />
               <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isDays />
@@ -333,11 +312,12 @@ export default function ErSnapshotTable({
         nodes.push(renderRow(row, depth))
         continue
       }
-      if (row.row_kind === 'kpi' && !kpiHeaderInserted && data?.statement !== 'wc') {
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && (data?.statement === 'bs' || data?.statement === 'wc')) {
         kpiHeaderInserted = true
+        const kpiLabel = data?.statement === 'wc' ? 'KPIs — working capital days' : 'KPIs'
         nodes.push(
           <tr key="er-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td className="px-3 py-2 text-xs font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>KPIs</td>
+            <td className="px-3 py-2 text-xs font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>{kpiLabel}</td>
             {Array.from({ length: COLS }).map((_, i) => (
               <td key={i} style={{ background: i === CM_IDX ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
             ))}

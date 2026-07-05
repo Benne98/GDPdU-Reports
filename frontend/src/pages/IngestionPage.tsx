@@ -2,62 +2,64 @@
  * IngestionPage — GL-Ingestion + Konten-Mapping (two modes).
  *
  * Mode selector at the top lets admins switch between:
- *   A) GL-Ingestion   — Upload → Kontext → Spalten-Mapping → Optionen → Validierung → Commit
+ *   A) GL-Ingestion   — Per-entity years-first wizard using GlEntityCard
  *   B) Konten-Mapping — Upload → Kontext → Spalten-Mapping → Commit
  *      Uses POST /api/v1/ingest/mapping/commit (require_admin).
- *      Reuses the same ColumnMapper component with account-mapping target fields.
+ *   C) Partner-Master — inline PartnerMasterEditor
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import ColumnMapper, { missingRequiredFields } from "../components/ingest/ColumnMapper";
 import DataUpdateNav from "../components/ingest/DataUpdateNav";
 import AccountColumnMapper, { missingRequiredAccountFields } from "../components/ingest/AccountColumnMapper";
 import VersionHistoryPanel from "../components/ingest/VersionHistoryPanel";
 import UploadStep, { isBsPlMasterSheets } from "../components/ingest/UploadStep";
 import KontextStep from "../components/ingest/KontextStep";
-import OptionsStep from "../components/ingest/OptionsStep";
-import ValidierungStep from "../components/ingest/ValidierungStep";
 import { Stepper, StepCard, NavButtons } from "../components/ingest/IngestStepCard";
-import type { KontextState, OptionsState } from "../components/ingest/ingestTypes";
+import type { KontextState } from "../components/ingest/ingestTypes";
 import { useAuth } from "../context/AuthContext";
+import { api } from "../lib/api";
 import {
   commitAccountMapping,
+  commitIngest,
   getIngestFiscalYears,
-  listProfiles,
   previewAccountMapping,
-  saveProfile,
   type AccountMappingProfile,
   type CommitResponse,
   type MappingCommitResponse,
   type MappingPreviewResponse,
-  type MappingProfile,
-  type Profile,
   type UploadResponse,
-  type ValidationResponse,
   type BsPlReplaceMode,
 } from "../lib/gdpduApi";
+import {
+  GlEntityCard,
+  defaultGlEntityState,
+  type GlEntityState,
+  type GlFormatGroup,
+} from "../components/ingest/GlEntityCard";
+import GlGroupUploadCard, { type GlGroupState } from "../components/ingest/GlGroupUploadCard";
+import { IS_DATA_UPDATE_V4 } from "../lib/dataUpdateMode";
+import GlGroupConfigPanel from "../components/ingest/GlGroupConfigPanel";
+import {
+  createGroup,
+  reindexGroupsAfterRemove,
+  applyGroupHeadersToMembers,
+} from "../components/ingest/glFormatGroups";
 import PageShell from "../components/ui/PageShell";
 import SoftSegment from "../components/ui/SoftSegment";
+import PartnerMasterEditor from "../components/masters/PartnerMasterEditor";
+import { glFiscalYearLabel, fyEndMonthName } from "../lib/fiscalYear";
+import { fyEndFromStartMonth } from "./ProjectSetupWizard";
 
 // ---------------------------------------------------------------------------
 // Mode selector
 // ---------------------------------------------------------------------------
 
-type WizardMode = "gl" | "account-mapping";
+type WizardMode = "gl" | "account-mapping" | "partner-master";
 
 // ---------------------------------------------------------------------------
-// Stepper
+// Stepper definitions (account-mapping only)
 // ---------------------------------------------------------------------------
-
-const GL_STEPS = [
-  "Upload",
-  "Context",
-  "Column mapping",
-  "Options",
-  "Validation",
-  "Commit",
-] as const;
 
 const ACCOUNT_STEPS = [
   "Upload",
@@ -73,44 +75,7 @@ const ACCOUNT_STEPS_BSPL = [
   "Commit",
 ] as const;
 
-type GLStepIndex = 0 | 1 | 2 | 3 | 4 | 5;
 type AccountStepIndex = 0 | 1 | 2 | 3;
-
-// ---------------------------------------------------------------------------
-// Step 2 — Spalten-Mapping (GL mode)
-// ---------------------------------------------------------------------------
-
-function MappingStep({
-  uploadResult,
-  mapping,
-  onChange,
-}: {
-  uploadResult: UploadResponse;
-  mapping: Record<string, string>;
-  onChange: (m: Record<string, string>) => void;
-}) {
-  const missing = missingRequiredFields(mapping);
-
-  return (
-    <StepCard
-      title="Column mapping"
-      subtitle="Drag source columns onto target fields. Required fields (*) must be mapped before you can continue."
-    >
-      {missing.length > 0 && (
-        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-          <span className="font-medium">Missing required fields:</span>{" "}
-          {missing.join(", ")}
-        </div>
-      )}
-      <ColumnMapper
-        sourceColumns={uploadResult.columns}
-        sample={uploadResult.sample}
-        mapping={mapping}
-        onChange={onChange}
-      />
-    </StepCard>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Step 2 — Spalten-Mapping (Account-Mapping mode) — reuses AccountColumnMapper
@@ -337,9 +302,7 @@ function BsPlPreviewStep({
                 onClick={() => setShowDuplicates((v) => !v)}
                 className="flex w-full items-center justify-between px-3 py-2 text-left text-sm font-medium text-red-900 hover:bg-red-50"
               >
-                <span>
-                  Duplicate rows: {duplicates.length}
-                </span>
+                <span>Duplicate rows: {duplicates.length}</span>
                 <span className="text-xs text-red-700">{showDuplicates ? "▼" : "▶"}</span>
               </button>
               {showDuplicates && (
@@ -393,9 +356,7 @@ function BsPlPreviewStep({
                 onClick={() => setShowInserts((v) => !v)}
                 className="flex w-full items-center justify-between px-3 py-2 text-left text-sm font-medium text-emerald-900 hover:bg-emerald-50"
               >
-                <span>
-                  New accounts (insert): {inserts.length}
-                </span>
+                <span>New accounts (insert): {inserts.length}</span>
                 <span className="text-xs text-emerald-700">{showInserts ? "▼" : "▶"}</span>
               </button>
               {showInserts && (
@@ -544,11 +505,13 @@ function BsPlCommitStep({
   fiscalYears,
   replaceMode,
   preview,
+  onAddAnother,
 }: {
   uploadResult: UploadResponse;
   fiscalYears: number[];
   replaceMode: BsPlReplaceMode;
   preview: MappingPreviewResponse | null;
+  onAddAnother?: () => void;
 }) {
   const [committing, setCommitting] = useState(false);
   const [committed, setCommitted] = useState<MappingCommitResponse | null>(null);
@@ -602,13 +565,24 @@ function BsPlCommitStep({
             </div>
           ))}
         </div>
-        <button
-          type="button"
-          onClick={() => window.location.reload()}
-          className="rounded-md border border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100"
-        >
-          Import another file
-        </button>
+        <div className="flex items-center justify-center gap-3 flex-wrap">
+          {onAddAnother && (
+            <button
+              type="button"
+              onClick={onAddAnother}
+              className="rounded-md border-2 border-dashed border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100 transition"
+            >
+              + Add another mapping table (entity / year)
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="rounded-md border border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100"
+          >
+            Done — start over
+          </button>
+        </div>
       </div>
     );
   }
@@ -681,10 +655,12 @@ function AccountMappingCommitStep({
   uploadResult,
   kontext,
   mapping,
+  onAddAnother,
 }: {
   uploadResult: UploadResponse;
   kontext: KontextState;
   mapping: Record<string, string>;
+  onAddAnother?: () => void;
 }) {
   const [committing, setCommitting] = useState(false);
   const [committed, setCommitted] = useState<MappingCommitResponse | null>(null);
@@ -736,13 +712,24 @@ function AccountMappingCommitStep({
             </div>
           ))}
         </div>
-        <button
-          type="button"
-          onClick={() => window.location.reload()}
-          className="rounded-md border border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100"
-        >
-          Import another file
-        </button>
+        <div className="flex items-center justify-center gap-3 flex-wrap">
+          {onAddAnother && (
+            <button
+              type="button"
+              onClick={onAddAnother}
+              className="rounded-md border-2 border-dashed border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100 transition"
+            >
+              + Add another mapping table (entity / year)
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="rounded-md border border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100"
+          >
+            Done — start over
+          </button>
+        </div>
       </div>
     );
   }
@@ -773,13 +760,11 @@ function AccountMappingCommitStep({
             {Object.keys(mapping).length}
           </p>
         </div>
-
         {error && (
           <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
             {error}
           </div>
         )}
-
         <button
           type="button"
           onClick={handleCommit}
@@ -794,165 +779,289 @@ function AccountMappingCommitStep({
 }
 
 // ---------------------------------------------------------------------------
-// GL Commit success card
+// Data Update GL — per-entity commit section
 // ---------------------------------------------------------------------------
 
-function CommitSuccessCard({ result }: { result: CommitResponse }) {
-  return (
-    <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-8 text-center shadow-sm">
-      <div className="text-5xl mb-4">&#10003;</div>
-      <h2 className="text-xl font-semibold text-emerald-800 mb-1">
-        Ingestion completed successfully
-      </h2>
-      <p className="text-sm text-emerald-700 mb-6">
-        Load ID: {result.load_id ?? "—"}
-        {result.commit_mode ? ` · mode: ${result.commit_mode}` : ""}
-      </p>
-      <div className="inline-grid grid-cols-3 gap-x-8 gap-y-3 text-left mb-6">
-        {[
-          ["Entries", result.entries],
-          ["Lines", result.lines],
-          ["Sales", result.sales],
-          ["CoM", result.com],
-          ["AR", result.ar],
-          ["AP", result.ap],
-          ["Skipped", result.skipped],
-        ].map(([label, val]) => (
-          <div key={String(label)}>
-            <div className="text-xs text-emerald-600 font-medium">{label}</div>
-            <div className="text-lg font-semibold text-emerald-900">
-              {Number(val).toLocaleString("en-US")}
-            </div>
-          </div>
-        ))}
-      </div>
-      <button
-        type="button"
-        onClick={() => window.location.reload()}
-        className="rounded-md border border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-100"
-      >
-        Import another file
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Profile loader bar
-// ---------------------------------------------------------------------------
-
-function ProfileBar({
-  profiles,
-  onLoad,
+function DuGlCommitSection({
+  entities,
+  onDone,
+  uploadMode = 'per-entity',
+  group,
 }: {
-  profiles: MappingProfile[];
-  onLoad: (p: MappingProfile) => void;
+  entities: GlEntityState[];
+  onDone: () => void;
+  uploadMode?: 'per-entity' | 'group';
+  group?: GlGroupState;
 }) {
-  const [open, setOpen] = useState(false);
-  if (profiles.length === 0) return null;
+  // Group commit state (hooks before any conditional return)
+  const [groupCommitting, setGroupCommitting] = useState(false);
+  const [groupResult, setGroupResult] = useState<CommitResponse | string | null>(null);
 
-  return (
-    <div className="mb-5 rounded-lg border border-slate-200 bg-white px-4 py-3 flex items-center gap-3 shadow-sm">
-      <span className="text-sm text-slate-600 font-medium">Saved profiles:</span>
-      <div className="relative">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-50"
-        >
-          Load profile &#9660;
-        </button>
-        {open && (
-          <div className="absolute left-0 top-full mt-1 z-10 min-w-[220px] rounded-lg border border-slate-200 bg-white shadow-lg">
-            {profiles.map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => {
-                  onLoad(p);
-                  setOpen(false);
-                }}
-                className="block w-full text-left px-4 py-2.5 text-sm text-slate-700 hover:bg-slate-50 first:rounded-t-lg last:rounded-b-lg"
-              >
-                <span className="font-medium">{p.name}</span>
-                <span className="ml-2 text-xs text-slate-400">{p.source_system}</span>
-              </button>
-            ))}
+  const committable = entities.filter(
+    (e) => e.validationOk !== undefined && e.assembledProfile && e.combinedFileId
+  );
+
+  const [results, setResults] = useState<Record<number, CommitResponse | string>>({});
+  const [committing, setCommitting] = useState<Record<number, boolean>>({});
+
+  async function handleCommitGroup() {
+    if (!group?.fileId || !group?.assembledProfile) return;
+    setGroupCommitting(true);
+    setGroupResult(null);
+    try {
+      const r = await commitIngest({
+        file_id: group.fileId,
+        profile: group.assembledProfile,
+        dataset: "gl",
+        confirm_soft: true,
+        commit_mode: "replace",
+      });
+      setGroupResult(r);
+    } catch (e) {
+      setGroupResult(e instanceof Error ? e.message : "Commit failed");
+    } finally {
+      setGroupCommitting(false);
+    }
+  }
+
+  async function handleCommitEntity(entity: GlEntityState, idx: number) {
+    if (!entity.combinedFileId || !entity.assembledProfile) return;
+    setCommitting((prev) => ({ ...prev, [idx]: true }));
+    try {
+      const r = await commitIngest({
+        file_id: entity.combinedFileId,
+        profile: entity.assembledProfile,
+        dataset: "gl",
+        confirm_soft: true,
+        commit_mode: "replace",
+      });
+      setResults((prev) => ({ ...prev, [idx]: r }));
+    } catch (e) {
+      setResults((prev) => ({ ...prev, [idx]: e instanceof Error ? e.message : "Commit failed" }));
+    } finally {
+      setCommitting((prev) => ({ ...prev, [idx]: false }));
+    }
+  }
+
+  // Group mode — render commit UI for the single group file
+  if (uploadMode === 'group' && group) {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white px-6 py-5 shadow-sm space-y-4">
+        <h3 className="text-base font-semibold text-slate-900">Commit group upload</h3>
+        <p className="text-sm text-slate-500">
+          Commit the group file to the database. Rows are routed to the correct entity via
+          entity_assignments.
+        </p>
+        {typeof groupResult === "string" ? (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {groupResult}
           </div>
+        ) : groupResult ? (
+          <div className="space-y-3">
+            <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+              Committed — {groupResult.entries} entries written.
+            </div>
+            <button
+              type="button"
+              onClick={onDone}
+              className="rounded-md border-2 border-dashed border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-50 transition"
+            >
+              + Start over (upload another file)
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void handleCommitGroup()}
+            disabled={groupCommitting}
+            className="rounded-md bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40"
+          >
+            {groupCommitting ? "Committing…" : "Commit group file"}
+          </button>
         )}
       </div>
+    );
+  }
+
+  const allDone = committable.length > 0 && committable.every((_, i) => results[i] !== undefined);
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white px-6 py-5 shadow-sm space-y-4">
+      <h3 className="text-base font-semibold text-slate-900">Commit all entities</h3>
+      <p className="text-sm text-slate-500">
+        Commit each validated entity to the database. Each entity is committed with{" "}
+        <code className="text-xs bg-slate-100 rounded px-1">commit_mode: replace</code>.
+      </p>
+      <div className="space-y-3">
+        {committable.map((entity, idx) => {
+          const result = results[idx];
+          const busy = committing[idx] ?? false;
+          return (
+            <div
+              key={idx}
+              className="flex items-center justify-between rounded-lg border border-slate-200 px-4 py-3"
+            >
+              <div>
+                <span className="text-sm font-medium text-slate-800">
+                  {entity.entityLabel || entity.entityCode || `Entity ${idx + 1}`}
+                </span>
+                <span className="ml-2 text-xs text-slate-400">({entity.entityCode})</span>
+                {entity.validationOk === false && (
+                  <span className="ml-2 text-xs text-amber-600">Warnings present</span>
+                )}
+              </div>
+              <div className="flex items-center gap-3">
+                {typeof result === "string" ? (
+                  <span className="text-xs text-red-600">{result}</span>
+                ) : result ? (
+                  <span className="text-xs text-emerald-700 font-medium">
+                    Committed — {result.entries} entries
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleCommitEntity(entity, idx)}
+                    disabled={busy}
+                    className="rounded-md bg-blue-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-40"
+                  >
+                    {busy ? "Committing…" : "Commit"}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {allDone && (
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={onDone}
+            className="rounded-md border-2 border-dashed border-emerald-400 px-5 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-50 transition"
+          >
+            + Start over (upload more entities)
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Profile builder helper
+// Data Update GL — clickable year chip picker
 // ---------------------------------------------------------------------------
 
-/** Default GoBD GL column mapping when source headers match the Decidra export. */
-const GOBD_GL_COLUMN_DEFAULTS: Record<string, string> = {
-  journal_entry_number: "Transaction number",
-  account_number: "Account number",
-  posting_date: "Posting date",
-  document_date: "Document date",
-  document_type: "Document type",
-  reference_document_number: "Document number",
-  amount: "Amount",
-  vat_amount: "VAT amount",
-  line_note: "Booking text",
-  posting_type: "Posting type",
-  source_type: "Source type",
-  source_no: "Source No.",
-};
+const DU_CHIP_TOP = 2026;
+const DU_CHIP_BOTTOM = 2020;
+const DU_PRIOR_BLOCK = 5;
 
-function suggestGlColumnMapping(columns: string[]): Record<string, string> {
-  const colSet = new Set(columns);
-  const mapping: Record<string, string> = {};
-  for (const [target, source] of Object.entries(GOBD_GL_COLUMN_DEFAULTS)) {
-    if (colSet.has(source)) mapping[target] = source;
-  }
-  return mapping;
+function duChipYears(priorBlocks: number): number[] {
+  const bottom = DU_CHIP_BOTTOM - priorBlocks * DU_PRIOR_BLOCK;
+  const years: number[] = [];
+  for (let y = bottom; y <= DU_CHIP_TOP; y++) years.push(y);
+  return years;
 }
 
-function buildProfile(
-  kontext: KontextState,
-  mapping: Record<string, string>,
-  opts: OptionsState,
-  dialect: { decimal: string; thousands: string },
-  variant: "gl" | "account-mapping" = "gl",
-  entityAssignments: Record<string, string> = {}
-): Profile {
-  const signConfig = (() => {
-    if (opts.signMode === "signed") return { mode: "signed" as const, amount: opts.signAmount };
-    if (opts.signMode === "soll_haben")
-      return { mode: "soll_haben" as const, soll: opts.signSoll, haben: opts.signHaben };
-    return {
-      mode: "amount_dc" as const,
-      amount: opts.signAmount,
-      dc_flag: opts.signDcFlag,
-      debit_value: opts.signDebitValue,
-    };
-  })();
+function DuGlYearsSelector({
+  years,
+  fyEndMonth,
+  onYearsChange,
+}: {
+  years: number[];
+  fyEndMonth: number;
+  onYearsChange: (years: number[]) => void;
+}) {
+  const [priorBlocks, setPriorBlocks] = useState(0);
+  const chips = duChipYears(priorBlocks);
+  const selectedSet = new Set(years);
 
-  const fiscalYear =
-    variant === "gl"
-      ? { mode: "from_date" as const, value: "" }
-      : { mode: kontext.fiscalYearMode, value: kontext.fiscalYearValue };
+  function toggle(y: number) {
+    const next = selectedSet.has(y)
+      ? years.filter((v) => v !== y)
+      : [...new Set([...years, y])].sort((a, b) => a - b);
+    onYearsChange(next);
+  }
 
-  return {
-    entity: { mode: kontext.entityMode, value: kontext.entityValue },
-    fiscal_year: fiscalYear,
-    sign: signConfig,
-    decimal: opts.decimal || dialect.decimal || ",",
-    thousands: opts.thousands,
-    date_dayfirst: opts.dateDayfirst,
-    columns: mapping,
-    linking_strategy: opts.linking,
-    entry_type: "actual",
-    ...(Object.keys(entityAssignments).length > 0
-      ? { entity_assignments: entityAssignments }
-      : {}),
-  };
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white px-6 py-5 shadow-sm space-y-4">
+      <div>
+        <h3 className="text-base font-semibold text-slate-900">Which fiscal years are you loading?</h3>
+        <p className="mt-0.5 text-xs text-slate-500">
+          Click years to select them. Each entity card will show one upload slot per year.
+        </p>
+      </div>
+      <div className="space-y-3">
+        <p className="text-xs text-slate-500">
+          Fiscal years (year-end:{" "}
+          <span className="font-medium">{fyEndMonthName(fyEndMonth)}</span>).
+          Click to select or deselect.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {chips.map((y) => {
+            const isSelected = selectedSet.has(y);
+            return (
+              <button
+                key={y}
+                type="button"
+                onClick={() => toggle(y)}
+                className={`rounded-full px-3 py-1 text-sm font-semibold border transition focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-blue-500 ${
+                  isSelected
+                    ? "text-white border-transparent"
+                    : "bg-white border-slate-300 text-slate-700 hover:border-blue-400 hover:text-blue-700"
+                }`}
+                style={isSelected ? { backgroundColor: "#1E3A5F", borderColor: "#1E3A5F" } : undefined}
+                aria-pressed={isSelected}
+                aria-label={`${isSelected ? "Deselect" : "Select"} ${glFiscalYearLabel(y, fyEndMonth)}`}
+              >
+                {glFiscalYearLabel(y, fyEndMonth)}
+              </button>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={() => setPriorBlocks((b) => b + 1)}
+          className="text-xs text-slate-500 underline underline-offset-2 hover:text-blue-600 transition"
+        >
+          + Prior years ({DU_CHIP_BOTTOM - priorBlocks * DU_PRIOR_BLOCK - DU_PRIOR_BLOCK}–{DU_CHIP_BOTTOM - priorBlocks * DU_PRIOR_BLOCK - 1})
+        </button>
+      </div>
+      {years.length === 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          Select at least one fiscal year before uploading GL files.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Partner Master Panel — customer/supplier tabs rendered inside Data Update
+// ---------------------------------------------------------------------------
+
+function PartnerMasterPanel() {
+  const [tab, setTab] = useState<"customers" | "suppliers">("customers");
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl border border-slate-200 bg-white px-6 py-5 shadow-sm">
+        <h2 className="text-lg font-semibold text-slate-900">Partner master</h2>
+        <p className="mt-0.5 text-sm text-slate-500">
+          Add, edit, or delete customer and supplier master records. Use bulk import for large data sets.
+        </p>
+        <div className="mt-4">
+          <SoftSegment
+            value={tab}
+            onChange={(v) => setTab(v as "customers" | "suppliers")}
+            options={[
+              { value: "customers", label: "Customers" },
+              { value: "suppliers", label: "Suppliers" },
+            ]}
+          />
+        </div>
+      </div>
+      <PartnerMasterEditor side={tab} />
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -962,32 +1071,46 @@ function buildProfile(
 export default function IngestionPage() {
   const { isAdmin } = useAuth();
   const [searchParams] = useSearchParams();
+  const rawMode = searchParams.get("mode");
   const mode: WizardMode =
-    searchParams.get("mode") === "account-mapping" ? "account-mapping" : "gl";
+    rawMode === "account-mapping" ? "account-mapping"
+    : rawMode === "partner-master" ? "partner-master"
+    : "gl";
   const prevModeRef = useRef<WizardMode | null>(null);
 
-  // GL mode state
-  const [glStep, setGlStep] = useState<GLStepIndex>(0);
+  // -------------------------------------------------------------------------
+  // Project fiscal-year end month (fetched once on mount for GL labels)
+  // Derived from GET /api/v1/projects/default → fy_start_month
+  // end = ((fy_start_month + 10) % 12) + 1  (i.e. month before start)
+  // -------------------------------------------------------------------------
+  const [duFyEndMonth, setDuFyEndMonth] = useState<number>(12);
+  useEffect(() => {
+    api.getProject("default")
+      .then((r) => setDuFyEndMonth(fyEndFromStartMonth(r.fy_start_month)))
+      .catch(() => { /* leave default 12 (December) on error */ });
+  }, []);
 
+  // -------------------------------------------------------------------------
+  // GL Data Update state (new per-entity model)
+  // -------------------------------------------------------------------------
+  const [duGlYears, setDuGlYears] = useState<number[]>([]);
+  const [duGlEntities, setDuGlEntities] = useState<GlEntityState[]>([defaultGlEntityState()]);
+  const [duGlFormatGroups, setDuGlFormatGroups] = useState<GlFormatGroup[]>([]);
+  // v4 group-upload state (gated by IS_DATA_UPDATE_V4; default keeps per-entity path unchanged)
+  const [duGlUploadMode, setDuGlUploadMode] = useState<'per-entity' | 'group'>('per-entity');
+  const [duGlGroup, setDuGlGroup] = useState<GlGroupState>({});
+
+  // -------------------------------------------------------------------------
   // Account-mapping mode state
+  // -------------------------------------------------------------------------
   const [amStep, setAmStep] = useState<AccountStepIndex>(0);
-
-  // Shared upload state (reset when mode changes)
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null);
-
-  // Kontext (shared shape, used by both modes)
   const [kontext, setKontext] = useState<KontextState>({
     entityMode: "fixed",
     entityValue: "",
     fiscalYearMode: "fixed",
     fiscalYearValue: "",
   });
-
-  // GL mapping
-  const [glMapping, setGlMapping] = useState<Record<string, string>>({});
-  const [entityAssignments, setEntityAssignments] = useState<Record<string, string>>({});
-
-  // Account mapping
   const [amMapping, setAmMapping] = useState<Record<string, string>>({});
 
   // BS/PL Master wizard (account-mapping sub-flow)
@@ -1002,47 +1125,39 @@ export default function IngestionPage() {
   const bsPlPreviewLoadedKey = useRef<string | null>(null);
   const bsPlPreviewRequestId = useRef(0);
 
-  // GL Options
-  const [opts, setOpts] = useState<OptionsState>({
-    signMode: "signed",
-    signAmount: "",
-    signSoll: "",
-    signHaben: "",
-    signDcFlag: "",
-    signDebitValue: "S",
-    decimal: ",",
-    thousands: ".",
-    dateDayfirst: true,
-    linking: "txn",
-    profileName: "",
-    profileSystem: "",
-  });
-
-  // Profile save (GL mode)
-  const [savingProfile, setSavingProfile] = useState(false);
-  const [profileSaved, setProfileSaved] = useState(false);
-  const [profiles, setProfiles] = useState<MappingProfile[]>([]);
-  const [profilesLoading, setProfilesLoading] = useState(true);
-
-  // Validation result (GL mode)
-  const [_validationResult, setValidationResult] = useState<ValidationResponse | null>(null);
-  const [glCommitResult, setGlCommitResult] = useState<CommitResponse | null>(null);
+  // -------------------------------------------------------------------------
+  // Reset helpers
+  // -------------------------------------------------------------------------
 
   function resetWizard() {
-    setGlStep(0);
-    setGlCommitResult(null);
     setAmStep(0);
     setUploadResult(null);
     setKontext({ entityMode: "fixed", entityValue: "", fiscalYearMode: "fixed", fiscalYearValue: "" });
-    setGlMapping({});
-    setEntityAssignments({});
     setAmMapping({});
     setBsPlMode(false);
     setSelectedFiscalYears([]);
     setBsPlReplaceMode("append");
     setBsPlPreview(null);
     setBsPlPreviewError(null);
+    bsPlPreviewLoadedKey.current = null;
   }
+
+  function resetAmForNextTable() {
+    setAmStep(0);
+    setUploadResult(null);
+    setKontext({ entityMode: "fixed", entityValue: "", fiscalYearMode: "fixed", fiscalYearValue: "" });
+    setAmMapping({});
+    setBsPlMode(false);
+    setSelectedFiscalYears([]);
+    setBsPlReplaceMode("append");
+    setBsPlPreview(null);
+    setBsPlPreviewError(null);
+    bsPlPreviewLoadedKey.current = null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Effects
+  // -------------------------------------------------------------------------
 
   useEffect(() => {
     if (prevModeRef.current === null) {
@@ -1055,31 +1170,9 @@ export default function IngestionPage() {
     }
   }, [mode]);
 
-  useEffect(() => {
-    setEntityAssignments({});
-  }, [kontext.entityMode, kontext.entityValue]);
-
-  // Load saved profiles on mount
-  useEffect(() => {
-    setProfilesLoading(true);
-    listProfiles()
-      .then(setProfiles)
-      .catch(() => {
-        // silently ignore — backend may not be running
-      })
-      .finally(() => setProfilesLoading(false));
-  }, []);
-
-  // When dialect detected, pre-fill GL options
-  useEffect(() => {
-    if (uploadResult?.dialect) {
-      setOpts((prev) => ({
-        ...prev,
-        decimal: uploadResult.dialect.decimal || ",",
-        thousands: uploadResult.dialect.thousands || ".",
-      }));
-    }
-  }, [uploadResult]);
+  // -------------------------------------------------------------------------
+  // Account-mapping upload handler
+  // -------------------------------------------------------------------------
 
   function handleUploaded(result: UploadResponse, _file: File) {
     setUploadResult(result);
@@ -1088,28 +1181,6 @@ export default function IngestionPage() {
     setBsPlPreview(null);
     setBsPlPreviewError(null);
     bsPlPreviewLoadedKey.current = null;
-    if (mode === "gl") {
-      const suggested = suggestGlColumnMapping(result.columns);
-      if (Object.keys(suggested).length > 0) {
-        setGlMapping(suggested);
-      }
-      if (result.columns.includes("Entity No")) {
-        setKontext((prev) => ({
-          ...prev,
-          entityMode: "column",
-          entityValue: "Entity No",
-        }));
-      } else if (result.columns.includes("Entity")) {
-        setKontext((prev) => ({
-          ...prev,
-          entityMode: "column",
-          entityValue: "Entity",
-        }));
-      }
-      if (result.columns.includes("Amount")) {
-        setOpts((prev) => ({ ...prev, signMode: "signed", signAmount: "Amount" }));
-      }
-    }
     if (bsPl) {
       setFiscalYearsLoading(true);
       getIngestFiscalYears()
@@ -1124,9 +1195,12 @@ export default function IngestionPage() {
     } else {
       setSelectedFiscalYears([]);
     }
-    if (mode === "gl") setGlStep(1);
-    else setAmStep(1);
+    setAmStep(1);
   }
+
+  // -------------------------------------------------------------------------
+  // BS/PL preview loader
+  // -------------------------------------------------------------------------
 
   const loadBsPlPreview = useCallback(async () => {
     if (!uploadResult || selectedFiscalYears.length === 0) return;
@@ -1180,88 +1254,13 @@ export default function IngestionPage() {
     }
   }, [bsPlMode, uploadResult?.file_id, selectedFiscalYears.join(","), bsPlReplaceMode]);
 
-  function handleLoadProfile(p: MappingProfile) {
-    const pj = p.profile_json;
-    setKontext({
-      entityMode: pj.entity.mode,
-      entityValue: pj.entity.value,
-      fiscalYearMode: pj.fiscal_year.mode,
-      fiscalYearValue: pj.fiscal_year.value,
-    });
-    setGlMapping(pj.columns ?? {});
-    setOpts((prev) => ({
-      ...prev,
-      signMode: pj.sign.mode,
-      signAmount: pj.sign.amount ?? "",
-      signSoll: pj.sign.soll ?? "",
-      signHaben: pj.sign.haben ?? "",
-      signDcFlag: pj.sign.dc_flag ?? "",
-      signDebitValue: pj.sign.debit_value ?? "S",
-      decimal: pj.decimal,
-      thousands: pj.thousands,
-      dateDayfirst: pj.date_dayfirst,
-      linking: pj.linking_strategy,
-    }));
-  }
-
-  const handleSaveProfile = useCallback(async () => {
-    if (!uploadResult) return;
-    const profile = buildProfile(kontext, glMapping, opts, uploadResult.dialect, "gl", entityAssignments);
-    setSavingProfile(true);
-    try {
-      const saved = await saveProfile({
-        name: opts.profileName,
-        source_system: opts.profileSystem || "unbekannt",
-        profile_json: profile,
-      });
-      setProfiles((prev) => [...prev, saved]);
-      setProfileSaved(true);
-      setTimeout(() => setProfileSaved(false), 3000);
-    } catch {
-      // silently fail — save is optional
-    } finally {
-      setSavingProfile(false);
-    }
-  }, [kontext, glMapping, opts, uploadResult, entityAssignments]);
-
-  // -------------------------------------------------------------------------
-  // GL mode helpers
-  // -------------------------------------------------------------------------
-
-  const glMissing = missingRequiredFields(glMapping);
-  const glKontextValid = kontext.entityValue.trim() !== "";
-  const amKontextValid =
-    kontext.entityValue.trim() !== "" && kontext.fiscalYearValue.trim() !== "";
-
-  const glCanGoNext: Record<number, boolean> = {
-    0: Boolean(uploadResult),
-    1: glKontextValid,
-    2: glMissing.length === 0,
-    3: true,
-    4: true,
-    5: true,
-  };
-
-  function glGoNext() {
-    if (glStep < 5) setGlStep((s) => (s + 1) as GLStepIndex);
-  }
-  function glGoBack() {
-    if (glStep === 5 && glCommitResult) {
-      setGlCommitResult(null);
-      setGlStep(4);
-      return;
-    }
-    if (glStep > 0) setGlStep((s) => (s - 1) as GLStepIndex);
-  }
-
-  const glProfile =
-    uploadResult ? buildProfile(kontext, glMapping, opts, uploadResult.dialect, "gl", entityAssignments) : null;
-
   // -------------------------------------------------------------------------
   // Account-mapping mode helpers
   // -------------------------------------------------------------------------
 
   const amMissing = missingRequiredAccountFields(amMapping);
+  const amKontextValid =
+    kontext.entityValue.trim() !== "" && kontext.fiscalYearValue.trim() !== "";
 
   const bsPlFyValid = selectedFiscalYears.length > 0;
   const bsPlPreviewOk = Boolean(bsPlPreview && bsPlPreview.blockers.length === 0);
@@ -1287,260 +1286,372 @@ export default function IngestionPage() {
     if (amStep > 0) setAmStep((s) => (s - 1) as AccountStepIndex);
   }
 
+  const amStep_ = amStep;
+  const steps = bsPlMode ? ACCOUNT_STEPS_BSPL : ACCOUNT_STEPS;
+
   // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
 
-  const currentStep =
-    mode === "gl"
-      ? glCommitResult
-        ? GL_STEPS.length
-        : glStep
-      : amStep;
-  const steps =
-    mode === "gl"
-      ? GL_STEPS
-      : bsPlMode
-      ? ACCOUNT_STEPS_BSPL
-      : ACCOUNT_STEPS;
-  const canGoNext = mode === "gl" ? glCanGoNext : amCanGoNext;
-
   return (
     <PageShell
-      loading={profilesLoading}
+      loading={false}
       message="Loading Data Update…"
-      submessage="Saved mapping profiles and upload settings are loading."
+      submessage="Upload settings are loading."
     >
     <div>
       <DataUpdateNav
         topMode={mode}
-        accountView="upload"
+        accountView={mode === "account-mapping" ? "upload" : undefined}
       />
 
-      <Stepper current={currentStep} steps={steps} />
-
-      {/* Profile bar — only in GL mode after upload */}
-      {mode === "gl" && uploadResult && glStep > 0 && glStep < 4 && (
-        <ProfileBar profiles={profiles} onLoad={handleLoadProfile} />
+      {/* ------------------------------------------------------------------ Partner-master mode */}
+      {mode === "partner-master" && (
+        <PartnerMasterPanel />
       )}
 
-      {/* ------------------------------------------------------------------ GL mode */}
+      {/* ------------------------------------------------------------------ GL mode (new per-entity model) */}
       {mode === "gl" && (
-        <>
-          {glStep === 0 && <UploadStep onUploaded={handleUploaded} />}
-          {glStep === 1 && uploadResult && (
+        <div className="space-y-5">
+          {/* Header */}
+          <div className="rounded-xl border border-slate-200 bg-white px-6 pt-5 pb-4 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">Upload accounting data — per entity</h2>
+            <p className="mt-0.5 text-sm text-slate-500">
+              Select the fiscal years you are loading, then upload one file per year for each entity.
+              Files are combined and you map columns and validate once per entity.
+              Commit each entity individually when validation passes.
+            </p>
+            {duGlEntities.length > 1 && (
+              <p className="mt-2 text-xs text-blue-700">
+                {duGlEntities.filter((e) => e.validationOk !== undefined).length} of{" "}
+                {duGlEntities.length} entities validated.
+              </p>
+            )}
+          </div>
+
+          {/* v4 only: upload mode choice (non-v4 → falsy → renders nothing) */}
+          {IS_DATA_UPDATE_V4 && (
+            <div className="rounded-xl border border-slate-200 bg-white px-6 py-4 shadow-sm">
+              <p className="text-sm font-medium text-slate-700 mb-3">Upload mode</p>
+              <div className="flex flex-wrap gap-6">
+                {(["per-entity", "group"] as const).map((m) => (
+                  <label key={m} className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="duGlUploadMode"
+                      value={m}
+                      checked={duGlUploadMode === m}
+                      onChange={() => setDuGlUploadMode(m)}
+                      className="accent-blue-600"
+                    />
+                    {m === "per-entity" ? "Upload per entity" : "Upload one file for the whole group"}
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* v4 group mode: group upload card + group commit */}
+          {IS_DATA_UPDATE_V4 && duGlUploadMode === "group" && (
             <>
-              <KontextStep
-                sourceColumns={uploadResult.columns}
-                state={kontext}
-                onChange={setKontext}
-                variant="gl"
+              {/* B1: year selector shared with per-entity mode via duGlYears state */}
+              <DuGlYearsSelector years={duGlYears} fyEndMonth={duFyEndMonth} onYearsChange={setDuGlYears} />
+              <GlGroupUploadCard
+                group={duGlGroup}
+                years={duGlYears}
+                onPatch={(patch) => setDuGlGroup((prev) => ({ ...prev, ...patch }))}
+                fyEndMonth={duFyEndMonth}
               />
-              <NavButtons
-                step={glStep}
-                totalSteps={GL_STEPS.length}
-                onBack={glGoBack}
-                onNext={glGoNext}
-                nextDisabled={!canGoNext[glStep]}
-              />
+              {duGlGroup.validationOk !== undefined && (
+                <DuGlCommitSection
+                  entities={[]}
+                  uploadMode="group"
+                  group={duGlGroup}
+                  onDone={() => {
+                    setDuGlGroup({});
+                    setDuGlUploadMode("per-entity");
+                  }}
+                />
+              )}
             </>
           )}
-          {glStep === 2 && uploadResult && (
-            <>
-              <MappingStep
-                uploadResult={uploadResult}
-                mapping={glMapping}
-                onChange={setGlMapping}
-              />
-              <NavButtons
-                step={glStep}
-                totalSteps={GL_STEPS.length}
-                onBack={glGoBack}
-                onNext={glGoNext}
-                nextDisabled={!canGoNext[glStep]}
-                nextLabel={glMissing.length > 0 ? `Next (${glMissing.length} required fields missing)` : "Next"}
-              />
-            </>
-          )}
-          {glStep === 3 && uploadResult && (
-            <>
-              <OptionsStep
-                sourceColumns={uploadResult.columns}
-                dialect={uploadResult.dialect}
-                state={opts}
-                onChange={setOpts}
-                onSaveProfile={handleSaveProfile}
-                savingProfile={savingProfile}
-                profileSaved={profileSaved}
-              />
-              <NavButtons
-                step={glStep}
-                totalSteps={GL_STEPS.length}
-                onBack={glGoBack}
-                onNext={glGoNext}
-                nextDisabled={!canGoNext[glStep]}
-                nextLabel="Start validation"
-              />
-            </>
-          )}
-          {glStep === 4 && uploadResult && glProfile && !glCommitResult && (
-            <ValidierungStep
-              uploadResult={uploadResult}
-              profile={glProfile}
-              onResult={setValidationResult}
-              onEntityAssignmentsChange={setEntityAssignments}
-              onImportSuccess={(r) => {
-                setGlCommitResult(r);
-                setGlStep(5);
+
+          {/* Per-entity mode — non-v4 always evaluates true → renders UNCHANGED */}
+          {(!IS_DATA_UPDATE_V4 || duGlUploadMode === "per-entity") && <>
+
+          {/* Years selector */}
+          <DuGlYearsSelector years={duGlYears} fyEndMonth={duFyEndMonth} onYearsChange={setDuGlYears} />
+
+          {/* Format group config panels — one per group */}
+          {duGlFormatGroups.map((group) => (
+            <GlGroupConfigPanel
+              key={group.id}
+              group={group}
+              entities={duGlEntities}
+              onPatchGroup={(groupId, patch) => {
+                setDuGlFormatGroups((prev) =>
+                  prev.map((g) => (g.id === groupId ? { ...g, ...patch } : g))
+                );
+                setDuGlEntities((prev) =>
+                  prev.map((e) =>
+                    e.formatGroupId === groupId
+                      ? { ...e, validationOk: undefined, assembledProfile: undefined }
+                      : e
+                  )
+                );
+              }}
+            />
+          ))}
+
+          {/* Entity cards */}
+          {duGlEntities.map((entity, index) => (
+            <GlEntityCard
+              key={index}
+              entity={entity}
+              index={index}
+              total={duGlEntities.length}
+              years={duGlYears}
+              entityMode="select"
+              fyEndMonth={duFyEndMonth}
+              onPatch={(p) =>
+                setDuGlEntities((prev) =>
+                  prev.map((e, i) => (i === index ? { ...e, ...p } : e))
+                )
+              }
+              onRemove={
+                duGlEntities.length > 1
+                  ? () => {
+                      setDuGlEntities((prev) => prev.filter((_, i) => i !== index));
+                      setDuGlFormatGroups((prev) => reindexGroupsAfterRemove(index, prev));
+                    }
+                  : undefined
+              }
+              group={duGlFormatGroups.find((g) => g.id === entity.formatGroupId)}
+              groups={duGlFormatGroups}
+              entities={duGlEntities}
+              onCreateGroup={(fromIndex, headers, mapping) =>
+                setDuGlFormatGroups((prev) => {
+                  const newGroup = createGroup(fromIndex, headers, mapping, prev);
+                  setDuGlEntities((ents) =>
+                    ents.map((e, i) =>
+                      i === fromIndex ? { ...e, formatGroupId: newGroup.id } : e
+                    )
+                  );
+                  return [...prev, newGroup];
+                })
+              }
+              onAssignGroup={async (groupId, selectedIndices) => {
+                const group = duGlFormatGroups.find((g) => g.id === groupId);
+                if (!group) return;
+                const { patches } = await applyGroupHeadersToMembers(
+                  group,
+                  selectedIndices,
+                  duGlEntities,
+                );
+                setDuGlFormatGroups((prev) =>
+                  prev.map((g) =>
+                    g.id === groupId
+                      ? { ...g, memberIndices: [...new Set([...g.memberIndices, ...selectedIndices])] }
+                      : g
+                  )
+                );
+                if (patches.length > 0) {
+                  setDuGlEntities((prev) => {
+                    let next = [...prev];
+                    for (const { index: pi, patch } of patches) {
+                      next = next.map((e, i) => (i === pi ? { ...e, ...patch } : e));
+                    }
+                    return next;
+                  });
+                }
+                setDuGlEntities((prev) =>
+                  prev.map((e, i) =>
+                    selectedIndices.includes(i)
+                      ? { ...e, formatGroupId: groupId, validationOk: undefined, assembledProfile: undefined }
+                      : e
+                  )
+                );
+              }}
+              onPatchGroup={(groupId, patch) => {
+                setDuGlFormatGroups((prev) =>
+                  prev.map((g) => (g.id === groupId ? { ...g, ...patch } : g))
+                );
+                setDuGlEntities((prev) =>
+                  prev.map((e) =>
+                    e.formatGroupId === groupId
+                      ? { ...e, validationOk: undefined, assembledProfile: undefined }
+                      : e
+                  )
+                );
+              }}
+            />
+          ))}
+
+          {/* Add another entity */}
+          <button
+            type="button"
+            onClick={() => setDuGlEntities((prev) => [...prev, defaultGlEntityState()])}
+            className="flex items-center gap-2 rounded-xl border-2 border-dashed border-slate-300 bg-white px-5 py-3 text-sm font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition w-full justify-center"
+          >
+            <span className="text-lg leading-none">+</span>
+            Add another entity
+          </button>
+
+          {/* Commit section — shown when at least one entity has been validated */}
+          {duGlEntities.some((e) => e.validationOk !== undefined) && (
+            <DuGlCommitSection
+              entities={duGlEntities}
+              onDone={() => {
+                setDuGlYears([]);
+                setDuGlEntities([defaultGlEntityState()]);
+                setDuGlFormatGroups([]);
               }}
             />
           )}
-          {glStep === 5 && glCommitResult && (
-            <CommitSuccessCard result={glCommitResult} />
-          )}
-          {glStep === 4 && !glCommitResult && (
-            <div className="mt-4">
-              <button
-                type="button"
-                onClick={glGoBack}
-                className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-              >
-                Back to options
-              </button>
-            </div>
-          )}
-        </>
+
+          </>}
+
+          {isAdmin && <VersionHistoryPanel />}
+        </div>
       )}
 
       {/* ------------------------------------------------------------------ Account-mapping mode */}
-      {mode === "account-mapping" && bsPlMode && (
+      {mode === "account-mapping" && (
         <>
-          {amStep === 0 && <UploadStep onUploaded={handleUploaded} />}
-          {amStep === 1 && uploadResult && (
-            <>
-              <BsPlFiscalYearStep
-                availableYears={availableFiscalYears}
-                selected={selectedFiscalYears}
-                onChange={setSelectedFiscalYears}
-                loading={fiscalYearsLoading}
-                replaceMode={bsPlReplaceMode}
-                onReplaceModeChange={setBsPlReplaceMode}
-              />
-              <NavButtons
-                step={amStep}
-                totalSteps={ACCOUNT_STEPS_BSPL.length}
-                onBack={amGoBack}
-                onNext={amGoNext}
-                nextDisabled={!canGoNext[amStep]}
-              />
-            </>
-          )}
-          {amStep === 2 && uploadResult && (
-            <>
-              <BsPlPreviewStep
-                uploadResult={uploadResult}
-                fiscalYears={selectedFiscalYears}
-                replaceMode={bsPlReplaceMode}
-                preview={bsPlPreview}
-                loading={bsPlPreviewLoading}
-                error={bsPlPreviewError}
-                onLoadPreview={loadBsPlPreview}
-              />
-              <NavButtons
-                step={amStep}
-                totalSteps={ACCOUNT_STEPS_BSPL.length}
-                onBack={amGoBack}
-                onNext={amGoNext}
-                nextDisabled={!canGoNext[amStep]}
-                nextLabel={
-                  bsPlPreview?.blockers?.length
-                    ? "Resolve blockers"
-                    : bsPlPreviewLoading
-                    ? "Loading preview…"
-                    : "Next"
-                }
-              />
-            </>
-          )}
-          {amStep === 3 && uploadResult && (
-            <>
-              <BsPlCommitStep
-                uploadResult={uploadResult}
-                fiscalYears={selectedFiscalYears}
-                replaceMode={bsPlReplaceMode}
-                preview={bsPlPreview}
-              />
-              <div className="mt-4">
-                <button
-                  type="button"
-                  onClick={amGoBack}
-                  className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  Back to preview
-                </button>
-              </div>
-            </>
-          )}
-        </>
-      )}
-      {mode === "account-mapping" && !bsPlMode && (
-        <>
-          {amStep === 0 && <UploadStep onUploaded={handleUploaded} />}
-          {amStep === 1 && uploadResult && (
-            <>
-              <KontextStep
-                sourceColumns={uploadResult.columns}
-                state={kontext}
-                onChange={setKontext}
-              />
-              <NavButtons
-                step={amStep}
-                totalSteps={ACCOUNT_STEPS.length}
-                onBack={amGoBack}
-                onNext={amGoNext}
-                nextDisabled={!canGoNext[amStep]}
-              />
-            </>
-          )}
-          {amStep === 2 && uploadResult && (
-            <>
-              <AccountMappingStep
-                uploadResult={uploadResult}
-                mapping={amMapping}
-                onChange={setAmMapping}
-              />
-              <NavButtons
-                step={amStep}
-                totalSteps={ACCOUNT_STEPS.length}
-                onBack={amGoBack}
-                onNext={amGoNext}
-                nextDisabled={!canGoNext[amStep]}
-                nextLabel={amMissing.length > 0 ? `Next (${amMissing.length} required fields missing)` : "Next"}
-              />
-            </>
-          )}
-          {amStep === 3 && uploadResult && (
-            <>
-              <AccountMappingCommitStep
-                uploadResult={uploadResult}
-                kontext={kontext}
-                mapping={amMapping}
-              />
-              <div className="mt-4">
-                <button
-                  type="button"
-                  onClick={amGoBack}
-                  className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  Back to mapping
-                </button>
-              </div>
-            </>
-          )}
-        </>
-      )}
+        <Stepper current={amStep_} steps={steps} />
 
-      {isAdmin && <VersionHistoryPanel />}
+        {mode === "account-mapping" && bsPlMode && (
+          <>
+            {amStep === 0 && <UploadStep onUploaded={handleUploaded} />}
+            {amStep === 1 && uploadResult && (
+              <>
+                <BsPlFiscalYearStep
+                  availableYears={availableFiscalYears}
+                  selected={selectedFiscalYears}
+                  onChange={setSelectedFiscalYears}
+                  loading={fiscalYearsLoading}
+                  replaceMode={bsPlReplaceMode}
+                  onReplaceModeChange={setBsPlReplaceMode}
+                />
+                <NavButtons
+                  step={amStep}
+                  totalSteps={ACCOUNT_STEPS_BSPL.length}
+                  onBack={amGoBack}
+                  onNext={amGoNext}
+                  nextDisabled={!amCanGoNext[amStep]}
+                />
+              </>
+            )}
+            {amStep === 2 && uploadResult && (
+              <>
+                <BsPlPreviewStep
+                  uploadResult={uploadResult}
+                  fiscalYears={selectedFiscalYears}
+                  replaceMode={bsPlReplaceMode}
+                  preview={bsPlPreview}
+                  loading={bsPlPreviewLoading}
+                  error={bsPlPreviewError}
+                  onLoadPreview={loadBsPlPreview}
+                />
+                <NavButtons
+                  step={amStep}
+                  totalSteps={ACCOUNT_STEPS_BSPL.length}
+                  onBack={amGoBack}
+                  onNext={amGoNext}
+                  nextDisabled={!amCanGoNext[amStep]}
+                  nextLabel={
+                    bsPlPreview?.blockers?.length
+                      ? "Resolve blockers"
+                      : bsPlPreviewLoading
+                      ? "Loading preview…"
+                      : "Next"
+                  }
+                />
+              </>
+            )}
+            {amStep === 3 && uploadResult && (
+              <>
+                <BsPlCommitStep
+                  uploadResult={uploadResult}
+                  fiscalYears={selectedFiscalYears}
+                  replaceMode={bsPlReplaceMode}
+                  preview={bsPlPreview}
+                  onAddAnother={resetAmForNextTable}
+                />
+                <div className="mt-4">
+                  <button
+                    type="button"
+                    onClick={amGoBack}
+                    className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Back to preview
+                  </button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+        {mode === "account-mapping" && !bsPlMode && (
+          <>
+            {amStep === 0 && <UploadStep onUploaded={handleUploaded} />}
+            {amStep === 1 && uploadResult && (
+              <>
+                <KontextStep
+                  sourceColumns={uploadResult.columns}
+                  state={kontext}
+                  onChange={setKontext}
+                />
+                <NavButtons
+                  step={amStep}
+                  totalSteps={ACCOUNT_STEPS.length}
+                  onBack={amGoBack}
+                  onNext={amGoNext}
+                  nextDisabled={!amCanGoNext[amStep]}
+                />
+              </>
+            )}
+            {amStep === 2 && uploadResult && (
+              <>
+                <AccountMappingStep
+                  uploadResult={uploadResult}
+                  mapping={amMapping}
+                  onChange={setAmMapping}
+                />
+                <NavButtons
+                  step={amStep}
+                  totalSteps={ACCOUNT_STEPS.length}
+                  onBack={amGoBack}
+                  onNext={amGoNext}
+                  nextDisabled={!amCanGoNext[amStep]}
+                  nextLabel={amMissing.length > 0 ? `Next (${amMissing.length} required fields missing)` : "Next"}
+                />
+              </>
+            )}
+            {amStep === 3 && uploadResult && (
+              <>
+                <AccountMappingCommitStep
+                  uploadResult={uploadResult}
+                  kontext={kontext}
+                  mapping={amMapping}
+                  onAddAnother={resetAmForNextTable}
+                />
+                <div className="mt-4">
+                  <button
+                    type="button"
+                    onClick={amGoBack}
+                    className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Back to mapping
+                  </button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+
+        {isAdmin && <VersionHistoryPanel />}
+        </>
+      )}
     </div>
     </PageShell>
   );

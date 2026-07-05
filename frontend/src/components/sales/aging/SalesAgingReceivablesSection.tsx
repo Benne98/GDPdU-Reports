@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   api,
   ReceivablesAgingBand,
+  type ReceivablesAgingKpis as ReceivablesAgingKpisData,
   AgingPortfolioTableResponse,
   ReceivablesAgingDimension,
   ReceivablesCustomerRegisterRow,
@@ -54,9 +55,11 @@ export default function SalesAgingReceivablesSection({
 
   const [series, setSeries] = useState<ReceivablesAgingBand[]>([])
   const [total, setTotal] = useState(0)
+  const [totalOpenGross, setTotalOpenGross] = useState<number | undefined>()
+  const [agingKpis, setAgingKpis] = useState<ReceivablesAgingKpisData | undefined>()
   const [kpiMetrics, setKpiMetrics] = useState<Record<string, OperationalKpiMetric> | undefined>()
   const [statusSplit, setStatusSplit] = useState<ReceivablesStatusSplit | undefined>()
-  const [reconciliation, setReconciliation] = useState<'subledger' | 'scaled' | 'synthetic'>('subledger')
+  const [reconciliation, setReconciliation] = useState<'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'>('subledger')
   const [breakdownConfig, setBreakdownConfig] = useState<ReceivablesDimensionBreakdownConfig>(() =>
     loadReceivablesBreakdownConfig(),
   )
@@ -96,13 +99,15 @@ export default function SalesAgingReceivablesSection({
           api.salesReceivablesAging(year, month, entity),
           api.salesReceivablesCustomers(year, month, entity, 50),
           api.salesReceivablesGeo(year, month, entity, 50),
-          api.salesReceivablesTrend(year, month, entity, 12, 'month'),
+          api.salesReceivablesTrend(year, month, entity, 13, 'month'),
         ])
         if (!isCurrent()) return
 
         applyFulfilled(settled[0], isCurrent, aging => {
           setSeries(aging.series)
           setTotal(aging.total_receivables)
+          setTotalOpenGross(aging.total_open_gross)
+          setAgingKpis(aging.kpis)
           setKpiMetrics(aging.kpi_metrics)
           setStatusSplit(aging.status_split)
           setReconciliation(aging.reconciliation_mode)
@@ -175,9 +180,26 @@ export default function SalesAgingReceivablesSection({
 
   if (initialLoading) {
     return (
-      <p className="text-sm py-8 text-center" style={{ color: '#94A3B8' }}>
-        Loading receivables aging…
-      </p>
+      <div className="space-y-8 animate-pulse">
+        {/* KPI strip skeleton — 4 cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div
+              key={i}
+              className="rounded-xl p-5"
+              style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', minHeight: 172 }}
+            >
+              <div className="h-3 w-24 rounded mb-4" style={{ background: '#E2E8F0' }} />
+              <div className="h-8 w-16 rounded mb-2" style={{ background: '#E2E8F0' }} />
+              <div className="h-12 w-full rounded" style={{ background: '#F1F5F9' }} />
+            </div>
+          ))}
+        </div>
+        {/* Portfolio section skeleton */}
+        <div className="rounded-xl" style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', height: 320 }} />
+        {/* Table section skeleton */}
+        <div className="rounded-xl" style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', height: 200 }} />
+      </div>
     )
   }
 
@@ -202,8 +224,12 @@ export default function SalesAgingReceivablesSection({
       <section id="ar-portfolio" className="space-y-6 scroll-mt-20">
         <ReceivablesAgingKpis
           kpiMetrics={kpiMetrics}
+          kpis={agingKpis}
+          totalOpenGross={totalOpenGross}
           trendPoints={trend}
           trendLoading={secondaryLoading}
+          year={year}
+          month={month}
         />
 
         <AgingPortfolioSection

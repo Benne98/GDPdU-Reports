@@ -16,7 +16,11 @@ export type ConsolidationCellTarget =
   | { kind: 'ic' }
   | { kind: 'consolidation' }
 
-function findStatementRow(rows: FinancialStatementRow[], lineId: string): FinancialStatementRow | null {
+function findStatementRow(
+  rows: FinancialStatementRow[],
+  lineId: string,
+  label?: string,
+): FinancialStatementRow | null {
   for (const r of rows) {
     if (r.id === lineId) return r
     if (r.line_code) {
@@ -31,8 +35,18 @@ function findStatementRow(rows: FinancialStatementRow[], lineId: string): Financ
       }
     }
     if (r.children?.length) {
-      const c = findStatementRow(r.children, lineId)
+      const c = findStatementRow(r.children, lineId, label)
       if (c) return c
+    }
+  }
+
+  const plL4 = lineId.match(/^pl-(.+)-l4-/)
+  if (plL4 && label) {
+    const parent = findStatementRow(rows, `pl-${plL4[1]}`)
+    if (parent?.children?.length) {
+      for (const ch of parent.children) {
+        if (ch.label === label || ch.line_code?.endsWith(`::${label}`)) return ch
+      }
     }
   }
   return null
@@ -87,8 +101,20 @@ export function resolveConsolidationCell(
   const stmt = statementForTarget(target, statementByEntity, groupStatement)
   if (!stmt) return null
 
-  const srow = findStatementRow(stmt.rows, row.id)
+  const srow = findStatementRow(stmt.rows, row.id, row.label)
   if (!srow) return null
+
+  const PLAN_COLUMN_KINDS = new Set([
+    'plan_cm',
+    'plan_vs_actual',
+    'ytd_plan',
+    'ytd_vs_plan',
+    'ytg',
+    'coverage',
+  ])
+  if (srow.row_kind === 'account' && PLAN_COLUMN_KINDS.has(extraCol.kind)) {
+    return null
+  }
 
   const asPlCol: PlTableColumnDef = {
     id: extraCol.id,

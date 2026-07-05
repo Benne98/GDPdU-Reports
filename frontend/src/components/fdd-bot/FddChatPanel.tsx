@@ -53,10 +53,10 @@ function FddChatPanelView({
         type="button"
         onClick={() => void undoLastCard()}
         disabled={!canUndo || busy}
-        title="Letzte Karte zurück"
+        title="Undo last card"
         className="p-1.5 rounded-lg transition-colors disabled:opacity-40"
         style={{ color: 'rgba(255,255,255,0.85)' }}
-        aria-label="Letzte Karte zurück"
+        aria-label="Undo last card"
       >
         <Undo2 size={16} />
       </button>

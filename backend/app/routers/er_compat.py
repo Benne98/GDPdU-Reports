@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.auth import User, current_user
-from app.db import get_session
+from app.db import get_read_session
 from app.services.fin_compat_bs import build_bs_snapshot_annual
 from app.services.fin_compat_cf import build_cf_annual_compat
 from app.services.fin_compat_pl import (
@@ -40,7 +40,7 @@ router = APIRouter(
 )
 
 _UserDep = Annotated[User, Depends(current_user)]
-_SessionDep = Annotated[Session, Depends(get_session)]
+_SessionDep = Annotated[Session, Depends(get_read_session)]
 
 
 # ---------------------------------------------------------------------------

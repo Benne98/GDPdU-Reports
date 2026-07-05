@@ -38,6 +38,31 @@ def within_tolerance(a: float, b: float, abs_tol: float = ABS_TOL, rel_tol: floa
 
 
 # --------------------------------------------------------------------------- #
+# Stage-aware check selection
+# --------------------------------------------------------------------------- #
+#: Which checks make sense at each ingestion stage.
+#:
+#: At GL Project-Setup no Chart of Accounts mapping and no partner tables exist
+#: yet, so mapping-coverage (M1) and reconciliation (R1-R4) are meaningless there.
+#:
+#: NOTE: the "all" list order MUST match the exact order in which
+#: ``backend/app/routers/ingest.py`` validate() appends results, so the default
+#: response stays byte-stable. Verified append order (validate ~line 1329):
+#:   S1, S2, B1, B3, B2, Q2, R1, R2, R3, R4, M1  (M1 appended last).
+STAGE_CHECKS: dict[str, list[str]] = {
+    "gl":      ["S1", "S2", "B1", "B3", "B2", "Q2"],
+    "coa":     ["M1", "R3", "R4"],
+    "partner": ["R1", "R2"],
+    "all":     ["S1", "S2", "B1", "B3", "B2", "Q2", "R1", "R2", "R3", "R4", "M1"],
+}
+
+
+def checks_for_stage(stage: str | None) -> list[str]:
+    """Return the check ids relevant for ``stage`` (None/unknown => 'all')."""
+    return STAGE_CHECKS.get(stage or "all", STAGE_CHECKS["all"])
+
+
+# --------------------------------------------------------------------------- #
 # Structural
 # --------------------------------------------------------------------------- #
 _FIELD_LABELS: dict[str, str] = {
@@ -259,16 +284,21 @@ def check_booking_balance(lines: pd.DataFrame, tol: float = ABS_TOL) -> CheckRes
     keys = ["journal_entry_group_number", "fiscal_year"]
     sizes = movable.groupby(keys, dropna=False).size()
     g = movable.groupby(keys, dropna=False)["amount"].sum()
-    bad = g[g.abs() > tol]
+    mask = g.abs() > tol
+    bad = g[mask]
+    # Align line counts to `bad` by the same boolean mask (same groupby index),
+    # NOT via sizes.loc[k] — a key with a <NA> level (e.g. NA fiscal_year from an
+    # unparseable posting_date) cannot be looked up by .loc and would KeyError.
+    bad_sizes = sizes[mask]
     hint = _booking_group_hint(sizes, len(bad))
     offenders: list[dict] = []
-    for k, v in list(bad.items())[:50]:
+    for (k, v), sz in list(zip(bad.items(), bad_sizes))[:50]:
         jegn = str(k[0])
         offenders.append({
             "journal_entry_group_number": jegn,
             "journal_entry_number": jegn[2:] if len(jegn) > 2 else jegn,
             "fiscal_year": int(k[1]) if pd.notna(k[1]) else None,
-            "line_count": int(sizes.loc[k]),
+            "line_count": int(sz),
             "sum": round(float(v), 2),
         })
     detail = "All bookings balance." if bad.empty else (

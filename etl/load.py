@@ -6,9 +6,13 @@ a live session and are covered by integration tests (which need a real DB).
 
 Load strategy:
   - fact_gl_entry: upsert-or-skip by (journal_entry_group_number, fiscal_year)
-  - fact_gl_line:  insert-or-skip by booking_line_id (UNIQUE constraint)
+  - fact_gl_line:  insert-or-skip on the composite PK
+                   (journal_entry_group_number, fiscal_year, line_number)
+                   via ON CONFLICT DO NOTHING; a booking_line_id UNIQUE constraint
+                   also exists, so a duplicate booking_line_id under a different PK
+                   still raises (unchanged behaviour)
   - fact_ar/ap/sales/com: derive from final lines, insert-or-skip by booking_line_id
-  - meta_dataset_load: append a record regardless (audit trail)
+  - org_meta_dataset_load: append a record regardless (audit trail)
   - dim_gl_account: ON CONFLICT (account_number_group, fiscal_year) DO UPDATE
   - dim_gl_na:      ON CONFLICT (account_number_group, fiscal_year) DO UPDATE
   - dim_gl_cf:      ON CONFLICT (account_number_group, fiscal_year) DO UPDATE
@@ -16,14 +20,20 @@ Load strategy:
 Idempotency: re-running with the same data produces no duplicate rows.
 Transactional: all writes in one session.commit(); on error -> rollback.
 
-Performance: bulk inserts use SQLAlchemy executemany (a list of param dicts passed to
-session.execute) in chunks of BATCH_SIZE rows.  This avoids Python-level round-trips
-and lets the DBAPI driver (psycopg2) use server-side batch protocols.  At 1.3M rows
-this yields ~10-50x throughput versus per-row execute calls.
+Performance: the fact/entry/line bulk inserts stream rows via psycopg2 COPY into a
+typed TEMP staging table (a types-only clone of the target, no constraints and no
+generated entity_prefix), then run INSERT ... SELECT ... ON CONFLICT DO NOTHING to
+apply the same dedup/skip semantics COPY itself cannot express.  COPY runs on the
+SAME transaction's DBAPI connection (no intermediate commit -> fully rollback-safe).
+Row serialization (see _copy_field / _copy_stage_insert) is byte-compatible with the
+previous executemany path: NULL/empty/quoting and float repr are chosen so text->typed
+parsing happens once, in Postgres, exactly as psycopg2 did before.  At 1.3M rows COPY
+is materially faster than executemany while producing byte-identical stored rows.
 """
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -58,6 +68,28 @@ def content_hash(df: pd.DataFrame) -> str:
     # Convert to CSV bytes — deterministic (no index, na_rep='')
     csv_bytes = stable.to_csv(index=False, na_rep="").encode("utf-8")
     return hashlib.sha256(csv_bytes).hexdigest()
+
+
+def content_hash_with_strategy(df: pd.DataFrame, linking_strategy: str) -> str:
+    """Idempotency hash that also depends on the partner ``linking_strategy``.
+
+    ``content_hash(df)`` hashes only the canonical + dim_gl_account columns of the
+    enriched lines; it does NOT capture ``linking_strategy``, which is applied later
+    inside :func:`load_canonical` (``D.link_partners``) and drives the derived
+    fact_ar/ap/sales/com rows.  Re-committing the SAME file with a DIFFERENT strategy
+    would therefore yield an identical ``content_hash`` and a false replace-skip that
+    silently keeps stale derived facts.
+
+    This helper salts the frame hash with the strategy so the value changes when
+    EITHER the frame OR the strategy changes.  Deterministic and collision-safe:
+    the frame's 64-hex digest and the strategy are joined by a NUL byte (which cannot
+    appear in the hex digest) and re-hashed with SHA-256.  Both the store side
+    (``org_meta_dataset_load.content_hash`` in ``load_canonical``) and the replace
+    skip side (``ingest.commit``) MUST call this helper on the identical (frame,
+    strategy) pair, or the skip becomes unsound again.
+    """
+    salted = (content_hash(df) + "\x00" + str(linking_strategy)).encode("utf-8")
+    return hashlib.sha256(salted).hexdigest()
 
 
 def split_entry_line(lines: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -117,14 +149,14 @@ def dedup_check(
 ) -> bool:
     """Return True if this exact content (by hash) has already been loaded.
 
-    Queries meta_dataset_load for a row matching (dataset, content_hash).
+    Queries org_meta_dataset_load for a row matching (dataset, content_hash).
     Entity and fiscal_year are informational; the hash is the actual dedup key.
     """
     from sqlalchemy import text  # local import keeps module importable without SQLAlchemy
 
     row = session.execute(
         text(
-            "SELECT 1 FROM meta_dataset_load "
+            "SELECT 1 FROM org_meta_dataset_load "
             "WHERE dataset = :ds AND content_hash = :h "
             "LIMIT 1"
         ),
@@ -155,7 +187,7 @@ def load_canonical(
       4. Insert fact_gl_entry rows (skip existing PKs).
       5. Insert fact_gl_line rows (skip existing booking_line_ids).
       6. Derive fact_ar / fact_ap / fact_sales / fact_com and insert.
-      7. Record meta_dataset_load.
+      7. Record org_meta_dataset_load.
       8. Commit.
 
     Parameters
@@ -272,7 +304,7 @@ def load_canonical(
 
     load_row = session.execute(
         text("""
-            INSERT INTO meta_dataset_load
+            INSERT INTO org_meta_dataset_load
               (dataset, legal_entity_code, fiscal_year, row_count, content_hash,
                loaded_at, loaded_by, scope_entity_prefixes, scope_fiscal_years,
                commit_mode, snapshot_captured)
@@ -284,7 +316,7 @@ def load_canonical(
             "le": entity_prefix,
             "fy": fiscal_year_val,
             "rc": len(linked),
-            "h": content_hash(lines_df),
+            "h": content_hash_with_strategy(lines_df, linking_strategy),
             "la": datetime.now(timezone.utc),
             "lb": loaded_by,
             "pfx": prefixes or None,
@@ -297,7 +329,7 @@ def load_canonical(
     if load_id is not None and prefixes and years:
         capture_gl_snapshot(session, load_id, prefixes, years)
         session.execute(
-            text("UPDATE meta_dataset_load SET snapshot_captured = TRUE WHERE load_id = :id"),
+            text("UPDATE org_meta_dataset_load SET snapshot_captured = TRUE WHERE load_id = :id"),
             {"id": load_id},
         )
 
@@ -386,19 +418,114 @@ def _n(v, default=None):
     return v
 
 
-def _bulk_insert_entries(session: Session, new_entries: pd.DataFrame) -> None:
-    """Bulk-insert fact_gl_entry rows via executemany in BATCH_SIZE chunks."""
+# --------------------------------------------------------------------------- #
+# COPY fast-path (psycopg2 COPY -> typed TEMP staging -> INSERT ... ON CONFLICT)
+# --------------------------------------------------------------------------- #
+#
+# The staging table is a TYPES-ONLY clone of the target (CREATE TEMP TABLE ...
+# AS SELECT <cols> FROM <target> WITH NO DATA): no constraints, and crucially NOT
+# the entity_prefix GENERATED-ALWAYS column (regenerated on the real INSERT).
+# COPY runs on the SAME transaction's DBAPI connection (no intermediate commit),
+# so any later failure rolls the whole load back.  Serialization is byte-compatible
+# with the previous executemany path: text->typed parsing happens once, in Postgres,
+# exactly as psycopg2 did before (see _copy_field).
+
+def _copy_field(v) -> str:
+    r"""Render one Python scalar as a single CSV field for COPY (FORMAT csv, NULL '\N').
+
+    - None            -> unquoted ``\N``           => SQL NULL (what _n() yields for NaN).
+    - bool            -> ``true`` / ``false``       (no bool columns in these tables today;
+                                                     guarded before int since bool < int).
+    - int             -> ``str(int(v))``.
+    - float           -> ``repr(float(v))``         (full precision; Postgres rounds to the
+                                                     column scale exactly as psycopg2 did).
+    - date/Timestamp  -> quoted ``.isoformat()``    (parsed text->DATE once in the typed stage).
+    - str (incl. '')  -> ALWAYS double-quoted, ``"`` escaped as ``""``  => real ''
+                          stays an empty string, NOT NULL; a quoted value never matches
+                          the NULL token, so no false NULLs.
+    """
+    if v is None:
+        return "\\N"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(int(v))
+    if isinstance(v, float):
+        return repr(float(v))
+    if isinstance(v, str):
+        return '"' + v.replace('"', '""') + '"'
+    if hasattr(v, "isoformat"):  # datetime.date / pandas.Timestamp
+        return '"' + v.isoformat() + '"'
+    s = str(v)
+    return '"' + s.replace('"', '""') + '"'
+
+
+def _copy_stage_insert(
+    session: Session,
+    target: str,
+    columns: list[str],
+    param_keys: list[str],
+    conflict: str,
+    params: list[dict],
+) -> None:
+    r"""COPY ``params`` into a typed TEMP staging clone of ``target``, then
+    ``INSERT INTO target (columns) SELECT columns FROM stage ON CONFLICT conflict
+    DO NOTHING`` — all inside the caller's existing transaction.
+
+    ``columns``    ordered target column names to insert (excludes the generated
+                   ``entity_prefix``).  ``param_keys`` are the matching keys into each
+                   ``params`` dict, in the SAME order as ``columns``.
+    ``conflict``   the exact ON CONFLICT target clause, e.g. ``"(booking_line_id)"``.
+    """
     from sqlalchemy import text
 
-    sql = text("""
-        INSERT INTO fact_gl_entry
-          (journal_entry_group_number, fiscal_year, fiscal_period, entry_type,
-           posting_date, document_date, document_type_code, reference_document_number,
-           currency_code, header_note, source_system)
-        VALUES
-          (:jegn, :fy, :fp, :et, :pd, :dd, :dtc, :rdn, :cc, :hn, :ss)
-        ON CONFLICT (journal_entry_group_number, fiscal_year) DO NOTHING
-    """)
+    if not params:
+        return
+
+    col_sql = ", ".join(columns)
+    stage = f"_stage_{target}"
+
+    # Types-only clone: no constraints, no generated entity_prefix.  ON COMMIT DROP is
+    # a safety net; the explicit DROP frees it immediately within the transaction and
+    # the leading DROP IF EXISTS keeps a repeat call in the same tx clean.
+    session.execute(text(f"DROP TABLE IF EXISTS {stage}"))
+    session.execute(
+        text(
+            f"CREATE TEMP TABLE {stage} ON COMMIT DROP AS "
+            f"SELECT {col_sql} FROM {target} WITH NO DATA"
+        )
+    )
+
+    buf = io.StringIO()
+    for p in params:
+        buf.write(",".join(_copy_field(p[k]) for k in param_keys))
+        buf.write("\n")
+    buf.seek(0)
+
+    # SAME transaction's raw DBAPI connection — no commit/rollback on `raw`, so a later
+    # failure rolls back the COPY together with the rest of the load.
+    raw = session.connection().connection
+    cur = raw.cursor()
+    try:
+        cur.copy_expert(
+            rf"COPY {stage} ({col_sql}) FROM STDIN WITH (FORMAT csv, NULL '\N')",
+            buf,
+        )
+    finally:
+        cur.close()
+
+    session.execute(
+        text(
+            f"INSERT INTO {target} ({col_sql}) "
+            f"SELECT {col_sql} FROM {stage} "
+            f"ON CONFLICT {conflict} DO NOTHING"
+        )
+    )
+    session.execute(text(f"DROP TABLE {stage}"))
+
+
+def _bulk_insert_entries(session: Session, new_entries: pd.DataFrame) -> None:
+    """Bulk-insert fact_gl_entry rows via psycopg2 COPY into a typed TEMP stage."""
     params = [
         {
             "jegn": row["journal_entry_group_number"],
@@ -415,24 +542,22 @@ def _bulk_insert_entries(session: Session, new_entries: pd.DataFrame) -> None:
         }
         for row in new_entries.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_gl_entry",
+        [
+            "journal_entry_group_number", "fiscal_year", "fiscal_period", "entry_type",
+            "posting_date", "document_date", "document_type_code", "reference_document_number",
+            "currency_code", "header_note", "source_system",
+        ],
+        ["jegn", "fy", "fp", "et", "pd", "dd", "dtc", "rdn", "cc", "hn", "ss"],
+        "(journal_entry_group_number, fiscal_year)",
+        params,
+    )
 
 
 def _bulk_insert_lines(session: Session, new_lines: pd.DataFrame) -> None:
-    """Bulk-insert fact_gl_line rows via executemany in BATCH_SIZE chunks."""
-    from sqlalchemy import text
-
-    sql = text("""
-        INSERT INTO fact_gl_line
-          (journal_entry_group_number, fiscal_year, line_number, booking_line_id,
-           account_number_group, amount, vat_amount, line_note,
-           customer_id, supplier_id, posting_type, source_system)
-        VALUES
-          (:jegn, :fy, :ln, :bid, :ang, :amt, :vat, :lnote,
-           :cust, :supp, :pt, :ss)
-        ON CONFLICT (journal_entry_group_number, fiscal_year, line_number) DO NOTHING
-    """)
+    """Bulk-insert fact_gl_line rows via psycopg2 COPY into a typed TEMP stage."""
     params = [
         {
             "jegn":  row["journal_entry_group_number"],
@@ -450,28 +575,26 @@ def _bulk_insert_lines(session: Session, new_lines: pd.DataFrame) -> None:
         }
         for row in new_lines.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_gl_line",
+        [
+            "journal_entry_group_number", "fiscal_year", "line_number", "booking_line_id",
+            "account_number_group", "amount", "vat_amount", "line_note",
+            "customer_id", "supplier_id", "posting_type", "source_system",
+        ],
+        ["jegn", "fy", "ln", "bid", "ang", "amt", "vat", "lnote", "cust", "supp", "pt", "ss"],
+        "(journal_entry_group_number, fiscal_year, line_number)",
+        params,
+    )
 
 
 def _insert_fact_ar(session: Session, fact_ar: pd.DataFrame, skip_bids: set[int]) -> int:
-    from sqlalchemy import text
-
     candidates = fact_ar[~fact_ar["booking_line_id"].astype(int).isin(skip_bids)].reset_index(drop=True)
     inserted = len(candidates)
     if not inserted:
         return 0
 
-    sql = text("""
-        INSERT INTO fact_ar
-          (booking_line_id, journal_entry_group_number, fiscal_year, line_number,
-           account_number_group, customer_id, posting_date, document_date, due_date,
-           amount, reference_document_number, entry_type, link_method, source_system)
-        VALUES
-          (:bid, :jegn, :fy, :ln, :ang, :cust, :pd, :dd, :du,
-           :amt, :rdn, :et, :lm, :ss)
-        ON CONFLICT (booking_line_id) DO NOTHING
-    """)
     params = [
         {
             "bid":  int(row["booking_line_id"]),
@@ -491,29 +614,27 @@ def _insert_fact_ar(session: Session, fact_ar: pd.DataFrame, skip_bids: set[int]
         }
         for row in candidates.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_ar",
+        [
+            "booking_line_id", "journal_entry_group_number", "fiscal_year", "line_number",
+            "account_number_group", "customer_id", "posting_date", "document_date", "due_date",
+            "amount", "reference_document_number", "entry_type", "link_method", "source_system",
+        ],
+        ["bid", "jegn", "fy", "ln", "ang", "cust", "pd", "dd", "du", "amt", "rdn", "et", "lm", "ss"],
+        "(booking_line_id)",
+        params,
+    )
     return inserted
 
 
 def _insert_fact_ap(session: Session, fact_ap: pd.DataFrame, skip_bids: set[int]) -> int:
-    from sqlalchemy import text
-
     candidates = fact_ap[~fact_ap["booking_line_id"].astype(int).isin(skip_bids)].reset_index(drop=True)
     inserted = len(candidates)
     if not inserted:
         return 0
 
-    sql = text("""
-        INSERT INTO fact_ap
-          (booking_line_id, journal_entry_group_number, fiscal_year, line_number,
-           account_number_group, supplier_id, posting_date, document_date, due_date,
-           amount, reference_document_number, entry_type, link_method, source_system)
-        VALUES
-          (:bid, :jegn, :fy, :ln, :ang, :supp, :pd, :dd, :du,
-           :amt, :rdn, :et, :lm, :ss)
-        ON CONFLICT (booking_line_id) DO NOTHING
-    """)
     params = [
         {
             "bid":  int(row["booking_line_id"]),
@@ -533,28 +654,27 @@ def _insert_fact_ap(session: Session, fact_ap: pd.DataFrame, skip_bids: set[int]
         }
         for row in candidates.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_ap",
+        [
+            "booking_line_id", "journal_entry_group_number", "fiscal_year", "line_number",
+            "account_number_group", "supplier_id", "posting_date", "document_date", "due_date",
+            "amount", "reference_document_number", "entry_type", "link_method", "source_system",
+        ],
+        ["bid", "jegn", "fy", "ln", "ang", "supp", "pd", "dd", "du", "amt", "rdn", "et", "lm", "ss"],
+        "(booking_line_id)",
+        params,
+    )
     return inserted
 
 
 def _insert_fact_sales(session: Session, fact_sales: pd.DataFrame, skip_bids: set[int]) -> int:
-    from sqlalchemy import text
-
     candidates = fact_sales[~fact_sales["booking_line_id"].astype(int).isin(skip_bids)].reset_index(drop=True)
     inserted = len(candidates)
     if not inserted:
         return 0
 
-    sql = text("""
-        INSERT INTO fact_sales
-          (booking_line_id, journal_entry_group_number, fiscal_year,
-           account_number_group, customer_id, posting_date,
-           gross_sales, link_method, entry_type, source_system)
-        VALUES
-          (:bid, :jegn, :fy, :ang, :cust, :pd, :gs, :lm, :et, :ss)
-        ON CONFLICT (booking_line_id) DO NOTHING
-    """)
     params = [
         {
             "bid":  int(row["booking_line_id"]),
@@ -570,28 +690,27 @@ def _insert_fact_sales(session: Session, fact_sales: pd.DataFrame, skip_bids: se
         }
         for row in candidates.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_sales",
+        [
+            "booking_line_id", "journal_entry_group_number", "fiscal_year",
+            "account_number_group", "customer_id", "posting_date",
+            "gross_sales", "link_method", "entry_type", "source_system",
+        ],
+        ["bid", "jegn", "fy", "ang", "cust", "pd", "gs", "lm", "et", "ss"],
+        "(booking_line_id)",
+        params,
+    )
     return inserted
 
 
 def _insert_fact_com(session: Session, fact_com: pd.DataFrame, skip_bids: set[int]) -> int:
-    from sqlalchemy import text
-
     candidates = fact_com[~fact_com["booking_line_id"].astype(int).isin(skip_bids)].reset_index(drop=True)
     inserted = len(candidates)
     if not inserted:
         return 0
 
-    sql = text("""
-        INSERT INTO fact_com
-          (booking_line_id, journal_entry_group_number, fiscal_year,
-           account_number_group, supplier_id, posting_date,
-           cost_of_materials, link_method, entry_type, source_system)
-        VALUES
-          (:bid, :jegn, :fy, :ang, :supp, :pd, :com, :lm, :et, :ss)
-        ON CONFLICT (booking_line_id) DO NOTHING
-    """)
     params = [
         {
             "bid":  int(row["booking_line_id"]),
@@ -607,8 +726,18 @@ def _insert_fact_com(session: Session, fact_com: pd.DataFrame, skip_bids: set[in
         }
         for row in candidates.to_dict("records")
     ]
-    for i in range(0, len(params), BATCH_SIZE):
-        session.execute(sql, params[i : i + BATCH_SIZE])
+    _copy_stage_insert(
+        session,
+        "fact_com",
+        [
+            "booking_line_id", "journal_entry_group_number", "fiscal_year",
+            "account_number_group", "supplier_id", "posting_date",
+            "cost_of_materials", "link_method", "entry_type", "source_system",
+        ],
+        ["bid", "jegn", "fy", "ang", "supp", "pd", "com", "lm", "et", "ss"],
+        "(booking_line_id)",
+        params,
+    )
     return inserted
 
 
@@ -624,6 +753,7 @@ def load_legal_entity(
     country_code: str | None = None,
     default_currency: str = "EUR",
     source_system: str | None = None,
+    preserve_existing: bool = False,
 ) -> None:
     """Idempotent upsert of one row into ``dim_legal_entity``.
 
@@ -650,24 +780,54 @@ def load_legal_entity(
         ISO currency code; defaults to 'EUR'.
     source_system : str | None
         Originating system identifier.
+    preserve_existing : bool
+        ``False`` (default): a confirmed wizard upsert — every mutable column is
+        overwritten with the supplied values (the GL ``/commit`` real-name path).
+        ``True``: a *register-if-absent* placeholder upsert — when the row already
+        exists any confirmed real metadata is KEPT.  A later placeholder commit
+        (``entity_name == entity_prefix``) must NOT clobber a real ``entity_name``
+        / ``is_consolidation`` / ``country_code`` / ``source_system`` already set
+        by the GL ``/commit`` path.  Used by
+        :func:`upsert_legal_entities_for_prefixes`.
     """
     from sqlalchemy import text
 
     name = entity_name or entity_prefix
 
-    session.execute(
-        text("""
-            INSERT INTO dim_legal_entity
-              (legal_entity_code, entity_prefix, entity_name,
-               is_consolidation, country_code, default_currency, source_system)
-            VALUES
-              (:code, :ep, :name, :ic, :cc, :cur, :ss)
+    if preserve_existing:
+        # Register-if-absent: keep stored real metadata. EXCLUDED.* here are bare
+        # placeholders (name == prefix), so prefer the existing confirmed values.
+        conflict_clause = """
+            ON CONFLICT (legal_entity_code) DO UPDATE SET
+              entity_name      = CASE
+                WHEN dim_legal_entity.entity_name IS NOT NULL
+                     AND dim_legal_entity.entity_name <> EXCLUDED.entity_prefix
+                  THEN dim_legal_entity.entity_name
+                ELSE EXCLUDED.entity_name
+              END,
+              is_consolidation = COALESCE(dim_legal_entity.is_consolidation, EXCLUDED.is_consolidation),
+              country_code     = COALESCE(dim_legal_entity.country_code,     EXCLUDED.country_code),
+              default_currency = COALESCE(dim_legal_entity.default_currency, EXCLUDED.default_currency),
+              source_system    = COALESCE(dim_legal_entity.source_system,    EXCLUDED.source_system)
+        """
+    else:
+        conflict_clause = """
             ON CONFLICT (legal_entity_code) DO UPDATE SET
               entity_name      = EXCLUDED.entity_name,
               is_consolidation = EXCLUDED.is_consolidation,
               country_code     = EXCLUDED.country_code,
               default_currency = EXCLUDED.default_currency,
               source_system    = EXCLUDED.source_system
+        """
+
+    session.execute(
+        text(f"""
+            INSERT INTO dim_legal_entity
+              (legal_entity_code, entity_prefix, entity_name,
+               is_consolidation, country_code, default_currency, source_system)
+            VALUES
+              (:code, :ep, :name, :ic, :cc, :cur, :ss)
+            {conflict_clause}
         """),
         {
             "code": entity_prefix,   # legal_entity_code == entity_prefix (2-char natural key)
@@ -680,6 +840,54 @@ def load_legal_entity(
         },
     )
     logger.debug("load_legal_entity: upserted entity_prefix=%r name=%r", entity_prefix, name)
+
+
+def upsert_legal_entities_for_prefixes(
+    session: Session,
+    prefixes: list[str],
+    *,
+    source_system: str | None = None,
+    auto_commit: bool = False,
+) -> int:
+    """Idempotently register every committed entity prefix in ``dim_legal_entity``.
+
+    The account-mapping commit (DF1 — ``load_account_mapping``) writes only
+    ``dim_gl_account``/``dim_gl_na``/``dim_gl_cf``.  When a single shared chart of
+    accounts is committed per member of an entity group (prefix '01', then '02', …)
+    each member therefore gains ``dim_gl_account`` rows but **no** ``dim_legal_entity``
+    row, so the member is invisible downstream.  This mirrors the GL ``/commit`` path
+    (which upserts ``dim_legal_entity`` alongside the fact load) for the mapping path.
+
+    Each prefix is upserted via :func:`load_legal_entity` with
+    ``preserve_existing=True`` (register-if-absent), so repeat commits and
+    replace/append modes never error AND a confirmed real ``entity_name`` /
+    ``is_consolidation`` set earlier by the GL ``/commit`` path is never clobbered
+    back to the bare prefix.  ``entity_name`` defaults to the 2-char prefix itself —
+    a safe, non-PII placeholder (no customer data is invented).  The caller owns the
+    transaction unless ``auto_commit`` is True.
+
+    Returns the number of prefixes upserted.
+    """
+    seen: set[str] = set()
+    upserted = 0
+    for prefix in prefixes:
+        p = str(prefix).strip().zfill(2)
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        load_legal_entity(
+            session,
+            entity_prefix=p,
+            entity_name=p,
+            is_consolidation=False,
+            source_system=source_system,
+            preserve_existing=True,
+        )
+        upserted += 1
+    if auto_commit:
+        session.commit()
+    logger.debug("upsert_legal_entities_for_prefixes: %d prefixes upserted", upserted)
+    return upserted
 
 
 # --------------------------------------------------------------------------- #
@@ -927,6 +1135,7 @@ def load_account_mapping(
     session: Session,
     mapping_df: pd.DataFrame,
     auto_commit: bool = True,
+    on_conflict: str = "update",
 ) -> dict[str, int]:
     """Transactional UPSERT of a canonical mapping DataFrame into dim_gl_account,
     dim_gl_na, and dim_gl_cf.
@@ -954,10 +1163,20 @@ def load_account_mapping(
         An open SQLAlchemy session bound to the target database.
     mapping_df : pd.DataFrame
         Canonical mapping DataFrame from apply_account_mapping.
+    on_conflict : str
+        Conflict resolution for all three writers:
+          - ``"update"`` (DEFAULT) — ``ON CONFLICT (...) DO UPDATE SET ...`` so a
+            re-upload overwrites the existing mapping (idempotent re-upload). This
+            is the behaviour used by mapping_commit / mapping_apply_library.
+          - ``"nothing"`` — ``ON CONFLICT (...) DO NOTHING`` and the returned
+            counts reflect only TRULY-INSERTED rows (``res.rowcount``). This is the
+            authoritative NO-OVERWRITE guarantee for the cross-entity replicate
+            path: an existing dim_gl_account row is never clobbered.
 
     Returns
     -------
-    dict with keys: accounts (int), na (int), cf (int) — rows upserted per table.
+    dict with keys: accounts (int), na (int), cf (int) — rows written per table.
+    Under ``on_conflict="nothing"`` these are truly-inserted counts (skips excluded).
 
     Raises
     ------
@@ -968,32 +1187,24 @@ def load_account_mapping(
 
     from etl.mapping_account import NA_FIELDS, CF_FIELDS
 
+    if on_conflict not in ("update", "nothing"):
+        raise ValueError(
+            f"on_conflict must be 'update' or 'nothing', got {on_conflict!r}"
+        )
+    _do_nothing = on_conflict == "nothing"
+
     def _val(row, col, default=None):
         """Return row[col] as Python scalar, or default when null/absent."""
         v = row.get(col, default)
         return default if pd.isna(v) else v
 
-    accounts_upserted = 0
-    na_upserted = 0
-    cf_upserted = 0
-
-    try:
-        for _, row in mapping_df.iterrows():
-            ang = row["account_number_group"]
-            fy = int(row["fiscal_year"])
-
-            # -------------------------------------------------------- dim_gl_account
-            session.execute(
-                text("""
-                    INSERT INTO dim_gl_account
-                      (account_number_group, fiscal_year, gl_account_id, account_name,
-                       level_0, level_1, level_2, level_3, level_4, l4_sub,
-                       level_2_sort, level_3_sort, is_ic, source_system)
-                    VALUES
-                      (:ang, :fy, :glid, :aname,
-                       :l0, :l1, :l2, :l3, :l4, :l4s,
-                       :l2s, :l3s, :ic, :ss)
-                    ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
+    # Conflict clauses are selected per-mode. The DO UPDATE SET text is BYTE-FOR-BYTE
+    # identical to the historical inline SQL so existing callers (mapping_commit,
+    # mapping_apply_library) behave exactly as before under the default "update".
+    _acct_conflict = (
+        "DO NOTHING"
+        if _do_nothing
+        else """DO UPDATE SET
                       gl_account_id  = EXCLUDED.gl_account_id,
                       account_name   = EXCLUDED.account_name,
                       level_0        = EXCLUDED.level_0,
@@ -1005,7 +1216,48 @@ def load_account_mapping(
                       level_2_sort   = EXCLUDED.level_2_sort,
                       level_3_sort   = EXCLUDED.level_3_sort,
                       is_ic          = EXCLUDED.is_ic,
-                      source_system  = EXCLUDED.source_system
+                      source_system  = EXCLUDED.source_system"""
+    )
+    _na_conflict = (
+        "DO NOTHING"
+        if _do_nothing
+        else """DO UPDATE SET
+                          l6_na_mapping     = EXCLUDED.l6_na_mapping,
+                          l7_na_description = EXCLUDED.l7_na_description"""
+    )
+    _cf_conflict = (
+        "DO NOTHING"
+        if _do_nothing
+        else """DO UPDATE SET
+                          l1         = EXCLUDED.l1,
+                          l2         = EXCLUDED.l2,
+                          l3         = EXCLUDED.l3,
+                          l4         = EXCLUDED.l4,
+                          l5         = EXCLUDED.l5,
+                          cf_mapping = EXCLUDED.cf_mapping"""
+    )
+
+    accounts_upserted = 0
+    na_upserted = 0
+    cf_upserted = 0
+
+    try:
+        for _, row in mapping_df.iterrows():
+            ang = row["account_number_group"]
+            fy = int(row["fiscal_year"])
+
+            # -------------------------------------------------------- dim_gl_account
+            _acct_res = session.execute(
+                text(f"""
+                    INSERT INTO dim_gl_account
+                      (account_number_group, fiscal_year, gl_account_id, account_name,
+                       level_0, level_1, level_2, level_3, level_4, l4_sub,
+                       level_2_sort, level_3_sort, is_ic, source_system)
+                    VALUES
+                      (:ang, :fy, :glid, :aname,
+                       :l0, :l1, :l2, :l3, :l4, :l4s,
+                       :l2s, :l3s, :ic, :ss)
+                    ON CONFLICT (account_number_group, fiscal_year) {_acct_conflict}
                 """),
                 {
                     "ang": ang,
@@ -1024,7 +1276,9 @@ def load_account_mapping(
                     "ss": _val(row, "source_system", "unknown"),
                 },
             )
-            accounts_upserted += 1
+            # Under "nothing", count only rows actually inserted (skips => rowcount 0);
+            # under "update" the row is always written, so keep the unconditional +1.
+            accounts_upserted += _acct_res.rowcount if _do_nothing else 1
 
             # -------------------------------------------------------- dim_gl_na (conditional)
             has_na = any(
@@ -1032,14 +1286,12 @@ def load_account_mapping(
                 for f in NA_FIELDS
             )
             if has_na:
-                session.execute(
-                    text("""
+                _na_res = session.execute(
+                    text(f"""
                         INSERT INTO dim_gl_na
                           (account_number_group, fiscal_year, l6_na_mapping, l7_na_description)
                         VALUES (:ang, :fy, :l6, :l7)
-                        ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
-                          l6_na_mapping     = EXCLUDED.l6_na_mapping,
-                          l7_na_description = EXCLUDED.l7_na_description
+                        ON CONFLICT (account_number_group, fiscal_year) {_na_conflict}
                     """),
                     {
                         "ang": ang,
@@ -1048,7 +1300,7 @@ def load_account_mapping(
                         "l7": _val(row, "l7_na_description"),
                     },
                 )
-                na_upserted += 1
+                na_upserted += _na_res.rowcount if _do_nothing else 1
 
             # -------------------------------------------------------- dim_gl_cf (conditional)
             has_cf = any(
@@ -1056,19 +1308,13 @@ def load_account_mapping(
                 for f in CF_FIELDS
             )
             if has_cf:
-                session.execute(
-                    text("""
+                _cf_res = session.execute(
+                    text(f"""
                         INSERT INTO dim_gl_cf
                           (account_number_group, fiscal_year,
                            l1, l2, l3, l4, l5, cf_mapping)
                         VALUES (:ang, :fy, :l1, :l2, :l3, :l4, :l5, :cfm)
-                        ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
-                          l1         = EXCLUDED.l1,
-                          l2         = EXCLUDED.l2,
-                          l3         = EXCLUDED.l3,
-                          l4         = EXCLUDED.l4,
-                          l5         = EXCLUDED.l5,
-                          cf_mapping = EXCLUDED.cf_mapping
+                        ON CONFLICT (account_number_group, fiscal_year) {_cf_conflict}
                     """),
                     {
                         "ang": ang,
@@ -1081,7 +1327,7 @@ def load_account_mapping(
                         "cfm": _val(row, "cf_mapping"),
                     },
                 )
-                cf_upserted += 1
+                cf_upserted += _cf_res.rowcount if _do_nothing else 1
 
         if auto_commit:
             session.commit()

@@ -124,7 +124,7 @@ export default function UploadStep({ onUploaded }: UploadStepProps) {
   return (
     <StepCard
       title="Upload file"
-      subtitle="CSV, XLSX or Parquet — encoding and delimiter are detected automatically."
+      subtitle="CSV, TXT, XLSX or Parquet — encoding and delimiter are detected automatically."
     >
       <div
         onDragOver={(e) => {
@@ -143,7 +143,7 @@ export default function UploadStep({ onUploaded }: UploadStepProps) {
         <input
           ref={inputRef}
           type="file"
-          accept=".csv,.xlsx,.xls,.parquet"
+          accept=".csv,.txt,.xlsx,.xls,.parquet,text/plain,text/csv"
           className="hidden"
           onChange={(e) => handleFiles(e.target.files)}
         />
@@ -155,7 +155,7 @@ export default function UploadStep({ onUploaded }: UploadStepProps) {
             <p className="text-sm font-semibold text-slate-700">
               Drop a file here or click to browse
             </p>
-            <p className="mt-1 text-xs text-slate-400">CSV · XLSX · Parquet</p>
+            <p className="mt-1 text-xs text-slate-400">CSV · TXT · XLSX · Parquet</p>
           </>
         )}
       </div>

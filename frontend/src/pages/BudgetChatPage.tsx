@@ -20,7 +20,11 @@ import BudgetChat from '../components/budget/chat/BudgetChat';
 import ChatSummaryBar from '../components/budget/chat/ChatSummaryBar';
 import SaveProgress from '../components/budget/chat/SaveProgress';
 import StructuredBudgetView from '../components/budget/StructuredBudgetView';
+import BudgetMonthlyAdjustModal from '../components/budget/BudgetMonthlyAdjustModal';
 import type { PositionOverride } from '../components/budget/BudgetGrid';
+import { IS_REPORTING_V2_SANDBOX } from '../lib/reportingV2SandboxMode';
+import { groupPartnersByRank } from '../lib/budgetPartnerGroups';
+import { enrichPositionsByCode } from '../lib/budgetPartnerResolve';
 import {
   initialDraft,
   applyAnswer,
@@ -46,6 +50,7 @@ import {
   type BudgetGranularityRow,
   type BudgetGranularityPeriod,
 } from '../lib/gdpduApi';
+import { runWithConcurrency } from '../lib/budgetFetchPool';
 
 // ---------------------------------------------------------------------------
 // Undo/redo history snapshot
@@ -97,6 +102,89 @@ const SAVE_IDLE: SaveState = {
 
 function overrideKey(entity: string, year: number, statement: 'PL' | 'BS'): string {
   return `${entity}|${year}|${statement}`;
+}
+
+/** Blank / Excel grids skip backend heuristics (one DB round-trip per position saved). */
+function isBudgetLightMode(draft: BudgetDraft): boolean {
+  return draft.start.mode === 'blank' || draft.start.mode === 'excel';
+}
+
+function treeFetchParams(
+  draft: BudgetDraft,
+  entity: string,
+  year: number,
+  stmt: 'PL' | 'BS',
+  signal?: AbortSignal,
+) {
+  const light = isBudgetLightMode(draft);
+  return {
+    statement: stmt,
+    fiscal_year: year,
+    entity: entity || undefined,
+    level: 'L4' as const,
+    heuristic: !light && draft.start.mode === 'heuristic' ? draft.start.heuristic : undefined,
+    growth_pct: draft.start.growthPct,
+    top_n: draft.partner.topN,
+    light,
+    signal,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox blank: seed overrides with zero growth per granularity
+// ---------------------------------------------------------------------------
+
+function buildBlankOverrides(
+  triples: Array<{ entity: string; year: number; stmt: 'PL' | 'BS' }>,
+  posMap: Record<string, BudgetPosition[]>,
+  draft: BudgetDraft,
+): Record<string, Record<string, PositionOverride>> {
+  if (!IS_REPORTING_V2_SANDBOX || draft.start.mode !== 'blank') return {};
+
+  const rawByYearStmt = new Map<string, Record<number, Record<string, BudgetPosition>>>();
+  for (const { entity, year, stmt } of triples) {
+    const stmtKey = `${entity}|${stmt}`;
+    if (!rawByYearStmt.has(stmtKey)) rawByYearStmt.set(stmtKey, {});
+    const byYear = rawByYearStmt.get(stmtKey)!;
+    byYear[year] = Object.fromEntries((posMap[overrideKey(entity, year, stmt)] ?? []).map((p) => [p.line_code, p]));
+  }
+
+  const result: Record<string, Record<string, PositionOverride>> = {};
+  for (const { entity, year, stmt } of triples) {
+    const key = overrideKey(entity, year, stmt);
+    const rawPositions = Object.fromEntries((posMap[key] ?? []).map((p) => [p.line_code, p]));
+    const allYears = rawByYearStmt.get(`${entity}|${stmt}`) ?? {};
+    const positions = Object.values(enrichPositionsByCode(rawPositions, allYears, year));
+    const lineOverrides: Record<string, PositionOverride> = {};
+
+    for (const pos of positions) {
+      const gran = draft.granularityByPosition[`${stmt}|${pos.line_code}`] ?? 'L3';
+      if (gran === 'L3') {
+        lineOverrides[pos.line_code] = { growthPct: 0, annual: pos.annual };
+      } else if (gran === 'L4' && pos.children?.length) {
+        const l4: PositionOverride['l4'] = {};
+        for (const c of pos.children) {
+          l4[c.level_4] = { growthPct: 0, annual: c.annual };
+        }
+        lineOverrides[pos.line_code] = { l4 };
+      } else if ((gran === 'customers' || gran === 'suppliers') && pos.partners?.length) {
+        const partners: PositionOverride['partners'] = {};
+        const partnerGroups: PositionOverride['partnerGroups'] = {};
+        for (const p of pos.partners) {
+          partners[p.partner_id] = { growthPct: 0, annual: p.annual };
+        }
+        for (const g of groupPartnersByRank(pos.partners)) {
+          partnerGroups[g.id] = { growthPct: 0 };
+        }
+        lineOverrides[pos.line_code] = { partners, partnerGroups };
+      }
+    }
+
+    if (Object.keys(lineOverrides).length > 0) {
+      result[key] = lineOverrides;
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,30 +359,38 @@ export default function BudgetChatPage() {
 
   // ── Entity fetch ──
   const [entityOptions, setEntityOptions] = useState<{ value: string; label: string }[]>([]);
-  const [entityLoading, setEntityLoading] = useState(false);
+  const [entityLoading, setEntityLoading] = useState(true);
   const [entityError, setEntityError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadEntities = useCallback(() => {
+    const controller = new AbortController();
     setEntityLoading(true);
-    budgetEntities()
+    setEntityError(null);
+    budgetEntities(controller.signal)
       .then((res) => {
+        if (controller.signal.aborted) return;
         const opts = res.entities.map((e) => ({ value: e.code, label: e.label }));
         if (res.can_consolidate) {
-          // '' = consolidated is handled as a special option in the multi-select UI
-          // We keep it out of the regular options array to avoid duplication;
-          // the entity_multi_select input adds it separately.
-          // However, we still expose it so ChatSummaryBar / formatEntities can label it.
           opts.unshift({ value: '', label: 'Consolidated' });
         }
         setEntityOptions(opts);
         setEntityError(null);
       })
       .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
         const msg = err instanceof Error ? err.message : 'Failed to load entities';
         setEntityError(msg);
       })
-      .finally(() => setEntityLoading(false));
+      .finally(() => {
+        if (!controller.signal.aborted) setEntityLoading(false);
+      });
+    return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    const abort = loadEntities();
+    return abort;
+  }, [loadEntities]);
 
   // ── Heuristic fetch state ──
   const [heuristicLoading, setHeuristicLoading] = useState(false);
@@ -338,6 +434,8 @@ export default function BudgetChatPage() {
   const [granularityViewLoading, setGranularityViewLoading] = useState(false);
   const [granularityViewError, setGranularityViewError] = useState<string | null>(null);
 
+  const [monthlyAdjustOpen, setMonthlyAdjustOpen] = useState(false);
+
   // ── Undo/redo history ──
   const [historyStack, setHistoryStack] = useState<HistorySnapshot[]>([]);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
@@ -347,6 +445,9 @@ export default function BudgetChatPage() {
   // ── Save state ──
   const [saveState, setSaveState] = useState<SaveState>(SAVE_IDLE);
   const saveAbortRef = useRef(false);
+
+  /** Sandbox-only: editing → saved (freeze rates) → committing → committed */
+  const [sandboxPhase, setSandboxPhase] = useState<'editing' | 'saved' | 'committing' | 'committed'>('editing');
 
   // ── Reset confirmation ──
   const [resetConfirm, setResetConfirm] = useState(false);
@@ -361,21 +462,13 @@ export default function BudgetChatPage() {
   // ---------------------------------------------------------------------------
 
   const activeKey = overrideKey(activeEntity, activeYear, activeStatement);
-  const activeFinalPositions: BudgetPosition[] = finalPositionsMap[activeKey] ?? [];
   const activeOverrides: Record<string, PositionOverride> = overridesMap[activeKey] ?? {};
 
   // Granularity view key for current active (entity, statement) — year-independent
   const activeGranularityKey = `${activeEntity}|${activeStatement}`;
   const activeGranularityView = granularityViewMap[activeGranularityKey] ?? { rows: [], periods: [] };
 
-  // Positions-by-code lookup for StructuredBudgetView (active year)
-  const activePositionsByCode: Record<string, BudgetPosition> = Object.fromEntries(
-    activeFinalPositions.map((p) => [p.line_code, p]),
-  );
-
-  // All years' positions-by-code — keyed by fiscal year number.
-  // Used by StructuredBudgetView for annual mode plan columns.
-  const positionsByCodeAllYears: Record<number, Record<string, BudgetPosition>> = Object.fromEntries(
+  const rawPositionsByCodeAllYears: Record<number, Record<string, BudgetPosition>> = Object.fromEntries(
     draft.fiscalYears.map((yr) => [
       yr,
       Object.fromEntries(
@@ -383,6 +476,16 @@ export default function BudgetChatPage() {
       ),
     ]),
   ) as Record<number, Record<string, BudgetPosition>>;
+
+  const positionsByCodeAllYears: Record<number, Record<string, BudgetPosition>> = Object.fromEntries(
+    draft.fiscalYears.map((yr) => [
+      yr,
+      enrichPositionsByCode(rawPositionsByCodeAllYears[yr] ?? {}, rawPositionsByCodeAllYears, yr),
+    ]),
+  ) as Record<number, Record<string, BudgetPosition>>;
+
+  const activePositionsByCode: Record<string, BudgetPosition> =
+    positionsByCodeAllYears[activePlanYear] ?? {};
 
   // ---------------------------------------------------------------------------
   // History push helper
@@ -453,6 +556,18 @@ export default function BudgetChatPage() {
     pushHistory(draft, newOverridesMap);
   }
 
+  const handlePartnerRateLevelChange = useCallback(
+    (positionKey: PositionKey, level: 'group' | 'partner') => {
+      const newDraft: BudgetDraft = {
+        ...draft,
+        partnerRateLevel: { ...(draft.partnerRateLevel ?? {}), [positionKey]: level },
+      };
+      setDraft(newDraft);
+      pushHistory(newDraft, overridesMap);
+    },
+    [draft, overridesMap],
+  );
+
   // Entities to show in the entity-axis tab bar (only when >1 selected)
   const entityTabEntities: string[] = draft.entities;
   const showEntityTabs = entityTabEntities.length > 1;
@@ -469,6 +584,9 @@ export default function BudgetChatPage() {
 
   useEffect(() => {
     if (!chatComplete) return;
+    const abort = new AbortController();
+    const { signal } = abort;
+
     setFinalLoading(true);
     setFinalError(null);
     setGranularityViewLoading(true);
@@ -483,21 +601,6 @@ export default function BudgetChatPage() {
       }
     }
 
-    // Budget tree fetches (one per entity × year × statement)
-    const treeFetches = triples.map(({ entity, year, stmt }) =>
-      getBudgetTree({
-        statement: stmt,
-        fiscal_year: year,
-        entity: entity || undefined,
-        // Always fetch L4 so children + partners are available for per-position rendering.
-        level: 'L4',
-        heuristic: draft.start.mode === 'heuristic' ? draft.start.heuristic : undefined,
-        growth_pct: draft.start.growthPct,
-        top_n: draft.partner.topN,
-      }).then((res) => ({ key: overrideKey(entity, year, stmt), positions: res.positions })),
-    );
-
-    // Granularity view fetches (one per entity × statement — year-independent)
     const grain = draft.viewMode === 'monthly' ? 'month' : ('year' as const);
     const granularityPairs: Array<{ entity: string; stmt: 'PL' | 'BS' }> = [];
     const seenGranKeys = new Set<string>();
@@ -510,59 +613,113 @@ export default function BudgetChatPage() {
         }
       }
     }
-    const granFetches = granularityPairs.map(({ entity, stmt }) =>
-      getBudgetGranularityView({ statement: stmt, grain, entity })
-        .then((res) => ({
-          key: `${entity}|${stmt}`,
-          rows: res.rows ?? [],
-          periods: res.periods ?? [],
-        })),
-    );
 
-    // Run both in parallel
-    Promise.all([
-      Promise.all(treeFetches),
-      Promise.all(granFetches),
-    ])
-      .then(([treeResults, granResults]) => {
-        const posMap: Record<string, BudgetPosition[]> = {};
+    const firstEntity = draft.entities[0] ?? '';
+    const firstYear = draft.fiscalYears[0] ?? new Date().getFullYear() + 1;
+    const firstStmt = draft.statements[0];
+    const primaryGranKey = `${firstEntity}|${firstStmt}`;
+    const primaryTreeKey = overrideKey(firstEntity, firstYear, firstStmt);
+
+    const fetchGranularity = (entity: string, stmt: 'PL' | 'BS') =>
+      getBudgetGranularityView({ statement: stmt, grain, entity, signal }).then((res) => ({
+        key: `${entity}|${stmt}`,
+        rows: res.rows ?? [],
+        periods: res.periods ?? [],
+      }));
+
+    const fetchTree = (entity: string, year: number, stmt: 'PL' | 'BS') =>
+      getBudgetTree(treeFetchParams(draft, entity, year, stmt, signal)).then((res) => ({
+        key: overrideKey(entity, year, stmt),
+        positions: res.positions,
+      }));
+
+    const finishInitial = (posMap: Record<string, BudgetPosition[]>) => {
+      setActiveEntity(firstEntity);
+      setActiveYear(firstYear);
+      setActiveStatement(firstStmt);
+      setActivePlanYear(firstYear);
+
+      const blankOverrides = buildBlankOverrides(triples, posMap, draft);
+      setOverridesMap(blankOverrides);
+      const initialSnap: HistorySnapshot = { draft, overridesMap: blankOverrides };
+      setHistoryStack([initialSnap]);
+      setHistoryIdx(0);
+    };
+
+    const loadRemaining = (
+      posMap: Record<string, BudgetPosition[]>,
+      granMap: Record<string, { rows: BudgetGranularityRow[]; periods: BudgetGranularityPeriod[] }>,
+    ) => {
+      const remainingTrees = triples.filter(
+        (t) => overrideKey(t.entity, t.year, t.stmt) !== primaryTreeKey,
+      );
+      const remainingGran = granularityPairs.filter((g) => `${g.entity}|${g.stmt}` !== primaryGranKey);
+
+      const treePromise =
+        remainingTrees.length > 0
+          ? runWithConcurrency(remainingTrees, 2, (t) => fetchTree(t.entity, t.year, t.stmt))
+          : Promise.resolve([]);
+
+      const granPromise =
+        remainingGran.length > 0
+          ? runWithConcurrency(remainingGran, 2, (g) => fetchGranularity(g.entity, g.stmt))
+          : Promise.resolve([]);
+
+      return Promise.all([treePromise, granPromise]).then(([treeResults, granResults]) => {
+        if (signal.aborted) return;
+        const mergedPos = { ...posMap };
         for (const { key, positions } of treeResults) {
-          posMap[key] = positions;
+          mergedPos[key] = positions;
         }
-        setFinalPositionsMap(posMap);
+        setFinalPositionsMap(mergedPos);
 
-        const granMap: Record<string, { rows: BudgetGranularityRow[]; periods: BudgetGranularityPeriod[] }> = {};
+        const mergedGran = { ...granMap };
         for (const { key, rows, periods } of granResults) {
-          granMap[key] = { rows, periods };
+          mergedGran[key] = { rows, periods };
         }
+        setGranularityViewMap(mergedGran);
+      });
+    };
+
+    // Phase 1: active entity/statement structure + first tree (show table ASAP)
+    Promise.all([
+      fetchGranularity(firstEntity, firstStmt),
+      fetchTree(firstEntity, firstYear, firstStmt),
+    ])
+      .then(([primaryGran, primaryTree]) => {
+        if (signal.aborted) return;
+        const posMap: Record<string, BudgetPosition[]> = {
+          [primaryTree.key]: primaryTree.positions,
+        };
+        const granMap = {
+          [primaryGran.key]: { rows: primaryGran.rows, periods: primaryGran.periods },
+        };
+        setFinalPositionsMap(posMap);
         setGranularityViewMap(granMap);
+        finishInitial(posMap);
+        setFinalLoading(false);
+        setGranularityViewLoading(false);
 
-        // Default active entity/year/statement to first in draft
-        const firstEntity = draft.entities[0] ?? '';
-        const firstYear = draft.fiscalYears[0] ?? new Date().getFullYear() + 1;
-        const firstStmt = draft.statements[0];
-        setActiveEntity(firstEntity);
-        setActiveYear(firstYear);
-        setActiveStatement(firstStmt);
-        setActivePlanYear(firstYear);
-
-        // Reset overrides and history
-        const emptyOverrides = {};
-        setOverridesMap(emptyOverrides);
-        // Seed history with initial state
-        const initialSnap: HistorySnapshot = { draft, overridesMap: emptyOverrides };
-        setHistoryStack([initialSnap]);
-        setHistoryIdx(0);
+        // Phase 2: remaining scopes in background (bounded concurrency)
+        return loadRemaining(posMap, granMap);
       })
       .catch((err: unknown) => {
+        if (signal.aborted) return;
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         const msg = err instanceof Error ? err.message : 'Failed to load budget grid';
         setFinalError(msg);
         setGranularityViewError(msg);
       })
       .finally(() => {
-        setFinalLoading(false);
-        setGranularityViewLoading(false);
+        if (!signal.aborted) {
+          setFinalLoading(false);
+          setGranularityViewLoading(false);
+        }
       });
+
+    return () => {
+      abort.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatComplete]);
 
@@ -633,13 +790,14 @@ export default function BudgetChatPage() {
         try {
           const firstEntity = newDraft.entities[0] ?? '';
           const firstYear = newDraft.fiscalYears[0] ?? new Date().getFullYear() + 1;
-          const res = await getBudgetTree({
-            statement: newDraft.statements[0] as 'PL' | 'BS',
-            fiscal_year: firstYear,
-            entity: firstEntity || undefined,
-            level: 'L4',
-            top_n: newDraft.partner.topN,
-          });
+          const res = await getBudgetTree(
+            treeFetchParams(
+              newDraft,
+              firstEntity,
+              firstYear,
+              newDraft.statements[0] as 'PL' | 'BS',
+            ),
+          );
           const blankPositions: typeof newDraft.positions = {};
           res.positions.forEach((p) => {
             blankPositions[p.line_code] = { annual: 0, source: 'blank' };
@@ -686,6 +844,7 @@ export default function BudgetChatPage() {
     setCurrentStepId('entity');
     setSaveState(SAVE_IDLE);
     setLoopOffered(false);
+    setSandboxPhase('editing');
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -874,8 +1033,18 @@ export default function BudgetChatPage() {
       currentLabel: '',
       done: true,
     });
+    if (IS_REPORTING_V2_SANDBOX) {
+      setSandboxPhase('saved');
+    }
     setLoopOffered(true);
   }, [draft, finalPositionsMap, overridesMap]);
+
+  const handleSandboxCommit = useCallback(async () => {
+    if (!IS_REPORTING_V2_SANDBOX || sandboxPhase !== 'saved') return;
+    setSandboxPhase('committing');
+    await new Promise((resolve) => setTimeout(resolve, 28_000));
+    setSandboxPhase('committed');
+  }, [sandboxPhase]);
 
   // ---------------------------------------------------------------------------
   // Reset — iterates entities × statements
@@ -913,6 +1082,7 @@ export default function BudgetChatPage() {
       setChatComplete(false);
       setCurrentStepId('entity');
       setResetConfirm(false);
+      setSandboxPhase('editing');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Reset failed';
       setResetError(msg);
@@ -976,13 +1146,20 @@ export default function BudgetChatPage() {
         </div>
 
         {entityError && (
-          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-            {entityError}
+          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center justify-between gap-3">
+            <span>{entityError}</span>
+            <button
+              type="button"
+              onClick={() => loadEntities()}
+              className="shrink-0 rounded-lg border border-red-300 bg-white px-3 py-1 text-xs font-medium text-red-700 hover:bg-red-50"
+            >
+              Retry
+            </button>
           </div>
         )}
 
-        {entityLoading && !chatComplete && (
-          <div className="flex items-center gap-2 py-4 text-sm text-slate-500">
+        {entityLoading && !chatComplete ? (
+          <div className="flex items-center justify-center gap-2 py-16 text-sm text-slate-500">
             <svg
               className="animate-spin h-4 w-4 text-[#1E3A5F]"
               xmlns="http://www.w3.org/2000/svg"
@@ -993,11 +1170,9 @@ export default function BudgetChatPage() {
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
             </svg>
-            Loading entities...
+            Loading entities…
           </div>
-        )}
-
-        {!chatComplete ? (
+        ) : !chatComplete ? (
           /* ── Chat flow — narrow centered column ── */
           <BudgetChat
             draft={draft}
@@ -1231,7 +1406,42 @@ export default function BudgetChatPage() {
                   saveDone={saveState.done}
                   activePlanYear={activePlanYear}
                   onSetActivePlanYear={setActivePlanYear}
+                  onPartnerRateLevelChange={
+                    IS_REPORTING_V2_SANDBOX ? handlePartnerRateLevelChange : undefined
+                  }
+                  onOpenMonthlyAdjust={
+                    IS_REPORTING_V2_SANDBOX ? () => setMonthlyAdjustOpen(true) : undefined
+                  }
+                  ratesFrozen={
+                    IS_REPORTING_V2_SANDBOX &&
+                    (sandboxPhase === 'saved' || sandboxPhase === 'committing' || sandboxPhase === 'committed')
+                  }
+                  monthlyEditable={
+                    IS_REPORTING_V2_SANDBOX &&
+                    (sandboxPhase === 'saved' || sandboxPhase === 'committing')
+                  }
+                  onCommit={IS_REPORTING_V2_SANDBOX ? handleSandboxCommit : undefined}
+                  commitLoading={sandboxPhase === 'committing'}
+                  commitDone={sandboxPhase === 'committed'}
                 />
+
+                {IS_REPORTING_V2_SANDBOX && (
+                  <BudgetMonthlyAdjustModal
+                    open={monthlyAdjustOpen}
+                    onClose={() => setMonthlyAdjustOpen(false)}
+                    granularityRows={activeGranularityView.rows}
+                    granularityPeriods={activeGranularityView.periods}
+                    positionsByCode={activePositionsByCode}
+                    statement={activeStatement}
+                    granularityByPosition={draft.granularityByPosition}
+                    draft={draft}
+                    overrides={activeOverrides}
+                    onOverride={(lineCode, override) =>
+                      setActiveOverrides({ ...activeOverrides, [lineCode]: override })
+                    }
+                    activePlanYear={activePlanYear}
+                  />
+                )}
               </>
             )}
           </div>

@@ -8,6 +8,8 @@
     "dev:test": "vite --mode test",
     "dev:fdd-merge": "vite --mode fdd-merge",
     "dev:reporting-v2": "vite --mode reporting-v2",
+    "dev:reporting-v2-sandbox": "vite --mode reporting-v2-sandbox",
+    "dev:v4": "vite --mode v4",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

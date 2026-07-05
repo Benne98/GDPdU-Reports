@@ -267,11 +267,70 @@ class TestBsStatement:
     def test_equity_ratio_kpi(self):
         """Equity ratio = |equity raw| / |assets raw| * 100, EXCLUDING net profit."""
         rows, _ = self._build()
+        assert rows[-2]["row_kind"] == "kpi_header"
+        assert rows[-2]["label"] == "KPIs"
         er = _row_by_line_code(rows, "EQUITY_RATIO")
         assert er is not None
         assert er["row_kind"] == "kpi"
         assert er["amounts"]["cm"] == 50.0
         assert er["amounts"]["ytd"] == 50.0
+
+    def test_bs_display_order(self):
+        from app.services.fin_compat_bs import _sort_bs_display_order
+
+        rows = [
+            {
+                "label": "Assets",
+                "children": [
+                    {
+                        "label": "Current assets",
+                        "children": [
+                            {"label": "Other assets", "children": []},
+                            {"label": "Inventories", "children": []},
+                        ],
+                    },
+                    {
+                        "label": "Fixed assets",
+                        "children": [
+                            {"label": "Financial assets", "children": []},
+                            {"label": "Tangible assets", "children": []},
+                        ],
+                    },
+                    {"label": "Deferred tax assets", "children": []},
+                    {"label": "Prepaid expenses", "children": []},
+                ],
+            },
+            {
+                "label": "Equity & liabilities",
+                "children": [
+                    {"label": "Provisions & accruals", "children": []},
+                    {"label": "Equity", "children": []},
+                    {"label": "Liabilities", "children": []},
+                ],
+            },
+        ]
+        _sort_bs_display_order(rows)
+        assets = rows[0]["children"]
+        assert [c["label"] for c in assets] == [
+            "Fixed assets",
+            "Current assets",
+            "Prepaid expenses",
+            "Deferred tax assets",
+        ]
+        assert [c["label"] for c in assets[0]["children"]] == [
+            "Tangible assets",
+            "Financial assets",
+        ]
+        assert [c["label"] for c in assets[1]["children"]] == [
+            "Inventories",
+            "Other assets",
+        ]
+        eql = rows[1]["children"]
+        assert [c["label"] for c in eql] == [
+            "Equity",
+            "Liabilities",
+            "Provisions & accruals",
+        ]
 
     def test_credit_deltas_flipped(self):
         """Credit deltas flip with the amounts: equity MoM = +50 (display)."""
@@ -366,7 +425,8 @@ class TestBsSnapshot:
             "fy_py": "Dec23A",
             "fy": "Dec24A",
             "cm_py": "Jul24A",
-            "fy_f": "FY25F",
+            # BS is point-in-time (Stichtag) → anchor-month forecast label, not "FY..F".
+            "fy_f": "Jul25F",
             "cm": "Jul25A",
         }
 

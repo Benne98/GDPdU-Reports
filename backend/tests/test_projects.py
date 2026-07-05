@@ -77,7 +77,7 @@ class TestGetProject:
         assert set(cfg) == {
             "entities", "fy_start_month", "opening_balance_mode",
             "net_profit_source", "mapping_source", "partner_master_source",
-            "sales_label", "cost_label",
+            "sales_label", "cost_label", "account_mapping_mode",
         }
 
     def test_get_requires_auth(self):
@@ -138,6 +138,41 @@ class TestPutProject:
         # untouched field keeps its default (partial PUT merge)
         assert body["config"]["mapping_source"] == "library"
         assert captured["name"] == "Acme GmbH"
+
+    def test_put_upserts_entities_into_dim_legal_entity(self, monkeypatch):
+        """Phase-2 ordering fix: PUT creates the project's entities up front so the
+        later CoA (bs_pl_master) commit can resolve them on a fresh DB."""
+        from app.routers import projects as projects_router
+        from etl.project_config import DEFAULT_CONFIG
+
+        monkeypatch.setattr(
+            projects_router, "read_project_config",
+            lambda s, p: {"project_id": p, "name": None, "fy_start_month": 1,
+                          "config": dict(DEFAULT_CONFIG)},
+        )
+        monkeypatch.setattr(
+            projects_router, "upsert_project_config",
+            lambda s, pid, *, name=None, config=None: {
+                "project_id": pid, "name": name,
+                "fy_start_month": config["fy_start_month"], "config": config},
+        )
+        upserted = {}
+
+        def _fake_upsert_entities(session, entities, *, source_system="project_setup"):
+            upserted["entities"] = entities
+            return [str(e.get("prefix") or e.get("code")) for e in (entities or [])]
+
+        monkeypatch.setattr(projects_router, "upsert_project_entities", _fake_upsert_entities)
+
+        client = _client_as(_ADMIN)
+        resp = client.put(
+            "/api/v1/projects/acme",
+            json={"entities": [{"code": "01", "prefix": "01", "name": "Acme DE"},
+                               {"code": "02", "prefix": "02", "name": "Acme AT"}]},
+        )
+        assert resp.status_code == 200, resp.text
+        # entities forwarded to the dim_legal_entity upsert
+        assert [e["prefix"] for e in upserted["entities"]] == ["01", "02"]
 
     def test_put_rejects_invalid_opening_balance_mode(self, monkeypatch):
         from app.routers import projects as projects_router
@@ -211,6 +246,182 @@ class TestRebuildEndpoint:
 
 
 # ===========================================================================
+# POST /api/v1/projects/{id}/reset-data — destructive, two-layer gated
+# ===========================================================================
+class TestResetDataEndpoint:
+    """Unit-level (mocked session) coverage of the gating + delete contract.
+
+    Integration coverage (real DELETE against finssentials_v4, KEEP/EMPTY
+    invariants) is in the throwaway-worker verification; here we pin the guards
+    and the response/contract using a MagicMock session.
+    """
+
+    def _session(self, *, dbname: str) -> MagicMock:
+        """A mock session whose current_database() returns ``dbname`` and whose
+        pg_tables / DELETE calls are stubbed so the loop runs without a real DB."""
+        s = MagicMock()
+
+        def _execute(stmt, *a, **kw):
+            sql = str(stmt)
+            result = MagicMock()
+            if "current_database()" in sql:
+                result.fetchone.return_value = (dbname,)
+            elif "pg_tables" in sql:
+                # Pretend every EMPTY-list table exists.
+                from app.routers.projects import RESET_EMPTY_TABLES
+                result.fetchall.return_value = [(t,) for t in RESET_EMPTY_TABLES]
+            elif sql.startswith("DELETE FROM"):
+                result.rowcount = 3
+            else:
+                result.fetchone.return_value = None
+                result.fetchall.return_value = []
+            return result
+
+        s.execute.side_effect = _execute
+        return s
+
+    def test_reset_requires_admin(self, monkeypatch):
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        client = _client_as(_NON_ADMIN)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": True})
+        assert resp.status_code == 403
+
+    def test_reset_403_when_env_flag_off(self, monkeypatch):
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", False)
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="finssentials_v4")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        app.dependency_overrides[require_admin] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": True})
+        assert resp.status_code == 403
+        assert "disabled" in resp.json()["detail"].lower()
+
+    def test_reset_403_hard_refuse_live_db(self, monkeypatch):
+        """Belt-and-suspenders: even with the env flag ON, the live DB is refused."""
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="Finssentials")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        app.dependency_overrides[require_admin] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": True})
+        assert resp.status_code == 403
+        assert "live" in resp.json()["detail"].lower()
+
+    def test_reset_403_hard_refuse_live_db_case_insensitive(self, monkeypatch):
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="FINSSENTIALS")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        app.dependency_overrides[require_admin] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": True})
+        assert resp.status_code == 403
+
+    def test_reset_422_when_confirm_missing(self, monkeypatch):
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="finssentials_v4")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        app.dependency_overrides[require_admin] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": False})
+        assert resp.status_code == 422
+
+    def test_reset_200_empties_project_tables(self, monkeypatch):
+        from app.routers import projects as pr
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="finssentials_v4")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        app.dependency_overrides[require_admin] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/v1/projects/default/reset-data", json={"confirm": True})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["database"] == "finssentials_v4"
+        # every EMPTY-list table reported with a rowcount; no KEEP table present.
+        assert set(body["deleted"]) == set(pr.RESET_EMPTY_TABLES)
+        assert all(v == 3 for v in body["deleted"].values())
+        keep = set(pr.RESET_KEEP_TABLES)
+        assert keep.isdisjoint(set(body["deleted"]))
+
+    def test_empty_and_keep_lists_are_disjoint(self):
+        """Static safety invariant: no table is both emptied and kept."""
+        from app.routers import projects as pr
+
+        assert set(pr.RESET_EMPTY_TABLES).isdisjoint(set(pr.RESET_KEEP_TABLES))
+
+    def test_keep_list_covers_libraries_admin_auth_structure(self):
+        from app.routers import projects as pr
+
+        keep = set(pr.RESET_KEEP_TABLES)
+        for t in ("lib_account_mapping", "lib_cf_mapping", "lib_na_mapping",
+                  "admin_project_config", "admin_role_page_visibility",
+                  "dim_user", "dim_role", "user_role", "auth_session",
+                  "dim_pl_structure", "dim_project"):
+            assert t in keep, t
+
+    def test_capability_flag_true_on_nonlive_when_enabled(self, monkeypatch):
+        from app.routers import projects as pr
+        from etl.project_config import DEFAULT_CONFIG
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        monkeypatch.setattr(
+            pr, "read_project_config",
+            lambda s, p: {"project_id": p, "name": None, "fy_start_month": 1,
+                          "config": dict(DEFAULT_CONFIG)},
+        )
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="finssentials_v4")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/api/v1/projects/default")
+        assert resp.status_code == 200
+        assert resp.json()["data_reset_allowed"] is True
+
+    def test_capability_flag_false_on_live_db(self, monkeypatch):
+        from app.routers import projects as pr
+        from etl.project_config import DEFAULT_CONFIG
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", True)
+        monkeypatch.setattr(
+            pr, "read_project_config",
+            lambda s, p: {"project_id": p, "name": None, "fy_start_month": 1,
+                          "config": dict(DEFAULT_CONFIG)},
+        )
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="Finssentials")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/api/v1/projects/default")
+        assert resp.status_code == 200
+        assert resp.json()["data_reset_allowed"] is False
+
+    def test_capability_flag_false_when_env_off(self, monkeypatch):
+        from app.routers import projects as pr
+        from etl.project_config import DEFAULT_CONFIG
+
+        monkeypatch.setattr(pr.settings, "allow_data_reset", False)
+        monkeypatch.setattr(
+            pr, "read_project_config",
+            lambda s, p: {"project_id": p, "name": None, "fy_start_month": 1,
+                          "config": dict(DEFAULT_CONFIG)},
+        )
+        app.dependency_overrides[get_session] = lambda: self._session(dbname="finssentials_v4")
+        app.dependency_overrides[current_user] = lambda: _ADMIN
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/api/v1/projects/default")
+        assert resp.status_code == 200
+        assert resp.json()["data_reset_allowed"] is False
+
+
+# ===========================================================================
 # ingest._select_rebuild_mode — incremental vs full selection
 # ===========================================================================
 class TestSelectRebuildMode:
@@ -276,7 +487,8 @@ class TestResolveRebuildFlags:
         )
         flags = pc.resolve_rebuild_flags(MagicMock(), "default")
         assert flags == {"opening_balance_mode": "in_data",
-                         "net_profit_source": "report_inject"}
+                         "net_profit_source": "report_inject",
+                         "account_mapping_mode": "library"}
 
     def test_config_overrides_flags(self, monkeypatch):
         import etl.project_config as pc
@@ -289,7 +501,8 @@ class TestResolveRebuildFlags:
         )
         flags = pc.resolve_rebuild_flags(MagicMock(), "acme")
         assert flags == {"opening_balance_mode": "carry_forward",
-                         "net_profit_source": "gl_rows"}
+                         "net_profit_source": "gl_rows",
+                         "account_mapping_mode": "library"}
 
     def test_invalid_stored_flag_falls_back_to_settings(self, monkeypatch):
         import etl.project_config as pc
@@ -302,3 +515,49 @@ class TestResolveRebuildFlags:
         monkeypatch.setattr(pc, "_settings_defaults", lambda: ("in_data", "report_inject"))
         flags = pc.resolve_rebuild_flags(MagicMock(), "acme")
         assert flags["opening_balance_mode"] == "in_data"
+
+
+# ===========================================================================
+# project_config.upsert_project_entities — fresh-DB entity creation
+# ===========================================================================
+class TestUpsertProjectEntities:
+    def test_upserts_normalized_prefixes(self, monkeypatch):
+        import etl.project_config as pc
+        import etl.load as load_mod
+
+        calls = []
+        monkeypatch.setattr(
+            load_mod, "load_legal_entity",
+            lambda session, *, entity_prefix, entity_name, source_system=None, **kw:
+                calls.append((entity_prefix, entity_name)),
+        )
+        prefixes = pc.upsert_project_entities(
+            MagicMock(),
+            [{"code": "01", "prefix": "1", "name": "Acme DE"},
+             {"code": "02", "prefix": "", "name": "Acme AT"}],  # prefix falls back to code
+        )
+        assert prefixes == ["01", "02"]
+        assert calls == [("01", "Acme DE"), ("02", "Acme AT")]
+
+    def test_empty_list_is_noop(self):
+        import etl.project_config as pc
+
+        assert pc.upsert_project_entities(MagicMock(), None) == []
+        assert pc.upsert_project_entities(MagicMock(), []) == []
+
+    def test_non_numeric_entity_skipped(self, monkeypatch):
+        import etl.project_config as pc
+        import etl.load as load_mod
+
+        calls = []
+        monkeypatch.setattr(
+            load_mod, "load_legal_entity",
+            lambda session, *, entity_prefix, entity_name, source_system=None, **kw:
+                calls.append(entity_prefix),
+        )
+        # 'DEXX' is non-numeric → cannot be a prefix → skipped (no crash)
+        prefixes = pc.upsert_project_entities(
+            MagicMock(), [{"code": "DEXX", "prefix": "", "name": "Bad"}]
+        )
+        assert prefixes == []
+        assert calls == []

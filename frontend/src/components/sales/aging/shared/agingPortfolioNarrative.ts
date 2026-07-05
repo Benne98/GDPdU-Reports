@@ -1,5 +1,5 @@
 import type { ReceivablesAgingBand, ReceivablesStatusSplit } from '../../../../lib/api'
-import { fmtAmount, fmtKpi } from '../../../../lib/fmt'
+import { fmtAmount, fmtChartKpi } from '../../../../lib/fmt'
 
 export type AgingPortfolioNarrativeInput = {
   side: 'receivables' | 'payables'
@@ -57,8 +57,8 @@ export function buildAgingPortfolioNarrative(input: AgingPortfolioNarrativeInput
   const metrics: AgingPortfolioMetricChip[] = [
     {
       label: `Open ${label}`,
-      value: fmtKpi(total),
-      hint: `${fmtAmount(total)} · kEUR`,
+      value: fmtChartKpi(total),
+      hint: `${fmtChartKpi(total)} kEUR`,
       tone: 'brand',
     },
     {
@@ -92,7 +92,7 @@ export function buildAgingPortfolioNarrative(input: AgingPortfolioNarrativeInput
         : `Healthy due-date profile on open ${label}`
 
   const summary =
-    `As of ${periodLabel}, ${fmtAmount(total)} remains open (${fmtKpi(total)} kEUR). `
+    `As of ${periodLabel}, ${fmtAmount(total * 1000)} remains open (${fmtChartKpi(total)} kEUR). `
     + `${beforePct}% (${fmtAmount(beforeDueAmt)}) is not yet due, while ${overduePct}% (${fmtAmount(overdueAmt)}) is past due. `
     + (overdueDays != null
       ? `${daysLabel} at ${overdueDays.toLocaleString('de-DE', { maximumFractionDigits: 1 })} days `

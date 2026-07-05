@@ -20,7 +20,7 @@ Zugriff: Berater/Admin (Auth, §P4). Seite „Ingestion" (bzw. integriert in Rol
 3. **Spalten-Mapping (Drag & Drop)** — Quellspalten → Zielfelder (§3, §4). Pflichtfelder markiert; Auto-Vorschläge per Namensähnlichkeit; Speicherung als **Mapping-Profil**.
 4. **Transform-Optionen** — pro Feld: Datumsformat, Dezimal-/Vorzeichen-Logik (ein signierter Betrag vs. Soll/Haben-Spalten vs. Betrag + S/H-Kennzeichen), Konto-Normalisierung (`.0` strippen, zero-pad). **Linking-Strategie** für Debitoren/Kreditoren (txn-Propagation vs. Konto/Gegenkonto, siehe Schema §12).
 5. **Validierung** — Checks (§6) laufen auf **Staging** (kein DB-Write); Ergebnis als Pass/Fail-Report mit **Klick in die fehlerhaften Zeilen**.
-6. **Commit** — bei Pass (bzw. Override bei Soft-Warnungen) Transform + Load in die kanonische Struktur; Eintrag in `meta_dataset_load` (Dedup). Bei Hard-Fail: Blockade + herunterladbarer Fehlerreport.
+6. **Commit** — bei Pass (bzw. Override bei Soft-Warnungen) Transform + Load in die kanonische Struktur; Eintrag in `org_meta_dataset_load` (Dedup). Bei Hard-Fail: Blockade + herunterladbarer Fehlerreport.
 
 ---
 
@@ -136,7 +136,7 @@ Severity: **HARD** = blockiert Commit · **SOFT** = Warnung (Override möglich).
 ### 6.5 Qualität & Dedup
 | ID | Regel | Severity |
 |----|-------|----------|
-| **Q1** | **Dedup:** `content_hash` + (Entity, Jahr, Periode) gegen `meta_dataset_load`; bereits geladene Daten **nicht** erneut laden, nur Neues ergänzen | HARD (nur bei `commit_mode=append`) |
+| **Q1** | **Dedup:** `content_hash` + (Entity, Jahr, Periode) gegen `org_meta_dataset_load`; bereits geladene Daten **nicht** erneut laden, nur Neues ergänzen | HARD (nur bei `commit_mode=append`) |
 | Q2 | `booking_line_id` / `(jegn, fiscal_year, line_number)` eindeutig | HARD |
 | Q3 | Header-Felder je `journal_entry_number`-Gruppe konsistent (posting_date etc.) | SOFT |
 | Q4 | Währungskonsistenz; VAT-Plausibilität | SOFT |
@@ -161,7 +161,7 @@ Diese manuelle Zuordnung ist ebenfalls als **Profil** speicherbar (Konto → Map
 | `POST /api/v1/ingest/upload` | Datei speichern (`uploads/`), Format/Dialekt erkennen, Header + Sample + Sheets zurück |
 | `POST /api/v1/ingest/profiles` · `GET …` | Mapping-Profile speichern/laden (je Mandant/Quellsystem) |
 | `POST /api/v1/ingest/validate` | Mapping + file_id → Checks auf **Staging**, Report (kein DB-Write) |
-| `POST /api/v1/ingest/commit` | bei Pass: Transform + Load kanonisch + `meta_dataset_load` (`commit_mode`: default `replace` = Scope-Replace; `append` = Delta-Top-up mit Dedup) |
+| `POST /api/v1/ingest/commit` | bei Pass: Transform + Load kanonisch + `org_meta_dataset_load` (`commit_mode`: default `replace` = Scope-Replace; `append` = Delta-Top-up mit Dedup) |
 | `GET /api/v1/ingest/versions` · `GET …/{load_id}` | Version-Historie je `load_id` (Scope, Modus, Snapshot-Status) |
 | `POST /api/v1/ingest/versions/{load_id}/restore` | Admin: Scope auf Post-Commit-Stand des gewählten Loads zurücksetzen |
 | `GET /api/v1/ingest/runs` | Alias der Version-Historie (ohne Restore-Audit-Einträge) |
@@ -172,7 +172,7 @@ Diese manuelle Zuordnung ist ebenfalls als **Profil** speicherbar (Konto → Map
 - `transform.py` — Typ-/Locale-Normalisierung, Vorzeichenlogik, Schlüsselbau.
 - `derive.py` — abgeleitete Facts (sales/com/ar/ap), Linking-Strategien A/B.
 - `checks.py` — **jeder Check eine Funktion** `-> CheckResult{id, severity, passed, detail, rows}`; ein Runner aggregiert.
-- `load.py` — transaktionaler Load Staging → canonical; Dedup via `meta_dataset_load` (append); Scope-Replace + Snapshot via `versioning.py`.
+- `load.py` — transaktionaler Load Staging → canonical; Dedup via `org_meta_dataset_load` (append); Scope-Replace + Snapshot via `versioning.py`.
 
 ### 7.4 Data Versioning (load_id-Restore)
 - Jeder erfolgreiche GL- oder Mapping-Commit erzeugt einen **Post-Commit-Snapshot** (`snap_fact_gl_*`, `snap_dim_gl_*`) getaggt mit `load_id`.
@@ -182,7 +182,7 @@ Diese manuelle Zuordnung ist ebenfalls als **Profil** speicherbar (Konto → Map
 
 ### 7.3 Staging & Commit
 - Upload → DataFrame/Staging; Checks laufen darauf. **Erst bei Pass** transaktionaler Write nach canonical (alles-oder-nichts pro Ingestion-Run).
-- `meta_dataset_load` protokolliert (dataset, entity, year, period, row_count, content_hash, loaded_by) → Dedup + späterer inkrementeller Top-up (Schema §9 PLAN).
+- `org_meta_dataset_load` protokolliert (dataset, entity, year, period, row_count, content_hash, loaded_by) → Dedup + späterer inkrementeller Top-up (Schema §9 PLAN).
 
 ---
 
@@ -211,7 +211,7 @@ Diese manuelle Zuordnung ist ebenfalls als **Profil** speicherbar (Konto → Map
 | **P1c** | `checks.py` Check-Katalog (reine Fns + Tests) |
 | **P1d** | `IngestionWizard` + `ColumnMapper` (Frontend) |
 | **P1e** | `derive` (sales/com/ar/ap) + Reconciliation-Checks R1–R4 |
-| **P1f** | `commit`/Load + `meta_dataset_load` + Dedup + Mapping-Datei-Ingestion |
+| **P1f** | `commit`/Load + `org_meta_dataset_load` + Dedup + Mapping-Datei-Ingestion |
 
 Jede Teilphase: kleiner Diff, Tests grün, Quality-Gate.
 
@@ -221,7 +221,7 @@ Jede Teilphase: kleiner Diff, Tests grün, Quality-Gate.
 1. ✅ **Staging:** **in-memory** (DataFrame) für jetzt (decidra-GoBD ~24k Zeilen). **Umstieg auf physische Staging-Tabellen + `COPY` + SQL-Checks** ab ~mehreren 100k Zeilen / SaaS-Mehrlast.
 2. ✅ **Unmapped-Konten:** **SOFT** (Warnung, Stub, durchführen) + **manueller Mapping-Schritt** (§6.6), als Profil wiederverwendbar.
 3. ✅ **Fachliches Konten-Mapping** liegt als **`dim_gl_account`** (+ `dim_gl_na`/`dim_gl_cf`) in der DB (Name beibehalten; *ist* das Konten-Mapping).
-4. ✅ **Technisches Spalten-Mapping-Profil:** neue Tabelle **`ingest_mapping_profile`** (JSON je Mandant/Quellsystem) — speichert Quellspalte→Zielfeld + Transform-Optionen + Konto-Auflösungen.
+4. ✅ **Technisches Spalten-Mapping-Profil:** neue Tabelle **`org_ingest_mapping_profile`** (JSON je Mandant/Quellsystem) — speichert Quellspalte→Zielfeld + Transform-Optionen + Konto-Auflösungen.
 
 ## 12. Noch offen
 - **R-Check-Toleranz:** absolut (0,01) und/oder relative Schwelle? Umgang mit USt-Rundungsdifferenzen. *(Default vorerst: absolut 0,01; relativ 0,1 % als Soft-Schwelle.)*

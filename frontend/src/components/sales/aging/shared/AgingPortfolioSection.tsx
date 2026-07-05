@@ -28,7 +28,7 @@ type Props = {
   series: ReceivablesAgingBand[]
   statusSplit?: ReceivablesStatusSplit
   overdueDays?: number
-  reconciliation: 'subledger' | 'scaled' | 'synthetic'
+  reconciliation: 'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'
   reconciliationGlLabel: string
   dimension: string
   onDimensionChange: (d: string) => void

@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import type { ErSnapshotResponse, FinancialStatementRow } from '../../../lib/api'
 import type { PeriodSelection } from '../../../lib/periodSelection'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
@@ -10,7 +10,8 @@ import { buildReportCommentMarkerMap } from '../statement-two-view/reportComment
 import { buildAnnualSnapshotReportColumns } from './annualSnapshotReportColumns'
 import StatementSectionHeading from '../statement-two-view/StatementSectionHeading'
 import StatementNarrativeList from '../statement-two-view/StatementNarrativeList'
-import { mapApiBulletsToUi } from '../pl-two-view/plNarrativeEngine'
+import { mapApiBulletsToUi, type PlNarrativeBullet } from '../pl-two-view/plNarrativeEngine'
+import PlDetailOverlay from '../pl-two-view/PlDetailOverlay'
 import { ChartLoadReporter } from '../../../hooks/useChartLoadReporter'
 import type { FinStatementKind } from '../statement-two-view/statementTypes'
 import ErSnapshotMiniTable from './ErSnapshotMiniTable'
@@ -50,6 +51,7 @@ export default function ErSnapshotReportView({
   useClientNarrativeFallback = true,
 }: Props) {
   const stmtKind: FinStatementKind = statement
+  const [detailBullet, setDetailBullet] = useState<PlNarrativeBullet | null>(null)
   const { narrative, narrativeBusy } = useAnnualStatementNarrative(
     stmtKind,
     year,
@@ -85,7 +87,8 @@ export default function ErSnapshotReportView({
   const { tableWrapRef, tableHeightPx } = useFinReportTableHeight([data, year, month, checkOpen])
 
   return (
-    <div className="px-4 pt-6 pb-6">
+    <>
+      <div className="px-4 pt-6 pb-6">
       <ChartLoadReporter chartId={`fin-report-annual-${statement}`} loading={narrativeBusy} />
       <div className={FIN_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
         <div className="min-w-0" ref={tableWrapRef}>
@@ -104,7 +107,7 @@ export default function ErSnapshotReportView({
         <div
           className="min-w-0 flex flex-col"
           style={
-            tableHeightPx != null && tableHeightPx > 120
+            statement !== 'wc' && tableHeightPx != null && tableHeightPx > 120
               ? { maxHeight: tableHeightPx, overflowY: 'auto' }
               : undefined
           }
@@ -114,10 +117,21 @@ export default function ErSnapshotReportView({
             intro={narrative?.intro}
             bullets={bullets}
             loading={narrativeBusy}
-            onSelect={() => {}}
+            onSelect={setDetailBullet}
           />
         </div>
       </div>
     </div>
+      {detailBullet && (
+        <PlDetailOverlay
+          bullet={detailBullet}
+          year={year}
+          month={month}
+          entity={entity}
+          statement={stmtKind}
+          onClose={() => setDetailBullet(null)}
+        />
+      )}
+    </>
   )
 }

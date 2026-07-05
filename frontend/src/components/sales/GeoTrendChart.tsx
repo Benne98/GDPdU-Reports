@@ -30,6 +30,33 @@ interface Props {
   loading: boolean
 }
 
+type LegacyGeoRegion = { name: string; values: number[] }
+
+/** Accept legacy API shape `{ periods: string[], regions: {name, values}[] }`. */
+function normalizeGeoTrend(data: SalesGeoTrendResponse): SalesGeoTrendResponse {
+  if (!data?.periods?.length) return { periods: [], regions: [] }
+  const firstRegion = data.regions?.[0]
+  if (
+    firstRegion != null
+    && typeof firstRegion === 'object'
+    && 'name' in firstRegion
+    && 'values' in firstRegion
+  ) {
+    const legacyRegions = data.regions as unknown as LegacyGeoRegion[]
+    const labels = data.periods as unknown as string[]
+    const regionNames = legacyRegions.map(r => r.name)
+    const periods = labels.map((label, i) => {
+      const row: Record<string, number | string> = { label }
+      for (const region of legacyRegions) {
+        row[region.name] = region.values[i] ?? 0
+      }
+      return row
+    })
+    return { periods, regions: regionNames }
+  }
+  return data
+}
+
 function TrendTooltip({
   active,
   payload,
@@ -56,8 +83,9 @@ export default function GeoTrendChart({
   onDimChange,
   loading,
 }: Props) {
+  const chartData = normalizeGeoTrend(data)
   const dimLabel = analyticsDimLabel(dim)
-  const segments = data.regions ?? []
+  const segments = chartData.regions ?? []
 
   return (
     <SalesAnalyticsChartShell
@@ -79,13 +107,13 @@ export default function GeoTrendChart({
           <div className="flex items-center justify-center h-[250px] text-xs" style={{ color: '#94A3B8' }}>
             Loading…
           </div>
-        ) : !data.periods.length ? (
+        ) : !chartData.periods.length ? (
           <div className="flex items-center justify-center h-[250px] text-xs" style={{ color: '#94A3B8' }}>
             No data
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={data.periods} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+            <BarChart data={chartData.periods} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
               <CartesianGrid {...SALES_CHART_GRID_PROPS} />
               <XAxis dataKey="label" tick={CHART_TICK_STYLE} axisLine={false} tickLine={false} />
               <YAxis

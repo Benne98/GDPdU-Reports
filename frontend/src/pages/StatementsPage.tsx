@@ -50,6 +50,7 @@ import AnalyticsPageShell from '../components/ui/AnalyticsPageShell'
 import ErrorBoundary from '../components/ErrorBoundary'
 import { ChartLoadReporter } from '../hooks/useChartLoadReporter'
 import { stripLegalForm } from '../lib/stripLegalForm'
+import { IS_OVERVIEW_V2 } from '../lib/overviewV2Mode'
 
 // ─── Error boundary for WcTimelineChart ──────────────────────────────────────
 
@@ -136,9 +137,101 @@ async function fetchStatementForTab(
     ])
     return plan ? { ...pl, plan } : pl
   }
-  if (tab === 'bs') return api.financialsBalanceSheetPeriod(fp)
-  if (tab === 'cf') return api.financialsCashFlowPeriod(fp)
+  const planYear = period.grain === 'month' ? period.year : periodAnchorYearMonth(period).year
+  const planMonth = period.grain === 'month' ? period.month : periodAnchorYearMonth(period).month
+
+  if (tab === 'bs') {
+    if (IS_OVERVIEW_V2) {
+      const [bs, plan] = await Promise.all([
+        api.financialsBalanceSheetPeriod(fp),
+        api.financialsBsPlan(planYear, planMonth, ent).catch(() => null),
+      ])
+      return plan ? { ...bs, plan } : bs
+    }
+    return api.financialsBalanceSheetPeriod(fp)
+  }
+  if (tab === 'cf') {
+    if (IS_OVERVIEW_V2) {
+      const [cf, plan] = await Promise.all([
+        api.financialsCashFlowPeriod(fp),
+        api.financialsCfPlan(planYear, planMonth, ent).catch(() => null),
+      ])
+      return plan ? { ...cf, plan } : cf
+    }
+    return api.financialsCashFlowPeriod(fp)
+  }
+  // wc
+  if (IS_OVERVIEW_V2) {
+    const [wc, plan] = await Promise.all([
+      api.financialsWorkingCapitalPeriod(fp),
+      api.financialsWcPlan(planYear, planMonth, ent).catch(() => null),
+    ])
+    return plan ? { ...wc, plan } : wc
+  }
   return api.financialsWorkingCapitalPeriod(fp)
+}
+
+// ─── Financial query concurrency limiter ─────────────────────────────────────
+// Prevents saturating DB parallel workers when BS / WC / consolidation / monthly
+// all fire simultaneously on mount. Max 2 concurrent heavy financial queries.
+let _finQueryRunning = 0
+const _finQueryQueue: Array<() => void> = []
+const FIN_QUERY_MAX_CONCURRENT = 2
+
+async function acquireFinSlot(): Promise<() => void> {
+  if (_finQueryRunning < FIN_QUERY_MAX_CONCURRENT) {
+    _finQueryRunning++
+  } else {
+    await new Promise<void>(resolve => _finQueryQueue.push(resolve))
+    // Slot was passed to us by the previous holder — running count unchanged
+  }
+  return function releaseFinSlot() {
+    const next = _finQueryQueue.shift()
+    if (next) {
+      // Pass slot directly to next waiter — running count stays the same
+      next()
+    } else {
+      _finQueryRunning--
+    }
+  }
+}
+
+// ─── Section-level error card with Retry ─────────────────────────────────────
+
+function FinSectionErrorCard({
+  label,
+  error,
+  onRetry,
+}: {
+  label: string
+  error: string
+  onRetry: () => void
+}) {
+  return (
+    <div
+      className="mt-4 mb-2 rounded-xl px-5 py-4 text-sm"
+      style={{
+        background: 'rgba(239,68,68,0.08)',
+        border: '1.5px solid rgba(220,38,38,0.35)',
+        color: '#991B1B',
+      }}
+      role="alert"
+    >
+      <p className="font-medium mb-2">{label} could not be loaded — {error}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="rounded-md px-3 py-1 text-xs font-semibold transition-colors hover:opacity-80"
+        style={{
+          background: 'rgba(220,38,38,0.12)',
+          color: '#B91C1C',
+          border: '1px solid rgba(220,38,38,0.3)',
+        }}
+      >
+        Retry
+      </button>
+    </div>
+  )
 }
 
 export default function StatementsPage({
@@ -177,6 +270,11 @@ export default function StatementsPage({
   const [annualError, setAnnualError] = useState<string | null>(null)
   const [annualConsol, setAnnualConsol] = useState<ConsolidationResponse | null>(null)
   const [annualConsolLoading, setAnnualConsolLoading] = useState(false)
+  // Section-level errors — silently swallowed before; now surfaced with Retry
+  const [conslError, setConslError] = useState<string | null>(null)
+  const [monthlyError, setMonthlyError] = useState<string | null>(null)
+  const [weeklyError, setWeeklyError] = useState<string | null>(null)
+  const [annualConsolError, setAnnualConsolError] = useState<string | null>(null)
   const [filtersOpen, setFiltersOpen] = useState(false)
   const pageContentRef = useRef<HTMLDivElement>(null)
   const statementLoadId = useRef(0)
@@ -223,7 +321,7 @@ export default function StatementsPage({
         if (!cancelled) {
           const msg = e instanceof Error ? e.message : String(e)
           setError(
-            `${msg} — Prüfe Postgres und backend/.env (DB_*). API-Schnelltest: GET /api/v1/health`,
+            `${msg} — Check Postgres and backend/.env (DB_*). API quick test: GET /api/v1/health`,
           )
         }
       } finally {
@@ -242,7 +340,10 @@ export default function StatementsPage({
     const loadId = ++statementLoadId.current
     setLoading(true)
     setDrill(null)
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== statementLoadId.current) return
       const res = await fetchStatementForTab(tab, period, ent)
       if (loadId !== statementLoadId.current) return
       setData(res)
@@ -252,6 +353,7 @@ export default function StatementsPage({
       setData(null)
       setError(e instanceof Error ? e.message : 'Failed to load')
     } finally {
+      releaseSlot?.()
       if (loadId === statementLoadId.current) setLoading(false)
     }
   }, [tab, period, ent, periodReady, statementActive])
@@ -264,8 +366,12 @@ export default function StatementsPage({
     if (!periodReady || !statementActive) return
     const loadId = ++conslLoadId.current
     setConslLoading(true)
+    setConslError(null)
     const fp = finPeriodFromSelection(period, ent)
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== conslLoadId.current) return
       let res: ConsolidationResponse
       if (tab === 'pl')      res = await api.financialsPlConsolidation(fp)
       else if (tab === 'bs') res = await api.financialsBsConsolidation(fp)
@@ -273,10 +379,12 @@ export default function StatementsPage({
       else                   res = await api.financialsWcConsolidation(fp)
       if (loadId !== conslLoadId.current) return
       setConslData(res)
-    } catch {
+    } catch (e: unknown) {
       if (loadId !== conslLoadId.current) return
       setConslData(null)
+      setConslError(e instanceof Error ? e.message : 'Failed to load consolidation data')
     } finally {
+      releaseSlot?.()
       if (loadId === conslLoadId.current) setConslLoading(false)
     }
   }, [tab, period, ent, periodReady, statementActive])
@@ -289,9 +397,13 @@ export default function StatementsPage({
     if (!periodReady || !statementActive) return
     const loadId = ++monthlyLoadId.current
     setMonthlyLoading(true)
+    setMonthlyError(null)
     const fp = finPeriodFromSelection(period, ent)
     const useSpan = period.grain === 'month' || period.grain === 'year' || period.grain === 'week'
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== monthlyLoadId.current) return
       let res: MonthlyResponse
       if (tab === 'pl') {
         res = await api.financialsPlMonthly(fp, useSpan ? { span: 'fy3' } : undefined)
@@ -314,10 +426,12 @@ export default function StatementsPage({
       }
       if (loadId !== monthlyLoadId.current) return
       setMonthlyData(res)
-    } catch {
+    } catch (e: unknown) {
       if (loadId !== monthlyLoadId.current) return
       setMonthlyData(null)
+      setMonthlyError(e instanceof Error ? e.message : 'Failed to load monthly trend data')
     } finally {
+      releaseSlot?.()
       if (loadId === monthlyLoadId.current) setMonthlyLoading(false)
     }
   }, [tab, period, anchor.year, anchor.month, ent, periodReady, statementActive])
@@ -333,16 +447,22 @@ export default function StatementsPage({
     }
     const loadId = ++weeklyLoadId.current
     setWeeklyLoading(true)
+    setWeeklyError(null)
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== weeklyLoadId.current) return
       const res = tab === 'pl'
         ? await api.financialsPlWeekly(period.isoYear, period.isoWeek, ent)
         : await api.financialsCfWeekly(period.isoYear, period.isoWeek, ent)
       if (loadId !== weeklyLoadId.current) return
       setWeeklyData(res)
-    } catch {
+    } catch (e: unknown) {
       if (loadId !== weeklyLoadId.current) return
       setWeeklyData(null)
+      setWeeklyError(e instanceof Error ? e.message : 'Failed to load weekly breakdown data')
     } finally {
+      releaseSlot?.()
       if (loadId === weeklyLoadId.current) setWeeklyLoading(false)
     }
   }, [tab, period, ent, periodReady, statementActive])
@@ -360,7 +480,10 @@ export default function StatementsPage({
     const loadId = ++annualLoadId.current
     setAnnualLoading(true)
     setAnnualError(null)
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== annualLoadId.current) return
       let res: ErFlowResponse | ErSnapshotResponse
       if (tab === 'pl') {
         res = await api.exitReadinessPlStatement(anchor.year, anchor.month, ent)
@@ -389,6 +512,7 @@ export default function StatementsPage({
       setAnnualSnapData(null)
       setAnnualError(e instanceof Error ? e.message : 'Failed to load annual data')
     } finally {
+      releaseSlot?.()
       if (loadId === annualLoadId.current) setAnnualLoading(false)
     }
   }, [tab, period.grain, anchor.year, anchor.month, ent, periodReady, statementActive])
@@ -401,14 +525,20 @@ export default function StatementsPage({
     if (!periodReady || !statementActive || tab !== 'pl' || period.grain !== 'year') return
     const loadId = ++annualConsolLoadId.current
     setAnnualConsolLoading(true)
+    setAnnualConsolError(null)
+    let releaseSlot: (() => void) | null = null
     try {
+      releaseSlot = await acquireFinSlot()
+      if (loadId !== annualConsolLoadId.current) return
       const res = await api.exitReadinessPlConsolidation(anchor.year, anchor.month, ent)
       if (loadId !== annualConsolLoadId.current) return
       setAnnualConsol(res)
-    } catch {
+    } catch (e: unknown) {
       if (loadId !== annualConsolLoadId.current) return
       setAnnualConsol(null)
+      setAnnualConsolError(e instanceof Error ? e.message : 'Failed to load annual consolidation data')
     } finally {
+      releaseSlot?.()
       if (loadId === annualConsolLoadId.current) setAnnualConsolLoading(false)
     }
   }, [tab, period.grain, anchor.year, anchor.month, ent, periodReady, statementActive])
@@ -466,6 +596,18 @@ export default function StatementsPage({
           >
             {error}
           </div>
+        )}
+        {conslError && statementActive && (
+          <FinSectionErrorCard label="Consolidation breakdown" error={conslError} onRetry={loadConsolidation} />
+        )}
+        {monthlyError && statementActive && (
+          <FinSectionErrorCard label="Monthly trend" error={monthlyError} onRetry={loadMonthly} />
+        )}
+        {weeklyError && statementActive && (
+          <FinSectionErrorCard label="Weekly breakdown" error={weeklyError} onRetry={loadWeekly} />
+        )}
+        {annualConsolError && statementActive && tab === 'pl' && (
+          <FinSectionErrorCard label="Annual consolidation" error={annualConsolError} onRetry={loadAnnualConsol} />
         )}
 
         <div

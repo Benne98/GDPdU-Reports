@@ -1,9 +1,10 @@
 import { useState } from 'react'
+import GlFixedAssetsTab from '../components/financials/fixed-assets/GlFixedAssetsTab'
 import SalesAgingTab from '../components/sales/aging/SalesAgingTab'
 import { periodAnchorYearMonth } from '../lib/periodSelection'
 import StatementsPage from './StatementsPage'
 
-/** Balance sheet — sub-pages: Balance sheet (live) · AR / AP aging (GL subledger). */
+/** Balance sheet — sub-pages: Balance sheet (live) · AR / AP · Fixed assets. */
 export default function BalanceSheetPage() {
   const [subTab, setSubTab] = useState('balance-sheet')
   return (
@@ -15,20 +16,26 @@ export default function BalanceSheetPage() {
       subTabs={[
         { id: 'balance-sheet', label: 'Balance sheet' },
         { id: 'ar-ap', label: 'AR / AP' },
+        { id: 'fixed-assets', label: 'Fixed assets' },
       ]}
       activeSubTab={subTab}
       onSubTabChange={setSubTab}
       renderSubTabContent={ctx => {
-        if (subTab !== 'ar-ap') return null
-        const anchor = periodAnchorYearMonth(ctx.period)
-        return (
-          <SalesAgingTab
-            period={ctx.period}
-            year={anchor.year}
-            month={anchor.month}
-            legalEntity={ctx.entity}
-          />
-        )
+        if (subTab === 'ar-ap') {
+          const anchor = periodAnchorYearMonth(ctx.period)
+          return (
+            <SalesAgingTab
+              period={ctx.period}
+              year={anchor.year}
+              month={anchor.month}
+              legalEntity={ctx.entity}
+            />
+          )
+        }
+        if (subTab === 'fixed-assets') {
+          return <GlFixedAssetsTab period={ctx.period} entity={ctx.entity} />
+        }
+        return null
       }}
     />
   )

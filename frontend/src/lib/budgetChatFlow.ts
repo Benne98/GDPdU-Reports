@@ -101,6 +101,8 @@ export interface BudgetDraft {
   };
   positions: Record<string, BudgetPositionValue>;  // keyed by line_code
   positionCount?: number;                  // set after tree fetch (for display)
+  /** Sandbox blank: group vs partner growth rate level per position. */
+  partnerRateLevel?: Record<PositionKey, 'group' | 'partner'>;
 }
 
 export type StepId =
@@ -372,6 +374,7 @@ export function initialDraft(): BudgetDraft {
       topN: 10,
     },
     positions: {},
+    partnerRateLevel: {},
   };
 }
 

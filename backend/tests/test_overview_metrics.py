@@ -378,3 +378,115 @@ class TestBuildTopEntitiesGlue:
         out = build_top_entities(session, year=2025, month=7, type="supplier")
         assert out["rows"][0]["supplier_id"] == "AT9001"
         assert "customer_id" not in out["rows"][0]
+
+
+# ---------------------------------------------------------------------------
+# FIX M1 — plan-cm lookup is visibility-scoped by construction
+# ---------------------------------------------------------------------------
+def _plan_scoped_session(raw_rows, position_rows, captured):
+    """Session double that RECORDS plan SQL and emulates the inlined IN filter.
+
+    ``position_rows`` : list[(partner_id, prefix, plan_cm)] for fact_position_plan.
+    A candidate row is returned only when the query carries NO visibility IN-filter
+    (legacy/admin), or when its prefix literal ('XX') appears in the query text; a
+    fail-closed ``1 = 0`` query returns nothing.  Fallback plan tables always return
+    empty so the position_plan tier decides the map (plan_mix='budget').
+    """
+    session = MagicMock()
+
+    def _emulate(sql, rows):
+        if "1 = 0" in sql:
+            return []
+        if " IN (" in sql:  # visibility-scoped → keep only rows whose prefix is listed
+            return [r for r in rows if f"'{r[1]}'" in sql]
+        return list(rows)
+
+    def _execute(stmt, params=None):
+        result = MagicMock()
+        sql = str(stmt)
+        if "fact_position_plan" in sql:
+            captured["position"].append(sql)
+            kept = _emulate(sql, position_rows)
+            result.fetchall.return_value = [_dict_row({"pid": pid, "plan_cm": v})
+                                            for pid, _pref, v in kept]
+            result.fetchone.return_value = None
+            return result
+        if "fact_sales_plan" in sql or "fact_com_plan" in sql:
+            captured["fallback"].append(sql)
+            result.fetchall.return_value = []
+            result.fetchone.return_value = None
+            return result
+        rows = [_dict_row(r) for r in raw_rows]
+        result.fetchall.return_value = rows
+        result.fetchone.return_value = rows[0] if rows else None
+        return result
+
+    session.execute.side_effect = _execute
+    return session
+
+
+class TestPlanCmVisibilityScoping:
+
+    _RAW = [
+        {"partner_id": "100001", "name": "Vis Co", "cm": 200, "pm": 150,
+         "py_cm": 210, "ytd": 900, "ytd_py": 950},
+        {"partner_id": "300001", "name": "Hidden Co", "cm": 120, "pm": 100,
+         "py_cm": 90, "ytd": 700, "ytd_py": 600},
+    ]
+    # Budget plan rows: one visible ('10'), one out-of-visibility ('30').
+    _POS = [("100001", "10", 55.0), ("300001", "30", 99.0)]
+
+    def test_restricted_set_filters_plan_queries_and_excludes_out_of_visibility(self):
+        from app.services.overview_top_entities import build_top_entities
+        captured = {"position": [], "fallback": []}
+        session = _plan_scoped_session(self._RAW, self._POS, captured)
+        out = build_top_entities(
+            session, year=2025, month=7, type="customer",
+            allowed_entities={"10"},
+        )
+        # (a) The prefix filter is applied to the fact_position_plan query...
+        assert captured["position"], "position_plan query not issued"
+        pos_sql = captured["position"][0]
+        assert "p.entity_prefix IN ('10')" in pos_sql
+        # ...and only the in-visibility partner's plan survives (300001 excluded).
+        by_id = {r["customer_id"]: r for r in out["rows"]}
+        assert by_id["100001"]["plan_cm"] == 55.0
+        assert by_id["300001"]["plan_cm"] == 0.0  # out-of-visibility plan not leaked
+        assert out["plan_mix"] == "budget"
+
+    def test_restricted_set_filters_fallback_plan_query(self):
+        from app.services.overview_top_entities import build_top_entities
+        captured = {"position": [], "fallback": []}
+        # No position rows → forces the fact_sales_plan fallback path to be queried.
+        session = _plan_scoped_session(self._RAW, [], captured)
+        build_top_entities(
+            session, year=2025, month=7, type="customer",
+            allowed_entities={"10"},
+        )
+        assert captured["fallback"], "fallback plan query not issued"
+        assert "LEFT(customer_id, 2) IN ('10')" in captured["fallback"][0]
+
+    def test_none_default_is_byte_identical_no_new_filter(self):
+        from app.services.overview_top_entities import build_top_entities
+        captured = {"position": [], "fallback": []}
+        # No position rows so BOTH tiers run and are captured; None ⇒ no vis filter.
+        session = _plan_scoped_session(self._RAW, [], captured)
+        build_top_entities(session, year=2025, month=7, type="customer")  # allowed=None
+        assert captured["position"] and captured["fallback"]
+        for sql in captured["position"] + captured["fallback"]:
+            assert "entity_prefix IN (" not in sql
+            assert "LEFT(customer_id, 2) IN (" not in sql
+            assert "1 = 0" not in sql
+
+    def test_empty_set_fails_closed_no_plan_rows(self):
+        from app.services.overview_top_entities import build_top_entities
+        captured = {"position": [], "fallback": []}
+        session = _plan_scoped_session(self._RAW, self._POS, captured)
+        out = build_top_entities(
+            session, year=2025, month=7, type="customer",
+            allowed_entities=set(),
+        )
+        # Deny-all: plan queries carry `1 = 0` → no plan rows, plan_mix falls through.
+        assert "AND 1 = 0" in captured["position"][0]
+        assert all(r["plan_cm"] == 0.0 for r in out["rows"])
+        assert out["plan_mix"] == "py_proxy"

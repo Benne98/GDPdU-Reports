@@ -210,7 +210,8 @@ def assemble_dupont(cur: dict[str, Any], py: dict[str, Any], pm_: dict[str, Any]
 # DuPont — DB entrypoint
 # ---------------------------------------------------------------------------
 
-def build_dupont(session: Session, entity: Optional[str], year: int, month: int) -> dict[str, Any]:
+def build_dupont(session: Session, entity: Optional[str], year: int, month: int,
+                 *, allowed_entities: Optional[set[str]] = None) -> dict[str, Any]:
     """DuPontData for the full extended DuPont tree (GDPdU GL).
 
     P&L values are YTD (fiscal_period 1..selected month); BS values are cumulative
@@ -218,10 +219,23 @@ def build_dupont(session: Session, entity: Optional[str], year: int, month: int)
     py = same month previous year, pm = prior month.
 
     ``entity`` may be a single legal_entity_code, comma-separated codes, or None/all.
+
+    ``allowed_entities`` (fail-closed tenant isolation, see
+    ``app.services.entity_visibility.visible_entity_codes``): a set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  When provided it
+    is the ONLY entity filter (``entity`` is ignored — the caller has already
+    intersected it into the set); an EMPTY set fails closed (matches nothing).
+    ``None`` preserves the exact legacy ``entity``-driven behaviour.
     """
-    ep = resolve_entity_prefix(session, entity)
-    prefixes = resolve_entity_prefixes(session, entity)
-    ent_frag = entities_sql_fragment(prefixes) if prefixes else entity_sql_fragment(ep)
+    if allowed_entities is not None:
+        ent_frag = (
+            entities_sql_fragment(sorted(allowed_entities))
+            if allowed_entities else "AND 1 = 0"
+        )
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        prefixes = resolve_entity_prefixes(session, entity)
+        ent_frag = entities_sql_fragment(prefixes) if prefixes else entity_sql_fragment(ep)
 
     py = year - 1
     pm_y, pm_m = pm(year, month)
@@ -441,13 +455,26 @@ _EBIT_FROM = """
          AND a.fiscal_year = l.fiscal_year"""
 
 
-def build_ebit_table(session: Session, entity: Optional[str], year: int, month: int) -> dict[str, Any]:
+def build_ebit_table(session: Session, entity: Optional[str], year: int, month: int,
+                     *, allowed_entities: Optional[set[str]] = None) -> dict[str, Any]:
     """EbitTableData (month grain) — Total output + EBIT per legal entity.
 
     Columns: CM PY (same month prior year) | PM (prior month) | CM | YTD.
+
+    ``allowed_entities`` (fail-closed tenant isolation): set of 2-char
+    ``entity_prefix`` values, or ``None`` for admin/unrestricted.  When provided it
+    is the ONLY entity filter (``entity`` ignored — the caller has already
+    intersected it); an EMPTY set fails closed (matches nothing).  ``None``
+    preserves the exact legacy ``entity``-driven behaviour.
     """
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    if allowed_entities is not None:
+        ent_frag = (
+            entities_sql_fragment(sorted(allowed_entities))
+            if allowed_entities else "AND 1 = 0"
+        )
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
     to_f, ebit_f = _ebit_filters()
 
     py = year - 1

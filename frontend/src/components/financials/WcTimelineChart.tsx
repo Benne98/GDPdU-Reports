@@ -142,7 +142,7 @@ function AvgLabel(props: any) {
   const { x } = viewBox
   const formatted = Math.round(avgKeur).toLocaleString('de-DE')
   const text = `Ø ${formatted}`
-  const w = Math.max(text.length * 6.2 + 8, 44)
+  const w = Math.max(text.length * 7.5 + 12, 52)
   return (
     <g>
       <rect
@@ -168,16 +168,24 @@ interface WcTimelineChartProps {
 }
 
 export default function WcTimelineChart({ year, month, entity, onDrill }: WcTimelineChartProps) {
-  const [grain, setGrain]   = useState<Grain>('month')
-  const [res,   setRes]     = useState<WcTimelineResponse | null>(null)
+  const [grain, setGrain]     = useState<Grain>('month')
+  const [res,   setRes]       = useState<WcTimelineResponse | null>(null)
   const [loading, setLoading] = useState(false)
+  const [error, setError]     = useState<string | null>(null)
+  // Incremented to trigger a manual retry without changing other deps
+  const [retryCount, setRetryCount] = useState(0)
   useEffect(() => {
     setLoading(true)
+    setError(null)
     api.financialsWcTimeline(year, month, grain, entity)
-      .then(setRes)
-      .catch(() => setRes(null))
+      .then(r => { setRes(r); setError(null) })
+      .catch((e: unknown) => {
+        setRes(null)
+        setError(e instanceof Error ? e.message : 'Failed to load working capital timeline')
+      })
       .finally(() => setLoading(false))
-  }, [year, month, grain, entity])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [year, month, grain, entity, retryCount])
 
   const chartData = useMemo(() => {
     if (!res?.series) return []
@@ -297,12 +305,31 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
             <div className="h-full w-full rounded-lg" style={{ background: '#F4F6F9' }} />
           </div>
         )}
-        {!loading && !chartData.length && (
+        {!loading && error && (
+          <div className="flex flex-col items-center justify-center gap-3" style={{ height: 280 }}>
+            <p className="text-xs font-medium text-center px-4" style={{ color: '#991B1B' }}>
+              Working capital timeline could not be loaded — {error}
+            </p>
+            <button
+              type="button"
+              onClick={() => setRetryCount(c => c + 1)}
+              className="rounded-md px-3 py-1 text-xs font-semibold transition-colors hover:opacity-80"
+              style={{
+                background: 'rgba(220,38,38,0.12)',
+                color: '#B91C1C',
+                border: '1px solid rgba(220,38,38,0.3)',
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {!loading && !error && !chartData.length && (
           <div className="flex items-center justify-center text-xs" style={{ height: 280, color: '#94A3B8' }}>
             No working capital data for this period
           </div>
         )}
-        {!loading && chartData.length > 0 && (
+        {!loading && !error && chartData.length > 0 && (
           <ResponsiveContainer width="100%" height={280}>
             <ComposedChart
               data={chartData}

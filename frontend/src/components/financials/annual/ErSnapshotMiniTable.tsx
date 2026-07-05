@@ -4,9 +4,9 @@ import { DeltaCell, ValCell } from '../pl-two-view/plTableCore'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
 import {
   AnnualRowLabel,
+  annualChildRows,
   annualCommentColSpan,
   renderAnnualCommentCell,
-  sortAnnualChildRows,
 } from './annualMiniTableCore'
 
 import type { AnnualSnapshotColDef, AnnualSnapshotReportColId } from './annualSnapshotReportColumns'
@@ -70,8 +70,30 @@ export default function ErSnapshotMiniTable({
     })
   }
 
+  function renderKpiHeaderRow(): JSX.Element {
+    const label = isWc ? 'KPIs — working capital days' : 'KPIs'
+    return (
+      <tr key="er-snapshot-mini-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+        <td
+          className="px-3 py-2 text-xs font-semibold"
+          style={{ color: '#1E3A5F', fontStyle: 'italic', paddingLeft: 12 }}
+        >
+          {label}
+        </td>
+        {hasCommentCol && <td style={{ background: '#F8FAFC' }} />}
+        {columns.map(col => (
+          <td
+            key={`kpi-hdr-${col.id}`}
+            style={{ background: col.highlighted ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }}
+          />
+        ))}
+      </tr>
+    )
+  }
+
   function renderRow(row: ErStatementRow, depth: number): JSX.Element {
     const isTitle = row.row_kind === 'title'
+    const isKpiHdr = row.row_kind === 'kpi_header'
     const isKpi = row.row_kind === 'kpi'
     const isSubtotal = row.row_kind === 'subtotal'
     const isAccount = row.row_kind === 'account'
@@ -80,16 +102,35 @@ export default function ErSnapshotMiniTable({
     const am = row.amounts ?? {}
     const marker = row.line_code ? commentMarkersByLineCode?.[row.line_code] : undefined
 
-    if (isTitle) {
+    if (isTitle || isKpiHdr) {
       return (
-        <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '1px solid #E2E8F0' }}>
+        <tr
+          key={row.id}
+          style={{
+            background: '#F8FAFC',
+            borderTop: isKpiHdr ? '2px solid #E2E8F0' : '1px solid #E2E8F0',
+          }}
+        >
           <td
-            colSpan={annualCommentColSpan(columns.length, hasCommentCol)}
-            className="px-3 py-2 text-xs font-bold"
-            style={{ color: '#1E3A5F' }}
+            colSpan={isKpiHdr ? undefined : annualCommentColSpan(columns.length, hasCommentCol)}
+            className="px-3 py-2 text-xs font-semibold"
+            style={{
+              color: '#1E3A5F',
+              fontStyle: isKpiHdr ? 'italic' : undefined,
+              fontWeight: isKpiHdr ? 600 : 700,
+              paddingLeft: 12,
+            }}
           >
             {row.label}
           </td>
+          {isKpiHdr && hasCommentCol && <td style={{ background: '#F8FAFC' }} />}
+          {isKpiHdr &&
+            columns.map(col => (
+              <td
+                key={`${row.id}-${col.id}`}
+                style={{ background: col.highlighted ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }}
+              />
+            ))}
         </tr>
       )
     }
@@ -163,7 +204,8 @@ export default function ErSnapshotMiniTable({
             )
           }
 
-          const val = get(col.id)
+          // Forecast column intentionally left blank (forecast methodology parked).
+          const val = col.id === 'fy_f' ? NaN : get(col.id)
           if (isKpi) {
             if (isWc) {
               return <ValCell key={`${row.id}-${col.id}`} value={val} isDays italic highlighted={col.highlighted} compact />
@@ -187,14 +229,24 @@ export default function ErSnapshotMiniTable({
 
   function walkRows(rows: ErStatementRow[], depth: number): JSX.Element[] {
     const nodes: JSX.Element[] = []
+    let kpiHeaderInserted = depth > 0
     for (const row of rows) {
+      if (row.row_kind === 'kpi_header') {
+        kpiHeaderInserted = true
+        nodes.push(renderRow(row, depth))
+        continue
+      }
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && (data.statement === 'bs' || data.statement === 'wc')) {
+        kpiHeaderInserted = true
+        nodes.push(renderKpiHeaderRow())
+      }
       nodes.push(renderRow(row, depth))
       if (row.row_kind === 'title') continue
       if (!checkOpen(row.id)) continue
-      for (const ch of sortAnnualChildRows(row.children ?? [], 'cm')) {
+      for (const ch of annualChildRows(data.statement, row.children ?? [], 'cm')) {
         nodes.push(...walkRows([ch], depth + 1))
       }
-      for (const acc of sortAnnualChildRows(row.accounts ?? [], 'cm')) {
+      for (const acc of annualChildRows(data.statement, row.accounts ?? [], 'cm')) {
         nodes.push(...walkRows([acc], depth + 1))
       }
     }

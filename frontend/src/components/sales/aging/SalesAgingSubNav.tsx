@@ -31,13 +31,14 @@ export default function SalesAgingSubNav({ view, onChange }: Props) {
             role="tab"
             aria-selected={active}
             onClick={() => onChange(opt.id)}
-            className="flex-1 rounded-lg px-4 py-2.5 text-left transition-all duration-150"
+            className="flex-1 rounded-lg px-3 py-1.5 text-left text-xs font-medium transition-colors"
             style={{
               background: active ? 'rgba(30,58,95,0.1)' : 'transparent',
-              border: `1px solid ${active ? 'rgba(30,58,95,0.25)' : 'transparent'}`,
+              color: active ? '#1E3A5F' : '#64748B',
+              border: `1px solid ${active ? 'rgba(30,58,95,0.2)' : 'transparent'}`,
             }}
           >
-            <span className="block text-sm font-semibold" style={{ color: active ? '#1E3A5F' : '#334155' }}>
+            <span className="block font-semibold">
               {opt.label}
             </span>
             <span className="block text-[11px] mt-0.5" style={{ color: active ? '#64748B' : '#94A3B8' }}>

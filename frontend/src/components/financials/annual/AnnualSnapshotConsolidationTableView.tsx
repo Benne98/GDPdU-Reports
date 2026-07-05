@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
 import type { ConsolidationResponse, ConsolidationRow } from '../../../lib/api'
-import { fmtKpi, fmtPct } from '../../../lib/fmt'
+import { fmtKpi, fmtPct, fmtDays } from '../../../lib/fmt'
 import { FIN_TABLE_CELL_CLASS, FIN_TABLE_VALUE_FONT } from '../finReportLayout'
 import { shouldDisplayConsolidationRow } from './annualRowVisibility'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
@@ -17,8 +17,9 @@ import {
   snapColToPeriodKey,
   type SnapshotConsolTarget,
 } from './snapshotConsolidationCellResolver'
+import { computeAutoExpandedIds } from '../statementRowExpansion'
 
-const BS_KEEP_CLOSED = new Set(['Deferred tax assets', 'Prepaid expenses'])
+const WC_KPI_HEADER_LABEL = 'KPIs — working capital days'
 
 type BsSnapCol = 'dec_py2' | 'fy_py' | 'fy' | 'cm_py' | 'cm'
 
@@ -67,6 +68,7 @@ function NumCell({
   highlighted,
   muted,
   isKpi,
+  isDays,
   isDelta,
   isPct,
   maxDelta,
@@ -77,6 +79,7 @@ function NumCell({
   highlighted?: boolean
   muted?: boolean
   isKpi?: boolean
+  isDays?: boolean
   isDelta?: boolean
   isPct?: boolean
   maxDelta?: number
@@ -84,7 +87,7 @@ function NumCell({
 }) {
   let content: string
   if (isKpi || isPct) {
-    content = fmtPct(value)
+    content = isDays ? fmtDays(value) : fmtPct(value)
   } else if (isDelta) {
     const color = value === 0 ? '#94A3B8' : value > 0 ? '#10B981' : '#DC2626'
     content = fmtKpi(value)
@@ -198,22 +201,10 @@ export default function AnnualSnapshotConsolidationTableView({
     return { maxFy, maxCm }
   }, [data.rows, colGroups])
 
-  const autoExpandedIds = useMemo(() => {
-    const maxDepth = 2
-    function collectIds(rows: ConsolidationRow[], depth: number): string[] {
-      if (depth >= maxDepth) return []
-      const ids: string[] = []
-      for (const row of rows) {
-        if (row.children?.length) {
-          if (BS_KEEP_CLOSED.has(row.label)) continue
-          ids.push(row.id)
-          ids.push(...collectIds(row.children, depth + 1))
-        }
-      }
-      return ids
-    }
-    return new Set(collectIds(data.rows, 0))
-  }, [data.rows])
+  const autoExpandedIds = useMemo(
+    () => computeAutoExpandedIds(data.rows, data.statement),
+    [data.rows, data.statement],
+  )
 
   function checkOpen(id: string): boolean {
     return autoExpandedIds.has(id) !== userToggles.has(id)
@@ -307,6 +298,7 @@ export default function AnnualSnapshotConsolidationTableView({
                 highlighted={group.highlighted && sub.def.highlighted}
                 muted={group.muted}
                 isKpi={isKpi}
+                isDays={isKpi && data.statement === 'wc'}
                 isDelta={sub.def.isDelta}
                 isPct={sub.def.isPct}
                 maxDelta={sub.def.id === 'delta_fy' ? maxDeltas.maxFy : sub.def.id === 'delta_cm' ? maxDeltas.maxCm : undefined}
@@ -333,6 +325,42 @@ export default function AnnualSnapshotConsolidationTableView({
     if (!checkOpen(row.id)) return nodes
     if (row.children?.length) {
       for (const ch of row.children) nodes.push(...renderRow(ch, depth + 1))
+    }
+    return nodes
+  }
+
+  function renderKpiHeaderFallback(): JSX.Element {
+    return (
+      <tr key="wc-consol-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+        <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>{WC_KPI_HEADER_LABEL}</td>
+        {subCols.map(s => <td key={`kpi-hdr-${s.key}`} style={{ background: '#F8FAFC' }} />)}
+      </tr>
+    )
+  }
+
+  function renderAllRows(rows: ConsolidationRow[]): JSX.Element[] {
+    const nodes: JSX.Element[] = []
+    let kpiHeaderInserted = false
+    for (const row of rows) {
+      if (row.row_kind === 'kpi_header') {
+        kpiHeaderInserted = true
+        nodes.push(...renderRow(row, 0))
+        continue
+      }
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && data.statement === 'wc') {
+        kpiHeaderInserted = true
+        nodes.push(renderKpiHeaderFallback())
+      }
+      if (row.row_kind === 'kpi' && !kpiHeaderInserted && data.statement === 'bs') {
+        kpiHeaderInserted = true
+        nodes.push(
+          <tr key="bs-consol-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+            <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>KPIs</td>
+            {subCols.map(s => <td key={`kpi-hdr-${s.key}`} style={{ background: '#F8FAFC' }} />)}
+          </tr>,
+        )
+      }
+      nodes.push(...renderRow(row, 0))
     }
     return nodes
   }
@@ -376,7 +404,7 @@ export default function AnnualSnapshotConsolidationTableView({
             )}
           </tr>
         </thead>
-        <tbody>{data.rows.flatMap(r => renderRow(r, 0))}</tbody>
+        <tbody>{renderAllRows(data.rows)}</tbody>
       </table>
     </div>
   )

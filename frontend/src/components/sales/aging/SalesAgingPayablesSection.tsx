@@ -3,6 +3,7 @@ import {
   api,
   AgingPortfolioTableResponse,
   PayablesAgingBand,
+  type PayablesAgingKpis as PayablesAgingKpisData,
   PayablesAgingDimension,
   PayablesSupplierRegisterRow,
   PayablesSupplierScatterRow,
@@ -52,9 +53,11 @@ export default function SalesAgingPayablesSection({
 
   const [series, setSeries] = useState<PayablesAgingBand[]>([])
   const [total, setTotal] = useState(0)
+  const [totalOpenGross, setTotalOpenGross] = useState<number | undefined>()
+  const [agingKpis, setAgingKpis] = useState<PayablesAgingKpisData | undefined>()
   const [kpiMetrics, setKpiMetrics] = useState<Record<string, OperationalKpiMetric> | undefined>()
   const [statusSplit, setStatusSplit] = useState<PayablesStatusSplit | undefined>()
-  const [reconciliation, setReconciliation] = useState<'subledger' | 'scaled' | 'synthetic'>('subledger')
+  const [reconciliation, setReconciliation] = useState<'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'>('subledger')
   const [trend, setTrend] = useState<PayablesTrendPoint[]>([])
   const [dimConfig, setDimConfig] = useState<PayablesDimensionBreakdownConfig>(() => loadPayablesBreakdownConfig())
   const [dimRows, setDimRows] = useState<PayablesHierarchyBreakdownRow[]>([])
@@ -76,7 +79,7 @@ export default function SalesAgingPayablesSection({
       try {
         const settled = await Promise.allSettled([
           api.salesPayablesAging(year, month, entity),
-          api.salesPayablesTrend(year, month, entity, 12, 'month'),
+          api.salesPayablesTrend(year, month, entity, 13, 'month'),
           api.salesPayablesSuppliers(year, month, entity, 50),
           api.salesPayablesGeo(year, month, entity, 20),
         ])
@@ -85,6 +88,8 @@ export default function SalesAgingPayablesSection({
         applyFulfilled(settled[0], isCurrent, aging => {
           setSeries(aging.series)
           setTotal(aging.total_payables)
+          setTotalOpenGross(aging.total_open_gross)
+          setAgingKpis(aging.kpis)
           setKpiMetrics(aging.kpi_metrics)
           setStatusSplit(aging.status_split)
           setReconciliation(aging.reconciliation_mode)
@@ -157,9 +162,26 @@ export default function SalesAgingPayablesSection({
 
   if (initialLoading) {
     return (
-      <p className="text-sm py-8 text-center" style={{ color: '#94A3B8' }}>
-        Loading payables aging…
-      </p>
+      <div className="space-y-8 animate-pulse">
+        {/* KPI strip skeleton — 4 cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div
+              key={i}
+              className="rounded-xl p-5"
+              style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', minHeight: 172 }}
+            >
+              <div className="h-3 w-24 rounded mb-4" style={{ background: '#E2E8F0' }} />
+              <div className="h-8 w-16 rounded mb-2" style={{ background: '#E2E8F0' }} />
+              <div className="h-12 w-full rounded" style={{ background: '#F1F5F9' }} />
+            </div>
+          ))}
+        </div>
+        {/* Portfolio section skeleton */}
+        <div className="rounded-xl" style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', height: 320 }} />
+        {/* Table section skeleton */}
+        <div className="rounded-xl" style={{ background: '#F8FAFC', border: '1px solid #E2E8F0', height: 200 }} />
+      </div>
     )
   }
 
@@ -184,8 +206,12 @@ export default function SalesAgingPayablesSection({
       <section id="ap-portfolio" className="space-y-6 scroll-mt-20">
         <PayablesAgingKpis
           kpiMetrics={kpiMetrics}
+          kpis={agingKpis}
+          totalOpenGross={totalOpenGross}
           trendPoints={trend}
           trendLoading={secondaryLoading}
+          year={year}
+          month={month}
         />
 
         <AgingPortfolioSection

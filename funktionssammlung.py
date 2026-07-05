@@ -710,6 +710,8 @@ def _is_source_helper_header(name) -> bool:
         return True
     if s.startswith("_PVM_FX_"):
         return True
+    if s in ("_fte_avg", "_payroll"):
+        return True
     return False
 
 

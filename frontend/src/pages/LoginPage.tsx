@@ -29,7 +29,7 @@ export default function LoginPage() {
       await login(email.trim(), password);
       navigate(from, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Anmeldung fehlgeschlagen.");
+      setError(err instanceof Error ? err.message : "Sign-in failed.");
     } finally {
       setLoading(false);
     }
@@ -38,7 +38,6 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
       <div className="w-full max-w-sm">
-        {/* Header */}
         <div className="mb-8 text-center">
           <div className="inline-flex items-center gap-2 mb-4">
             <span className="text-2xl font-semibold tracking-tight text-slate-900">
@@ -48,13 +47,12 @@ export default function LoginPage() {
               GDPdU
             </span>
           </div>
-          <h1 className="text-lg font-semibold text-slate-800">Anmelden</h1>
+          <h1 className="text-lg font-semibold text-slate-800">Sign in</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Melden Sie sich mit Ihrem Finssentials-Konto an.
+            Sign in with your Finssentials account.
           </p>
         </div>
 
-        {/* Card */}
         <div className="rounded-xl border border-slate-200 bg-white p-7 shadow-sm">
           <form onSubmit={handleSubmit} className="space-y-5" noValidate>
             <div>
@@ -62,7 +60,7 @@ export default function LoginPage() {
                 htmlFor="email"
                 className="block text-sm font-medium text-slate-700 mb-1"
               >
-                E-Mail-Adresse
+                Email address
               </label>
               <input
                 id="email"
@@ -82,7 +80,7 @@ export default function LoginPage() {
                 htmlFor="password"
                 className="block text-sm font-medium text-slate-700 mb-1"
               >
-                Passwort
+                Password
               </label>
               <input
                 id="password"
@@ -93,7 +91,7 @@ export default function LoginPage() {
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={loading}
                 className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
-                placeholder="Passwort eingeben"
+                placeholder="Enter password"
               />
             </div>
 
@@ -108,7 +106,7 @@ export default function LoginPage() {
               disabled={loading || !email.trim() || !password}
               className="w-full rounded-md bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
             >
-              {loading ? "Anmelden..." : "Anmelden"}
+              {loading ? "Signing in…" : "Sign in"}
             </button>
           </form>
         </div>

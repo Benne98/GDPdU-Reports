@@ -599,12 +599,12 @@ export default function StatementConsolidationSection({
         )}
       </div>
 
-      {detailBullet && selected ? (
+      {detailBullet && (
         <DetailOverlay
           bullet={detailBullet}
           year={year}
           month={month}
-          entity={selected.code}
+          entity={selected?.code}
           narrativeContext={
             narrative
               ? { headline: narrative.headline, intro: narrative.intro, intro_facts: narrative.intro_facts }
@@ -612,7 +612,7 @@ export default function StatementConsolidationSection({
           }
           onClose={() => setDetailBullet(null)}
         />
-      ) : null}
+      )}
     </>
   )
 }

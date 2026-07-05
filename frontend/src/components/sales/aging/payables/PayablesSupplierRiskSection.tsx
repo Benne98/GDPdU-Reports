@@ -26,6 +26,7 @@ export default function PayablesSupplierRiskSection({
     customer_name: s.supplier_name,
     balance: s.balance,
     overdue_pct: s.overdue_pct,
+    credit_balance: s.credit_balance,
   }))
 
   return (

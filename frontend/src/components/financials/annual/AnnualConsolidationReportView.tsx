@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 
 import type { ConsolidationResponse, ErSnapshotColLabels, FinancialStatementRow } from '../../../lib/api'
 
@@ -11,6 +11,7 @@ import StatementSectionHeading from '../statement-two-view/StatementSectionHeadi
 import StatementNarrativeList from '../statement-two-view/StatementNarrativeList'
 
 import type { PlNarrativeBullet } from '../pl-two-view/plNarrativeEngine'
+import PlDetailOverlay from '../pl-two-view/PlDetailOverlay'
 
 import { ChartLoadReporter } from '../../../hooks/useChartLoadReporter'
 
@@ -80,6 +81,7 @@ export default function AnnualConsolidationReportView({
   statement = 'pl',
   onDrill,
 }: Props) {
+  const [detailBullet, setDetailBullet] = useState<PlNarrativeBullet | null>(null)
   const clientNarrative = useMemo(
     () => buildAnnualConsolidationNarrativeResponse(consol, ytdLabel),
     [consol, ytdLabel],
@@ -154,6 +156,7 @@ export default function AnnualConsolidationReportView({
           : 'fin-report-annual-pl-consolidation'
 
   return (
+    <>
     <div className="px-4 pt-6 pb-6">
       <ChartLoadReporter chartId={chartId} loading={narrativeBusy} />
       <div className={FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID}>
@@ -176,10 +179,20 @@ export default function AnnualConsolidationReportView({
             intro={narrative.intro}
             bullets={bullets}
             loading={narrativeBusy}
-            onSelect={() => {}}
+            onSelect={setDetailBullet}
           />
         </div>
       </div>
     </div>
+    {detailBullet && (
+      <PlDetailOverlay
+        bullet={detailBullet}
+        year={year}
+        month={month}
+        statement={statement}
+        onClose={() => setDetailBullet(null)}
+      />
+    )}
+    </>
   )
 }

@@ -3,9 +3,10 @@ import { saveSalesColumns } from './salesColumnRegistry'
 import type { SalesBreakdownRow } from '../../../lib/api'
 
 const VALID_DIM_KEYS = new Set([
-  ...SALES_ANALYTICS_DIMS.map(d => d.key),
-  'top_customers',
+  'end_customer_region',
+  'end_customer_city',
   'end_customer_name',
+  'entity',
 ])
 
 export function sanitizeBreakdownDims(dims: BreakdownDimConfig): BreakdownDimConfig {
@@ -48,7 +49,7 @@ export type BreakdownMiscConfig = {
 const MISC_STORAGE_KEY = 'finssentials.sales.breakdown.misc.v1'
 
 export function isCustomerBottomDim(dimBottom: string): boolean {
-  return dimBottom === 'end_customer_name' || dimBottom === 'top_customers'
+  return dimBottom === 'end_customer_name'
 }
 
 export function defaultBreakdownMisc(dimBottom: string): BreakdownMiscConfig {
@@ -75,15 +76,11 @@ export const BREAKDOWN_DIM_OPTIONS = SALES_ANALYTICS_DIMS.map(d => ({
   label: d.label,
 }))
 
-export const BREAKDOWN_DIM_BOTTOM_OPTIONS = [
-  ...BREAKDOWN_DIM_OPTIONS,
-  { key: 'end_customer_name', label: 'End customer' },
-  { key: 'top_customers', label: 'Top customers' },
-]
+export const BREAKDOWN_DIM_BOTTOM_OPTIONS = BREAKDOWN_DIM_OPTIONS
 
 export const DEFAULT_BREAKDOWN_DIMS: BreakdownDimConfig = {
-  dim_top: 'entity',
-  dim_mid: 'product_family',
+  dim_top: 'end_customer_region',
+  dim_mid: 'end_customer_city',
   dim_bottom: 'end_customer_name',
 }
 

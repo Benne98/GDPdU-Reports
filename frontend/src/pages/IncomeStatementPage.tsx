@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import GlProfitabilityTab from '../components/financials/profitability/GlProfitabilityTab'
+import GlPayrollTab from '../components/financials/payroll/GlPayrollTab'
 import StatementsPage from './StatementsPage'
 
-/** Income statement — sub-pages: P&L statement (live) · Profitability (GL-derived). */
+/** Income statement — sub-pages: P&L statement (live) · Profitability · Payroll. */
 export default function IncomeStatementPage() {
   const [subTab, setSubTab] = useState('pl-statement')
   return (
@@ -14,14 +15,19 @@ export default function IncomeStatementPage() {
       subTabs={[
         { id: 'pl-statement', label: 'P&L statement' },
         { id: 'profitability', label: 'Profitability' },
+        { id: 'payroll', label: 'Payroll' },
       ]}
       activeSubTab={subTab}
       onSubTabChange={setSubTab}
-      renderSubTabContent={ctx =>
-        subTab === 'profitability' ? (
-          <GlProfitabilityTab period={ctx.period} entity={ctx.entity} />
-        ) : null
-      }
+      renderSubTabContent={ctx => {
+        if (subTab === 'profitability') {
+          return <GlProfitabilityTab period={ctx.period} entity={ctx.entity} />
+        }
+        if (subTab === 'payroll') {
+          return <GlPayrollTab period={ctx.period} entity={ctx.entity} />
+        }
+        return null
+      }}
     />
   )
 }

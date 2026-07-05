@@ -20,8 +20,8 @@ export default function ProtectedRoute({ children, adminOnly }: ProtectedRoutePr
     return (
       <PageLoadingOverlay
         visible
-        message="Wird geladen…"
-        submessage="Sitzung und Berechtigungen werden geprüft."
+        message="Loading…"
+        submessage="Checking session and permissions."
       />
     );
   }
@@ -34,9 +34,9 @@ export default function ProtectedRoute({ children, adminOnly }: ProtectedRoutePr
     return (
       <div className="flex min-h-screen items-center justify-center">
         <div className="rounded-xl border border-red-200 bg-red-50 p-8 text-center max-w-sm">
-          <h2 className="text-lg font-semibold text-red-800 mb-2">Zugriff verweigert</h2>
+          <h2 className="text-lg font-semibold text-red-800 mb-2">Access denied</h2>
           <p className="text-sm text-red-600">
-            Diese Seite ist nur für Administratoren zugänglich.
+            This page is only available to administrators.
           </p>
         </div>
       </div>

@@ -9,6 +9,7 @@ import {
   sortAnnualChildRows,
 } from './annualMiniTableCore'
 import { shouldDisplayErStatementRow } from './annualRowVisibility'
+import { IS_OVERVIEW_V2 } from '../../../lib/overviewV2Mode'
 
 type FlowCol = 'fy1' | 'fy2' | 'fy3' | 'ytd' | 'ltm' | 'ytd_py' | 'ltm_py'
 
@@ -48,9 +49,9 @@ function periodRange(year: number, month: number, col: FlowCol): { from: string;
 }
 
 function resolveForecastAmount(amounts: Record<string, number> | null | undefined): number {
-  const am = amounts ?? {}
-  const forecast = Number(am.fy_f ?? am.ltm ?? NaN)
-  return Number.isFinite(forecast) ? forecast : 0
+  void amounts
+  // Forecast column intentionally left blank (forecast methodology parked).
+  return NaN
 }
 
 function resolveCoveragePct(amounts: Record<string, number> | null | undefined): number {
@@ -59,6 +60,13 @@ function resolveCoveragePct(amounts: Record<string, number> | null | undefined):
   if (Math.abs(forecast) <= 1e-6) return 0
   const ytd = Number(am.ytd ?? 0) || 0
   return (ytd / forecast) * 100
+}
+
+const KPI_HEADER_CELL_BG = '#F8FAFC'
+const HIGHLIGHT_CELL_BG = 'rgba(30,58,95,0.04)'
+
+function kpiHeaderCellBackground(col: ErFlowColDef): string {
+  return col.highlighted ? HIGHLIGHT_CELL_BG : KPI_HEADER_CELL_BG
 }
 
 type Props = {
@@ -116,6 +124,23 @@ export default function ErFlowMiniTable({
     })
   }
 
+  function renderKpiHeaderRow(key: string, label: string): JSX.Element {
+    return (
+      <tr key={key} style={{ background: KPI_HEADER_CELL_BG, borderTop: '2px solid #E2E8F0' }}>
+        <td
+          className="px-3 py-2 text-xs font-semibold italic"
+          style={{ color: '#1E3A5F', paddingLeft: 12 }}
+        >
+          {label}
+        </td>
+        {hasCommentCol && <td style={{ background: KPI_HEADER_CELL_BG }} />}
+        {columns.map(col => (
+          <td key={`${key}-${col.id}`} style={{ background: kpiHeaderCellBackground(col) }} />
+        ))}
+      </tr>
+    )
+  }
+
   function renderRow(row: ErStatementRow, depth: number): JSX.Element {
     const isTitle = row.row_kind === 'title'
     const isKpiHeader = row.row_kind === 'kpi_header'
@@ -128,18 +153,21 @@ export default function ErFlowMiniTable({
     const deltas = row.deltas ?? {}
     const marker = row.line_code ? commentMarkersByLineCode?.[row.line_code] : undefined
 
-    if (isTitle || isKpiHeader) {
+    if (isTitle) {
       return (
-        <tr key={row.id} style={{ background: '#F8FAFC', borderTop: isKpiHeader ? '2px solid #E2E8F0' : '1px solid #E2E8F0' }}>
+        <tr key={row.id} style={{ background: KPI_HEADER_CELL_BG, borderTop: '1px solid #E2E8F0' }}>
           <td
             colSpan={annualCommentColSpan(columns.length, hasCommentCol)}
             className="px-3 py-2 text-xs font-semibold"
-            style={{ color: '#1E3A5F', fontStyle: isKpiHeader ? 'italic' : undefined }}
+            style={{ color: '#1E3A5F' }}
           >
             {row.label}
           </td>
         </tr>
       )
+    }
+    if (isKpiHeader) {
+      return renderKpiHeaderRow(row.id, row.label)
     }
 
     return (
@@ -206,10 +234,14 @@ export default function ErFlowMiniTable({
               )
             }
             if (col.id === 'coverage_pct') {
+              if (IS_OVERVIEW_V2 && isKpi) {
+                return <td key={`${row.id}-cov`} className="px-1.5 py-1" style={{ background: '#F8FAFC' }} />
+              }
               const cov = resolveCoveragePct(am)
               return <ValCell key={`${row.id}-cov`} value={cov} isPct italic={isKpi} compact />
             }
-            const val = Number(am[col.amountKey ?? ''] ?? 0)
+            // Forecast column intentionally left blank (forecast methodology parked).
+            const val = col.amountKey === 'fy_f' ? NaN : Number(am[col.amountKey ?? ''] ?? 0)
             return (
               <ValCell
                 key={`${row.id}-${col.id}`}
@@ -253,17 +285,7 @@ export default function ErFlowMiniTable({
       if (!shouldDisplayErStatementRow(row)) continue
       if (row.row_kind === 'kpi' && !kpiHeaderInserted) {
         kpiHeaderInserted = true
-        nodes.push(
-          <tr key="er-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td
-              colSpan={annualCommentColSpan(columns.length, hasCommentCol)}
-              className="px-3 py-1.5 text-xs font-semibold italic"
-              style={{ color: '#1E3A5F' }}
-            >
-              KPIs — as % of total output
-            </td>
-          </tr>,
-        )
+        nodes.push(renderKpiHeaderRow('er-kpi-header-fallback', 'KPIs — as % of total output'))
       }
       nodes.push(renderRow(row, depth))
       if (row.row_kind === 'title') continue

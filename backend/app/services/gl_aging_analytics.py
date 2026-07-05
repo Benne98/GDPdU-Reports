@@ -1,4 +1,11 @@
-"""Extended AR/AP aging analytics for the ported Sales aging UI (fact_ar / fact_ap)."""
+"""Extended AR/AP aging analytics for the ported Sales aging UI.
+
+Two sources coexist:
+  * the legacy GL builders below (``fact_ar`` / ``fact_ap``) — kept intact;
+  * the Phase-2 OPOS subledger as-of variants (Method A + FIFO), re-exported at the
+    bottom of this module from :mod:`app.services.opos_aging` with a ``_opos``
+    suffix so callers (routers) can switch source without a second import path.
+"""
 from __future__ import annotations
 
 import calendar
@@ -701,15 +708,22 @@ def build_receivables_trend(
         from app.services.gl_aging import build_receivables_aging  # lazy — avoid cycle at import
         snap = build_receivables_aging(session, y, m, entity)
         total = float(snap.get("total_receivables") or 0)
-        overdue = float((snap.get("kpis") or {}).get("overdue") or 0)
+        gross = float(snap.get("total_open_gross") or total)
+        kpis = snap.get("kpis") or {}
+        overdue = float(kpis.get("overdue") or 0)
         points.append({
             "year": y,
             "month": m,
             "label": f"{m:02d}/{y}",
             "balance": total,
+            "gross_balance": gross,
             "overdue": overdue,
+            "overdue_pct": float(kpis.get("overdue_pct") or (round(overdue / gross * 100, 1) if gross > 0 else 0.0)),
+            "before_due": float(kpis.get("before_due") or 0),
+            "open_documents": int(kpis.get("open_documents") or 0),
             "net_sales": 0.0,
-            "credit_sales_pct": round(overdue / total * 100, 1) if total > 0 else 0.0,
+            "credit_sales_pct": float(kpis.get("overdue_pct") or 0.0),
+            "dso_days": float(kpis.get("dso_days") or 0.0),
         })
         y, m = _shift_month(y, m, -1)
     points.reverse()
@@ -731,15 +745,21 @@ def build_payables_trend(
         from app.services.gl_aging import build_payables_aging
         snap = build_payables_aging(session, y, m, entity)
         total = float(snap.get("total_payables") or 0)
-        overdue = float((snap.get("kpis") or {}).get("overdue") or 0)
+        gross = float(snap.get("total_open_gross") or total)
+        kpis = snap.get("kpis") or {}
+        overdue = float(kpis.get("overdue") or 0)
         points.append({
             "year": y,
             "month": m,
             "label": f"{m:02d}/{y}",
             "balance": total,
+            "gross_balance": gross,
             "overdue": overdue,
+            "overdue_pct": float(kpis.get("overdue_pct") or (round(overdue / gross * 100, 1) if gross > 0 else 0.0)),
+            "before_due": float(kpis.get("before_due") or 0),
+            "open_documents": int(kpis.get("open_documents") or 0),
             "procurement": 0.0,
-            "overdue_pct": round(overdue / total * 100, 1) if total > 0 else 0.0,
+            "dpo_days": float(kpis.get("dpo_days") or 0.0),
         })
         y, m = _shift_month(y, m, -1)
     points.reverse()
@@ -1065,3 +1085,34 @@ def build_payables_supplier_documents(
         "amount": round(float(r.amount or 0), 2),
     } for r in rows]
     return {"supplier_id": supplier_id, "year": year, "month": month, "documents": docs}
+
+
+# ─── Phase-2 OPOS as-of variants (re-exported from app.services.opos_aging) ─────
+# Method A net-open + FIFO aging + clamped overdue% + credit-balance flag, all
+# single-sourced through opos_aging.compute_opos_aging (the financial contract).
+from app.services.opos_aging import (  # noqa: E402
+    build_concentration_trend_ap_opos,
+    build_concentration_trend_ar_opos,
+    build_payables_by_dimension_hierarchy_opos,
+    build_payables_by_dimension_opos,
+    build_payables_concentration_opos,
+    build_payables_dimension_chart_opos,
+    build_payables_geo_country_locations_opos,
+    build_payables_geo_opos,
+    build_payables_portfolio_table_opos,
+    build_payables_supplier_documents_opos,
+    build_payables_suppliers_opos,
+    build_payables_trend_opos,
+    build_receivables_by_dimension_hierarchy_opos,
+    build_receivables_by_dimension_opos,
+    build_receivables_concentration_opos,
+    build_receivables_customer_documents_opos,
+    build_receivables_customers_opos,
+    build_receivables_dimension_chart_opos,
+    build_receivables_geo_country_locations_opos,
+    build_receivables_geo_opos,
+    build_receivables_portfolio_table_opos,
+    build_receivables_trend_opos,
+)
+
+__all__ = [n for n in dir() if n.startswith("build_")]

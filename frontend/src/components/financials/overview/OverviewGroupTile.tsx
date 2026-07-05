@@ -40,6 +40,14 @@ type Props = {
   onNavigateTab: (tab: FinTab) => void
   onDrillDown?: (req: DrillDownRequest) => void
   activeDrillKey?: string
+  /** When true, use overviewData/loading/error from the parent briefing hook (do not refetch). */
+  sharedBriefing?: boolean
+  overviewData?: FinancialsOverviewResponse | null
+  overviewLoading?: boolean
+  overviewError?: string | null
+  highlightsLoading?: boolean
+  /** Hide the intro paragraph when the lead story card already shows it. */
+  hideGroupIntro?: boolean
 }
 
 const CARD = {
@@ -56,19 +64,28 @@ export default function OverviewGroupTile({
   onNavigateTab,
   onDrillDown,
   activeDrillKey,
+  sharedBriefing = false,
+  overviewData,
+  overviewLoading,
+  overviewError,
+  highlightsLoading: highlightsLoadingProp,
+  hideGroupIntro = false,
 }: Props) {
   const [data, setData] = useState<FinancialsOverviewResponse | null>(null)
   const [loading, setLoading] = useState(false)
-  const [highlightsLoading, setHighlightsLoading] = useState(false)
+  const [highlightsLoadingLocal, setHighlightsLoadingLocal] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [highlightIdx, setHighlightIdx] = useState(0)
   const [viewMode, setViewMode] = useState<PlViewMode>(() => loadViewMode())
   const notesCtx = useOptionalActionNotesContext()
 
+  const usesExternalData = sharedBriefing
+
   useEffect(() => {
+    if (usesExternalData) return
     let cancelled = false
     setLoading(true)
-    setHighlightsLoading(true)
+    setHighlightsLoadingLocal(true)
     setError(null)
     setHighlightIdx(0)
 
@@ -98,14 +115,19 @@ export default function OverviewGroupTile({
         /* Sidebar highlights are optional; keep executive summary visible. */
       })
       .finally(() => {
-        if (!cancelled) setHighlightsLoading(false)
+        if (!cancelled) setHighlightsLoadingLocal(false)
       })
 
     return () => {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resetKey])
+  }, [resetKey, usesExternalData])
+
+  useEffect(() => {
+    if (!usesExternalData) return
+    setHighlightIdx(0)
+  }, [resetKey, usesExternalData])
 
   useEffect(() => {
     saveViewMode(viewMode)
@@ -113,7 +135,8 @@ export default function OverviewGroupTile({
 
   useEffect(() => {
     if (!notesCtx) return
-    if (!data) {
+    const snapshot = usesExternalData ? overviewData : data
+    if (!snapshot) {
       notesCtx.unregisterTableCandidate('overview-group-summary')
       return
     }
@@ -123,23 +146,30 @@ export default function OverviewGroupTile({
       description: viewMode === 'table'
         ? 'Executive summary — output, EBIT and margin by entity'
         : 'Executive summary — group KPIs',
-      capture: () => captureExecutiveSummarySnapshot(data),
+      capture: () => captureExecutiveSummarySnapshot(snapshot),
       viewState: { tab: 'overview', view: viewMode },
     })
     return () => notesCtx.unregisterTableCandidate('overview-group-summary')
-  }, [notesCtx, data, viewMode])
+  }, [notesCtx, data, overviewData, usesExternalData, viewMode])
 
-  useChartLoadReporter('overview-group-summary', loading, error)
+  const resolvedData = usesExternalData ? overviewData : data
+  const resolvedLoading = usesExternalData ? Boolean(overviewLoading) : loading
+  const resolvedError = usesExternalData ? (overviewError ?? null) : error
+  const highlightsLoading = usesExternalData
+    ? Boolean(highlightsLoadingProp)
+    : highlightsLoadingLocal
 
-  if (error) {
+  useChartLoadReporter('overview-group-summary', resolvedLoading, resolvedError)
+
+  if (resolvedError) {
     return (
       <div className="rounded-xl px-5 py-4 text-sm" style={{ background: '#FEF2F2', border: '1px solid #FECACA', color: '#B91C1C' }} role="alert">
-        {error}
+        {resolvedError}
       </div>
     )
   }
 
-  if (loading && !data) {
+  if (resolvedLoading && !resolvedData) {
     return (
       <div className="rounded-xl px-6 py-16 text-center text-sm animate-pulse" style={{ ...CARD, color: '#94A3B8' }}>
         Loading group overview…
@@ -147,13 +177,20 @@ export default function OverviewGroupTile({
     )
   }
 
-  if (!data) return null
+  if (!resolvedData) return null
 
   return (
     <div className="rounded-xl overflow-hidden" style={CARD}>
-      <div className="px-4 pt-6 pb-4 flex items-start justify-between gap-3" style={{ borderBottom: '1px solid #F1F5F9' }}>
+      <div
+        className={`px-4 flex items-start justify-between gap-3 ${hideGroupIntro ? 'pt-5 pb-3' : 'pt-6 pb-4'}`}
+        style={{ borderBottom: '1px solid #F1F5F9' }}
+      >
         <div className="min-w-0 flex-1">
-          <OverviewGroupSummary intro={data.intro} />
+          {hideGroupIntro ? (
+            <PlSectionHeading>Group overview</PlSectionHeading>
+          ) : (
+            <OverviewGroupSummary intro={resolvedData.intro} />
+          )}
         </div>
         <PlViewToggleButton mode={viewMode} onChange={setViewMode} />
       </div>
@@ -163,11 +200,11 @@ export default function OverviewGroupTile({
           <div className={FIN_REPORT_SPLIT_GRID}>
             <div className="min-w-0">
               <PlSectionHeading>Executive summary</PlSectionHeading>
-              <ExecutiveSummaryTable sections={data.sections} colLabels={data.col_labels} />
+              <ExecutiveSummaryTable sections={resolvedData.sections} colLabels={resolvedData.col_labels} />
             </div>
             <div className="min-w-0 lg:sticky lg:top-24 lg:self-start">
               <OverviewHighlightsPanel
-                highlights={data.highlights}
+                highlights={resolvedData.highlights}
                 loading={highlightsLoading}
                 activeIndex={highlightIdx}
                 onActiveIndexChange={setHighlightIdx}

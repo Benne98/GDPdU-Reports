@@ -32,13 +32,15 @@ function toAgingGeoLocations(locs: PayablesGeoCountryLocation[]): AgingGeoLocati
 }
 
 function toWorldMapRows(rows: PayablesGeoRow[]): SalesGeoCountry[] {
-  return rows.map(r => ({
-    country: countryDisplayName(r.country),
-    revenue_keur: Math.round((r.balance / 1000) * 100) / 100,
-    py_revenue_keur: 0,
-    delta_keur: 0,
-    gross_margin_pct: r.overdue_pct,
-  }))
+  return rows
+    .filter(r => !!r.country)   // skip rows without a country_code (pre-OPOS rows)
+    .map(r => ({
+      country: countryDisplayName(r.country),
+      revenue_keur: Math.round((r.balance / 1000) * 100) / 100,
+      py_revenue_keur: 0,
+      delta_keur: 0,
+      gross_margin_pct: r.overdue_pct,
+    }))
 }
 
 export default function PayablesGeographySection({

@@ -37,38 +37,54 @@ interface WEntry {
 
 function buildEntries(data: SalesChurnBridgeResponse): WEntry[] {
   const entries: WEntry[] = []
+  const [pmLabel, cmLabel] = data.periods
+  const [pmTotal, cmTotal] = data.period_totals
 
-  data.periods.forEach((label, i) => {
-    const total = data.period_totals[i]
-    entries.push({ name: label, base: 0, value: total, rawValue: total, color: C.total, isTotal: true })
+  // PM total bar
+  entries.push({
+    name: pmLabel ?? 'PM',
+    base: 0,
+    value: pmTotal ?? 0,
+    rawValue: pmTotal ?? 0,
+    color: C.total,
+    isTotal: true,
+  })
 
-    if (i < data.bridges.length) {
-      const b = data.bridges[i]
-      let cursor = total
-
-      const deltas: Array<{ key: ChurnComponentKey; v: number }> = [
-        { key: 'new', v: b.new },
-        { key: 'upsell', v: b.upsell },
-        { key: 'cross_sell', v: b.cross_sell },
-        { key: 'downsell', v: b.downsell },
-        { key: 'lost', v: b.lost },
-      ]
-
-      deltas.forEach(({ key, v }) => {
-        if (v === 0) return
-        entries.push({
-          name: key === 'cross_sell' ? 'Cross' : key.charAt(0).toUpperCase() + key.slice(1),
-          base: v >= 0 ? cursor : cursor + v,
-          value: Math.abs(v),
-          rawValue: v,
-          color: C[key],
-          isTotal: false,
-          component: key,
-          bridgeIdx: i,
-        })
-        cursor += v
+  // Bridge component bars (single PM→CM transition)
+  const bridge = data.bridge
+  if (bridge) {
+    let cursor = pmTotal ?? 0
+    const deltas: Array<{ key: ChurnComponentKey; v: number }> = [
+      { key: 'new', v: bridge.new },
+      { key: 'upsell', v: bridge.upsell },
+      { key: 'cross_sell', v: bridge.cross_sell },
+      { key: 'downsell', v: bridge.downsell },
+      { key: 'lost', v: bridge.lost },
+    ]
+    deltas.forEach(({ key, v }) => {
+      if (v === 0) return
+      entries.push({
+        name: key === 'cross_sell' ? 'Cross' : key.charAt(0).toUpperCase() + key.slice(1),
+        base: v >= 0 ? cursor : cursor + v,
+        value: Math.abs(v),
+        rawValue: v,
+        color: C[key],
+        isTotal: false,
+        component: key,
+        bridgeIdx: 0,
       })
-    }
+      cursor += v
+    })
+  }
+
+  // CM total bar
+  entries.push({
+    name: cmLabel ?? 'CM',
+    base: 0,
+    value: cmTotal ?? 0,
+    rawValue: cmTotal ?? 0,
+    color: C.total,
+    isTotal: true,
   })
 
   return entries
@@ -169,7 +185,7 @@ export default function SalesChurnBridge({
   const entries = buildEntries(data)
   const columns = buildChurnTableColumns(data)
   const gridTemplate = churnGridTemplate(columns)
-  const timedOut = useChartLoadReporter('sales-churn-bridge', !!loading, null, !!data?.bridges?.length)
+  const timedOut = useChartLoadReporter('sales-churn-bridge', !!loading, null, data.period_totals.length > 0)
   if (timedOut) return null
 
   const handleClick = (entry: { activePayload?: { payload?: WEntry }[] }) => {

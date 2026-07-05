@@ -23,13 +23,16 @@ import { usePageChartKeyboardNav } from '../hooks/usePageChartKeyboardNav'
 import FloatingAssistants from '../components/action-notes/FloatingAssistants'
 import type { FinTab } from '../components/financials/financialsTabs'
 import OverviewGroupTile from '../components/financials/overview/OverviewGroupTile'
+import OverviewBriefingBlock from '../components/financials/overview/OverviewBriefingBlock'
+import OverviewMarketWatch from '../components/financials/overview/OverviewMarketWatch'
+import { useOverviewBriefing } from '../components/financials/overview/useOverviewBriefing'
 import DuPontTree from '../components/cockpit/DuPontTree'
 import type { DrillDownRequest } from '../components/cockpit/EbitTable'
-import TopCustomerTable from '../components/cockpit/TopCustomerTable'
-import TopSupplierTable from '../components/cockpit/TopSupplierTable'
 import DrillDownTable from '../components/cockpit/DrillDownTable'
 import AnomaliesPanel from '../components/financials/AnomaliesPanel'
 import type { AnomalyPeriodParams } from '../lib/api'
+import { IS_OVERVIEW_V2 } from '../lib/overviewV2Mode'
+import OverviewPageV2 from './OverviewPageV2'
 
 const ROUTE_BY_TAB: Record<FinTab, string> = {
   overview: '/overview',
@@ -60,6 +63,8 @@ function cockpitPeriodFromSelection(p: PeriodSelection): PeriodSelection {
 }
 
 export default function OverviewPage() {
+  // eslint-disable-next-line react-hooks/rules-of-hooks -- IS_OVERVIEW_V2 is a build-time constant (Vite inlines MODE); the branch is fully dead-code-eliminated per bundle, so hook order is never violated at runtime.
+  if (IS_OVERVIEW_V2) return <OverviewPageV2 />   // reporting-v2 (5177/8011) only
   const navigate = useNavigate()
   const [entities, setEntities] = useState<Entity[]>([])
   const [entity, setEntity] = useState('all')
@@ -107,7 +112,7 @@ export default function OverviewPage() {
       } catch (e: unknown) {
         if (!cancelled) {
           const msg = e instanceof Error ? e.message : String(e)
-          setBootError(`${msg} — Prüfe Postgres und backend/.env (DB_*). API-Schnelltest: GET /api/v1/health`)
+          setBootError(`${msg} — Check Postgres and backend/.env (DB_*). API quick test: GET /api/v1/health`)
         }
       } finally {
         if (!cancelled) setPeriodReady(true)
@@ -129,6 +134,7 @@ export default function OverviewPage() {
   }, [resetKey])
 
   const periodParams = finParamsFromPeriod(period, ent)
+  const briefing = useOverviewBriefing(periodParams, resetKey, anchor.year, anchor.month, ent, grain)
 
   const anomalyParams: AnomalyPeriodParams =
     period.grain === 'week'
@@ -162,7 +168,7 @@ export default function OverviewPage() {
               Overview
             </h1>
             <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
-              Performance overview, executive summary and top customers &amp; suppliers · {periodLabel}
+              Executive briefing, performance drivers and partner concentration · {periodLabel}
             </p>
           </motion.div>
 
@@ -189,7 +195,13 @@ export default function OverviewPage() {
           />
 
           <div className="space-y-5">
-            {/* 1 — Performance overview (DuPont) */}
+            <OverviewBriefingBlock
+              briefing={briefing}
+              period={cockpitPeriod}
+              grain={grain}
+              entity={ent}
+            />
+
             <DuPontTree
               key={`dupont-${resetKey}`}
               title="Performance Overview"
@@ -198,18 +210,21 @@ export default function OverviewPage() {
               entities={entities}
             />
 
-            {/* 2 — Group overview (Report ↔ Table) */}
-            {periodReady && (
-              <OverviewGroupTile
-                periodParams={periodParams}
-                cockpitPeriod={cockpitPeriod}
-                entity={ent}
-                resetKey={resetKey}
-                onNavigateTab={onNavigateTab}
-                onDrillDown={setDrill}
-                activeDrillKey={drill?.title}
-              />
-            )}
+            <OverviewGroupTile
+              periodParams={periodParams}
+              cockpitPeriod={cockpitPeriod}
+              entity={ent}
+              resetKey={resetKey}
+              onNavigateTab={onNavigateTab}
+              onDrillDown={setDrill}
+              activeDrillKey={drill?.title}
+              sharedBriefing
+              overviewData={briefing.data}
+              overviewLoading={briefing.loading}
+              overviewError={briefing.error}
+              highlightsLoading={briefing.highlightsLoading}
+              hideGroupIntro
+            />
 
             {drill && (
               <DrillDownTable
@@ -224,21 +239,14 @@ export default function OverviewPage() {
               />
             )}
 
-            {/* 5 — Top customers */}
-            <TopCustomerTable period={cockpitPeriod} entity={ent} />
+            <OverviewMarketWatch period={cockpitPeriod} entity={ent} />
 
-            {/* 6 — Top suppliers */}
-            <TopSupplierTable period={cockpitPeriod} entity={ent} />
-
-            {/* 7 — Anomalies (compact panel, basis for narratives) */}
-            {periodReady && (
-              <AnomaliesPanel
-                key={`anomaly-overview-${resetKey}`}
-                periodParams={anomalyParams}
-                entity={ent}
-                mode="compact"
-              />
-            )}
+            <AnomaliesPanel
+              key={`anomaly-overview-${resetKey}`}
+              periodParams={anomalyParams}
+              entity={ent}
+              mode="compact"
+            />
           </div>
 
           <div className="mt-16" />

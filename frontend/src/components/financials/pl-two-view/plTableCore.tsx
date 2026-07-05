@@ -180,6 +180,9 @@ export function collectNumericRows(rows: FinancialStatementRow[]): FinancialStat
 
 const CM_HIGHLIGHT_BG = 'rgba(30,58,95,0.04)'
 
+/** Shared period-column tint (CM / YTD in P&L, anchor year-end in fixed assets). */
+export const PERIOD_HIGHLIGHT_BG = CM_HIGHLIGHT_BG
+
 /** Dark tint only for current-month (CM) and YTD actual columns — not custom month columns. */
 export function isReportPeriodHighlightColumn(kind: string): boolean {
   return kind === 'cm' || kind === 'ytd'
@@ -230,7 +233,10 @@ export function ExpandChevron({
   return (
     <button
       type="button"
-      onClick={onToggle}
+      onClick={e => {
+        e.stopPropagation()
+        onToggle()
+      }}
       className="p-0.5 rounded shrink-0"
       style={{ color: '#1E3A5F' }}
       aria-expanded={open}

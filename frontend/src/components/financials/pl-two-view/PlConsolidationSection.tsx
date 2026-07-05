@@ -7,6 +7,7 @@ import type {
 } from '../../../lib/api'
 import { api, type FinPeriodParams } from '../../../lib/api'
 import type { PeriodSelection } from '../../../lib/periodSelection'
+import { periodAnchorYearMonth, periodCacheKey, periodQueryParams } from '../../../lib/periodSelection'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlConsolidationColumnEditor from './PlConsolidationColumnEditor'
 import PlConsolidationTableView from './PlConsolidationTableView'
@@ -82,11 +83,21 @@ export default function PlConsolidationSection({
   periodSelection,
   onDrill,
 }: Props) {
-  const periodParams: FinPeriodParams = periodSelection
-    ? periodSelection.grain === 'week'
-      ? { period_grain: 'week', iso_year: periodSelection.isoYear, iso_week: periodSelection.isoWeek }
-      : { year: periodSelection.year, month: periodSelection.month }
-    : { year, month }
+  const periodParams: FinPeriodParams = useMemo(
+    () =>
+      periodSelection
+        ? (periodQueryParams(periodSelection) as FinPeriodParams)
+        : { year, month },
+    [periodSelection, year, month],
+  )
+  const planAnchor = useMemo(
+    () => (periodSelection ? periodAnchorYearMonth(periodSelection) : { year, month }),
+    [periodSelection, year, month],
+  )
+  const periodKey = useMemo(
+    () => (periodSelection ? periodCacheKey(periodSelection) : `m-${year}-${month}`),
+    [periodSelection, year, month],
+  )
   const [viewMode, setViewMode] = useState<PlViewMode>(loadViewMode)
   const [entityIndex, setEntityIndex] = useState(0)
   const [entityStmt, setEntityStmt] = useState<FinancialStatementResponse | null>(null)
@@ -103,9 +114,15 @@ export default function PlConsolidationSection({
   useChartLoadReporter('fin-consl-pl', loading || entityLoading, error)
 
   useEffect(() => {
+    setStmtCache(new Map())
+    setEntityStmt(null)
+    setGroupStatement(null)
+  }, [periodKey])
+
+  useEffect(() => {
     if (!entities.length) return
     setEntityIndex(Math.min(loadEntityIndex(entities.length), entities.length - 1))
-  }, [entities.length, year, month])
+  }, [entities.length, periodKey])
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, viewMode)
@@ -117,7 +134,7 @@ export default function PlConsolidationSection({
 
   useEffect(() => {
     setNarrative(null)
-  }, [selected?.code, year, month])
+  }, [selected?.code, periodKey])
 
   useEffect(() => {
     if (!selected?.code) {
@@ -139,7 +156,7 @@ export default function PlConsolidationSection({
       try {
         const [pl, plan] = await Promise.all([
           api.financialsPlStatementPeriod({ ...periodParams, entity: code }),
-          api.financialsPlPlan(year, month, code).catch(() => null),
+          api.financialsPlPlan(planAnchor.year, planAnchor.month, code).catch(() => null),
         ])
         if (cancelled) return
         const res = plan ? { ...pl, plan } : pl
@@ -154,7 +171,7 @@ export default function PlConsolidationSection({
     return () => {
       cancelled = true
     }
-  }, [selected?.code, year, month])
+  }, [selected?.code, periodParams, planAnchor.year, planAnchor.month])
 
   useEffect(() => {
     if (viewMode !== 'table') return
@@ -162,7 +179,7 @@ export default function PlConsolidationSection({
     void (async () => {
       try {
         const pl = await api.financialsPlStatementPeriod(periodParams)
-        const plan = await api.financialsPlPlan(year, month).catch(() => null)
+        const plan = await api.financialsPlPlan(planAnchor.year, planAnchor.month).catch(() => null)
         if (cancelled) return
         setGroupStatement(plan ? { ...pl, plan } : pl)
       } catch {
@@ -172,7 +189,7 @@ export default function PlConsolidationSection({
     return () => {
       cancelled = true
     }
-  }, [viewMode, year, month])
+  }, [viewMode, periodParams, planAnchor.year, planAnchor.month])
 
   useEffect(() => {
     if (!consol?.entities.length || !extraColumns.length) return
@@ -183,14 +200,14 @@ export default function PlConsolidationSection({
     for (const code of needed) {
       if (!stmtCache.has(code)) {
         void api.financialsPlStatementPeriod({ ...periodParams, entity: code }).then(pl =>
-          api.financialsPlPlan(year, month, code).catch(() => null).then(plan => {
+          api.financialsPlPlan(planAnchor.year, planAnchor.month, code).catch(() => null).then(plan => {
             const res = plan ? { ...pl, plan } : pl
             setStmtCache(prev => new Map(prev).set(code, res))
           }),
         )
       }
     }
-  }, [consol, extraColumns, year, month])
+  }, [consol, extraColumns, periodParams, planAnchor.year, planAnchor.month, periodKey])
 
   const planMap = useMemo(
     () => (entityStmt ? buildPlanMapFromStatement(entityStmt) : {}),
@@ -218,12 +235,18 @@ export default function PlConsolidationSection({
 
   const exportBullets = useMemo((): PlNarrativeBullet[] => {
     if (!entityStmt) return []
-    const client = buildClientNarrativeResponse(entityStmt, planMap, year, month, 5)
+    const client = buildClientNarrativeResponse(
+      entityStmt,
+      planMap,
+      planAnchor.year,
+      planAnchor.month,
+      5,
+    )
     const src =
       narrative && isTrustedApiNarrative(narrative, selected?.code) ? narrative : client
     if (src?.bullets?.length) return mapApiBulletsToUi(src.bullets, entityStmt.rows)
     return []
-  }, [entityStmt, narrative, planMap, year, month, selected?.code])
+  }, [entityStmt, narrative, planMap, planAnchor.year, planAnchor.month, selected?.code])
 
   const consolidationCheckOpenRef = useRef<((id: string) => boolean) | null>(null)
   const notesCtx = useOptionalActionNotesContext()
@@ -469,12 +492,12 @@ export default function PlConsolidationSection({
         )}
       </div>
 
-      {detailBullet && selected && (
+      {detailBullet && (
         <PlDetailOverlay
           bullet={detailBullet}
           year={year}
           month={month}
-          entity={selected.code}
+          entity={selected?.code}
           narrativeContext={
             narrative
               ? { headline: narrative.headline, intro: narrative.intro, intro_facts: narrative.intro_facts }

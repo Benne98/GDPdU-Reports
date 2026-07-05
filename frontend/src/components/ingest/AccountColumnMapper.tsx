@@ -11,12 +11,13 @@
  */
 
 import { useState } from "react";
+import { v4Label } from "../../lib/dataUpdateMode";
 
 // ---------------------------------------------------------------------------
 // Target field manifest — mirrors etl/mapping_account.py REQUIRED/OPTIONAL
 // ---------------------------------------------------------------------------
 
-export type AccountFieldGroup = "Core" | "Sort & Flags" | "NA-Mapping" | "CF-Mapping";
+export type AccountFieldGroup = "Core" | "Sort & Flags" | "NA-Mapping" | "CF-Mapping" | "Additional Information";
 
 export interface AccountTargetField {
   key: string;
@@ -39,7 +40,7 @@ export const ACCOUNT_TARGET_FIELDS: AccountTargetField[] = [
   { key: "level_2_sort", label: "Level 2 Sort", group: "Sort & Flags", required: false },
   { key: "level_3_sort", label: "Level 3 Sort", group: "Sort & Flags", required: false },
   { key: "is_ic", label: "Is Intercompany", group: "Sort & Flags", required: false, hint: "Boolean" },
-  { key: "account_name", label: "Account Name", group: "Sort & Flags", required: false },
+  { key: "account_name", label: v4Label("Account Name", "Account name"), group: "Sort & Flags", required: false },
   { key: "gl_account_id", label: "GL Account ID", group: "Sort & Flags", required: false },
   // NA-Mapping — optional
   { key: "l6_na_mapping", label: "L6 NA Mapping", group: "NA-Mapping", required: false, hint: "TWC/OWC/etc." },
@@ -53,7 +54,51 @@ export const ACCOUNT_TARGET_FIELDS: AccountTargetField[] = [
   { key: "cf_mapping", label: "CF Mapping", group: "CF-Mapping", required: false },
 ];
 
-const ACCOUNT_GROUPS: AccountFieldGroup[] = ["Core", "Sort & Flags", "NA-Mapping", "CF-Mapping"];
+// ---------------------------------------------------------------------------
+// Statement-aware trimmed field set for the CoA wizard (BS/PL upload path)
+// Excludes l4_sub, level_*_sort, is_ic, gl_account_id, cf_* fields.
+// l6_na_mapping is relabeled to "Net assets (NA)" for brevity.
+// PL adds "Reported / adjusted"; BS keeps l6_na_mapping (NA-Mapping).
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the trimmed CoA field set for the wizard upload path.
+ *
+ * BS includes l6_na_mapping (Net assets) in the NA-Mapping group.
+ * PL drops l6_na_mapping and adds reported_adjusted (Additional Information).
+ * account_name is "Additional Information" in both statements.
+ *
+ * Field order: Core → NA-Mapping (bs only) → Additional Information.
+ */
+export function coaGenericFields(statement: 'bs' | 'pl'): AccountTargetField[] {
+  const core: AccountTargetField[] = [
+    { key: "account_number", label: "Account Number",   group: "Core", required: true,  hint: "Account number" },
+    { key: "level_0",        label: "Level 0 (PL/BS)",  group: "Core", required: true,  hint: "Statement type" },
+    { key: "level_1",        label: "Level 1",           group: "Core", required: true  },
+    { key: "level_2",        label: "Level 2",           group: "Core", required: true  },
+    { key: "level_3",        label: "Level 3",           group: "Core", required: true  },
+    { key: "level_4",        label: "Level 4",           group: "Core", required: false },
+  ];
+
+  const naMapping: AccountTargetField[] = statement === 'bs'
+    ? [{ key: "l6_na_mapping", label: "Net assets (NA)", group: "NA-Mapping", required: false }]
+    : [];
+
+  const additional: AccountTargetField[] = [
+    { key: "account_name", label: v4Label("Account Name", "Account name"), group: "Additional Information", required: false },
+    ...(statement === 'pl'
+      ? [{ key: "reported_adjusted", label: "Reported / adjusted", group: "Additional Information" as AccountFieldGroup, required: false }]
+      : []),
+  ];
+
+  return [...core, ...naMapping, ...additional];
+}
+
+/**
+ * Backward-compatible alias — equals coaGenericFields('bs').
+ * Kept so existing importers (IngestionPage, etc.) do not need changes.
+ */
+export const COA_GENERIC_FIELDS: AccountTargetField[] = coaGenericFields('bs');
 
 // ---------------------------------------------------------------------------
 // Props
@@ -64,6 +109,12 @@ export interface AccountColumnMapperProps {
   sample: Record<string, unknown>[];
   mapping: Record<string, string>;
   onChange: (mapping: Record<string, string>) => void;
+  /**
+   * Override the field set rendered in the drop-zone panel.
+   * Defaults to ACCOUNT_TARGET_FIELDS (full set with all groups).
+   * Pass COA_GENERIC_FIELDS for the trimmed CoA-wizard upload path.
+   */
+  fields?: AccountTargetField[];
 }
 
 // ---------------------------------------------------------------------------
@@ -77,10 +128,6 @@ function getSampleValues(col: string, sample: Record<string, unknown>[]): string
     .slice(0, 2)
     .map(String);
   return vals.join(" · ");
-}
-
-function groupFields(group: AccountFieldGroup): AccountTargetField[] {
-  return ACCOUNT_TARGET_FIELDS.filter((f) => f.group === group);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +256,15 @@ export default function AccountColumnMapper({
   sample,
   mapping,
   onChange,
+  fields = ACCOUNT_TARGET_FIELDS,
 }: AccountColumnMapperProps) {
   const mappedSources = new Set(Object.values(mapping));
+
+  // Derive unique group names from the active field set in insertion order.
+  const effectiveGroups: AccountFieldGroup[] = [];
+  for (const f of fields) {
+    if (!effectiveGroups.includes(f.group)) effectiveGroups.push(f.group);
+  }
 
   function handleDrop(targetKey: string, sourceCol: string) {
     onChange({ ...mapping, [targetKey]: sourceCol });
@@ -260,7 +314,7 @@ export default function AccountColumnMapper({
           </span>
         </div>
         <div className="max-h-[560px] overflow-y-auto space-y-5 pr-1">
-          {ACCOUNT_GROUPS.map((group) => (
+          {effectiveGroups.map((group) => (
             <div key={group}>
               <div className="mb-2 flex items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
@@ -269,7 +323,7 @@ export default function AccountColumnMapper({
                 <div className="flex-1 border-t border-slate-200" />
               </div>
               <div className="space-y-2">
-                {groupFields(group).map((field) => (
+                {fields.filter(f => f.group === group).map((field) => (
                   <DropZone
                     key={field.key}
                     field={field}
@@ -291,6 +345,16 @@ export default function AccountColumnMapper({
 // Utility: check required fields
 // ---------------------------------------------------------------------------
 
-export function missingRequiredAccountFields(mapping: Record<string, string>): string[] {
-  return ACCOUNT_TARGET_FIELDS.filter((f) => f.required && !mapping[f.key]).map((f) => f.label);
+/**
+ * Returns the labels of required fields that are not yet mapped.
+ *
+ * @param mapping  The current column mapping (target key → source column).
+ * @param fields   The field set to check against. Defaults to ACCOUNT_TARGET_FIELDS
+ *                 (full set). Pass COA_GENERIC_FIELDS for the CoA wizard upload path.
+ */
+export function missingRequiredAccountFields(
+  mapping: Record<string, string>,
+  fields: AccountTargetField[] = ACCOUNT_TARGET_FIELDS,
+): string[] {
+  return fields.filter((f) => f.required && !mapping[f.key]).map((f) => f.label);
 }

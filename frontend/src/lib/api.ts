@@ -49,7 +49,9 @@ export const BASE_URL =
 
 const DEFAULT_API_TIMEOUT_MS = 60_000
 /** Overview aggregates P&L, BS, WC and narratives — allow longer than default. */
-const FINANCIALS_OVERVIEW_TIMEOUT_MS = 45_000
+const FINANCIALS_OVERVIEW_TIMEOUT_MS = 90_000
+/** Heavy bal_mov report endpoints — 100 s > backend 90 s statement_timeout so the server fires first and returns a real error instead of a bare client abort. */
+const FINANCIAL_STATEMENT_TIMEOUT_MS = 100_000
 
 function apiTimeoutMs(): number {
   const raw = import.meta.env.VITE_API_TIMEOUT_MS as string | undefined
@@ -899,7 +901,7 @@ export interface FinancialStatementDeltas {
 export interface FinancialStatementRow {
   id:            string
   line_code:     string
-  row_kind:      'line' | 'subtotal' | 'title' | 'kpi' | 'detail' | 'account'
+  row_kind:      'line' | 'subtotal' | 'title' | 'kpi' | 'kpi_header' | 'detail' | 'account'
   label:         string
   amounts:       FinancialStatementAmounts | null
   deltas:        FinancialStatementDeltas | null
@@ -1041,6 +1043,262 @@ export interface FinancialsOverviewResponse {
   entity_snapshots?: OverviewEntitySnapshot[]
   sections: FinancialsOverviewSection[]
   highlights: OverviewHighlight[]
+}
+
+export type PersonnelRowKind = 'line' | 'total' | 'section_header' | 'subtotal' | 'kpi_header' | 'kpi'
+export type PersonnelUnit = 'keur' | 'pct' | 'count' | 'none'
+export type PersonnelDimension = 'entity' | 'org_unit' | 'gew_ang' | 'kst_name' | 'bereich'
+export type PersonnelLayout = 'flat' | 'column_split' | 'row_hierarchy'
+
+export interface PersonnelMetricDef {
+  id: string
+  label: string
+  unit: PersonnelUnit
+}
+
+export interface PersonnelTableRow {
+  id: string
+  label: string
+  row_kind: PersonnelRowKind
+  unit: PersonnelUnit
+  depth?: number
+  dimension?: PersonnelDimension
+  amounts?: Record<string, number | null | undefined>
+}
+
+export interface PersonnelAccountingResponse {
+  anchor_date: string
+  layout: PersonnelLayout
+  column_dimension: PersonnelDimension | null
+  row_dimensions: PersonnelDimension[]
+  col_keys: string[]
+  col_labels: Record<string, string>
+  col_groups: Record<string, string | null>
+  col_dates: string[]
+  sections: Array<{ id: string; title: string; kind: string }>
+  rows: PersonnelTableRow[]
+  available_metrics: PersonnelMetricDef[]
+  available_dimensions: Array<{ id: PersonnelDimension; label: string }>
+  narrative?: PersonnelReportNarrative | null
+  intro?: string | null
+}
+
+export interface PersonnelNarrativeBullet {
+  index: number
+  row_id: string
+  label: string
+  text: string
+  tone?: string
+}
+
+export interface PersonnelReportNarrative {
+  headline?: string
+  intro: string
+  bullets: PersonnelNarrativeBullet[]
+  meta?: Record<string, unknown>
+}
+
+export interface PersonnelSnapshotInfo {
+  as_of_date: string
+  label: string
+  col_label: string
+}
+
+export interface PersonnelSnapshotsResponse {
+  snapshots: PersonnelSnapshotInfo[]
+}
+
+export interface PersonnelWaterfallEntry {
+  name: string
+  base: number
+  value: number
+  raw: number
+  is_total: boolean
+}
+
+export interface PersonnelMovementsResponse {
+  anchor_date: string
+  prior_date: string | null
+  intro: string
+  bullets: string[]
+  charts: {
+    payroll_by_dimension: Array<{
+      key: string
+      label: string
+      anchor: number
+      prior: number
+      delta_pct: number | null
+    }>
+    payroll_dimension: PersonnelDimension
+    fte_trend: Array<{
+      period: string
+      value: number
+      prior_value: number
+      fte: number
+      prior_fte: number
+      delta_pct: number | null
+    }>
+    trend_metric?: string
+    trend_metrics?: Array<{ id: string; label: string; unit: string }>
+    top_raises: Array<{
+      personalnummer: string
+      bereich: string
+      delta_keur: number
+      delta_pct: number
+    }>
+  }
+  counts: { hires: number; terms: number; raises: number }
+}
+
+export type FixedAssetRowKind = 'line' | 'total' | 'section_header' | 'subtotal'
+export type FixedAssetDimension = 'bilanzposition' | 'segment' | 'entity' | 'asset'
+
+export interface FixedAssetTableRow {
+  id: string
+  label: string
+  row_kind: FixedAssetRowKind
+  unit: 'keur'
+  depth?: number
+  dimension?: FixedAssetDimension
+  amounts?: Record<string, number | null | undefined>
+}
+
+export interface FixedAssetRollforwardResponse {
+  anchor_date: string
+  dimensions: FixedAssetDimension[]
+  col_keys: string[]
+  col_labels: Record<string, string>
+  rows: FixedAssetTableRow[]
+  available_dimensions: Array<{ id: FixedAssetDimension; label: string }>
+}
+
+export interface FixedAssetPositionAsset {
+  asset_id: string
+  asset_label: string
+  label: string
+  amounts?: Record<string, number | null | undefined>
+}
+
+export interface FixedAssetNarrativeBullet {
+  index: number
+  position_id: string
+  label: string
+  text: string
+  tone?: string
+}
+
+export interface FixedAssetReportNarrative {
+  headline?: string
+  intro: string
+  bullets: FixedAssetNarrativeBullet[]
+  meta?: Record<string, unknown>
+}
+
+export interface FixedAssetReportPosition {
+  id: string
+  bilanzposition: string
+  amounts?: Record<string, number | null | undefined>
+  assets: FixedAssetPositionAsset[]
+}
+
+export interface FixedAssetReportDetailResponse {
+  anchor_date: string
+  col_keys: string[]
+  col_labels: Record<string, string>
+  positions: FixedAssetReportPosition[]
+  total?: {
+    label: string
+    amounts?: Record<string, number | null | undefined>
+  }
+  narrative?: FixedAssetReportNarrative
+  intro: string
+  bullets: string[]
+}
+
+export interface FixedAssetBridgeMovementGroup {
+  key: string
+  label: string
+  additions: number
+  disposals: number
+  depreciation: number
+}
+
+export interface FixedAssetBridgeColumn {
+  kind: 'total' | 'movements' | 'movements_by_dimension'
+  year: number
+  label?: string
+  value?: number
+  additions?: number
+  disposals?: number
+  depreciation?: number
+  groups?: FixedAssetBridgeMovementGroup[]
+}
+
+export interface FixedAssetWaterfallEntry {
+  name: string
+  base: number
+  value: number
+  raw: number
+  is_total: boolean
+}
+
+export interface FixedAssetSnapshotInfo {
+  as_of_date: string
+  label: string
+  col_label: string
+}
+
+export interface FixedAssetSnapshotsResponse {
+  snapshots: FixedAssetSnapshotInfo[]
+}
+
+export interface FixedAssetNbvBridgeChart {
+  opening_date?: string
+  closing_date?: string
+  opening_label?: string
+  closing_label?: string
+  dimension?: FixedAssetDimension | null
+  scope_label?: string
+  columns?: FixedAssetBridgeColumn[]
+  anchor_date?: string
+  prior_date?: string | null
+  anchor_label?: string
+  prior_label?: string
+  opening: number
+  additions: number
+  disposals: number
+  depreciation: number
+  closing: number
+  entries: FixedAssetWaterfallEntry[]
+}
+
+export interface FixedAssetMovementsResponse {
+  anchor_date: string
+  prior_date: string | null
+  intro: string
+  bullets: string[]
+  charts: {
+    nbv_bridge?: FixedAssetNbvBridgeChart
+    nbv_bridges?: FixedAssetNbvBridgeChart[]
+    additions_disposals?: Array<{
+      key: string
+      label: string
+      additions: number
+      disposals: number
+      depreciation: number
+    }>
+    additions_disposals_dimension?: FixedAssetDimension
+    nbv_by_category?: Array<{
+      category: string
+      nbv: number
+      prior_nbv: number
+      delta_pct: number | null
+    }>
+    nbv_by_category_dimension?: FixedAssetDimension
+  }
+  entity_prefixes?: string[]
+  scope_options?: Partial<Record<FixedAssetDimension, string[]>>
+  scope_option_labels?: Partial<Record<FixedAssetDimension, Record<string, string>>>
 }
 
 export interface EntityBreakdownEntity {
@@ -1609,9 +1867,14 @@ export interface SalesDimensionPerformanceResponse {
   prior_label: string
   value_unit: 'keur' | 'units'
   chart: { segments: SalesDimensionPerformanceSegment[] }
+  /**
+   * Gross-sales-by-period table: `columns` are the months Jan..anchor of the
+   * current year; each `rows[]` entry is a top dimension value with a `values`
+   * array (kEUR gross sales, aligned to `columns`) plus a row `total` (kEUR).
+   */
   matrix: {
     columns: SalesGrossMarginMatrixColumn[]
-    rows: Array<{ dim_value: string; periods: Record<string, SalesDimensionMatrixCell> }>
+    rows: Array<{ name: string; values: number[]; total: number }>
   }
 }
 
@@ -2287,8 +2550,10 @@ export interface ReceivablesAgingResponse {
   month: number
   as_of: string
   total_receivables: number
+  total_open_gross?: number
+  credit_balances?: number
   subledger_total: number
-  reconciliation_mode: 'subledger' | 'scaled' | 'synthetic'
+  reconciliation_mode: 'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'
   series: ReceivablesAgingBand[]
   kpis: ReceivablesAgingKpis
   extended_kpis?: ReceivablesExtendedKpis
@@ -2420,6 +2685,7 @@ export interface ReceivablesTrendPoint {
   month: number
   label: string
   balance: number
+  gross_balance?: number
   overdue: number
   overdue_pct: number
   dso_days: number
@@ -2462,14 +2728,21 @@ export interface ReceivablesCustomerRegisterDocument {
 export interface ReceivablesCustomerRegisterRow {
   customer_id: string
   customer_name: string
+  /** Legacy field name — prefer `contact` when backend sends it. */
   contact_name?: string | null
+  /** New field from OPOS rebuild — contact person name. */
+  contact?: string | null
   balance: number
   overdue: number
+  /** Already clamped [0,100] by backend. */
   overdue_pct: number
   days_outstanding: number
   payment_terms_days: number
   open_documents: number
-  gross_sales: number
+  /** Gross sales in EUR (or null when not linked). kEUR display handled in register column. */
+  gross_sales?: number | null
+  /** True when the customer has a net credit balance (excluded from scatter). */
+  credit_balance?: boolean
   documents?: ReceivablesCustomerRegisterDocument[]
 }
 
@@ -2483,7 +2756,10 @@ export interface ReceivablesCustomerScatterRow {
   customer_id?: string
   customer_name: string
   balance: number
+  /** Already clamped [0,100] by backend. */
   overdue_pct: number
+  /** True when net credit balance — backend excludes these from scatter results. */
+  credit_balance?: boolean
 }
 
 export interface ReceivablesEntityRow {
@@ -2585,8 +2861,10 @@ export interface PayablesAgingResponse {
   month: number
   as_of: string
   total_payables: number
+  total_open_gross?: number
+  credit_balances?: number
   subledger_total: number
-  reconciliation_mode: 'subledger' | 'scaled' | 'synthetic'
+  reconciliation_mode: 'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'
   series: PayablesAgingBand[]
   kpis: PayablesAgingKpis
   extended_kpis?: PayablesExtendedKpis
@@ -2713,6 +2991,7 @@ export interface PayablesTrendPoint {
   month: number
   label: string
   balance: number
+  gross_balance?: number
   overdue: number
   overdue_pct: number
   dpo_days: number
@@ -2738,14 +3017,21 @@ export interface PayablesConcentrationTrendPoint {
 export interface PayablesSupplierRegisterRow {
   supplier_id: string
   supplier_name: string
+  /** Contact person at the supplier — populated by OPOS rebuild. */
+  contact?: string | null
   balance: number
   overdue: number
+  /** Already clamped [0,100] by backend. */
   overdue_pct: number
   days_outstanding: number
   payment_terms_days: number
   open_documents: number
-  procurement_spend: number
+  procurement_spend?: number
   cost_of_materials?: number
+  /** Gross procurement spend in EUR (or null when not linked). */
+  gross_spend?: number | null
+  /** True when the supplier has a net credit balance (excluded from scatter). */
+  credit_balance?: boolean
   documents?: PayablesSupplierRegisterDocument[]
 }
 
@@ -2768,7 +3054,10 @@ export interface PayablesSupplierComboRow {
 export interface PayablesSupplierScatterRow {
   supplier_name: string
   balance: number
+  /** Already clamped [0,100] by backend. */
   overdue_pct: number
+  /** True when net credit balance — backend excludes these from scatter results. */
+  credit_balance?: boolean
 }
 
 export interface PayablesEntityRow {
@@ -3009,9 +3298,8 @@ export interface SalesMetricBridgeResponse {
   value_unit: 'keur'
 }
 
+/** The five PM→CM revenue-transition components (kEUR). Signs: new/upsell/cross_sell >= 0; downsell/lost <= 0. */
 export interface SalesChurnBridge {
-  from:       string
-  to:         string
   new:        number
   upsell:     number
   cross_sell: number
@@ -3019,17 +3307,31 @@ export interface SalesChurnBridge {
   lost:       number
 }
 
+/** Per-dimension-segment PM→CM bridge row (kEUR). */
 export interface SalesChurnTableRow {
-  dim_value:     string
-  period_totals: number[]
-  bridges:       Array<Pick<SalesChurnBridge, 'new' | 'upsell' | 'cross_sell' | 'downsell' | 'lost'>>
+  dim_value:  string
+  from_keur:  number
+  to_keur:    number
+  new:        number
+  upsell:     number
+  cross_sell: number
+  downsell:   number
+  lost:       number
 }
 
+/**
+ * PM→CM customer-revenue churn bridge.
+ *   periods       = [pm_label, cm_label]
+ *   period_totals = [from_total_keur, to_total_keur]
+ *   bridge        = ONE aggregate transition; reconciliation identity:
+ *                   from_total + new + upsell + cross_sell + downsell + lost === to_total
+ *   table_rows    = the same transition split by dimension segment
+ */
 export interface SalesChurnBridgeResponse {
   periods:       string[]
   period_totals: number[]
-  bridges:       SalesChurnBridge[]
-  table_rows?:   SalesChurnTableRow[]
+  bridge:        SalesChurnBridge
+  table_rows:    SalesChurnTableRow[]
   dim?:          string
   dim_label?:    string
 }
@@ -3606,6 +3908,70 @@ export interface WcTimelinePoint {
   nwc:               number
 }
 
+export interface NetDebtRow {
+  id: string
+  label: string
+  row_kind: string
+  ref: string | null
+  amount_keur: number
+  amounts?: Record<string, number>
+  clickable?: boolean
+  account_number_group?: string
+  gl_account_id?: string
+  /** Present when duplicate entity accounts were merged into one display row. */
+  merged_account_groups?: string[]
+  children?: NetDebtRow[]
+}
+
+export interface NetDebtNarrativeBullet {
+  index: number
+  row_id: string
+  label: string
+  text: string
+  tone?: string
+}
+
+export interface NetDebtNarrative {
+  headline?: string
+  intro?: string
+  bullets?: NetDebtNarrativeBullet[]
+  meta?: Record<string, unknown>
+}
+
+export interface NetDebtTableResponse {
+  year: number
+  month: number
+  anchor_date: string
+  col_keys: string[]
+  col_labels: Record<string, string>
+  col_label: string
+  unit: string
+  entity?: string | null
+  has_debt_like: boolean
+  net_financial_debt_keur: number
+  net_debt_keur: number
+  narrative?: NetDebtNarrative
+  rows: NetDebtRow[]
+}
+
+export interface CashDebtBookingEntry {
+  posting_date: string
+  amount_keur: number
+  line_note: string
+  booking_line_id?: string
+  journal_entry_number?: string
+}
+
+export interface CashDebtPositionBookingsResponse {
+  account_number_group: string
+  account_name: string
+  fiscal_year: number
+  from_date: string
+  to_date: string
+  unit: string
+  entries: CashDebtBookingEntry[]
+}
+
 export interface WcTimelineResponse {
   grain:             string
   series:            WcTimelinePoint[]
@@ -3808,6 +4174,15 @@ export const api = {
 
   financialsPlPlan: (year: number, month: number, entity?: string): Promise<PlPlanResponse> =>
     get('/api/v1/financials/pl-statement/plan', { year, month, entity }),
+
+  financialsBsPlan: (year: number, month: number, entity?: string): Promise<PlPlanResponse> =>
+    get('/api/v1/financials/balance-sheet/plan', { year, month, entity }),
+
+  financialsWcPlan: (year: number, month: number, entity?: string): Promise<PlPlanResponse> =>
+    get('/api/v1/financials/working-capital/plan', { year, month, entity }),
+
+  financialsCfPlan: (year: number, month: number, entity?: string): Promise<PlPlanResponse> =>
+    get('/api/v1/financials/cash-flow/plan', { year, month, entity }),
 
   financialsPlNarrative: (
     year: number,
@@ -4054,37 +4429,37 @@ export const api = {
   }> => get('/api/v1/financials/journal-entry-by-booking', { booking_line_id: bookingLineId }),
 
   financialsBalanceSheet: (year: number, month: number, entity?: string): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/balance-sheet', { period_grain: 'month', year, month, entity }),
+    get('/api/v1/financials/balance-sheet', { period_grain: 'month', year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsBalanceSheetPeriod: (p: FinPeriodParams): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/balance-sheet', finPeriodQuery(p)),
+    get('/api/v1/financials/balance-sheet', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsCashFlow: (year: number, month: number, entity?: string): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/cash-flow', { period_grain: 'month', year, month, entity }),
+    get('/api/v1/financials/cash-flow', { period_grain: 'month', year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsCashFlowPeriod: (p: FinPeriodParams): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/cash-flow', finPeriodQuery(p)),
+    get('/api/v1/financials/cash-flow', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsWorkingCapital: (year: number, month: number, entity?: string): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/working-capital', { period_grain: 'month', year, month, entity }),
+    get('/api/v1/financials/working-capital', { period_grain: 'month', year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsWorkingCapitalPeriod: (p: FinPeriodParams): Promise<FinancialStatementResponse> =>
-    get('/api/v1/financials/working-capital', finPeriodQuery(p)),
+    get('/api/v1/financials/working-capital', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsPlConsolidation: (p: FinPeriodParams): Promise<ConsolidationResponse> =>
-    get('/api/v1/financials/pl-statement/consolidation', finPeriodQuery(p)),
+    get('/api/v1/financials/pl-statement/consolidation', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsBsConsolidation: (p: FinPeriodParams): Promise<ConsolidationResponse> =>
-    get('/api/v1/financials/balance-sheet/consolidation', finPeriodQuery(p)),
+    get('/api/v1/financials/balance-sheet/consolidation', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsCfConsolidation: (p: FinPeriodParams): Promise<ConsolidationResponse> =>
-    get('/api/v1/financials/cash-flow/consolidation', finPeriodQuery(p)),
+    get('/api/v1/financials/cash-flow/consolidation', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsWcConsolidation: (p: FinPeriodParams): Promise<ConsolidationResponse> =>
-    get('/api/v1/financials/working-capital/consolidation', finPeriodQuery(p)),
+    get('/api/v1/financials/working-capital/consolidation', finPeriodQuery(p), { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsPlMonthly: (p: FinPeriodParams, opts?: { span?: string }): Promise<MonthlyResponse> =>
-    get('/api/v1/financials/pl-statement/monthly', { ...finPeriodQuery(p), span: opts?.span }),
+    get('/api/v1/financials/pl-statement/monthly', { ...finPeriodQuery(p), span: opts?.span }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsPlWeekly: (isoYear: number, isoWeek: number, entity?: string): Promise<WeeklyBreakdownResponse> =>
     get('/api/v1/financials/pl-statement/weekly', { iso_year: isoYear, iso_week: isoWeek, entity }),
@@ -4098,7 +4473,7 @@ export const api = {
     entity?: string,
     opts?: { span?: string },
   ): Promise<MonthlyResponse> =>
-    get('/api/v1/financials/balance-sheet/monthly', { year, month, entity, span: opts?.span }),
+    get('/api/v1/financials/balance-sheet/monthly', { year, month, entity, span: opts?.span }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsCfMonthly: (
     year: number,
@@ -4106,7 +4481,7 @@ export const api = {
     entity?: string,
     opts?: { span?: string },
   ): Promise<MonthlyResponse> =>
-    get('/api/v1/financials/cash-flow/monthly', { year, month, entity, span: opts?.span }),
+    get('/api/v1/financials/cash-flow/monthly', { year, month, entity, span: opts?.span }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsWcMonthly: (
     year: number,
@@ -4114,7 +4489,7 @@ export const api = {
     entity?: string,
     opts?: { span?: string },
   ): Promise<MonthlyResponse> =>
-    get('/api/v1/financials/working-capital/monthly', { year, month, entity, span: opts?.span }),
+    get('/api/v1/financials/working-capital/monthly', { year, month, entity, span: opts?.span }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   financialsL4Trend: (
     stmt: string, year: number, month: number, grain: string,
@@ -4123,23 +4498,36 @@ export const api = {
     get(`/api/v1/financials/${stmt}/l4-trend`, { year, month, grain, level_2, level_3, level_4, entity }),
 
   financialsWcTimeline: (year: number, month: number, grain: string, entity?: string): Promise<WcTimelineResponse> =>
-    get('/api/v1/financials/working-capital/wc-timeline', { year, month, grain, entity }),
+    get('/api/v1/financials/working-capital/wc-timeline', { year, month, grain, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
+
+  financialsNetDebtTable: (year: number, month: number, entity?: string): Promise<NetDebtTableResponse> =>
+    get('/api/v1/financials/cash-debt/net-debt', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
+
+  financialsCashDebtPositionBookings: (params: {
+    account_number_group: string
+    fiscal_year: number
+    year: number
+    month: number
+    entity?: string
+    months_back?: number
+  }): Promise<CashDebtPositionBookingsResponse> =>
+    get('/api/v1/financials/cash-debt/position-bookings', params, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   // ─── Exit Readiness ─────────────────────────────────────────────────────────
   exitReadinessPlStatement: (year: number, month: number, entity?: string): Promise<ErFlowResponse> =>
-    get('/api/v1/exit-readiness/pl-statement', { year, month, entity }),
+    get('/api/v1/exit-readiness/pl-statement', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   exitReadinessCashFlow: (year: number, month: number, entity?: string): Promise<ErFlowResponse> =>
-    get('/api/v1/exit-readiness/cash-flow', { year, month, entity }),
+    get('/api/v1/exit-readiness/cash-flow', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   exitReadinessBalanceSheet: (year: number, month: number, entity?: string): Promise<ErSnapshotResponse> =>
-    get('/api/v1/exit-readiness/balance-sheet', { year, month, entity }),
+    get('/api/v1/exit-readiness/balance-sheet', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   exitReadinessWorkingCapital: (year: number, month: number, entity?: string): Promise<ErSnapshotResponse> =>
-    get('/api/v1/exit-readiness/working-capital', { year, month, entity }),
+    get('/api/v1/exit-readiness/working-capital', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   exitReadinessPlConsolidation: (year: number, month: number, entity?: string): Promise<ConsolidationResponse> =>
-    get('/api/v1/exit-readiness/pl-consolidation', { year, month, entity }),
+    get('/api/v1/exit-readiness/pl-consolidation', { year, month, entity }, { timeoutMs: FINANCIAL_STATEMENT_TIMEOUT_MS }),
 
   // ─── Benchmark ──────────────────────────────────────────────────────────────
   benchmarkSources: (): Promise<BenchmarkSource[]> =>
@@ -5940,6 +6328,65 @@ export const api = {
       account_number_group: accountNumberGroup,
       limit,
     }, { timeoutMs: 60_000 }),
+
+  personnelSnapshots: (): Promise<PersonnelSnapshotsResponse> =>
+    get('/api/v1/personnel/snapshots'),
+
+  personnelAccounting: (params: {
+    anchor_date: string
+    compare_dates?: string
+    entity?: string
+    layout?: PersonnelLayout
+    column_dimension?: PersonnelDimension
+    row_dimensions?: string
+    metrics?: string
+  }): Promise<PersonnelAccountingResponse> =>
+    get('/api/v1/personnel/accounting', params),
+
+  personnelMovements: (params: {
+    anchor_date: string
+    prior_date?: string
+    entity?: string
+    chart_dimension?: PersonnelDimension
+    trend_metric?: string
+  }): Promise<PersonnelMovementsResponse> =>
+    get('/api/v1/personnel/movements', params),
+
+  fixedAssetsSnapshots: (): Promise<FixedAssetSnapshotsResponse> =>
+    get('/api/v1/fixed-assets/snapshots'),
+
+  fixedAssetsRollforward: (params: {
+    anchor_date: string
+    compare_dates?: string
+    entity?: string
+    dimensions?: string
+  }): Promise<FixedAssetRollforwardResponse> =>
+    get('/api/v1/fixed-assets/rollforward', params),
+
+  fixedAssetsReportDetail: (params: {
+    anchor_date: string
+    compare_dates?: string
+    entity?: string
+    use_llm?: boolean
+  }): Promise<FixedAssetReportDetailResponse> =>
+    get('/api/v1/fixed-assets/report-detail', params),
+
+  fixedAssetsMovements: (params: {
+    anchor_date: string
+    prior_date?: string
+    entity?: string
+    bridge_entity?: string
+    bridge_anchor_date?: string
+    bridge_prior_date?: string
+    bridge_dimension?: FixedAssetDimension
+    bridge_scope?: string
+    bridge_extra_years?: string
+    category_prior_date?: string
+    category_dimension?: FixedAssetDimension
+    add_disp_dimension?: FixedAssetDimension
+    section?: string
+  }): Promise<FixedAssetMovementsResponse> =>
+    get('/api/v1/fixed-assets/movements', params),
 }
 
 // ─── Anomaly Detection types ──────────────────────────────────────────────────
@@ -6579,6 +7026,8 @@ export type NetProfitSource     = 'report_inject' | 'gl_rows'
 export type MappingSource       = 'library' | 'client_coa'
 export type PartnerMasterSource = 'files' | 'gdpdu'
 
+export type AccountMappingMode = 'library' | 'exclusive'
+
 export interface ProjectConfig {
   name:                  string
   fy_start_month:        number
@@ -6589,15 +7038,24 @@ export interface ProjectConfig {
   partner_master_source: PartnerMasterSource
   sales_label:           string
   cost_label:            string
+  /** Controls how accounts not covered by the uploaded mapping are classified.
+   *  'library' (default) — fill gaps from the Finssentials library (most-frequent).
+   *  'exclusive'         — leave unmatched accounts unmapped (no library fill). */
+  account_mapping_mode?: AccountMappingMode
 }
 
 /** Backend GET /api/v1/projects/{id} returns the config NESTED under `config`,
- *  with name + fy_start_month also mirrored at the top level (dim_project columns). */
+ *  with name + fy_start_month also mirrored at the top level (dim_project columns).
+ *  data_reset_allowed is true only on non-live stacks where ALLOW_DATA_RESET is set. */
 export interface ProjectConfigResponse {
   project_id: string
   name: string
   fy_start_month: number
   config: ProjectConfig
+  /** When true the admin "Reset all ingested data" button is rendered.
+   *  The backend only sets this to true on non-live stacks (ALLOW_DATA_RESET env var).
+   *  Never show the Danger Zone when this is false or absent. */
+  data_reset_allowed?: boolean
 }
 
 export interface RebuildResponse {

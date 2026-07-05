@@ -1,4 +1,4 @@
-r"""Seed / extend the **CF mapping library** (``cf_mapping_library``).
+r"""Seed / extend the **CF mapping library** (``lib_cf_mapping``).
 
 The library is the shared, accumulating reference the populate step
 (``populate_dim_gl_cf.py``) joins to fill ``dim_gl_cf`` for any classified
@@ -182,7 +182,7 @@ def _upsert(session: SASession, key_kind: str, key_1: str, key_2: str,
             rec: dict, source: str) -> None:
     session.execute(
         text("""
-            INSERT INTO cf_mapping_library
+            INSERT INTO lib_cf_mapping
               (key_kind, key_1, key_2, l1, l2, l3, l4, l5, cf_mapping,
                l2_sort, l3_sort, source, updated_at)
             VALUES
@@ -204,7 +204,7 @@ def _upsert(session: SASession, key_kind: str, key_1: str, key_2: str,
 
 
 def load_na_side(session: SASession, xlsx: str, sheet: str) -> dict:
-    """Load the BS/NA side from the workbook into cf_mapping_library (key_kind='na')."""
+    """Load the BS/NA side from the workbook into lib_cf_mapping (key_kind='na')."""
     df = pd.read_excel(xlsx, sheet_name=sheet, header=0)
     source = Path(xlsx).name
 
@@ -284,7 +284,7 @@ def load_pl_side(session: SASession) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Seed/extend cf_mapping_library.")
+    parser = argparse.ArgumentParser(description="Seed/extend lib_cf_mapping.")
     parser.add_argument("--xlsx", default=_DEFAULT_XLSX)
     parser.add_argument("--sheet", default=_DEFAULT_SHEET)
     parser.add_argument("--skip-na", action="store_true", help="skip the workbook/NA side")
@@ -300,11 +300,11 @@ def main() -> int:
         if not args.skip_pl:
             pl_res = load_pl_side(session)
         session.commit()
-        total = session.execute(text("SELECT COUNT(*) FROM cf_mapping_library")).scalar()
+        total = session.execute(text("SELECT COUNT(*) FROM lib_cf_mapping")).scalar()
 
     print(f"[na] {na_res['rows']} NA rows upserted ({na_res['conflicts']} conflicts resolved)")
     print(f"[pl] {pl_res['rows']} P&L level_3 rows upserted")
-    print(f"cf_mapping_library now holds {total} rows total.")
+    print(f"lib_cf_mapping now holds {total} rows total.")
     return 0
 
 

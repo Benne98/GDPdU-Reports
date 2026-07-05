@@ -26,7 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import User
-from app.db import get_session
+from app.db import get_read_session, get_session
 from app.main import app
 
 
@@ -217,6 +217,9 @@ def _dict_row(d: dict) -> _DictRow:
 def _make_client(session=None):
     mock_session = session or _make_mock_session()
     app.dependency_overrides[get_session] = lambda: mock_session
+    # The compat routers depend on get_read_session (scoped statement_timeout);
+    # override it to the same mock so tests don't hit a real DB.
+    app.dependency_overrides[get_read_session] = lambda: mock_session
     from app.auth import current_user
     app.dependency_overrides[current_user] = _override_current_user
     client = TestClient(app, raise_server_exceptions=False)

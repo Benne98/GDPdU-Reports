@@ -89,12 +89,15 @@ export function buildTopEntityReportInsights({
     ? `Overall development: CM customer portfolio stands at ${fmtChartKpi(totalCm)} kEUR (${signed(totalCm - totalPm)} vs PM; ${signed(totalCm - totalPlan)} vs plan). Top customer is ${top?.name ?? 'n/a'} with ${fmtChartKpi(top?.cm ?? 0)} kEUR.`
     : `Overall development: CM supplier portfolio stands at ${fmtChartKpi(totalCm)} kEUR (${signed(totalCm - totalPm)} vs PM; ${signed(totalCm - totalPlan)} vs plan). Largest supplier is ${top?.name ?? 'n/a'} with ${fmtChartKpi(top?.cm ?? 0)} kEUR.`
 
-  const churnBridge = churn?.bridges?.[churn.bridges.length - 1]
+  // New contract: single bridge object; downsell/lost are already negative
+  const churnBridge = churn?.bridge ?? null
   const churnNet = churnBridge
-    ? (churnBridge.new + churnBridge.upsell + churnBridge.cross_sell - churnBridge.downsell - churnBridge.lost)
+    ? (churnBridge.new + churnBridge.upsell + churnBridge.cross_sell + churnBridge.downsell + churnBridge.lost)
     : null
-  const churnBullet = churnBridge
-    ? `Churn: latest bridge (${churnBridge.from}→${churnBridge.to}) nets ${signed(churnNet ?? 0)} kEUR (new ${fmtChartKpi(churnBridge.new)}, upsell ${fmtChartKpi(churnBridge.upsell)}, cross-sell ${fmtChartKpi(churnBridge.cross_sell)}, downsell ${fmtChartKpi(churnBridge.downsell)}, lost ${fmtChartKpi(churnBridge.lost)}).`
+  const churnPmLabel = churn?.periods?.[0] ?? ''
+  const churnCmLabel = churn?.periods?.[1] ?? ''
+  const churnBullet = churnBridge && churnNet !== null
+    ? `Churn: PM→CM bridge (${churnPmLabel}→${churnCmLabel}) nets ${signed(churnNet)} kEUR (new ${fmtChartKpi(churnBridge.new)}, upsell ${fmtChartKpi(churnBridge.upsell)}, cross-sell ${fmtChartKpi(churnBridge.cross_sell)}, downsell ${fmtChartKpi(churnBridge.downsell)}, lost ${fmtChartKpi(churnBridge.lost)}).`
     : 'Churn: no bridge data returned for this period.'
 
   const pvmBridge = pvm?.bridges?.[pvm.bridges.length - 1]

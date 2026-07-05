@@ -369,7 +369,7 @@ export default function GlProfitabilityTab({ period, entity }: Props) {
   )
 
   return (
-    <div className="flex flex-col gap-6" style={{ contain: 'layout' }}>
+    <div className="flex flex-col gap-6">
       {/* KPI strip (2×3) + section navigation (nav scrolls within KPI strip height) */}
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_min(300px,22rem)] gap-4 items-start">
         <div

@@ -28,6 +28,7 @@ from app.services.fin_compat_sql import (
     col_labels_annual,
     col_labels_month,
     col_labels_week,
+    entities_sql_fragment,
     entity_sql_fragment,
     period_key,
     period_label,
@@ -318,10 +319,264 @@ def _attach_plan(
     return out
 
 
+_PLAN_KEYS = ["plan_cm", "ytd_plan", "ytg"]
+
+
+def _apply_plan_data(am: dict[str, float], pm_data: dict[str, float]) -> dict[str, float]:
+    """Merge presented plan grains into an amounts dict (no account-level planning)."""
+    out = dict(am)
+    plan_cm = float(pm_data.get("plan_cm") or 0)
+    out["plan_cm"] = round(plan_cm, 2)
+    out["plan_vs_actual"] = round(float(am.get("cm") or 0) - plan_cm, 2)
+    for k in ("ytd_plan", "ytg"):
+        if k in pm_data:
+            out[k] = round(float(pm_data.get(k) or 0), 2)
+    return out
+
+
+def attach_hierarchy_plan_to_rows(
+    rows: list[dict[str, Any]],
+    plan_map: dict[str, dict[str, float]],
+    struct_rows: list[dict[str, Any]],
+) -> None:
+    """Attach plan_cm to hierarchy-based BS/WC rows (skips account leaves).
+
+    Interior nodes inherit the sum of their children's plan so subtotals stay
+    aligned with actual roll-ups.  Leaf mapping rows match ``dim_pl_structure``
+    mapping lines via drill ``level_2/3/4``.
+    """
+    if not plan_map:
+        return
+
+    mapping_by_drill: dict[tuple[str, str, str], str] = {}
+    for r in struct_rows:
+        if r.get("row_type") != "mapping":
+            continue
+        key = (
+            (r.get("level_2") or "").strip(),
+            (r.get("level_3") or "").strip(),
+            (r.get("level_4") or "").strip(),
+        )
+        mapping_by_drill[key] = str(r["line_code"])
+
+    def _sum_child_plan(children: list[dict[str, Any]]) -> dict[str, float]:
+        acc = {k: 0.0 for k in _PLAN_KEYS}
+        for ch in children:
+            if ch.get("row_kind") == "account":
+                continue
+            am = ch.get("amounts") or {}
+            for k in _PLAN_KEYS:
+                acc[k] += float(am.get(k) or 0.0)
+        return acc
+
+    def _walk(row_list: list[dict[str, Any]]) -> None:
+        for row in row_list:
+            children = row.get("children") or []
+            if children:
+                _walk(children)
+            if row.get("row_kind") in ("account", "kpi", "kpi_header", "title"):
+                continue
+            am = row.get("amounts")
+            if not isinstance(am, dict):
+                continue
+
+            pm_data: Optional[dict[str, float]] = None
+            if children:
+                summed = _sum_child_plan(children)
+                if any(abs(float(summed.get(k) or 0)) > 1e-6 for k in _PLAN_KEYS):
+                    pm_data = summed
+            if pm_data is None:
+                drill = row.get("drill") or {}
+                dkey = (
+                    (drill.get("level_2") or "").strip(),
+                    (drill.get("level_3") or "").strip(),
+                    (drill.get("level_4") or "").strip(),
+                )
+                code = mapping_by_drill.get(dkey)
+                if code and code in plan_map:
+                    pm_data = plan_map[code]
+                else:
+                    lc = str(row.get("line_code") or "")
+                    if lc in plan_map:
+                        pm_data = plan_map[lc]
+
+            if pm_data is None:
+                continue
+            row["amounts"] = _round_am(_apply_plan_data(am, pm_data))
+
+    _walk(rows)
+
+
+def _statement_structure_rows(session: Session, statement: str) -> list[dict[str, Any]]:
+    """Value-bearing structure rows for a statement, in sort order.
+
+    Reuses each module's OWN structure loader + row predicate so the plan map is
+    aligned with the SAME rows the actual statement builder uses:
+      * PL → ``_is_pl_structure_row`` over ``dim_pl_structure``.
+      * BS → ``fin_compat_bs._is_bs_structure_row``.
+      * CF → ``fin_compat_cf._cf_struct_rows`` (already filtered).
+    Imports for BS/CF are LOCAL to avoid a circular import (both import this module).
+    """
+    if statement == "PL":
+        return [r for r in (_row_dict(r) for r in _load_structure(session))
+                if _is_pl_structure_row(r)]
+    if statement == "BS":
+        from app.services import fin_compat_bs as _bs
+        return [r for r in (_row_dict(r) for r in _bs._load_structure(session))
+                if _bs._is_bs_structure_row(r)]
+    if statement == "CF":
+        from app.services import fin_compat_cf as _cf
+        return list(_cf._cf_struct_rows(session))
+    raise ValueError(f"unknown statement {statement!r}")
+
+
+def load_position_plan_map(
+    session: Session,
+    statement: str,
+    year: int, month: int,
+    ent_frag: str,
+    *,
+    scenario: str = "budget",
+    prefixes: Optional[list[str]] = None,
+) -> dict[str, dict[str, float]]:
+    """Statement-generic position-plan map: ``{line_code: {plan_cm, ytd_plan, ytg}}``.
+
+    Reads ``fact_position_plan`` at POSITION grain via
+    :func:`position_plan_grain_sql` (which applies the single ``amount * -1``
+    presentation flip ONCE), maps the grains onto the statement's structure rows,
+    runs the running-sum snapshot (:func:`_compute_running_values`), and returns the
+    map ONLY when a plan signal is present — else ``{}`` (the golden-safe
+    fall-through: an empty plan store leaves every downstream statement byte-identical
+    because ``{}`` adds no keys via :func:`_attach_plan` and keeps ``cm_vs_plan`` at
+    ``0.0``).
+
+    Grain → structure matching is per statement:
+      * PL / BS : grain ``line_code`` matches the structure ``line_code`` (identity).
+      * CF      : grain ``line_code`` (= the ``cf_mapping`` leaf) matches a structure
+                  mapping row's ``balance_title`` via :func:`_norm_cf_key` — the SAME
+                  normalisation the actual CF body uses.
+
+    SIGN.  ``position_plan_grain_sql`` returns PRESENTED values with the single
+    ``* -1`` flip, which is correct as-is for PL and CF (both present ``amount * -1``).
+    For BS the presented convention is asset(+)/credit(−), so we DO NOT flip again:
+    we recover the stored amount (``stored = -sql_value``) and re-present it through
+    the centralized :func:`budget_service.stored_to_present` helper — no new sign
+    literal is introduced, only the sanctioned BS helper.
+
+    ``prefixes`` (default ``None``) forwards a restricted multi-prefix visibility set
+    to :func:`position_plan_grain_sql`, which BOUND-restricts the plan read to EXACTLY
+    those entity prefixes (``= ANY(:eps)``) instead of relying on the ``ent_frag``
+    string sniff — closing the cross-tenant plan leak for users granted ≥2 entities.
+    ``None`` keeps the single-prefix / consolidated ``ent_frag`` behaviour unchanged.
+    """
+    struct = _statement_structure_rows(session, statement)
+
+    sql, params = position_plan_grain_sql(
+        year, month, ent_frag, statement, scenario=scenario, prefixes=prefixes
+    )
+    plan_grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
+    if not plan_grains:
+        return {}
+
+    if statement == "CF":
+        from app.services.fin_compat_cf import _norm_cf_key
+        # Primary index: norm(grain.line_code) — matches a plan row whose line_code
+        # was stored as the balance_title (e.g. "Δ Trade receivables").
+        by_key = {_norm_cf_key(g.get("line_code")): g for g in plan_grains}
+        # Fallback index: direct structure line_code match — the seeder
+        # (seed_plan_forecast_budget.py) stores line_code = structure.line_code
+        # (e.g. "CF_TRADE_RECEIVABLES") via _cf_leaf_map; the balance_title norm
+        # does NOT match that key, so without this fallback CF forecast plan is
+        # invisible to the reader.  BUG FLAG: both conventions are in-flight; the
+        # direct-code path closes the seeder→reader key-space gap without breaking
+        # any legacy balance_title-keyed rows.
+        by_direct = {str(g.get("line_code", "")): g for g in plan_grains}
+    else:
+        by_code = {str(g.get("line_code")): g for g in plan_grains}
+
+    mapping_plan: dict[str, dict[str, float]] = {}
+    for r in struct:
+        if r.get("row_type") != "mapping":
+            continue
+        code = r["line_code"]
+        if statement == "CF":
+            from app.services.fin_compat_cf import _norm_cf_key
+            # Try balance_title norm first (legacy path), then direct line_code.
+            g = by_key.get(_norm_cf_key(r.get("balance_title")))
+            if g is None:
+                g = by_direct.get(str(code))
+        else:
+            g = by_code.get(str(code))
+        if g is None:
+            mapping_plan[code] = {k: 0.0 for k in _PLAN_KEYS}
+        elif statement == "BS":
+            # position_plan_grain_sql already applied the single *-1 → recover the
+            # stored amount and re-present via the BS asset/credit helper (no re-flip).
+            from app.services.budget_service import stored_to_present as _stp
+            mapping_plan[code] = {
+                k: _stp(-float(g.get(k) or 0.0), "BS", str(code)) for k in _PLAN_KEYS
+            }
+        else:  # PL, CF — SQL output is already the correct presented value.
+            mapping_plan[code] = {k: float(g.get(k) or 0.0) for k in _PLAN_KEYS}
+
+    running = _compute_running_values(struct, mapping_plan, _PLAN_KEYS)
+    line_plan = {
+        code: {k: float(v.get(k) or 0.0) for k in _PLAN_KEYS}
+        for code, v in running.items()
+    }
+
+    # BUG FIX: original gate checked only plan_cm (current-month plan).
+    # Forecast rows are seeded for OPEN periods only (p > L), so plan_cm == 0
+    # for the closed current month — the gate was always False for a pure-forecast
+    # band.  We extend the signal check to include ytg (open-period plan) so that a
+    # scenario seeded for future months is recognised as having plan data.
+    # Golden-safety is preserved: with NO rows at all, both plan_cm and ytg are 0.0
+    # (computed via _compute_running_values over an empty mapping_plan), so {} is
+    # still returned for a genuinely empty plan store.
+    has_signal = any(
+        abs(float(v.get("plan_cm") or 0)) > 1e-6
+        or abs(float(v.get("ytg") or 0)) > 1e-6
+        for v in line_plan.values()
+    )
+    return line_plan if has_signal else {}
+
+
+def load_position_plan_map_pref(
+    session: Session,
+    statement: str,
+    year: int, month: int,
+    ent_frag: str,
+    *,
+    prefixes: Optional[list[str]] = None,
+) -> dict[str, dict[str, float]]:
+    """Forecast-preferred position-plan reader for the two-view Forecast/Coverage cols.
+
+    Resolves the ``scenario='forecast'`` band in ``fact_position_plan`` first and only
+    falls back to ``scenario='budget'`` when forecast has NO signal.  Delegates entirely
+    to the primitive :func:`load_position_plan_map` — same sign conventions, same tenant
+    scoping (``ent_frag`` / ``prefixes`` forwarded verbatim), same ``has_signal`` gate.
+
+    GOLDEN-SAFETY: on a DB WITHOUT forecast rows the forecast read returns ``{}`` (the
+    ``has_signal`` gate), so this wrapper is byte-identical to today's budget read.
+    """
+    fc = load_position_plan_map(
+        session, statement, year, month, ent_frag,
+        scenario="forecast", prefixes=prefixes,
+    )
+    if fc:
+        return fc
+    return load_position_plan_map(
+        session, statement, year, month, ent_frag,
+        scenario="budget", prefixes=prefixes,
+    )
+
+
 def _load_plan_map(
     session: Session,
     year: int, month: int,
     ent_frag: str,
+    *,
+    prefixes: Optional[list[str]] = None,
 ) -> dict[str, dict[str, float]]:
     """Load plan data; resolution order budget → forecast → plan (first with signal).
 
@@ -347,25 +602,15 @@ def _load_plan_map(
 
     for scenario in ("budget", "forecast", "plan"):
         if scenario == "budget":
-            # Position-grain budget: key grain rows by line_code directly.
-            sql, params = position_plan_grain_sql(year, month, ent_frag, "PL")
-            plan_grains = [
-                dict(r._mapping) for r in session.execute(text(sql), params).fetchall()
-            ]
-            if not plan_grains:
-                continue
-            by_code = {str(g.get("line_code")): g for g in plan_grains}
-            mapping_plan = {}
-            for r in struct_pl:
-                if r.get("row_type") != "mapping":
-                    continue
-                code = r["line_code"]
-                g = by_code.get(str(code))
-                mapping_plan[code] = (
-                    {k: float(g.get(k) or 0.0) for k in plan_keys}
-                    if g is not None
-                    else {k: 0.0 for k in plan_keys}
-                )
+            # Position-grain budget: delegate to the statement-generic loader, which
+            # reproduces this branch's output exactly for "PL" (same SQL, same
+            # line_code identity match, same running-sum + has_signal gate).
+            budget_map = load_position_plan_map(
+                session, "PL", year, month, ent_frag, prefixes=prefixes
+            )
+            if budget_map:
+                return budget_map
+            continue
         else:
             sql, params = plan_grain_sql(year, month, ent_frag, scenario)
             plan_grains = [
@@ -940,42 +1185,163 @@ def _build_annual_rows(
 # Plan response builder (standalone /pl-statement/plan endpoint)
 # ---------------------------------------------------------------------------
 
-def build_pl_plan_response(
+def _statement_actual_running(
     session: Session,
-    year: int, month: int, entity: Optional[str],
-) -> dict[str, Any]:
-    ep = resolve_entity_prefix(session, entity)
-    ent_frag = entity_sql_fragment(ep)
+    statement: str,
+    year: int, month: int,
+    ent_frag: str,
+    struct: list[dict[str, Any]],
+) -> dict[str, float]:
+    """{line_code: presented actual CM} for a statement, with running-sum subtotals.
 
-    struct_pl = [r for r in (_row_dict(r) for r in _load_structure(session))
-                 if _is_pl_structure_row(r)]
-    # Emit value-bearing P&L rows (mapping + subtotal/calc/grandtotal); skip
+    Presentation is aligned with :func:`load_position_plan_map` so plan and actual
+    share ONE convention per statement (no re-flip):
+      * PL : the ``cm`` grain column is already presented (``amount * -1`` in SQL).
+      * CF : the ``cm`` grain column is already presented (``dim_gl_cf.amount * -1``);
+             grains match a structure row by the ``cf_mapping`` leaf.
+      * BS : the ``cm`` grain column is the RAW stored balance (Σ GL amounts); we
+             present it through the SAME centralized ``stored_to_present`` BS helper
+             the plan side uses, so asset(+)/credit(−) reconcile line-for-line.
+    """
+    mapping_actual: dict[str, dict[str, float]] = {}
+    if statement == "CF":
+        from app.services.fin_compat_cf import _matched_cf_grains
+        from app.services.fin_compat_cf_sql import cf_grain_sql_month
+        sql, params = cf_grain_sql_month(year, month, ent_frag)
+        grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
+        for r in struct:
+            if r.get("row_type") != "mapping":
+                continue
+            cm = sum(float(g.get("cm") or 0.0)
+                     for g in _matched_cf_grains(grains, r.get("balance_title")))
+            mapping_actual[r["line_code"]] = {"cm": cm}
+    elif statement == "BS":
+        from app.services.budget_service import stored_to_present as _stp
+        from app.services.fin_compat_bs_sql import bs_grain_sql_month
+        sql, params = bs_grain_sql_month(year, month, ent_frag)
+        grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
+        for r in struct:
+            if r.get("row_type") != "mapping":
+                continue
+            code = r["line_code"]
+            raw = sum(float(g.get("cm") or 0.0) for g in grains if _match_grain(g, r))
+            mapping_actual[code] = {"cm": _stp(raw, "BS", str(code))}
+    else:  # PL
+        sql, params = pl_grain_sql_month(year, month, ent_frag)
+        grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
+        for r in struct:
+            if r.get("row_type") != "mapping":
+                continue
+            cm = sum(float(g.get("cm") or 0.0) for g in grains if _match_grain(g, r))
+            mapping_actual[r["line_code"]] = {"cm": cm}
+
+    running_actual = _compute_running_values(struct, mapping_actual, ["cm"])
+    return {code: float(v.get("cm") or 0.0) for code, v in running_actual.items()}
+
+
+def build_statement_plan_response(
+    session: Session,
+    statement: str,
+    year: int, month: int, entity: Optional[str],
+    *,
+    allowed_prefixes: Optional[set[str]] = None,
+) -> dict[str, Any]:
+    """Per-line plan overlay (PlPlanResponse shape) for PL | BS | CF | WC.
+
+    Shape: ``{year, month, entity, has_plan_data, lines:[{line_code, plan_cm,
+    plan_vs_actual, ytd_plan, ytg, coverage_pct}, ...]}`` — identical to the legacy
+    ``build_pl_plan_response``.  For ``statement="PL"`` with ``allowed_prefixes=None``
+    the output is BYTE-IDENTICAL to that legacy function (same scope, same
+    budget→forecast→plan resolution, same running-sum actuals).
+
+    ``plan_vs_actual = actual − plan`` in PRESENTED terms.  ``position_plan_grain_sql``
+    already applies the single ``* -1`` flip, so NOTHING here flips again.
+
+    WC derives from the BS position plan (``effstmt = "BS"``) — there is no separate
+    WC plan store; the caller/frontend projects the returned BS-keyed lines onto the
+    WC TWC/OWC subset (the same subset the actual WC body uses).
+
+    ``allowed_prefixes`` (fail-closed visibility scope, mirrors
+    ``build_pl_annual_compat``'s ``ent_frag_override``).  The requested ``entity`` is
+    intersected with the visible set HERE via
+    :func:`overview_summary._effective_prefixes` (this function does the narrowing —
+    the caller does NOT pre-intersect):
+      * ``None``      → unrestricted (admin); resolve the single ``entity`` as today.
+      * empty ``set`` → DENY-ALL: ``has_plan_data=False, lines=[]`` (never leaks).
+      * non-empty set, no ``entity``     → scope to the FULL allowed set.
+      * non-empty set, ``entity`` inside → narrow to that single prefix.
+      * non-empty set, ``entity`` OUTSIDE the set → intersection empty → DENY-ALL
+        (never widen, never fall back to consolidated).
+    The resulting scope is applied to BOTH the plan-map and the actuals.  A single
+    resolved prefix uses the existing ``= 'XX'`` ``ent_frag`` path; a set of ≥2 also
+    threads the FULL prefix set into the plan read as ``prefixes`` so
+    :func:`position_plan_grain_sql` BOUND-restricts to ``= ANY(:eps)`` — no consolidated
+    fallback, no cross-tenant leak (a user granted ``{AA,BB}`` sees ONLY AA+BB).
+    """
+    restrict_prefixes: Optional[list[str]] = None
+    if allowed_prefixes is not None:
+        if not allowed_prefixes:  # fail closed — deny-all
+            return {"year": year, "month": month, "entity": entity,
+                    "has_plan_data": False, "lines": []}
+        # Intersect the requested entity with the visible set (reuse the canonical
+        # narrowing helper — do NOT re-derive it).  ``denied`` covers both an empty
+        # visibility and an ``entity`` narrowed outside the boundary → fail closed.
+        from app.services.overview_summary import _effective_prefixes
+        eff, _builder_entity, denied = _effective_prefixes(
+            session, entity=entity, allowed_prefixes=allowed_prefixes
+        )
+        if denied or not eff:
+            return {"year": year, "month": month, "entity": entity,
+                    "has_plan_data": False, "lines": []}
+        if len(eff) == 1:
+            # Single visible/narrowed prefix → existing ``= 'XX'`` path (byte-identical
+            # to the single-prefix behaviour; plan read keeps prefixes=None).
+            ent_frag = entity_sql_fragment(next(iter(eff)))
+        else:
+            # ≥2 visible prefixes → restrict actuals via IN(...) AND bind the full set
+            # into the plan read so it can never fall back to the consolidated total.
+            restrict_prefixes = sorted(eff)
+            ent_frag = entities_sql_fragment(restrict_prefixes)
+    else:
+        ep = resolve_entity_prefix(session, entity)
+        ent_frag = entity_sql_fragment(ep)
+
+    effstmt = "BS" if statement == "WC" else statement
+    struct = _statement_structure_rows(session, effstmt)
+    # Emit value-bearing rows (mapping + subtotal/calc/grandtotal); skip
     # presentation-only legacy 'title'/'kpi' rows.
     struct_codes = [
-        r["line_code"] for r in struct_pl
+        r["line_code"] for r in struct
         if r.get("row_type") in ("mapping", "subtotal", "calc", "grandtotal", "computed")
     ]
 
-    plan_map = _load_plan_map(session, year, month, ent_frag)
+    # PL keeps the full budget→forecast→plan resolution (fact_gl_plan fallback);
+    # BS/CF/WC read the manual budget position store only.
+    # Pass ``prefixes`` ONLY for the restricted ≥2-prefix scope; admin / single-prefix
+    # call byte-identically to before (no kwarg → default None → unchanged behaviour).
+    if effstmt == "PL":
+        # Forecast-preferred PRE-CHECK: try the position-grain forecast band (falls back
+        # to budget internally).  Only when it has signal do we use it; otherwise the
+        # existing budget→gl_plan(forecast)→plan fallback stays UNCHANGED.  On a DB with
+        # no forecast rows this pref == today's budget read, so PL is byte-identical.
+        pref = load_position_plan_map_pref(
+            session, "PL", year, month, ent_frag, prefixes=restrict_prefixes
+        )
+        if pref:
+            plan_map = pref
+        elif restrict_prefixes is not None:
+            plan_map = _load_plan_map(session, year, month, ent_frag, prefixes=restrict_prefixes)
+        else:
+            plan_map = _load_plan_map(session, year, month, ent_frag)
+    else:
+        if restrict_prefixes is not None:
+            plan_map = load_position_plan_map_pref(
+                session, effstmt, year, month, ent_frag, prefixes=restrict_prefixes
+            )
+        else:
+            plan_map = load_position_plan_map_pref(session, effstmt, year, month, ent_frag)
 
-    # Actuals CM for plan_vs_actual — same running-sum semantics as the statement.
-    sql, params = pl_grain_sql_month(year, month, ent_frag)
-    grains_raw = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
-
-    mapping_actual: dict[str, dict[str, float]] = {}
-    for r in struct_pl:
-        if r.get("row_type") != "mapping":
-            continue
-        code = r["line_code"]
-        cm = 0.0
-        for g in grains_raw:
-            if _match_grain(g, r):
-                cm += float(g.get("cm") or 0)
-        mapping_actual[code] = {"cm": cm}
-    running_actual = _compute_running_values(struct_pl, mapping_actual, ["cm"])
-    actual_vals: dict[str, float] = {
-        code: float(v.get("cm") or 0.0) for code, v in running_actual.items()
-    }
+    actual_vals = _statement_actual_running(session, effstmt, year, month, ent_frag, struct)
 
     has_plan = bool(plan_map)
     lines: list[dict[str, Any]] = []
@@ -998,6 +1364,17 @@ def build_pl_plan_response(
         })
 
     return {"year": year, "month": month, "entity": entity, "has_plan_data": has_plan, "lines": lines}
+
+
+def build_pl_plan_response(
+    session: Session,
+    year: int, month: int, entity: Optional[str],
+) -> dict[str, Any]:
+    """Thin PL wrapper — preserved verbatim for existing callers/route.
+
+    Byte-identical to the pre-generalization behaviour: PL scope, unrestricted.
+    """
+    return build_statement_plan_response(session, "PL", year, month, entity)
 
 
 # ---------------------------------------------------------------------------

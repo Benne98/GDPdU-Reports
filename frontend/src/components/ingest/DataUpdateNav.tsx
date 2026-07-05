@@ -1,7 +1,7 @@
 import { useNavigate } from "react-router-dom";
 import SoftSegment from "../ui/SoftSegment";
 
-export type DataUpdateTopMode = "gl" | "account-mapping";
+export type DataUpdateTopMode = "gl" | "account-mapping" | "partner-master";
 export type ChartOfAccountsView = "upload" | "editor";
 
 export default function DataUpdateNav({
@@ -18,7 +18,7 @@ export default function DataUpdateNav({
       <div className="mb-5">
         <h1 className="text-2xl font-semibold text-slate-900">Data Update</h1>
         <p className="mt-1 text-sm text-slate-500 max-w-2xl">
-          Upload new accounting files or update your chart of accounts.
+          Upload new accounting files, update your chart of accounts, or manage partner master data.
         </p>
       </div>
 
@@ -27,11 +27,13 @@ export default function DataUpdateNav({
           value={topMode}
           onChange={(v) => {
             if (v === "gl") navigate("/ingestion");
-            else navigate("/ingestion?mode=account-mapping");
+            else if (v === "account-mapping") navigate("/ingestion?mode=account-mapping");
+            else navigate("/ingestion?mode=partner-master");
           }}
           options={[
             { value: "gl", label: "Accounting data" },
             { value: "account-mapping", label: "Chart of accounts" },
+            { value: "partner-master", label: "Partner master" },
           ]}
         />
       </div>

@@ -12,33 +12,60 @@
  *   3  Chart of accounts         (Phase 3 — COMPLETE)
  *   4  Opening balances          (Phase 4 — COMPLETE)
  *   5  Partner master            (Phase 4 — COMPLETE)
- *   6  Review & Finish           (Phase 5 — COMPLETE)
+ *   6  Additional information    (FTE Development — COMPLETE)
+ *   7  Review & Finish           (Phase 5 — COMPLETE)
  *
  * Commit sequence (in dependency order):
- *   1. Save config    PUT /projects/default
- *   2. GL commit      POST /ingest/commit
- *   3. CoA commit     POST /ingest/mapping/commit  (skipped when source=library)
- *   4. OB commit      POST /ingest/opening-balance/commit  (skipped when mode=in_data)
- *   5. Partner commit POST /ingest/partner-master/commit  (skipped when no file staged)
- *   6. Rebuild        POST /projects/default/rebuild  (optional checkbox)
+ *   1. Save config      PUT /projects/default
+ *   2. CoA commit       POST /ingest/mapping/commit  (skipped when source=library)
+ *      NOTE: library-source skips this step — dim_gl_account won't be pre-populated, so
+ *      GL accounts must already exist in the DB when using the library CoA source on a fresh project.
+ *   3. GL commit        POST /ingest/commit  (requires dim_gl_account rows — CoA must run first)
+ *   4. OB commit        POST /ingest/opening-balance/commit  (skipped when mode=in_data)
+ *   5. Partner commit   POST /ingest/partner-master/commit  (skipped when no file staged)
+ *   6. FTE Development  POST /api/v1/fdd/run/fte_development  (skipped when no uploads)
+ *   7. Rebuild          POST /projects/default/rebuild  (optional checkbox)
  *
  * On mount: prefills from api.getProject('default') where sensible.
  * The /ingestion route is NOT linked here — this wizard is self-contained.
  */
 
-import { type Dispatch, useCallback, useEffect, useReducer, useRef, useState } from 'react'
-import { api, type ProjectConfigResponse } from '../lib/api'
+import { type Dispatch, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import PartnerMasterEditor from '../components/masters/PartnerMasterEditor'
+import { api, type ProjectConfigResponse, type AccountMappingMode } from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Stepper, StepCard, NavButtons } from '../components/ingest/IngestStepCard'
-import UploadStep from '../components/ingest/UploadStep'
-import KontextStep from '../components/ingest/KontextStep'
-import ColumnMapper, { missingRequiredFields } from '../components/ingest/ColumnMapper'
-import OptionsStep from '../components/ingest/OptionsStep'
-import ValidierungStep from '../components/ingest/ValidierungStep'
-import AccountColumnMapper, { missingRequiredAccountFields } from '../components/ingest/AccountColumnMapper'
-import { isBsPlMasterSheets } from '../components/ingest/UploadStep'
+import EntitySourceSelector, { type EntitySource } from '../components/ingest/EntitySourceSelector'
+import AccountColumnMapper, { missingRequiredAccountFields, coaGenericFields } from '../components/ingest/AccountColumnMapper'
+import ColumnMapper, { type TargetField } from '../components/ingest/ColumnMapper'
+// isBsPlMasterSheets removed — CoaGroupCard now uses per-slot sheet detection inline
 import type { KontextState, OptionsState } from '../components/ingest/ingestTypes'
 import {
+  GlEntityCard,
+  defaultGlEntityState,
+  suggestGlMapping,
+  type GlEntityState,
+  type WizardGlState,
+  type GlFormatGroup,
+  type PartnerColumnsMode,
+  type PartnerColumnsSplit,
+  type GlYearFileState,
+} from '../components/ingest/GlEntityCard'
+import GlGroupConfigPanel from '../components/ingest/GlGroupConfigPanel'
+import {
+  createGroup,
+  reindexGroupsAfterRemove,
+  applyGroupHeadersToMembers,
+  buildGroupsFromAssignments,
+} from '../components/ingest/glFormatGroups'
+import GlFormatAssignmentStep from '../components/ingest/GlFormatAssignmentStep'
+import CoaMappingAssignmentStep from '../components/ingest/CoaMappingAssignmentStep'
+import PerEntityPager from '../components/ingest/PerEntityPager'
+import { glFiscalYearLabel } from '../lib/fiscalYear'
+import {
   uploadFile,
+  combineGlFiles,
+  applyHeaders,
   downloadCoaTemplate,
   uploadOpeningBalance,
   uploadPartnerMaster,
@@ -46,15 +73,43 @@ import {
   commitAccountMapping,
   commitOpeningBalance,
   commitPartnerMaster,
+  resetProjectData,
+  uploadFddFile,
+  runFteDevelopment,
+  glUnmappedDetail,
+  applyLibraryMapping,
+  type ResetProjectDataResponse,
   type Profile,
-  type UploadResponse,
-  type ValidationResponse,
+  type AccountMappingProfile,
   type CommitResponse,
   type Dialect,
   type MappingCommitResponse,
   type ObCommitResponse,
   type PartnerCommitResponse,
+  type FteDevelopmentRequest,
+  type GlUnmappedDetail,
+  type GlUnmappedAccount,
+  type ApplyLibraryResponse,
 } from '../lib/gdpduApi'
+import FteColumnMapper, { type FteMappingPayload } from '../components/fdd-bot/FteColumnMapper'
+import FteDimensionPicker, { type FteDimension } from '../components/fdd-bot/FteDimensionPicker'
+import FtePexGrid from '../components/fdd-bot/FtePexGrid'
+import type { AdaptiveCardInput } from '../components/fdd-bot/useFddBot'
+import DatasetSelector from '../components/ingest/DatasetSelector'
+import PerYearPager from '../components/ingest/PerYearPager'
+import {
+  buildInitialCoaAssignment,
+  buildCoaItems,
+  migrateLegacyCoaGroups,
+  coaGroupsCoverAllEntities,
+  type CoaItem,
+} from '../components/ingest/coaAssignment'
+import AnlagenStep, {
+  type WizardAnlagenState,
+} from '../components/ingest/AnlagenStep'
+import OposStep, {
+  type WizardOposState,
+} from '../components/ingest/OposStep'
 
 // ---------------------------------------------------------------------------
 // FY helper — exported for reuse in Phase 5 Finish orchestration
@@ -73,96 +128,130 @@ export function fyEndFromStartMonth(start: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Wizard state shape — GL partner-columns toggle + full GL sub-wizard state
+// Wizard state shape — GL types imported from GlEntityCard
+// ---------------------------------------------------------------------------
+// PartnerColumnsMode, PartnerColumnsSplit, GlYearFileState, GlEntityState,
+// WizardGlState are all imported from '../components/ingest/GlEntityCard'
+// and re-exported below for backward compatibility.
+export type { PartnerColumnsMode, PartnerColumnsSplit, GlYearFileState, GlEntityState, WizardGlState }
+
+// ---------------------------------------------------------------------------
+// Legacy GlInputState — kept for the OLD flat-list path in WizardGlState.inputs
+// (only used by the old Finish loop; the new flow uses entities).
 // ---------------------------------------------------------------------------
 
 /**
- * Describes how creditor / debtor / fixed-asset numbers appear in the GL file.
- *
- * 'single' (default, fully functional): one "source_no" column holds the
- *   partner number; a companion "source_type" column distinguishes creditor /
- *   debtor / fixed-asset. The backend's apply_profile handles this natively.
- *
- * 'split': three separate columns (creditor_no, debtor_no, fixed_asset_no).
- *   The column-names below are stored in the profile under partner_columns.
- *   NOTE: backend consumption of the split case is a documented follow-up
- *   (Phase 4 / backend-engineer); the single-column path is the functional
- *   default for the current backend.
+ * @deprecated Use GlEntityState instead.
+ * Kept only so the Finish orchestration can still reference .inputs if needed
+ * during transition.  New code uses gl.entities exclusively.
  */
-export type PartnerColumnsMode = 'single' | 'split'
-
-export interface PartnerColumnsSplit {
-  creditorNoCol: string
-  debtorNoCol: string
-  fixedAssetNoCol: string
-}
-
-export interface WizardGlState {
-  // --- Upload sub-step ---
+export interface GlInputState {
   fileId?: string
   sheet?: string
   columns?: string[]
   sample?: Record<string, unknown>[]
   dialect?: Dialect
-
-  // --- Entity (KontextStep) sub-step ---
   kontext?: KontextState
-
-  // --- Partner columns toggle ---
   partnerColumnsMode?: PartnerColumnsMode
   partnerColumnsSplit?: PartnerColumnsSplit
-
-  // --- Column mapping sub-step ---
   mapping?: Record<string, string>
-
-  // --- Options (amount/date/linking) sub-step ---
   opts?: OptionsState
-
-  // --- Validation sub-step ---
   validationOk?: boolean
   entityAssignments?: Record<string, string>
-
-  /**
-   * The fully assembled Profile (built from kontext + mapping + opts at
-   * validation time). Stored here so Phase 5 Finish can use it for the commit
-   * without rebuilding from scratch.
-   */
   assembledProfile?: Profile
 }
 
-export interface WizardCoaState {
-  /** 'library' = Finssentials standard; 'upload' = client master upload */
-  source?: 'library' | 'upload'
-  /** e.g. 'skr03' | 'statutory' | 'past_projects' — populated when source='library' */
-  libraryVariant?: string
-  /** file_id from uploadFile(), populated when source='upload' */
-  masterFileId?: string
-  /** sheet name(s) from the uploaded file */
-  masterSheets?: string[]
-  /** detected columns from the uploaded master file */
-  masterColumns?: string[]
-  /** sample rows from the uploaded master file */
-  masterSample?: Record<string, unknown>[]
+/** Upload slot for one BS or PL file within a CoA mapping group. */
+export interface CoaUploadSlot {
+  /** file_id from uploadFile() */
+  fileId?: string
+  /** Sheet names from the uploaded file */
+  sheets?: string[]
+  /** Detected columns from the uploaded file */
+  columns?: string[]
+  /** Sample rows */
+  sample?: Record<string, unknown>[]
   /**
-   * Whether the uploaded file is already in Master_BS/Master_PL shape.
-   * true  → commits as format=bs_pl_master (no column mapping needed)
-   * false → generic client CoA, column mapping via AccountColumnMapper
+   * true  → single-sheet master detected (Master_BS or Master_PL sheet present);
+   *         commits as format=bs_pl_master, no column mapping needed.
+   * false → generic client CoA file; column mapping via AccountColumnMapper (COA_GENERIC_FIELDS).
    */
-  isBsPlMaster?: boolean
-  /** Column mapping for generic (non-master-shaped) client CoA uploads */
+  isMaster?: boolean
+  /** Column mapping for generic (non-master-shaped) client CoA uploads. */
   mapping?: Record<string, string>
+}
+
+/** One CoA mapping group — a set of entities sharing the same account mapping source. */
+export interface CoaMappingGroup {
+  /** Stable key derived from the CoaMappingAssignmentStep output. */
+  id: string
+  /** Human-readable label, e.g. "Format A". */
+  label: string
+  /** Entity codes belonging to this group (matches WizardState.entities[i].code). */
+  memberEntityCodes: string[]
+  /** 'library' = Finssentials built-in; 'upload' = client-provided BS/PL files. */
+  method?: 'library' | 'upload'
+  /**
+   * True when the user actively chose this group's method or membership.
+   * migrateLegacyCoaGroups never folds a methodExplicit group into the pivot group,
+   * so genuine multi-chart and library+upload-mixed setups are preserved.
+   */
+  methodExplicit?: boolean
+  /** Library variant slug when method='library'. e.g. 'skr03' | 'statutory' | 'past_projects' */
+  libraryVariant?: string
+  /** Balance-sheet upload slot (method='upload'). */
+  bs?: CoaUploadSlot
+  /** Profit-and-loss upload slot (method='upload'). */
+  pl?: CoaUploadSlot
+}
+
+export interface WizardCoaState {
+  /** Per-entity-group CoA mapping configuration. */
+  groups: CoaMappingGroup[]
+  /**
+   * How accounts in years/entities NOT covered by the uploaded mapping should be classified.
+   * 'library' (default) — fill gaps from the Finssentials library (most-frequent).
+   * 'exclusive'         — leave unmatched accounts unmapped (no library fill).
+   */
+  accountMappingMode: AccountMappingMode
+  /**
+   * true once the CoaMappingAssignmentStep has been confirmed.
+   * Auto-set to true for single-entity projects via useEffect in StepChartOfAccounts.
+   */
+  assigned?: boolean
+  /**
+   * true once the legacy-migration useEffect has run its first check with non-empty
+   * groups. Prevents re-firing on subsequent group changes (e.g., file uploads in a
+   * deliberate multi-CoA flow). Persists in reducer state so it survives component
+   * remounts when the user navigates between wizard steps.
+   */
+  migrationChecked?: boolean
 }
 
 export interface WizardObState {
   /** 'in_data' | 'file_first_year' | 'file_all' */
   mode?: 'in_data' | 'file_first_year' | 'file_all'
+  /** 'combined' = single file with entity column; 'per_entity' = one file per entity. */
+  entitySource?: EntitySource
+  /** Combined mode: column in the file that identifies the legal entity. */
+  entityCol?: string
+  /** Combined mode: whether the entity column holds entity names ('names') or 2-digit prefixes ('prefixes'). Default 'names'. */
+  entityColKind?: 'names' | 'prefixes'
+  /** Per-entity upload slots keyed by entity code. */
+  perEntity?: Record<string, {
+    obFileId?: string
+    obColumns?: string[]
+    obSample?: Record<string, unknown>[]
+    obProfile?: { account_col?: string; amount_col?: string; fiscal_year_col?: string }
+  }>
+  /** Single-file (combined / back-compat) fields. */
   obFileId?: string
   /** Detected columns from the uploaded OB file */
   obColumns?: string[]
   /** Sample rows from the uploaded OB file */
   obSample?: Record<string, unknown>[]
-  /** Minimal column profile: account → column, amount → column */
-  obProfile?: { account_col?: string; amount_col?: string }
+  /** Minimal column profile: account → column, amount → column, fiscal_year → column */
+  obProfile?: { account_col?: string; amount_col?: string; fiscal_year_col?: string }
 }
 
 /**
@@ -187,7 +276,17 @@ export interface PartnerMappingProfile {
   }
 }
 
-export interface WizardPartnerState {
+export interface PartnerSideState {
+  /** 'combined' = single file with entity column; 'per_entity' = one file per entity. */
+  entitySource?: EntitySource
+  /** Per-entity upload slots keyed by entity code. */
+  perEntity?: Record<string, {
+    fileId?: string
+    columns?: string[]
+    sample?: Record<string, unknown>[]
+    profile?: PartnerMappingProfile
+  }>
+  /** Single-file (combined / back-compat) fields. */
   fileId?: string
   /** Detected columns from the uploaded partner master file */
   columns?: string[]
@@ -197,6 +296,60 @@ export interface WizardPartnerState {
   profile?: PartnerMappingProfile
 }
 
+export interface WizardPartnerState {
+  sides: Record<'customer' | 'supplier', PartnerSideState>
+}
+
+// ---------------------------------------------------------------------------
+// FTE / Additional information state
+// ---------------------------------------------------------------------------
+
+/** One upload slot — one entity × one FY. Multiple FYs sharing a file_id are separate entries. */
+export interface WizardFteUpload {
+  entity_index: number
+  entity_name: string
+  fy_label: string    // e.g. "FY2023" — must contain a year
+  file_ids: string[]
+}
+
+export interface WizardFteState {
+  /** true once the user has provided at least one upload */
+  provided: boolean
+  /** Wizard-minted ephemeral session_id (crypto.randomUUID() on first render) */
+  sessionId: string
+  /** 'consolidated' = one file for all entities; 'per_entity' = one file per entity */
+  viewMode: 'consolidated' | 'per_entity'
+  /** upload_mode forwarded to the backend script */
+  uploadMode: string
+  /** Flat list: one entry per entity × FY slot (expanded at upload time) */
+  uploads: WizardFteUpload[]
+  /** file_id used for FteColumnMapper / FteDimensionPicker preview */
+  previewFileId: string
+  /** FTE tenure mapping payload from FteColumnMapper (mode='fte') */
+  fteMapping: Record<string, unknown>
+  /** Tenure mode: 'months_col' | 'entry_exit_dates' */
+  tenureMode: string
+  /** Payroll mapping payload from FteColumnMapper (mode='payroll') */
+  payrollMapping: Record<string, unknown>
+  /** Payroll mode: 'sum_components' | 'total_col' | 'monthly_col' */
+  payrollMode: string
+  /** Breakdown dimensions from FteDimensionPicker (max 3) */
+  dimensions: Array<{ source_col: string; output_label: string }>
+  /** Preset metric keys — see FTE_PRESET_METRIC_OPTIONS */
+  presetMetrics: string[]
+  /** Custom output columns (source_col → output_label) */
+  customMetrics: Array<{ source_col: string; output_label: string }>
+  /** PEX view mode: 'consolidated' | 'per_entity' */
+  pexViewMode: 'consolidated' | 'per_entity'
+  /** Flat cell values: key = "entity{idx+1}_FY{yyyy}", value = EURk */
+  pexValues: Record<string, number>
+}
+
+// WizardAnlagenState and WizardOposState are defined in and imported from their step components.
+// Re-export them so external consumers (e.g. tests) can import from this file as before.
+export type { WizardAnlagenUpload, WizardAnlagenState } from '../components/ingest/AnlagenStep'
+export type { WizardOposUpload, WizardOposSideState, WizardOposState } from '../components/ingest/OposStep'
+
 export interface WizardState {
   projectName: string
   fyEndMonth: number          // 1–12; UI value (converted to fy_start_month at Finish)
@@ -205,6 +358,13 @@ export interface WizardState {
   coa: WizardCoaState
   ob: WizardObState
   partner: WizardPartnerState
+  fte: WizardFteState
+  /** Which additional-information datasets the user has opted into (all default false). */
+  additionalDatasets: { fte: boolean; anlagen: boolean; opos: boolean }
+  /** DRAFT provisioning state for Anlagenregister (fixed-asset register). */
+  anlagen: WizardAnlagenState
+  /** DRAFT provisioning state for OPOS (open-items lists). */
+  opos: WizardOposState
 }
 
 function defaultState(): WizardState {
@@ -212,10 +372,40 @@ function defaultState(): WizardState {
     projectName: '',
     fyEndMonth: 12,
     entities: [{ code: '', prefix: '', name: '' }],
-    gl: {},
-    coa: {},
+    gl: { years: [], entities: [defaultGlEntityState()], formatGroups: [] },
+    coa: { groups: [], accountMappingMode: 'library', assigned: false },
     ob: {},
-    partner: {},
+    partner: { sides: { customer: {}, supplier: {} } },
+    fte: {
+      provided: false,
+      sessionId: crypto.randomUUID(),
+      viewMode: 'consolidated',
+      uploadMode: 'per_fy_grid',
+      uploads: [],
+      previewFileId: '',
+      fteMapping: {},
+      tenureMode: 'months_col',
+      payrollMapping: {},
+      payrollMode: 'sum_components',
+      dimensions: [],
+      presetMetrics: ['fte', 'payroll', 'avg_cost_per_fte'],
+      customMetrics: [],
+      pexViewMode: 'consolidated',
+      pexValues: {},
+    },
+    additionalDatasets: { fte: false, anlagen: false, opos: false },
+    anlagen: {
+      provided: false,
+      viewMode: 'combined',
+      uploads: [],
+      columnMap: {},
+      dimensions: {},
+    },
+    opos: {
+      provided: false,
+      debitor:  { viewMode: 'combined', uploads: [], columnMap: {} },
+      kreditor: { viewMode: 'combined', uploads: [], columnMap: {} },
+    },
   }
 }
 
@@ -227,24 +417,274 @@ type WizardAction =
   | { type: 'SET_NAME'; value: string }
   | { type: 'SET_FY_END_MONTH'; value: number }
   | { type: 'SET_ENTITIES'; entities: WizardState['entities'] }
-  | { type: 'PATCH_GL'; patch: Partial<WizardGlState> }
+  // GL — new entity-based actions
+  | { type: 'SET_GL_YEARS'; years: number[] }
+  | { type: 'PATCH_GL_ENTITY'; index: number; patch: Partial<GlEntityState> }
+  | { type: 'ADD_GL_ENTITY' }
+  | { type: 'REMOVE_GL_ENTITY'; index: number }
+  | { type: 'CREATE_GL_GROUP'; fromIndex: number; headers: string[]; mapping: Record<string, string> }
+  | { type: 'ASSIGN_GL_GROUP'; groupId: string; memberIndices: number[] }
+  | { type: 'PATCH_GL_GROUP'; groupId: string; patch: Partial<GlFormatGroup> }
+  | { type: 'PATCH_GL_ENTITY_MULTI'; patches: Array<{ index: number; patch: Partial<GlEntityState> }> }
+  /**
+   * Replaces all format groups with ones derived from GlFormatAssignmentStep's output.
+   * assignment: Record<entityIndex, formatKey> — entities sharing a key share a group.
+   */
+  | { type: 'APPLY_GL_FORMAT_ASSIGNMENTS'; assignment: Record<number, string> }
+  /**
+   * Clears all combined-file state from every entity and empties formatGroups.
+   * Dispatched when the user clicks Back from assign or configure sub-phase,
+   * so that glSubPhase falls back to 'collect' and the user can re-upload or
+   * add/remove entities before combining again.
+   */
+  | { type: 'RESET_GL_COMBINE' }
+  // CoA
   | { type: 'PATCH_COA'; patch: Partial<WizardCoaState> }
+  /**
+   * Rebuilds coa.groups from the CoaMappingAssignmentStep output.
+   * assignment: Record<entityCode, groupKey> — entities sharing a key form one group.
+   * Preserves method/libraryVariant/bs/pl from any existing group whose id matches the key.
+   */
+  | { type: 'APPLY_COA_ASSIGNMENTS'; assignment: Record<string, string>; explicit?: boolean }
+  /** Patch scalar fields (method, libraryVariant, …) of one CoA mapping group by id. */
+  | { type: 'PATCH_COA_GROUP'; id: string; patch: Partial<CoaMappingGroup> }
+  /** Patch the bs or pl upload slot of a CoA mapping group. */
+  | { type: 'PATCH_COA_SLOT'; id: string; statement: 'bs' | 'pl'; patch: Partial<CoaUploadSlot> }
+  /**
+   * Mark the legacy-migration check as done so it never fires again this session.
+   * Dispatched by StepChartOfAccounts after the first migration check with non-empty groups.
+   */
+  | { type: 'SET_COA_MIGRATION_CHECKED' }
   | { type: 'PATCH_OB'; patch: Partial<WizardObState> }
-  | { type: 'PATCH_PARTNER'; patch: Partial<WizardPartnerState> }
+  | { type: 'PATCH_PARTNER'; side: 'customer' | 'supplier'; patch: Partial<PartnerSideState> }
+  | { type: 'PATCH_FTE'; patch: Partial<WizardFteState> }
+  | { type: 'PATCH_ANLAGEN'; patch: Partial<WizardAnlagenState> }
+  | { type: 'PATCH_OPOS'; patch: Partial<WizardOposState> }
+  | { type: 'TOGGLE_DATASET'; dataset: 'fte' | 'anlagen' | 'opos'; value: boolean }
   | { type: 'PREFILL'; partial: Partial<WizardState> }
 
-function wizardReducer(state: WizardState, action: WizardAction): WizardState {
+export function wizardReducer(state: WizardState, action: WizardAction): WizardState {
   switch (action.type) {
     case 'SET_NAME':         return { ...state, projectName: action.value }
     case 'SET_FY_END_MONTH': return { ...state, fyEndMonth: action.value }
     case 'SET_ENTITIES':     return { ...state, entities: action.entities }
-    case 'PATCH_GL':         return { ...state, gl: { ...state.gl, ...action.patch } }
-    case 'PATCH_COA':        return { ...state, coa: { ...state.coa, ...action.patch } }
+
+    case 'SET_GL_YEARS': {
+      const sorted = [...new Set(action.years)].sort((a, b) => a - b)
+      return { ...state, gl: { ...state.gl, years: sorted } }
+    }
+    case 'PATCH_GL_ENTITY': {
+      const entities = state.gl.entities.map((e, i) =>
+        i === action.index ? { ...e, ...action.patch } : e
+      )
+      return { ...state, gl: { ...state.gl, entities } }
+    }
+    case 'ADD_GL_ENTITY':
+      return { ...state, gl: { ...state.gl, entities: [...state.gl.entities, defaultGlEntityState()] } }
+    case 'REMOVE_GL_ENTITY': {
+      if (state.gl.entities.length <= 1) return state
+      const entities = state.gl.entities.filter((_, i) => i !== action.index)
+      const formatGroups = reindexGroupsAfterRemove(action.index, state.gl.formatGroups)
+      return { ...state, gl: { ...state.gl, entities, formatGroups } }
+    }
+    case 'CREATE_GL_GROUP': {
+      const newGroup = createGroup(action.fromIndex, action.headers, action.mapping, state.gl.formatGroups)
+      const entities = state.gl.entities.map((e, i) =>
+        i === action.fromIndex ? { ...e, formatGroupId: newGroup.id } : e
+      )
+      return { ...state, gl: { ...state.gl, formatGroups: [...state.gl.formatGroups, newGroup], entities } }
+    }
+    case 'ASSIGN_GL_GROUP': {
+      // Add new member indices to the group and update their formatGroupId
+      const formatGroups = state.gl.formatGroups.map(g =>
+        g.id === action.groupId
+          ? { ...g, memberIndices: [...new Set([...g.memberIndices, ...action.memberIndices])] }
+          : g
+      )
+      const entities = state.gl.entities.map((e, i) =>
+        action.memberIndices.includes(i)
+          ? { ...e, formatGroupId: action.groupId, validationOk: undefined, assembledProfile: undefined }
+          : e
+      )
+      return { ...state, gl: { ...state.gl, formatGroups, entities } }
+    }
+    case 'PATCH_GL_GROUP': {
+      const formatGroups = state.gl.formatGroups.map(g =>
+        g.id === action.groupId ? { ...g, ...action.patch } : g
+      )
+      const entities = state.gl.entities.map(e =>
+        e.formatGroupId === action.groupId
+          ? { ...e, validationOk: undefined, assembledProfile: undefined }
+          : e
+      )
+      return { ...state, gl: { ...state.gl, formatGroups, entities } }
+    }
+    case 'PATCH_GL_ENTITY_MULTI': {
+      let entities = state.gl.entities
+      for (const { index, patch } of action.patches) {
+        entities = entities.map((e, i) => i === index ? { ...e, ...patch } : e)
+      }
+      return { ...state, gl: { ...state.gl, entities } }
+    }
+    case 'APPLY_GL_FORMAT_ASSIGNMENTS': {
+      const { groups, entityPatches } = buildGroupsFromAssignments(action.assignment, state.gl.entities)
+      let entities = state.gl.entities
+      for (const { index, patch } of entityPatches) {
+        entities = entities.map((e, i) => i === index ? { ...e, ...patch } : e)
+      }
+      return { ...state, gl: { ...state.gl, formatGroups: groups, entities } }
+    }
+    case 'RESET_GL_COMBINE': {
+      // Strip all combine-derived state from every entity; clear format groups.
+      // glSubPhase re-derives to 'collect' since allCombined becomes false.
+      const entities = state.gl.entities.map(e => ({
+        ...e,
+        combinedFileId: undefined,
+        combinedColumns: undefined,
+        combinedSample: undefined,
+        combinedDialect: undefined,
+        combinedSuggestedHeaders: undefined,
+        headersConfirmed: undefined,
+        combinedColumnWarning: undefined,
+        formatGroupId: undefined,
+        validationOk: undefined,
+        assembledProfile: undefined,
+        entityAssignments: undefined,
+      }))
+      return { ...state, gl: { ...state.gl, entities, formatGroups: [] } }
+    }
+
+    case 'PATCH_COA':
+      return { ...state, coa: { ...state.coa, ...action.patch } }
+    case 'APPLY_COA_ASSIGNMENTS': {
+      // Collect distinct group keys in the order they first appear
+      const keyOrder: string[] = []
+      for (const key of Object.values(action.assignment)) {
+        if (!keyOrder.includes(key)) keyOrder.push(key)
+      }
+      // Preserve method/libraryVariant/bs/pl from any existing group whose id matches the key
+      const existingById = new Map(state.coa.groups.map(g => [g.id, g]))
+      const groups: CoaMappingGroup[] = keyOrder.map((key, idx) => {
+        const memberEntityCodes = Object.entries(action.assignment)
+          .filter(([, k]) => k === key)
+          .map(([code]) => code)
+        const existing = existingById.get(key)
+        return {
+          id: key,
+          label: `Group ${String.fromCharCode(65 + idx)}`,
+          memberEntityCodes,
+          method: existing?.method,
+          // When the user explicitly confirmed the assignment/method, mark all created groups
+          // as methodExplicit so migrateLegacyCoaGroups won't fold them. Otherwise preserve
+          // whatever flag the existing group already carried (undefined for auto-created groups).
+          methodExplicit: action.explicit ? true : existing?.methodExplicit,
+          libraryVariant: existing?.libraryVariant,
+          bs: existing?.bs,
+          pl: existing?.pl,
+        }
+      })
+      return { ...state, coa: { ...state.coa, groups, assigned: true } }
+    }
+    case 'SET_COA_MIGRATION_CHECKED':
+      return { ...state, coa: { ...state.coa, migrationChecked: true } }
+    case 'PATCH_COA_GROUP': {
+      const groups = state.coa.groups.map(g =>
+        g.id === action.id ? { ...g, ...action.patch } : g
+      )
+      return { ...state, coa: { ...state.coa, groups } }
+    }
+    case 'PATCH_COA_SLOT': {
+      const groups = state.coa.groups.map(g =>
+        g.id === action.id
+          ? { ...g, [action.statement]: { ...(g[action.statement] ?? {}), ...action.patch } }
+          : g
+      )
+      return { ...state, coa: { ...state.coa, groups } }
+    }
     case 'PATCH_OB':         return { ...state, ob: { ...state.ob, ...action.patch } }
-    case 'PATCH_PARTNER':    return { ...state, partner: { ...state.partner, ...action.patch } }
+    case 'PATCH_PARTNER':
+      return { ...state, partner: { ...state.partner, sides: { ...state.partner.sides, [action.side]: { ...state.partner.sides[action.side], ...action.patch } } } }
+    case 'PATCH_FTE':
+      return { ...state, fte: { ...state.fte, ...action.patch } }
+    case 'PATCH_ANLAGEN':
+      return { ...state, anlagen: { ...state.anlagen, ...action.patch } }
+    case 'PATCH_OPOS': {
+      const { debitor, kreditor, ...rest } = action.patch
+      return {
+        ...state,
+        opos: {
+          ...state.opos,
+          ...rest,
+          ...(debitor  !== undefined ? { debitor:  { ...state.opos.debitor,  ...debitor  } } : {}),
+          ...(kreditor !== undefined ? { kreditor: { ...state.opos.kreditor, ...kreditor } } : {}),
+        },
+      }
+    }
+    case 'TOGGLE_DATASET': {
+      // When a dataset is toggled off, clear its upload/mapping state so that submit
+      // is skipped cleanly and isNextDisabled() is not affected.
+      const nextFte =
+        action.dataset === 'fte' && !action.value
+          ? { ...state.fte, uploads: [], previewFileId: '', provided: false }
+          : state.fte
+      const nextAnlagen =
+        action.dataset === 'anlagen' && !action.value
+          ? { provided: false, viewMode: 'combined' as const, uploads: [], columnMap: {}, dimensions: {} }
+          : state.anlagen
+      const nextOpos =
+        action.dataset === 'opos' && !action.value
+          ? {
+              provided: false,
+              debitor:  { viewMode: 'combined' as const, uploads: [], columnMap: {} },
+              kreditor: { viewMode: 'combined' as const, uploads: [], columnMap: {} },
+            }
+          : state.opos
+      return {
+        ...state,
+        additionalDatasets: { ...state.additionalDatasets, [action.dataset]: action.value },
+        fte: nextFte,
+        anlagen: nextAnlagen,
+        opos: nextOpos,
+      }
+    }
     case 'PREFILL':          return { ...state, ...action.partial }
     default:                 return state
   }
+}
+
+// ---------------------------------------------------------------------------
+// Entity-sync helpers — exported for unit-testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the canonical project entity list from the GL entity cards.
+ * prefix === code === entityCode so that CoA key joins line up with GL keys.
+ * Returns only entries where entityCode is non-empty after trimming.
+ */
+export function deriveProjectEntities(
+  glEntities: ReadonlyArray<Pick<GlEntityState, 'entityCode' | 'entityLabel'>>
+): Array<{ code: string; prefix: string; name: string }> {
+  return glEntities
+    .map(e => ({ code: e.entityCode.trim(), entityLabel: e.entityLabel }))
+    .filter(e => e.code.length > 0)
+    .map(e => ({ code: e.code, prefix: e.code, name: (e.entityLabel?.trim() || e.code) }))
+}
+
+/**
+ * Structural equality for the project entity list.
+ * Returns true only when length and every { code, prefix, name } triplet match.
+ */
+export function projectEntitiesEqual(
+  a: ReadonlyArray<{ code: string; prefix: string; name: string }>,
+  b: ReadonlyArray<{ code: string; prefix: string; name: string }>
+): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].code !== b[i].code || a[i].prefix !== b[i].prefix || a[i].name !== b[i].name) {
+      return false
+    }
+  }
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -259,14 +699,22 @@ const MONTH_NAMES = [
 ] as const
 
 const WIZARD_STEPS = [
-  'Project name',
-  'Fiscal year',
-  'GL bookings',
-  'Chart of accounts',
-  'Opening balances',
-  'Partner master',
-  'Review & Finish',
+  'Project name',           // 0
+  'Fiscal year',            // 1
+  'GL bookings',            // 2
+  'Chart of accounts',      // 3
+  'Opening balances',       // 4
+  'Partner master',         // 5
+  'Additional information', // 6 — optional FTE/personnel-cost provisioning
+  'Review & Finish',        // 7 (was 6)
 ] as const
+
+/** Preset metric options for FTE Development — exact string values from rasa/actions/fte_flow.py. */
+const FTE_PRESET_METRIC_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'fte',              label: 'Average FTEs # (whole numbers)' },
+  { value: 'payroll',          label: 'Payroll accounting (EURk)' },
+  { value: 'avg_cost_per_fte', label: 'Average cost per FTE (EURk)' },
+]
 
 // ---------------------------------------------------------------------------
 // Shared primitives
@@ -335,7 +783,7 @@ function StepProjectName({
             type="text"
             value={state.projectName}
             onChange={e => dispatch({ type: 'SET_NAME', value: e.target.value })}
-            placeholder="e.g. Acme GmbH FDD 2024"
+            placeholder="your project"
             className="rounded-md border border-slate-300 px-3 py-2 text-sm w-full max-w-md focus:outline-none focus:ring-2 focus:ring-blue-500"
             autoFocus
           />
@@ -359,8 +807,6 @@ function StepFiscalYear({
   state: WizardState
   dispatch: Dispatch<WizardAction>
 }) {
-  const startMonth = fyStartFromEndMonth(state.fyEndMonth)
-
   return (
     <StepCard
       title="Fiscal year end month"
@@ -387,21 +833,6 @@ function StepFiscalYear({
           </select>
         </Field>
 
-        <div className="rounded-lg border border-slate-100 bg-slate-50 px-4 py-3 text-sm text-slate-600 space-y-1">
-          <p>
-            <span className="font-medium text-slate-700">Fiscal year start: </span>
-            {MONTH_NAMES[startMonth - 1]}
-          </p>
-          <p>
-            <span className="font-medium text-slate-700">Fiscal year end: </span>
-            {MONTH_NAMES[state.fyEndMonth - 1]}
-          </p>
-          <p className="text-xs text-slate-400 mt-1">
-            Stored internally as <code className="bg-white border border-slate-200 rounded px-1">fy_start_month = {startMonth}</code>.
-            This setting drives all period buckets and FY/YTD labels throughout the platform.
-          </p>
-        </div>
-
         <InfoBox>
           This setting is saved as part of your project configuration and applies to every data
           pipeline run. It can be changed later but will require a full rebuild to take effect.
@@ -411,694 +842,381 @@ function StepFiscalYear({
   )
 }
 
+// GlYearSlot and GlEntityCard are now in ../components/ingest/GlEntityCard.tsx
+
 // ---------------------------------------------------------------------------
-// GL sub-wizard helpers
+// GlYearChipPicker — clickable year chips with "Prior years" expansion
 // ---------------------------------------------------------------------------
+
+const DEFAULT_CHIP_TOP = 2026
+const DEFAULT_CHIP_BOTTOM = 2020
+const PRIOR_BLOCK_SIZE = 5
 
 /**
- * Default GoBD column mapping when source headers match a standard DATEV/Decidra export.
- * Mirrors the same table in IngestionPage so suggestions are consistent.
+ * Returns the sorted list of available calendar years given how many prior
+ * blocks have been revealed. Default range is 2020–2026; each prior block
+ * prepends 5 more years going back.
  */
-const GOBD_GL_DEFAULTS: Record<string, string> = {
-  journal_entry_number: 'Transaction number',
-  account_number: 'Account number',
-  posting_date: 'Posting date',
-  document_date: 'Document date',
-  document_type: 'Document type',
-  reference_document_number: 'Document number',
-  amount: 'Amount',
-  vat_amount: 'VAT amount',
-  line_note: 'Booking text',
-  posting_type: 'Posting type',
-  source_type: 'Source type',
-  source_no: 'Source No.',
+function availableChipYears(priorBlocks: number): number[] {
+  const bottom = DEFAULT_CHIP_BOTTOM - priorBlocks * PRIOR_BLOCK_SIZE
+  const years: number[] = []
+  for (let y = bottom; y <= DEFAULT_CHIP_TOP; y++) years.push(y)
+  return years
 }
 
-function suggestGlMapping(columns: string[]): Record<string, string> {
-  const colSet = new Set(columns)
-  const out: Record<string, string> = {}
-  for (const [target, source] of Object.entries(GOBD_GL_DEFAULTS)) {
-    if (colSet.has(source)) out[target] = source
-  }
-  return out
-}
+function GlYearChipPicker({
+  selected,
+  fyEndMonth,
+  onToggle,
+  readOnly = false,
+}: {
+  selected: number[]
+  fyEndMonth: number
+  onToggle: (year: number) => void
+  readOnly?: boolean
+}) {
+  const [priorBlocks, setPriorBlocks] = useState(0)
+  const chips = availableChipYears(priorBlocks)
+  const selectedSet = new Set(selected)
 
-/** Default OptionsState for the GL sub-wizard. */
-function defaultGlOpts(): OptionsState {
-  return {
-    signMode: 'signed',
-    signAmount: '',
-    signSoll: '',
-    signHaben: '',
-    signDcFlag: '',
-    signDebitValue: 'S',
-    decimal: ',',
-    thousands: '.',
-    dateDayfirst: true,
-    linking: 'txn',
-    profileName: '',
-    profileSystem: '',
-  }
-}
-
-/** Default KontextState for the GL sub-wizard (entity only — FY derived from date). */
-function defaultGlKontext(): KontextState {
-  return {
-    entityMode: 'fixed',
-    entityValue: '',
-    fiscalYearMode: 'fixed',
-    fiscalYearValue: '',
-  }
-}
-
-/**
- * Assemble a GL Profile from the sub-wizard pieces.
- * Replicates buildProfile() from IngestionPage exactly so the same backend
- * logic is exercised.
- */
-function buildGlProfile(
-  kontext: KontextState,
-  mapping: Record<string, string>,
-  opts: OptionsState,
-  dialect: Dialect,
-  entityAssignments: Record<string, string> = {},
-): Profile {
-  const signConfig = (() => {
-    if (opts.signMode === 'signed') return { mode: 'signed' as const, amount: opts.signAmount }
-    if (opts.signMode === 'soll_haben')
-      return { mode: 'soll_haben' as const, soll: opts.signSoll, haben: opts.signHaben }
-    return {
-      mode: 'amount_dc' as const,
-      amount: opts.signAmount,
-      dc_flag: opts.signDcFlag,
-      debit_value: opts.signDebitValue,
-    }
-  })()
-
-  return {
-    entity: { mode: kontext.entityMode, value: kontext.entityValue },
-    fiscal_year: { mode: 'from_date' as const, value: '' },
-    sign: signConfig,
-    decimal: opts.decimal || dialect.decimal || ',',
-    thousands: opts.thousands,
-    date_dayfirst: opts.dateDayfirst,
-    columns: mapping,
-    linking_strategy: opts.linking,
-    entry_type: 'actual',
-    ...(Object.keys(entityAssignments).length > 0 ? { entity_assignments: entityAssignments } : {}),
-  }
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        {chips.map(y => {
+          const isSelected = selectedSet.has(y)
+          return (
+            <button
+              key={y}
+              type="button"
+              onClick={() => onToggle(y)}
+              disabled={readOnly}
+              className={`rounded-full px-3 py-1 text-sm font-semibold border transition focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-blue-500 ${
+                isSelected
+                  ? 'text-white border-transparent'
+                  : 'bg-white border-slate-300 text-slate-700 hover:border-blue-400 hover:text-blue-700'
+              } ${readOnly ? 'cursor-default' : ''}`}
+              style={isSelected ? { backgroundColor: '#1E3A5F', borderColor: '#1E3A5F' } : undefined}
+              aria-pressed={isSelected}
+              aria-label={glFiscalYearLabel(y, fyEndMonth)}
+            >
+              {glFiscalYearLabel(y, fyEndMonth)}
+            </button>
+          )
+        })}
+      </div>
+      {!readOnly && (
+        <button
+          type="button"
+          onClick={() => setPriorBlocks(b => b + 1)}
+          className="text-xs text-slate-500 underline underline-offset-2 hover:text-blue-600 transition"
+        >
+          + Prior years ({DEFAULT_CHIP_BOTTOM - priorBlocks * PRIOR_BLOCK_SIZE - PRIOR_BLOCK_SIZE}–{DEFAULT_CHIP_BOTTOM - priorBlocks * PRIOR_BLOCK_SIZE - 1})
+        </button>
+      )}
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
-// GL sub-stepper labels
-// ---------------------------------------------------------------------------
-
-const GL_SUB_STEPS = [
-  'Upload',
-  'Entity',
-  'Partner columns',
-  'Column mapping',
-  'Options',
-  'Validation',
-] as const
-
-// ---------------------------------------------------------------------------
-// Step 2 — GL bookings (Phase 2 — full inline flow)
+// Step 2 — GL bookings: years-first selector + entity cards
 // ---------------------------------------------------------------------------
 
 function StepGlBookings({
   gl,
+  fyEndMonth,
   dispatch,
+  batchCombining,
+  batchCombineErrors,
 }: {
   gl: WizardGlState
+  fyEndMonth: number
   dispatch: Dispatch<WizardAction>
+  /** True while the parent's batchCombineGlEntities is running. */
+  batchCombining: boolean
+  /** Per-entity errors from the last batchCombineGlEntities call. */
+  batchCombineErrors: Array<{ index: number; entityCode: string; error: string }>
 }) {
-  // Local sub-step index (0–5 matching GL_SUB_STEPS)
-  const [subStep, setSubStep] = useState<number>(() => {
-    // Restore to the furthest reached sub-step on re-entry
-    if (gl.validationOk !== undefined) return 5
-    if (gl.opts) return 5      // jump to validation if options done
-    if (gl.mapping) return 4
-    if (gl.partnerColumnsMode) return 3
-    if (gl.kontext?.entityValue) return 2
-    if (gl.fileId) return 1
-    return 0
-  })
+  function toggleYear(y: number) {
+    const next = gl.years.includes(y)
+      ? gl.years.filter(v => v !== y)
+      : [...new Set([...gl.years, y])].sort((a, b) => a - b)
+    dispatch({ type: 'SET_GL_YEARS', years: next })
+  }
 
-  // Local upload result (not persisted globally — we only persist the extracted fields)
-  const [uploadResult, setUploadResult] = useState<UploadResponse | null>(() => {
-    if (gl.fileId && gl.columns && gl.sample && gl.dialect) {
-      return {
-        file_id: gl.fileId,
-        filename: '',
-        sheets: gl.sheet ? [gl.sheet] : [],
-        columns: gl.columns,
-        sample: gl.sample,
-        dialect: gl.dialect,
+  const validatedCount = gl.entities.filter(e => e.validationOk !== undefined).length
+
+  // ── Sub-phase: derived from gl state so re-uploads drop back automatically ──
+  // 'collect'  — upload + combine all entities (no groups yet)
+  // 'assign'   — GlFormatAssignmentStep (multi-entity only, all combined)
+  // 'configure' — GlGroupConfigPanel + per-entity header confirm + validation
+  const allCombined =
+    gl.years.length > 0 &&
+    gl.entities.length > 0 &&
+    gl.entities.every(e => !!e.combinedFileId)
+
+  const allAssigned = gl.entities.every(e => !!e.formatGroupId)
+
+  const glSubPhase: 'collect' | 'assign' | 'configure' = (() => {
+    if (!allCombined) return 'collect'
+    if (gl.entities.length === 1 || allAssigned) return 'configure'
+    return 'assign'
+  })()
+
+  // Single-entity: auto-create one singleton group and skip 'assign'
+  useEffect(() => {
+    if (allCombined && gl.entities.length === 1 && !gl.entities[0].formatGroupId) {
+      dispatch({ type: 'APPLY_GL_FORMAT_ASSIGNMENTS', assignment: { 0: 'grp-0' } })
+    }
+  }, [allCombined, gl.entities, dispatch])
+
+  // ── Async onPatchGroup: dispatches PATCH_GL_GROUP then propagates headers ──
+  // Called by GlEntityCard when representative confirms headers (external mode).
+  const handlePatchGroup = useCallback(async (groupId: string, patch: Partial<GlFormatGroup>) => {
+    dispatch({ type: 'PATCH_GL_GROUP', groupId, patch })
+    if (patch.headers && patch.headers.length > 0) {
+      const group = gl.formatGroups.find(g => g.id === groupId)
+      if (group) {
+        const updatedGroup = { ...group, ...patch }
+        const nonRepIndices = group.memberIndices.filter(i => i !== group.representativeIndex)
+        if (nonRepIndices.length > 0) {
+          const { patches } = await applyGroupHeadersToMembers(updatedGroup, nonRepIndices, gl.entities)
+          if (patches.length > 0) dispatch({ type: 'PATCH_GL_ENTITY_MULTI', patches })
+        }
       }
     }
-    return null
-  })
+  }, [gl.formatGroups, gl.entities, dispatch])
 
-  // Local opts (initialised from persisted state or defaults)
-  const [opts, setOpts] = useState<OptionsState>(() => gl.opts ?? defaultGlOpts())
+  // ── Group-level header confirm: called from GlGroupConfigPanel (wizard mode) ──
+  // Applies headers to the representative's combined file, derives the mapping,
+  // patches both the representative entity and the group, then propagates headers
+  // positionally to all non-representative members.
+  const handleConfirmGroupHeaders = useCallback(async (groupId: string, headers: string[]) => {
+    // Snapshot entities at call-time so the rep lookup and applyGroupHeadersToMembers
+    // both read the same consistent array, regardless of the two dispatches that follow.
+    const entitiesAtStart = gl.entities
+    const group = gl.formatGroups.find(g => g.id === groupId)
+    if (!group) return
+    const rep = entitiesAtStart[group.representativeIndex]
+    if (!rep?.combinedFileId) return
 
-  // Local kontext (initialised from persisted state or defaults)
-  const [kontext, setKontext] = useState<KontextState>(() => gl.kontext ?? defaultGlKontext())
+    // Apply header labels to the representative's staged file
+    const result = await applyHeaders(rep.combinedFileId, headers)
+    const mapping = suggestGlMapping(result.columns.filter(c => c !== 'fiscal_year'))
 
-  // Partner columns mode
-  const [partnerMode, setPartnerMode] = useState<PartnerColumnsMode>(
-    () => gl.partnerColumnsMode ?? 'single',
-  )
-  const [partnerSplit, setPartnerSplit] = useState<PartnerColumnsSplit>(
-    () =>
-      gl.partnerColumnsSplit ?? {
-        creditorNoCol: '',
-        debtorNoCol: '',
-        fixedAssetNoCol: '',
-      },
-  )
-
-  // Column mapping
-  const [mapping, setMapping] = useState<Record<string, string>>(() => gl.mapping ?? {})
-
-  // Validation result (staging — no DB write)
-  const [validationResult, setValidationResult] = useState<ValidationResponse | null>(null)
-  const [entityAssignments, setEntityAssignments] = useState<Record<string, string>>(
-    () => gl.entityAssignments ?? {},
-  )
-
-  // Sync opts decimal/thousands when dialect is detected
-  useEffect(() => {
-    if (uploadResult?.dialect) {
-      setOpts(prev => ({
-        ...prev,
-        decimal: uploadResult.dialect.decimal || ',',
-        thousands: uploadResult.dialect.thousands || '.',
-      }))
-    }
-  }, [uploadResult?.dialect])
-
-  // Sync local opts/kontext back into wizard state when they change (so Back→Next restores)
-  useEffect(() => {
-    dispatch({ type: 'PATCH_GL', patch: { opts } })
-  }, [opts, dispatch])
-
-  useEffect(() => {
-    dispatch({ type: 'PATCH_GL', patch: { kontext } })
-  }, [kontext, dispatch])
-
-  // -------------------------------------------------------------------------
-  // Upload handler
-  // -------------------------------------------------------------------------
-
-  function handleUploaded(result: UploadResponse) {
-    setUploadResult(result)
-    const suggested = suggestGlMapping(result.columns)
-    const newMapping = Object.keys(suggested).length > 0 ? suggested : {}
-    setMapping(newMapping)
-
-    // Auto-detect entity column
-    const cols = result.columns
-    const newKontext: KontextState = { ...kontext }
-    if (cols.includes('Entity No')) {
-      newKontext.entityMode = 'column'
-      newKontext.entityValue = 'Entity No'
-    } else if (cols.includes('Entity')) {
-      newKontext.entityMode = 'column'
-      newKontext.entityValue = 'Entity'
-    }
-    setKontext(newKontext)
-
-    // Auto-detect amount column
-    if (cols.includes('Amount')) {
-      setOpts(prev => ({ ...prev, signMode: 'signed', signAmount: 'Amount' }))
-    }
-
+    // Patch the representative entity
     dispatch({
-      type: 'PATCH_GL',
+      type: 'PATCH_GL_ENTITY',
+      index: group.representativeIndex,
       patch: {
-        fileId: result.file_id,
-        sheet: result.sheets[0] ?? undefined,
-        columns: result.columns,
-        sample: result.sample,
-        dialect: result.dialect,
-        mapping: newMapping,
-        kontext: newKontext,
-        // Reset downstream state on new upload
+        combinedFileId: result.file_id,
+        combinedColumns: result.columns,
+        combinedSample: result.sample,
+        combinedSuggestedHeaders: undefined,
+        headersConfirmed: true,
         validationOk: undefined,
         assembledProfile: undefined,
         entityAssignments: undefined,
       },
     })
-    setSubStep(1)
-  }
 
-  // -------------------------------------------------------------------------
-  // Validation result handler (staging — no commit)
-  // -------------------------------------------------------------------------
+    // Patch the group with confirmed headers + derived mapping
+    dispatch({
+      type: 'PATCH_GL_GROUP',
+      groupId,
+      patch: {
+        headers: result.columns,
+        mapping,
+        columnCount: result.columns.length,
+        headersConfirmed: true,
+      },
+    })
 
-  function handleValidationResult(r: ValidationResponse) {
-    setValidationResult(r)
-    const ok = r.summary.passed
-    if (uploadResult) {
-      const profile = buildGlProfile(kontext, mapping, opts, uploadResult.dialect, entityAssignments)
-      dispatch({
-        type: 'PATCH_GL',
-        patch: {
-          validationOk: ok,
-          entityAssignments,
-          assembledProfile: profile,
-        },
-      })
+    // Propagate headers positionally to non-representative members.
+    // entitiesAtStart is used intentionally: the two dispatches above only mutate
+    // the rep entity and the group; non-rep members' combinedFileId/combinedColumns
+    // are unchanged, so reading them from the pre-dispatch snapshot is correct.
+    const updatedGroup: GlFormatGroup = {
+      ...group,
+      headers: result.columns,
+      columnCount: result.columns.length,
+      headersConfirmed: true,
     }
-  }
-
-  function handleEntityAssignmentsChange(ea: Record<string, string>) {
-    setEntityAssignments(ea)
-  }
-
-  // onImportSuccess is never called because stagingMode=true hides the commit button.
-  // Typed as required by ValidierungStep; safe no-op here.
-  const noopImportSuccess = useCallback((_r: CommitResponse) => {
-    // staging mode — commit happens in Phase 5 Finish, not here
-  }, [])
-
-  // -------------------------------------------------------------------------
-  // Sub-step navigation helpers
-  // -------------------------------------------------------------------------
-
-  function goSubNext() {
-    setSubStep(s => Math.min(GL_SUB_STEPS.length - 1, s + 1))
-  }
-  function goSubBack() {
-    setSubStep(s => Math.max(0, s - 1))
-  }
-
-  const columns = uploadResult?.columns ?? gl.columns ?? []
-  const sample = uploadResult?.sample ?? gl.sample ?? []
-  const dialect = uploadResult?.dialect ?? gl.dialect ?? { decimal: ',', thousands: '.', delimiter: ';', encoding: 'utf-8' }
-
-  const missing = missingRequiredFields(mapping)
-  const kontextValid = kontext.entityValue.trim() !== ''
-
-  // Assembled profile (live — used by ValidierungStep)
-  const glProfile = uploadResult
-    ? buildGlProfile(kontext, mapping, opts, uploadResult.dialect, entityAssignments)
-    : null
-
-  // -------------------------------------------------------------------------
-  // Sub-step content
-  // -------------------------------------------------------------------------
+    const nonRepIndices = group.memberIndices.filter(i => i !== group.representativeIndex)
+    if (nonRepIndices.length > 0) {
+      const { patches } = await applyGroupHeadersToMembers(updatedGroup, nonRepIndices, entitiesAtStart)
+      if (patches.length > 0) dispatch({ type: 'PATCH_GL_ENTITY_MULTI', patches })
+    }
+  }, [gl.formatGroups, gl.entities, dispatch])
 
   return (
-    <div className="space-y-4">
-      {/* GL sub-stepper */}
-      <div className="rounded-xl border border-slate-200 bg-white px-6 pt-5 pb-3 shadow-sm">
+    <div className="space-y-5">
+      {/* Header */}
+      <div className="rounded-xl border border-slate-200 bg-white px-6 pt-5 pb-4 shadow-sm">
         <h2 className="text-lg font-semibold text-slate-900">Upload GL bookings</h2>
         <p className="mt-0.5 text-sm text-slate-500">
-          Upload your GDPdU general ledger export and map it to the Finssentials schema.
+          First select the fiscal years you are loading. Then upload one file per year for each
+          entity. The files are concatenated with a <span className="font-mono text-xs bg-slate-100 rounded px-1">fiscal_year</span> column
+          and you map columns and validate once per entity.
           Nothing is written to the database until the final Finish step.
         </p>
-
-        {/* Inline progress dots */}
-        <div className="mt-4 flex items-center gap-1.5 flex-wrap">
-          {GL_SUB_STEPS.map((label, idx) => {
-            const done = idx < subStep
-            const active = idx === subStep
-            const reachable = (
-              idx === 0 ||
-              (idx === 1 && Boolean(gl.fileId)) ||
-              (idx === 2 && kontextValid && Boolean(gl.fileId)) ||
-              (idx === 3 && Boolean(gl.partnerColumnsMode) && kontextValid && Boolean(gl.fileId)) ||
-              (idx === 4 && missing.length === 0 && kontextValid && Boolean(gl.fileId)) ||
-              (idx === 5 && Boolean(gl.fileId) && kontextValid && missing.length === 0)
-            )
-            return (
-              <button
-                key={label}
-                type="button"
-                disabled={!reachable && !done && !active}
-                onClick={() => { if (done || active || reachable) setSubStep(idx) }}
-                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition ${
-                  active
-                    ? 'bg-blue-600 text-white'
-                    : done
-                    ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
-                    : reachable
-                    ? 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                    : 'bg-slate-50 text-slate-300 cursor-not-allowed'
-                }`}
-              >
-                {done ? <span aria-hidden>&#10003;</span> : <span>{idx + 1}</span>}
-                {label}
-              </button>
-            )
-          })}
-        </div>
+        {gl.entities.length > 1 && (
+          <p className="mt-2 text-xs text-blue-700">
+            {validatedCount} of {gl.entities.length} entities validated.
+            {glSubPhase === 'collect' && ' — combine all entities to proceed.'}
+            {glSubPhase === 'assign' && ' — assign formats to proceed.'}
+          </p>
+        )}
       </div>
 
-      {/* Sub-step 0: Upload */}
-      {subStep === 0 && (
-        <UploadStep onUploaded={handleUploaded} />
-      )}
-
-      {/* Sub-step 1: Entity */}
-      {subStep === 1 && columns.length > 0 && (
+      {/* ── COLLECT phase: year picker + entity upload cards ── */}
+      {(glSubPhase === 'collect' || glSubPhase === 'configure') && (
         <>
-          <KontextStep
-            sourceColumns={columns}
-            state={kontext}
-            onChange={k => {
-              setKontext(k)
-              dispatch({ type: 'PATCH_GL', patch: { kontext: k } })
-            }}
-            variant="gl"
-          />
-          <div className="flex justify-between mt-4">
-            <button type="button" onClick={goSubBack}
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-              Back
-            </button>
-            <button type="button" onClick={goSubNext} disabled={!kontextValid}
-              className="rounded-md bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40">
-              Next
-            </button>
-          </div>
-        </>
-      )}
-
-      {/* Sub-step 2: Partner columns question */}
-      {subStep === 2 && (
-        <>
-          <StepCard
-            title="Partner column layout"
-            subtitle="Tell us how creditor, debtor, and fixed-asset numbers are stored in your GL file."
-          >
-            <div className="space-y-5">
-              <div className="space-y-3">
-                <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white p-4 hover:bg-slate-50 transition">
-                  <input
-                    type="radio"
-                    name="partnerMode"
-                    value="single"
-                    checked={partnerMode === 'single'}
-                    onChange={() => setPartnerMode('single')}
-                    className="mt-0.5 accent-blue-600"
-                  />
-                  <div>
-                    <p className="text-sm font-semibold text-slate-800">
-                      One combined column (recommended)
-                    </p>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      A single "Source No." column holds the partner number, and a companion
-                      "Source Type" column contains a code that distinguishes creditor, debtor,
-                      or fixed asset. This is the standard DATEV / GoBD layout and is fully
-                      supported by the backend.
-                    </p>
-                    <p className="text-xs text-slate-400 mt-1 italic">
-                      Example: Source No. = "01100", Source Type = "K" (Kreditor)
-                    </p>
-                  </div>
-                </label>
-
-                <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white p-4 hover:bg-slate-50 transition">
-                  <input
-                    type="radio"
-                    name="partnerMode"
-                    value="split"
-                    checked={partnerMode === 'split'}
-                    onChange={() => setPartnerMode('split')}
-                    className="mt-0.5 accent-blue-600"
-                  />
-                  <div>
-                    <p className="text-sm font-semibold text-slate-800">
-                      Three separate columns
-                    </p>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Creditor number, debtor number, and fixed-asset number each have their own
-                      column. Map them in the next step. The mapping is stored in the profile;
-                      full backend processing of this layout is a planned follow-up (Phase 4).
-                    </p>
-                    <p className="text-xs text-slate-400 mt-1 italic">
-                      Example: "Kred. No." = "01100", "Deb. No." = "" (empty on this line)
-                    </p>
-                  </div>
-                </label>
-              </div>
-
-              {partnerMode === 'split' && (
-                <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 space-y-3">
-                  <p className="text-xs font-semibold text-amber-800">
-                    Map the three partner columns
-                  </p>
-                  {(
-                    [
-                      ['creditorNoCol', 'Creditor No. column'],
-                      ['debtorNoCol', 'Debtor No. column'],
-                      ['fixedAssetNoCol', 'Fixed-Asset No. column'],
-                    ] as [keyof PartnerColumnsSplit, string][]
-                  ).map(([field, label]) => (
-                    <div key={field} className="flex items-center gap-3">
-                      <label className="text-xs text-amber-900 w-40 shrink-0">{label}</label>
-                      <select
-                        value={partnerSplit[field]}
-                        onChange={e =>
-                          setPartnerSplit(prev => ({ ...prev, [field]: e.target.value }))
-                        }
-                        className="rounded-md border border-slate-300 px-2 py-1.5 text-sm flex-1 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      >
-                        <option value="">-- Select column --</option>
-                        {columns.map(c => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    </div>
-                  ))}
-                  <p className="text-xs text-amber-700">
-                    Note: backend consumption of the three-separate-column layout is a
-                    documented follow-up (Phase 4 / backend-engineer). The profile is stored
-                    correctly; the single-column path is the active processing default.
-                  </p>
-                </div>
-              )}
-
-              <InfoBox>
-                If you are unsure, choose "One combined column" — it covers the vast majority
-                of DATEV, Lexware, and GoBD-compliant exports.
-              </InfoBox>
+          {/* Years selector */}
+          <div className="rounded-xl border border-slate-200 bg-white px-6 py-5 shadow-sm space-y-4">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900">Which fiscal years are you loading?</h3>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Click years to select them. Each entity card will show one upload slot per year.
+              </p>
             </div>
-          </StepCard>
 
-          <div className="flex justify-between mt-4">
-            <button type="button" onClick={goSubBack}
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-              Back
-            </button>
-            <button
-              type="button"
-              onClick={() => {
+            <GlYearChipPicker
+              selected={gl.years}
+              fyEndMonth={fyEndMonth}
+              onToggle={toggleYear}
+              readOnly={glSubPhase !== 'collect'}
+            />
+
+            {gl.years.length === 0 && (
+              <WarnBox>Select at least one fiscal year before uploading GL files.</WarnBox>
+            )}
+          </div>
+
+          {/* Format group config panels — rendered in configure phase only */}
+          {glSubPhase === 'configure' && gl.formatGroups.map(group => (
+            <GlGroupConfigPanel
+              key={group.id}
+              group={group}
+              entities={gl.entities}
+              onPatchGroup={(groupId, patch) => { void handlePatchGroup(groupId, patch) }}
+              onConfirmGroupHeaders={handleConfirmGroupHeaders}
+              // F-3: consolidated validation — stage='gl' prevents R1-R4/M1 regression
+              validationStage="gl"
+              onMemberValidated={(entityIndex, result, assembledProfile, excludedLineIds) => {
                 dispatch({
-                  type: 'PATCH_GL',
+                  type: 'PATCH_GL_ENTITY',
+                  index: entityIndex,
                   patch: {
-                    partnerColumnsMode: partnerMode,
-                    partnerColumnsSplit: partnerMode === 'split' ? partnerSplit : undefined,
+                    validationOk: result.summary.passed,
+                    assembledProfile,
+                    excludedLineIds,
                   },
                 })
-                goSubNext()
-              }}
-              className="rounded-md bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700"
-            >
-              Next
-            </button>
-          </div>
-        </>
-      )}
-
-      {/* Sub-step 3: Column mapping */}
-      {subStep === 3 && columns.length > 0 && (
-        <>
-          <StepCard
-            title="Column mapping"
-            subtitle="Drag source columns onto target fields. Required fields (*) must be mapped before you can continue."
-          >
-            {missing.length > 0 && (
-              <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-                <span className="font-medium">Missing required fields:</span>{' '}
-                {missing.join(', ')}
-              </div>
-            )}
-
-            {/* Partner-column hint */}
-            {partnerMode === 'single' && (
-              <div className="mb-4 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                <span className="font-semibold">Partner columns (single-column layout):</span>{' '}
-                Map "Source Type" and "Source No." in the Partner group below to enable
-                creditor / debtor assignment during validation.
-              </div>
-            )}
-            {partnerMode === 'split' && (
-              <div className="mb-4 rounded-md border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                <span className="font-semibold">Three-column layout selected.</span>{' '}
-                The separate creditor / debtor / fixed-asset columns you chose are stored in
-                the profile. Map any remaining required fields below.
-              </div>
-            )}
-
-            <ColumnMapper
-              sourceColumns={columns}
-              sample={sample}
-              mapping={mapping}
-              onChange={m => {
-                setMapping(m)
-                dispatch({ type: 'PATCH_GL', patch: { mapping: m } })
               }}
             />
-          </StepCard>
+          ))}
 
-          <div className="flex justify-between mt-4">
-            <button type="button" onClick={goSubBack}
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-              Back
-            </button>
+          {/* Entity cards — external grouping mode, footer combine mode, GL validation stage */}
+          {gl.entities.map((entity, index) => (
+            <GlEntityCard
+              key={index}
+              entity={entity}
+              index={index}
+              total={gl.entities.length}
+              years={gl.years}
+              entityMode="create"
+              fyEndMonth={fyEndMonth}
+              groupingMode="external"
+              combineMode="footer"
+              validationStage="gl"
+              onPatch={p => dispatch({ type: 'PATCH_GL_ENTITY', index, patch: p })}
+              onRemove={
+                glSubPhase === 'collect' && gl.entities.length > 1
+                  ? () => dispatch({ type: 'REMOVE_GL_ENTITY', index })
+                  : undefined
+              }
+              group={gl.formatGroups.find(g => g.id === entity.formatGroupId)}
+              groups={gl.formatGroups}
+              entities={gl.entities}
+              onCreateGroup={(fromIndex, headers, mapping) =>
+                dispatch({ type: 'CREATE_GL_GROUP', fromIndex, headers, mapping })
+              }
+              onAssignGroup={async (groupId, selectedIndices) => {
+                const group = gl.formatGroups.find(g => g.id === groupId)
+                if (!group) return
+                const { patches } = await applyGroupHeadersToMembers(
+                  group,
+                  selectedIndices,
+                  gl.entities,
+                )
+                dispatch({ type: 'ASSIGN_GL_GROUP', groupId, memberIndices: selectedIndices })
+                if (patches.length > 0) dispatch({ type: 'PATCH_GL_ENTITY_MULTI', patches })
+              }}
+              onPatchGroup={(groupId, patch) => { void handlePatchGroup(groupId, patch) }}
+            />
+          ))}
+
+          {/* Add another entity — only in collect phase */}
+          {glSubPhase === 'collect' && (
             <button
               type="button"
-              onClick={goSubNext}
-              disabled={missing.length > 0}
-              className="rounded-md bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-40"
+              onClick={() => dispatch({ type: 'ADD_GL_ENTITY' })}
+              className="flex items-center gap-2 rounded-xl border-2 border-dashed border-slate-300 bg-white px-5 py-3 text-sm font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition w-full justify-center"
             >
-              {missing.length > 0 ? `Next (${missing.length} required fields missing)` : 'Next'}
+              <span className="text-lg leading-none">+</span>
+              Add another entity
             </button>
-          </div>
-        </>
-      )}
+          )}
 
-      {/* Sub-step 4: Options (amount logic, separators, date, AR/AP linking) */}
-      {subStep === 4 && columns.length > 0 && (
-        <>
-          {/* AR/AP linking explanation — shown ABOVE the OptionsStep */}
-          <div className="rounded-xl border border-blue-200 bg-blue-50/70 px-5 py-4 shadow-sm">
-            <h3 className="text-sm font-semibold text-blue-900 mb-2">
-              AR/AP linking — how should a customer or supplier be attached to the matching
-              revenue or cost line?
-            </h3>
-            <p className="text-xs text-blue-800 mb-3">
-              In a double-entry GL, an invoice booking typically has two lines: one on a
-              receivable / payable account (which carries the partner number) and one on the
-              revenue / cost account (which does not). The linking strategy controls whether and
-              how the partner is copied onto the revenue / cost line so that drill-downs by
-              customer or supplier work correctly.
+          {/* Lock hint — shown only in collect phase, near the footer */}
+          {glSubPhase === 'collect' && (
+            <p className="text-xs text-slate-500 text-center">
+              Add or remove entities now — combining locks the list. Use Back to make changes after combining.
             </p>
-            <div className="space-y-3 text-xs text-blue-900">
-              <div className="rounded-md border border-blue-200 bg-white px-3 py-2.5">
-                <p className="font-semibold mb-0.5">
-                  A — By transaction (GoBD)
-                </p>
-                <p className="text-blue-700">
-                  Within one journal entry all lines share a transaction number. The partner
-                  from the receivable / payable line is propagated to every other line in the
-                  same entry.
-                </p>
-                <p className="mt-1.5 text-blue-600 italic">
-                  Example: entry #1001 — line 1: Receivables 1,000 (customer 01100); line 2:
-                  Revenue 1,000 (no partner). After linking: Revenue line also gets customer
-                  01100. If more than one unique partner exists in the entry the lines remain
-                  unlinked (ambiguous).
-                </p>
-              </div>
-              <div className="rounded-md border border-blue-200 bg-white px-3 py-2.5">
-                <p className="font-semibold mb-0.5">
-                  B — By counter-account (DATEV / Gegenkonto)
-                </p>
-                <p className="text-blue-700">
-                  The counter-account is stored in the same row. If the counter-account is a
-                  receivable / payable account, the partner associated with that account is
-                  assigned to this line. Already-set partner IDs are not overwritten.
-                </p>
-                <p className="mt-1.5 text-blue-600 italic">
-                  Example: Revenue line, counter-account = 10000 (Receivables) → system looks
-                  up the partner on account 10000 and attaches it to the Revenue line.
-                </p>
-              </div>
-              <div className="rounded-md border border-blue-200 bg-white px-3 py-2.5">
-                <p className="font-semibold mb-0.5">No automatic attachment</p>
-                <p className="text-blue-700">
-                  Partner numbers are used only where they already appear in the source file.
-                  Choose this if your GL already contains partner IDs on every relevant line,
-                  or if AR/AP drill-downs are not needed.
-                </p>
-              </div>
-            </div>
-            <p className="mt-3 text-xs text-blue-700">
-              Select your preferred strategy in the options panel below. You can change it
-              later and re-run validation without re-uploading.
-            </p>
-          </div>
+          )}
 
-          <OptionsStep
-            sourceColumns={columns}
-            dialect={dialect}
-            state={opts}
-            onChange={o => {
-              setOpts(o)
-              dispatch({ type: 'PATCH_GL', patch: { opts: o } })
-            }}
-            onSaveProfile={() => { /* profile save is optional; wired in full Data Update flow */ }}
-            savingProfile={false}
-            profileSaved={false}
-          />
-
-          <div className="flex justify-between mt-4">
-            <button type="button" onClick={goSubBack}
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-              Back
-            </button>
-            <button type="button" onClick={goSubNext}
-              className="rounded-md bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700">
-              Run validation
-            </button>
-          </div>
-        </>
-      )}
-
-      {/* Sub-step 5: Validation (staging — no commit) */}
-      {subStep === 5 && uploadResult && glProfile && (
-        <>
-          <ValidierungStep
-            uploadResult={uploadResult}
-            profile={glProfile}
-            onResult={handleValidationResult}
-            onEntityAssignmentsChange={handleEntityAssignmentsChange}
-            onImportSuccess={noopImportSuccess}
-            stagingMode
-          />
-
-          {/* Wizard-level status after validation */}
-          {validationResult && (
-            <div className={`rounded-lg border px-4 py-3 text-sm ${
-              validationResult.summary.passed
-                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
-                : 'border-amber-200 bg-amber-50 text-amber-800'
-            }`}>
-              {validationResult.summary.passed
-                ? 'Validation passed. Click "Next" on the outer wizard to continue to the Chart of Accounts step.'
-                : 'Validation has warnings or errors. You can still continue — the GL will be committed in the Finish step once all issues are resolved, or you can accept soft warnings.'}
+          {/* Per-entity combine errors from the last batch combine attempt */}
+          {batchCombineErrors.length > 0 && glSubPhase === 'collect' && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 space-y-1.5">
+              <p className="text-sm font-semibold text-red-800">
+                Some entities failed to combine. Fix the issues above and try again.
+              </p>
+              {batchCombineErrors.map(err => (
+                <p key={err.index} className="text-xs text-red-700">
+                  Entity {err.index + 1} ({err.entityCode || `Entity ${err.index + 1}`}): {err.error}
+                </p>
+              ))}
             </div>
           )}
 
-          <div className="flex justify-between mt-4">
-            <button type="button" onClick={goSubBack}
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-              Back to options
-            </button>
-            {gl.validationOk !== undefined && (
-              <div className={`flex items-center gap-2 text-sm font-medium ${
-                gl.validationOk ? 'text-emerald-700' : 'text-amber-700'
-              }`}>
-                {gl.validationOk ? '&#10003; Validation passed' : 'Warnings present'}
-              </div>
-            )}
+          {/* Combining progress indicator */}
+          {batchCombining && (
+            <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
+              Combining files for all entities — please wait…
+            </div>
+          )}
+
+          {/* In configure phase: note that Back resets to uploads */}
+          {glSubPhase === 'configure' && (
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+              Need to add or remove entities? Use the Back button below to return to the upload step.
+              All combined files and format groups will be cleared so you can start fresh.
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── ASSIGN phase: forced format-assignment screen (multi-entity only) ── */}
+      {glSubPhase === 'assign' && (
+        <>
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+            Need to add or remove entities? Use the Back button below to return to the upload step.
+            All combined files and format groups will be cleared so you can start fresh.
           </div>
+          <GlFormatAssignmentStep
+            entities={gl.entities}
+            onConfirm={assignment => dispatch({ type: 'APPLY_GL_FORMAT_ASSIGNMENTS', assignment })}
+          />
         </>
       )}
     </div>
@@ -1134,159 +1252,217 @@ const LIBRARY_VARIANTS: Array<{ value: string; label: string; description: strin
   },
 ]
 
-function StepChartOfAccounts({
-  coa,
-  dispatch,
-  fyEndMonth,
+// ---------------------------------------------------------------------------
+// CoaGroupCard — per-group mapping configuration card (BS + PL upload slots)
+// ---------------------------------------------------------------------------
+
+function CoaGroupCard({
+  group,
   entities,
+  dispatch,
 }: {
-  coa: WizardCoaState
-  dispatch: Dispatch<WizardAction>
-  fyEndMonth: number
+  group: CoaMappingGroup
   entities: WizardState['entities']
+  dispatch: Dispatch<WizardAction>
 }) {
-  // Local source choice (controlled by radio)
-  const [source, setSource] = useState<'library' | 'upload'>(coa.source ?? 'library')
-  const [libraryVariant, setLibraryVariant] = useState<string>(
-    coa.libraryVariant ?? 'skr03',
+  const [expanded, setExpanded] = useState(true)
+
+  // BS slot state
+  const [bsUploading, setBsUploading] = useState(false)
+  const [bsUploadError, setBsUploadError] = useState<string | null>(null)
+  const [bsDownloading, setBsDownloading] = useState(false)
+  const [bsDownloadError, setBsDownloadError] = useState<string | null>(null)
+  const bsFileRef = useRef<HTMLInputElement>(null)
+  const [bsMapping, setBsMapping] = useState<Record<string, string>>(group.bs?.mapping ?? {})
+
+  // PL slot state
+  const [plUploading, setPlUploading] = useState(false)
+  const [plUploadError, setPlUploadError] = useState<string | null>(null)
+  const [plDownloading, setPlDownloading] = useState(false)
+  const [plDownloadError, setPlDownloadError] = useState<string | null>(null)
+  const plFileRef = useRef<HTMLInputElement>(null)
+  const [plMapping, setPlMapping] = useState<Record<string, string>>(group.pl?.mapping ?? {})
+
+  const patchGroup = useCallback(
+    (patch: Partial<CoaMappingGroup>) => dispatch({ type: 'PATCH_COA_GROUP', id: group.id, patch }),
+    [dispatch, group.id],
+  )
+  const patchSlot = useCallback(
+    (stmt: 'bs' | 'pl', patch: Partial<CoaUploadSlot>) =>
+      dispatch({ type: 'PATCH_COA_SLOT', id: group.id, statement: stmt, patch }),
+    [dispatch, group.id],
   )
 
-  // Upload path state
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState<string | null>(null)
-  const [downloading, setDownloading] = useState(false)
-  const [downloadError, setDownloadError] = useState<string | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-
-  // Mapping state for generic client CoA (non-master-shaped uploads)
-  const [mapping, setMapping] = useState<Record<string, string>>(coa.mapping ?? {})
-
-  // Sync source choice into wizard state
-  function handleSourceChange(val: 'library' | 'upload') {
-    setSource(val)
-    dispatch({ type: 'PATCH_COA', patch: { source: val } })
-  }
-
-  // Sync library variant into wizard state
-  function handleVariantChange(val: string) {
-    setLibraryVariant(val)
-    dispatch({ type: 'PATCH_COA', patch: { libraryVariant: val } })
-  }
-
-  // Template download
-  async function handleDownloadTemplate() {
-    setDownloading(true)
-    setDownloadError(null)
+  async function handleDownload(stmt: 'bs' | 'pl') {
+    if (stmt === 'bs') { setBsDownloading(true); setBsDownloadError(null) }
+    else { setPlDownloading(true); setPlDownloadError(null) }
     try {
-      const firstEntity = entities.find(e => e.code.trim() !== '')
-      await downloadCoaTemplate({
-        entity: firstEntity?.code ?? undefined,
-        fiscalYear: fyEndMonth,   // pass end-month as a proxy; backend interprets
-        library: libraryVariant,
-      })
+      await downloadCoaTemplate({ statement: stmt, library: group.libraryVariant })
     } catch (e) {
-      setDownloadError(e instanceof Error ? e.message : 'Download failed')
+      const msg = e instanceof Error ? e.message : 'Download failed'
+      if (stmt === 'bs') setBsDownloadError(msg)
+      else setPlDownloadError(msg)
     } finally {
-      setDownloading(false)
+      if (stmt === 'bs') setBsDownloading(false)
+      else setPlDownloading(false)
     }
   }
 
-  // File upload handler
-  async function handleFileSelected(file: File) {
-    setUploading(true)
-    setUploadError(null)
+  async function handleFileSelected(file: File, stmt: 'bs' | 'pl') {
+    if (stmt === 'bs') { setBsUploading(true); setBsUploadError(null) }
+    else { setPlUploading(true); setPlUploadError(null) }
     try {
       const res = await uploadFile(file)
-      const isMaster = isBsPlMasterSheets(res.sheets)
-      dispatch({
-        type: 'PATCH_COA',
-        patch: {
-          source: 'upload',
-          masterFileId: res.file_id,
-          masterSheets: res.sheets,
-          masterColumns: res.columns,
-          masterSample: res.sample,
-          isBsPlMaster: isMaster,
-          // reset mapping on new upload
-          mapping: undefined,
-        },
+      // Detect single-sheet master via sheet name
+      const isMaster = stmt === 'bs'
+        ? res.sheets.includes('Master_BS')
+        : res.sheets.includes('Master_PL')
+      patchSlot(stmt, {
+        fileId: res.file_id,
+        sheets: res.sheets,
+        columns: res.columns,
+        sample: res.sample,
+        isMaster,
+        mapping: undefined,
       })
-      setMapping({})
+      if (stmt === 'bs') setBsMapping({})
+      else setPlMapping({})
     } catch (e) {
-      setUploadError(e instanceof Error ? e.message : 'Upload failed')
+      const msg = e instanceof Error ? e.message : 'Upload failed'
+      if (stmt === 'bs') setBsUploadError(msg)
+      else setPlUploadError(msg)
     } finally {
-      setUploading(false)
+      if (stmt === 'bs') setBsUploading(false)
+      else setPlUploading(false)
     }
   }
 
-  function handleMappingChange(m: Record<string, string>) {
-    setMapping(m)
-    dispatch({ type: 'PATCH_COA', patch: { mapping: m } })
+  function handleMappingChange(stmt: 'bs' | 'pl', m: Record<string, string>) {
+    if (stmt === 'bs') { setBsMapping(m); patchSlot('bs', { mapping: m }) }
+    else { setPlMapping(m); patchSlot('pl', { mapping: m }) }
   }
 
-  const missingAccountFields = coa.masterColumns
-    ? missingRequiredAccountFields(mapping)
-    : []
+  const method = group.method
+  const bsMissing = group.bs?.columns && !group.bs?.isMaster
+    ? missingRequiredAccountFields(bsMapping, coaGenericFields('bs')) : []
+  const plMissing = group.pl?.columns && !group.pl?.isMaster
+    ? missingRequiredAccountFields(plMapping, coaGenericFields('pl')) : []
 
-  const uploadStagedOk =
-    Boolean(coa.masterFileId) &&
-    (coa.isBsPlMaster || missingAccountFields.length === 0)
+  const memberNames = group.memberEntityCodes.map(code => {
+    const e = entities.find(en => en.code === code)
+    return e ? (e.name || e.prefix || code || '—') : (code || '—')
+  })
+
+  const isConfigured = !method || method === 'library'
+    || (method === 'upload' && (group.bs?.fileId || group.pl?.fileId))
+  const badge = isConfigured
+    ? <span className="text-emerald-600 font-medium text-xs">Configured</span>
+    : <span className="text-slate-400 text-xs">Not configured</span>
 
   return (
-    <StepCard
-      title="Chart of accounts"
-      subtitle="Choose how accounts are classified into the P&L and Balance Sheet hierarchy."
-    >
-      <div className="space-y-6">
+    <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+      {/* Card header */}
+      <div
+        className="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-slate-50 transition"
+        onClick={() => setExpanded(v => !v)}
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="text-xs font-semibold uppercase tracking-wide text-slate-400 shrink-0">
+            {group.label}
+          </span>
+          <span className="text-sm text-slate-500 truncate">{memberNames.join(', ')}</span>
+          <span className="text-slate-300 shrink-0">·</span>
+          {badge}
+        </div>
+        <span className="text-slate-400 text-xs shrink-0">{expanded ? '▲' : '▼'}</span>
+      </div>
 
-        {/* ------------------------------------------------------------------ */}
-        {/* Source choice — radio group                                         */}
-        {/* ------------------------------------------------------------------ */}
-        <div className="space-y-3">
-          <p className="text-sm font-medium text-slate-700">
-            Account classification source
-          </p>
-
-          {/* Option A: Finssentials library */}
-          <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white p-4 hover:bg-slate-50 transition">
-            <input
-              type="radio"
-              name="coaSource"
-              value="library"
-              checked={source === 'library'}
-              onChange={() => handleSourceChange('library')}
-              className="mt-0.5 accent-blue-600"
-            />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-slate-800">
-                Finssentials library
-              </p>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Accounts are auto-classified using a built-in mapping library.
-                Unmatched accounts can be fine-tuned in the CoA Editor after the
-                initial commit.
-              </p>
+      {/* Expandable body */}
+      {expanded && (
+        <div className="border-t border-slate-100 px-5 pt-4 pb-5 space-y-5">
+          {/* Member entities */}
+          <div className="rounded-lg border border-slate-100 bg-slate-50 px-4 py-3">
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+              Entities in this group
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {group.memberEntityCodes.map(code => {
+                const e = entities.find(en => en.code === code)
+                return (
+                  <span
+                    key={code}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-slate-200 px-2.5 py-0.5 text-xs font-medium text-slate-700"
+                  >
+                    {e?.name || e?.prefix || code || '—'}
+                    {e?.prefix && <span className="text-slate-400">({e.prefix})</span>}
+                  </span>
+                )
+              })}
             </div>
-          </label>
+          </div>
+
+          {/* Method selection */}
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-slate-700">Mapping method for this group</p>
+            <label className={`flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
+              !method || method === 'library'
+                ? 'border-blue-400 bg-blue-50' : 'border-slate-200 bg-white hover:bg-slate-50'
+            }`}>
+              <input
+                type="radio"
+                name={`method-${group.id}`}
+                value="library"
+                checked={!method || method === 'library'}
+                onChange={() => patchGroup({ method: 'library', methodExplicit: true })}
+                className="mt-0.5 accent-blue-600"
+              />
+              <div>
+                <p className="text-sm font-semibold text-slate-800">Finssentials library</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Auto-classify accounts using the built-in mapping library. No file upload required.
+                </p>
+              </div>
+            </label>
+            <label className={`flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
+              method === 'upload'
+                ? 'border-blue-400 bg-blue-50' : 'border-slate-200 bg-white hover:bg-slate-50'
+            }`}>
+              <input
+                type="radio"
+                name={`method-${group.id}`}
+                value="upload"
+                checked={method === 'upload'}
+                onChange={() => patchGroup({ method: 'upload', methodExplicit: true })}
+                className="mt-0.5 accent-blue-600"
+              />
+              <div>
+                <p className="text-sm font-semibold text-slate-800">Upload client chart of accounts</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Download the BS and PL templates, fill in account numbers and hierarchy,
+                  then re-upload separately for Balance Sheet and Profit &amp; Loss.
+                </p>
+              </div>
+            </label>
+          </div>
 
           {/* Library variant sub-select */}
-          {source === 'library' && (
+          {(!method || method === 'library') && (
             <div className="ml-7 space-y-3">
               {LIBRARY_VARIANTS.map(v => (
                 <label
                   key={v.value}
                   className={`flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
-                    libraryVariant === v.value
+                    (group.libraryVariant ?? 'skr03') === v.value
                       ? 'border-blue-400 bg-blue-50'
                       : 'border-slate-200 bg-white hover:bg-slate-50'
                   }`}
                 >
                   <input
                     type="radio"
-                    name="libraryVariant"
+                    name={`variant-${group.id}`}
                     value={v.value}
-                    checked={libraryVariant === v.value}
-                    onChange={() => handleVariantChange(v.value)}
+                    checked={(group.libraryVariant ?? 'skr03') === v.value}
+                    onChange={() => patchGroup({ libraryVariant: v.value })}
                     className="mt-0.5 accent-blue-600"
                   />
                   <div>
@@ -1295,226 +1471,358 @@ function StepChartOfAccounts({
                   </div>
                 </label>
               ))}
-
-              <InfoBox>
-                <strong>How library classification works:</strong> after the Finish
-                step commits the GL data and CoA mapping, the platform runs
-                account auto-classification against the chosen library. Any account
-                that could not be matched automatically will appear in the CoA
-                Editor under{' '}
-                <span className="font-mono text-xs bg-white border border-blue-200 rounded px-1">
-                  /mapping-editor
-                </span>{' '}
-                where you can assign it to the correct P&amp;L or Balance Sheet
-                hierarchy node. The Editor is only available after the initial
-                commit because it works directly on the classified account dimension
-                table.
-              </InfoBox>
             </div>
           )}
 
-          {/* Option B: Upload */}
-          <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white p-4 hover:bg-slate-50 transition">
-            <input
-              type="radio"
-              name="coaSource"
-              value="upload"
-              checked={source === 'upload'}
-              onChange={() => handleSourceChange('upload')}
-              className="mt-0.5 accent-blue-600"
-            />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-slate-800">
-                Upload client chart of accounts
-              </p>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Download the Master template (Master_BS + Master_PL sheets, L1–L4
-                hierarchy), fill in your account numbers and hierarchy assignments,
-                and re-upload. Or upload an existing client CoA and map columns
-                manually.
-              </p>
-            </div>
-          </label>
-        </div>
-
-        {/* ------------------------------------------------------------------ */}
-        {/* Upload path                                                          */}
-        {/* ------------------------------------------------------------------ */}
-        {source === 'upload' && (
-          <div className="space-y-5">
-
-            {/* Download Master template button */}
-            <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
-              <p className="text-sm font-semibold text-slate-700">
-                Step 1 — Download the Master template
-              </p>
-              <p className="text-xs text-slate-500">
-                The template contains two sheets: <strong>Master_BS</strong> (Balance
-                Sheet) and <strong>Master_PL</strong> (P&amp;L). Each row maps an
-                account number to a hierarchy position (L1 through L4). Fill in your
-                client&apos;s account numbers and hierarchy labels, then upload the
-                completed file below.
-              </p>
-              <button
-                type="button"
-                onClick={handleDownloadTemplate}
-                disabled={downloading}
-                className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition"
-              >
-                {downloading ? (
-                  <>
-                    <svg className="animate-spin h-4 w-4 text-slate-500" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                    </svg>
-                    Downloading…
-                  </>
-                ) : (
-                  <>
-                    <svg className="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3" />
-                    </svg>
-                    Download Master template (.xlsx)
-                  </>
-                )}
-              </button>
-              {downloadError && (
-                <p className="text-xs text-red-600">{downloadError}</p>
-              )}
-            </div>
-
-            {/* Upload area */}
-            <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
-              <p className="text-sm font-semibold text-slate-700">
-                Step 2 — Upload the completed CoA file
-              </p>
-              <p className="text-xs text-slate-500">
-                If you upload the filled-in Master template (Master_BS + Master_PL
-                sheets), no column mapping is needed — it commits directly as{' '}
-                <span className="font-mono text-xs bg-white border border-slate-200 rounded px-1">
-                  format=bs_pl_master
-                </span>
-                . If you upload a generic client CoA file, you will map its columns
-                to the required target fields below.
-              </p>
-
-              {/* File drop / click area */}
-              <div
-                onClick={() => fileInputRef.current?.click()}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => {
-                  e.preventDefault()
-                  const f = e.dataTransfer.files[0]
-                  if (f) handleFileSelected(f)
-                }}
-                className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-8 py-10 cursor-pointer transition ${
-                  uploading
-                    ? 'border-blue-400 bg-blue-50'
-                    : coa.masterFileId
-                    ? 'border-emerald-300 bg-emerald-50'
+          {/* Upload slots: BS + PL */}
+          {method === 'upload' && (
+            <div className="space-y-4">
+              {/* Balance Sheet slot */}
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
+                <p className="text-sm font-semibold text-slate-700">Balance Sheet (BS)</p>
+                <button
+                  type="button"
+                  onClick={() => void handleDownload('bs')}
+                  disabled={bsDownloading}
+                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition"
+                >
+                  {bsDownloading ? 'Downloading…' : 'Download BS template (.xlsx)'}
+                </button>
+                {bsDownloadError && <p className="text-xs text-red-600">{bsDownloadError}</p>}
+                <div
+                  onClick={() => bsFileRef.current?.click()}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) void handleFileSelected(f, 'bs') }}
+                  className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-6 cursor-pointer transition ${
+                    bsUploading ? 'border-blue-400 bg-blue-50'
+                    : group.bs?.fileId ? 'border-emerald-300 bg-emerald-50'
                     : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
-                }`}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".xlsx,.xls,.csv"
-                  className="hidden"
-                  onChange={e => {
-                    const f = e.target.files?.[0]
-                    if (f) handleFileSelected(f)
-                  }}
-                />
-                {uploading ? (
-                  <p className="text-sm font-medium text-blue-600">Processing file…</p>
-                ) : coa.masterFileId ? (
-                  <div className="text-center">
-                    <p className="text-sm font-semibold text-emerald-700">
-                      File staged
-                    </p>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      File ID: <span className="font-mono">{coa.masterFileId}</span>
-                    </p>
-                    {coa.masterSheets && coa.masterSheets.length > 0 && (
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        Sheets: {coa.masterSheets.join(', ')}
-                      </p>
-                    )}
-                    {coa.isBsPlMaster && (
-                      <p className="text-xs font-medium text-emerald-600 mt-1">
-                        Master_BS + Master_PL detected — no column mapping needed
-                      </p>
-                    )}
-                    <p className="text-xs text-slate-400 mt-1.5 italic">
-                      Click or drop to replace
-                    </p>
-                  </div>
-                ) : (
-                  <>
-                    <div className="text-3xl text-slate-300 mb-2">&#128196;</div>
-                    <p className="text-sm font-semibold text-slate-700">
-                      Drop a file here or click to browse
-                    </p>
-                    <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
-                  </>
-                )}
-              </div>
-
-              {uploadError && (
-                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                  {uploadError}
+                  }`}
+                >
+                  <input ref={bsFileRef} type="file" accept=".xlsx,.xls,.csv,.txt" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) void handleFileSelected(f, 'bs') }} />
+                  {bsUploading ? (
+                    <p className="text-sm font-medium text-blue-600">Processing…</p>
+                  ) : group.bs?.fileId ? (
+                    <div className="text-center">
+                      <p className="text-sm font-semibold text-emerald-700">BS file staged</p>
+                      {group.bs.isMaster && (
+                        <p className="text-xs font-medium text-emerald-600 mt-1">Master_BS detected — no mapping needed</p>
+                      )}
+                      <p className="text-xs text-slate-400 mt-1 italic">Click or drop to replace</p>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm font-semibold text-slate-700">Drop BS file here or click to browse</p>
+                      <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
+                    </>
+                  )}
                 </div>
-              )}
-            </div>
-
-            {/* Column mapper — only shown for generic (non-master-shaped) uploads */}
-            {coa.masterFileId && !coa.isBsPlMaster && coa.masterColumns && coa.masterSample && (
-              <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-3">
-                <p className="text-sm font-semibold text-slate-700">
-                  Step 3 — Map source columns to account target fields
-                </p>
-                <p className="text-xs text-slate-500">
-                  This file does not have the standard Master_BS / Master_PL sheet
-                  layout. Drag source columns onto the required target fields so the
-                  backend can classify accounts correctly.
-                </p>
-                {missingAccountFields.length > 0 && (
-                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-                    <span className="font-medium">Missing required fields:</span>{' '}
-                    {missingAccountFields.join(', ')}
+                {bsUploadError && (
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{bsUploadError}</div>
+                )}
+                {group.bs?.fileId && !group.bs.isMaster && group.bs.columns && group.bs.sample && (
+                  <div className="space-y-2">
+                    {bsMissing.length > 0 && (
+                      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                        <span className="font-medium">Missing required fields:</span>{' '}{bsMissing.join(', ')}
+                      </div>
+                    )}
+                    <AccountColumnMapper
+                      key={group.bs.fileId}
+                      sourceColumns={group.bs.columns}
+                      sample={group.bs.sample}
+                      mapping={bsMapping}
+                      onChange={m => handleMappingChange('bs', m)}
+                      fields={coaGenericFields('bs')}
+                    />
                   </div>
                 )}
-                <AccountColumnMapper
-                  sourceColumns={coa.masterColumns}
-                  sample={coa.masterSample}
-                  mapping={mapping}
-                  onChange={handleMappingChange}
-                />
               </div>
-            )}
 
-            {/* Staged status summary */}
-            {uploadStagedOk && (
-              <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-                <strong>CoA file staged.</strong>{' '}
-                {coa.isBsPlMaster
-                  ? 'The Master template will be committed as bs_pl_master format at the Finish step.'
-                  : 'Column mapping complete. The file will be committed with the mapped column profile at the Finish step.'}
+              {/* Profit & Loss slot */}
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
+                <p className="text-sm font-semibold text-slate-700">Profit &amp; Loss (PL)</p>
+                <button
+                  type="button"
+                  onClick={() => void handleDownload('pl')}
+                  disabled={plDownloading}
+                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition"
+                >
+                  {plDownloading ? 'Downloading…' : 'Download PL template (.xlsx)'}
+                </button>
+                {plDownloadError && <p className="text-xs text-red-600">{plDownloadError}</p>}
+                <div
+                  onClick={() => plFileRef.current?.click()}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) void handleFileSelected(f, 'pl') }}
+                  className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-6 cursor-pointer transition ${
+                    plUploading ? 'border-blue-400 bg-blue-50'
+                    : group.pl?.fileId ? 'border-emerald-300 bg-emerald-50'
+                    : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
+                  }`}
+                >
+                  <input ref={plFileRef} type="file" accept=".xlsx,.xls,.csv,.txt" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) void handleFileSelected(f, 'pl') }} />
+                  {plUploading ? (
+                    <p className="text-sm font-medium text-blue-600">Processing…</p>
+                  ) : group.pl?.fileId ? (
+                    <div className="text-center">
+                      <p className="text-sm font-semibold text-emerald-700">PL file staged</p>
+                      {group.pl.isMaster && (
+                        <p className="text-xs font-medium text-emerald-600 mt-1">Master_PL detected — no mapping needed</p>
+                      )}
+                      <p className="text-xs text-slate-400 mt-1 italic">Click or drop to replace</p>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm font-semibold text-slate-700">Drop PL file here or click to browse</p>
+                      <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
+                    </>
+                  )}
+                </div>
+                {plUploadError && (
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{plUploadError}</div>
+                )}
+                {group.pl?.fileId && !group.pl.isMaster && group.pl.columns && group.pl.sample && (
+                  <div className="space-y-2">
+                    {plMissing.length > 0 && (
+                      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                        <span className="font-medium">Missing required fields:</span>{' '}{plMissing.join(', ')}
+                      </div>
+                    )}
+                    <AccountColumnMapper
+                      key={group.pl.fileId}
+                      sourceColumns={group.pl.columns}
+                      sample={group.pl.sample}
+                      mapping={plMapping}
+                      onChange={m => handleMappingChange('pl', m)}
+                      fields={coaGenericFields('pl')}
+                    />
+                  </div>
+                )}
               </div>
-            )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
-            {coa.masterFileId && !uploadStagedOk && !coa.isBsPlMaster && (
-              <WarnBox>
-                Map all required account fields above before continuing. You can
-                also proceed and return here, or continue past this step with a
-                note — the CoA can be uploaded separately after project creation.
-              </WarnBox>
-            )}
+function StepChartOfAccounts({
+  coa,
+  gl,
+  dispatch,
+  entities,
+}: {
+  coa: WizardCoaState
+  gl: WizardGlState
+  dispatch: Dispatch<WizardAction>
+  entities: WizardState['entities']
+}) {
+  // Auto-singleton: for single-entity projects skip the assignment UI and auto-create one group.
+  // Mirrors the GL single-entity auto-group logic (~line 654 in StepGlBookings).
+  useEffect(() => {
+    if (entities.length === 1 && !coa.assigned) {
+      const entityCode = entities[0].code
+      // Default the group key via the shared helper (same logic as the multi-entity branch).
+      const glEntity = gl.entities.find(e => e.entityCode === entityCode)
+      const formatGroupIdByEntity: Record<string, string | undefined> = {
+        [entityCode]: glEntity?.formatGroupId,
+      }
+      const assignment = buildInitialCoaAssignment([entityCode], formatGroupIdByEntity)
+      dispatch({ type: 'APPLY_COA_ASSIGNMENTS', assignment })
+    }
+  }, [entities, coa.assigned, gl.entities, dispatch])
+
+  // Auto-migrate legacy per-format CoA groups (Retry / resume path only).
+  //
+  // OLD buildInitialCoaAssignment keyed CoA groups by GL formatGroupId, so a two-entity
+  // project with different column layouts landed in two separate CoA groups. When the user
+  // uploaded ONE shared CoA file, only the first group got a fileId — the second group's
+  // slot was never filled → entity 02 produced zero commitAccountMapping rows.
+  //
+  // GUARD: the migration must NOT fire during a legitimate deliberate multi-CoA upload
+  // where the user intentionally has 2+ groups and is mid-upload (has uploaded to group A
+  // but not yet to group B). To prevent that, we gate on two conditions:
+  //   1. coa.assigned — the assignment step was already confirmed (resume/Retry path).
+  //   2. !coa.migrationChecked — the check has not run yet this session.
+  //
+  // coa.migrationChecked is set to true (via SET_COA_MIGRATION_CHECKED) after the first
+  // check against non-empty groups. Because it lives in the reducer — not in a local ref —
+  // it survives component remounts (user navigating away from step 3 and back).
+  //
+  // Sequence:
+  //   Resume / Retry with legacy groups → assigned=true, migrationChecked=false at mount
+  //     → migration runs → collapses groups → SET_COA_MIGRATION_CHECKED
+  //   New config: user confirms 2-group assignment (no files) → assigned=true,
+  //     migrationChecked=false → migration returns null (no files) → SET_COA_MIGRATION_CHECKED
+  //     → user uploads first file → migrationChecked=true → effect skips → NO premature merge.
+  useEffect(() => {
+    if (!coa.assigned || coa.migrationChecked) return
+    const migration = migrateLegacyCoaGroups(coa.groups)
+    if (migration !== null) {
+      dispatch({ type: 'APPLY_COA_ASSIGNMENTS', assignment: migration })
+    }
+    // Mark checked once groups are non-empty. If groups haven't been created yet
+    // (state still settling), hold off so we retry on the next change.
+    if (coa.groups.length > 0) {
+      dispatch({ type: 'SET_COA_MIGRATION_CHECKED' })
+    }
+  }, [coa.groups, coa.assigned, coa.migrationChecked, dispatch])
+
+  // Build the initial assignment from current coa.groups (re-assignment) or from GL groups (first time).
+  const initialAssignment: Record<string, string> = (() => {
+    if (coa.groups.length > 0) {
+      const result: Record<string, string> = {}
+      entities.forEach(e => {
+        const g = coa.groups.find(g => g.memberEntityCodes.includes(e.code))
+        if (g) result[e.code] = g.id
+      })
+      // Entities NOT found in any existing group get a fallback key so they are never silently dropped.
+      // Prefer the id of the single non-empty group when exactly one exists (pre-fills them into it),
+      // otherwise fall back to the generic shared key so the user sees one merged group by default.
+      const nonEmptyGroups = coa.groups.filter(g => g.memberEntityCodes.length > 0)
+      const fallbackKey = nonEmptyGroups.length === 1 ? nonEmptyGroups[0].id : 'coa-shared'
+      entities.forEach(e => {
+        if (result[e.code] === undefined) result[e.code] = fallbackKey
+      })
+      return result
+    }
+    // First visit: default via shared helper (all entities share one group key).
+    const formatGroupIdByEntity: Record<string, string | undefined> = {}
+    entities.forEach(e => {
+      const glEntity = gl.entities.find(ge => ge.entityCode === e.code)
+      formatGroupIdByEntity[e.code] = glEntity?.formatGroupId
+    })
+    return buildInitialCoaAssignment(entities.map(e => e.code), formatGroupIdByEntity)
+  })()
+
+  // Show the assignment step for multi-entity projects that haven't confirmed yet,
+  // OR whose stale coa.groups don't cover all current entities (coverage-completeness gate).
+  const showAssignment =
+    entities.length > 1 &&
+    (!coa.assigned || !coaGroupsCoverAllEntities(coa.groups, entities.map(e => e.code)))
+
+  function handleMappingModeChange(mode: AccountMappingMode) {
+    dispatch({ type: 'PATCH_COA', patch: { accountMappingMode: mode } })
+  }
+
+  return (
+    <StepCard
+      title="Chart of accounts"
+      subtitle="Configure how accounts are classified into the P&L and Balance Sheet hierarchy."
+    >
+      <div className="space-y-6">
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Assignment step (multi-entity only, hides once assigned)            */}
+        {/* ------------------------------------------------------------------ */}
+        {showAssignment && (
+          <>
+            <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+              Assign each entity to a CoA mapping group. Entities sharing the same account
+              structure can share one mapping. Defaults are suggested from your GL format groups.
+            </div>
+            <CoaMappingAssignmentStep
+              entities={entities}
+              initialAssignment={initialAssignment}
+              onConfirm={assignment =>
+                dispatch({ type: 'APPLY_COA_ASSIGNMENTS', assignment, explicit: true })
+              }
+            />
+          </>
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Per-group configuration cards                                        */}
+        {/* ------------------------------------------------------------------ */}
+        {!showAssignment && coa.groups.length > 0 && (
+          <div className="space-y-4">
+            <div className="rounded-xl border border-slate-200 bg-white px-6 pt-5 pb-4 shadow-sm">
+              <h3 className="text-base font-semibold text-slate-900">Mapping group configuration</h3>
+              <p className="mt-0.5 text-sm text-slate-500">
+                Configure the account mapping method for each group. Nothing is written to the
+                database until the Finish step.
+              </p>
+            </div>
+            {coa.groups.map(group => (
+              <CoaGroupCard
+                key={group.id}
+                group={group}
+                entities={entities}
+                dispatch={dispatch}
+              />
+            ))}
           </div>
         )}
 
         {/* ------------------------------------------------------------------ */}
-        {/* CoA Editor hint (collect-then-commit — editor available post-Finish) */}
+        {/* Fallback mode for accounts not covered by any group mapping         */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-3">
+          <p className="text-sm font-semibold text-slate-700">
+            How should accounts NOT covered by your mapping be classified?
+          </p>
+          <div className="space-y-2">
+            <label className={`flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
+              coa.accountMappingMode === 'library'
+                ? 'border-blue-400 bg-blue-50'
+                : 'border-slate-200 bg-white hover:bg-slate-50'
+            }`}>
+              <input
+                type="radio"
+                name="accountMappingMode"
+                value="library"
+                checked={coa.accountMappingMode === 'library'}
+                onChange={() => handleMappingModeChange('library')}
+                className="mt-0.5 accent-blue-600"
+              />
+              <div>
+                <p className="text-sm font-semibold text-slate-800">
+                  Use the Finssentials library to fill them in (most-frequent)
+                </p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Accounts not in your mapping file are auto-classified using the built-in library.
+                  Recommended for projects with standard German chart-of-accounts numbering (SKR03, GKR).
+                </p>
+              </div>
+            </label>
+            <label className={`flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
+              coa.accountMappingMode === 'exclusive'
+                ? 'border-amber-400 bg-amber-50'
+                : 'border-slate-200 bg-white hover:bg-slate-50'
+            }`}>
+              <input
+                type="radio"
+                name="accountMappingMode"
+                value="exclusive"
+                checked={coa.accountMappingMode === 'exclusive'}
+                onChange={() => handleMappingModeChange('exclusive')}
+                className="mt-0.5 accent-blue-600"
+              />
+              <div>
+                <p className="text-sm font-semibold text-slate-800">
+                  Use ONLY the mapping I provide (leave the rest unmapped)
+                </p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Accounts not present in any uploaded mapping file remain unclassified.
+                  Use this when the client has a fully custom chart of accounts.
+                </p>
+              </div>
+            </label>
+          </div>
+          {coa.accountMappingMode === 'exclusive' && (
+            <WarnBox>
+              Exclusive mode: accounts not covered by your mapping files will appear as "unmapped"
+              in P&amp;L and Balance Sheet views until reclassified in the CoA Editor.
+            </WarnBox>
+          )}
+        </div>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* CoA Editor hint                                                     */}
         {/* ------------------------------------------------------------------ */}
         <div className="rounded-lg border border-blue-200 bg-blue-50/70 px-4 py-4 space-y-2">
           <p className="text-sm font-semibold text-blue-900">
@@ -1525,8 +1833,8 @@ function StepChartOfAccounts({
             <span className="font-mono text-xs bg-white border border-blue-200 rounded px-1">
               /mapping-editor
             </span>
-            ) lets you remap individual accounts, adjust hierarchy nodes (L2 / L3
-            / L4), and re-run classification at any time.
+            ) lets you remap individual accounts, adjust hierarchy nodes (L2 / L3 / L4),
+            and re-run classification at any time.
           </p>
           <p className="text-xs text-blue-700">
             Because this wizard uses a <strong>collect-then-commit</strong> model,
@@ -1534,9 +1842,8 @@ function StepChartOfAccounts({
             <span className="font-mono text-xs bg-white border border-blue-200 rounded px-1">
               dim_gl_account
             </span>
-            ) does not exist until the Finish step commits the GL data and CoA
-            mapping. The Editor link will become active in the navigation after
-            you complete the wizard.
+            ) does not exist until the Finish step commits the GL data and CoA mapping.
+            The Editor link will become active in the navigation after you complete the wizard.
           </p>
         </div>
 
@@ -1552,16 +1859,27 @@ function StepChartOfAccounts({
 function StepOpeningBalances({
   ob,
   dispatch,
+  entities,
 }: {
   ob: WizardObState
   dispatch: Dispatch<WizardAction>
+  entities: WizardState['entities']
 }) {
+  const validEntities = entities.filter(e => e.code.trim())
+  const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
+
   const [mode, setMode] = useState<WizardObState['mode']>(ob.mode ?? 'in_data')
+  const [entitySource, setEntitySource] = useState<EntitySource>(ob.entitySource ?? defaultEntitySource)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Local profile for account/amount column mapping
+  // Per-entity refs and upload state
+  const perEntityInputRefs = useRef<Record<string, HTMLInputElement | null>>({})
+  const [perEntityUploading, setPerEntityUploading] = useState<Record<string, boolean>>({})
+  const [perEntityErrors, setPerEntityErrors] = useState<Record<string, string | null>>({})
+
+  // Local profile for combined account/amount column mapping
   const [obProfile, setObProfile] = useState<WizardObState['obProfile']>(
     ob.obProfile ?? {},
   )
@@ -1611,8 +1929,131 @@ function StepOpeningBalances({
     dispatch({ type: 'PATCH_OB', patch: { obProfile: updated } })
   }
 
+  function handleEntitySourceChange(val: EntitySource) {
+    setEntitySource(val)
+    dispatch({ type: 'PATCH_OB', patch: { entitySource: val } })
+  }
+
+  function handleEntityColChange(col: string) {
+    dispatch({ type: 'PATCH_OB', patch: { entityCol: col } })
+  }
+
+  function handleEntityColKindChange(val: 'names' | 'prefixes') {
+    dispatch({ type: 'PATCH_OB', patch: { entityColKind: val } })
+  }
+
+  async function handlePerEntityFileSelected(entityCode: string, file: File) {
+    setPerEntityUploading(prev => ({ ...prev, [entityCode]: true }))
+    setPerEntityErrors(prev => ({ ...prev, [entityCode]: null }))
+    try {
+      const res = await uploadOpeningBalance(file)
+      const cols = res.columns
+      const accountGuess = cols.find(c => /account|konto/i.test(c)) ?? ''
+      const amountGuess = cols.find(c => /amount|betrag/i.test(c)) ?? ''
+      const suggested = { account_col: accountGuess, amount_col: amountGuess }
+      dispatch({
+        type: 'PATCH_OB',
+        patch: {
+          perEntity: {
+            ...ob.perEntity,
+            [entityCode]: {
+              ...(ob.perEntity?.[entityCode] ?? {}),
+              obFileId: res.file_id,
+              obColumns: cols,
+              obSample: res.sample,
+              obProfile: suggested,
+            },
+          },
+        },
+      })
+    } catch (e) {
+      setPerEntityErrors(prev => ({
+        ...prev,
+        [entityCode]: e instanceof Error ? e.message : 'Upload failed',
+      }))
+    } finally {
+      setPerEntityUploading(prev => ({ ...prev, [entityCode]: false }))
+    }
+  }
+
+  function handlePerEntityProfileChange(
+    entityCode: string,
+    field: 'account_col' | 'amount_col' | 'fiscal_year_col',
+    value: string,
+  ) {
+    const existing = ob.perEntity?.[entityCode]?.obProfile ?? {}
+    const updated = { ...existing, [field]: value }
+    dispatch({
+      type: 'PATCH_OB',
+      patch: {
+        perEntity: {
+          ...ob.perEntity,
+          [entityCode]: {
+            ...(ob.perEntity?.[entityCode] ?? {}),
+            obProfile: updated,
+          },
+        },
+      },
+    })
+  }
+
   const columns = ob.obColumns ?? []
   const needsFile = mode === 'file_first_year' || mode === 'file_all'
+
+  // ---------------------------------------------------------------------------
+  // OB column mapper — manifest + mapping bridge
+  // ---------------------------------------------------------------------------
+
+  // Build OB target-field manifest; mode/entity conditionals determine which
+  // fields are included. Groups render in first-seen order (single group here).
+  const obFields = useMemo<TargetField[]>(() => {
+    const fs: TargetField[] = []
+    if (validEntities.length > 0) {
+      fs.push({
+        key: 'entity',
+        label: 'Entity',
+        group: 'Opening balances',
+        required: true,
+        hint: 'Column identifying the legal entity (name or prefix) for each row',
+      })
+    }
+    fs.push({
+      key: 'account_number',
+      label: 'Account Number',
+      group: 'Opening balances',
+      required: true,
+      hint: 'The account number — combined with the entity to build the account group for the join',
+    })
+    fs.push({ key: 'amount', label: 'Opening Balance Amount', group: 'Opening balances', required: true })
+    if (mode === 'file_all') {
+      fs.push({
+        key: 'fiscal_year',
+        label: 'Fiscal Year',
+        group: 'Opening balances',
+        required: true,
+        hint: 'Which fiscal year each opening-balance row belongs to',
+      })
+    }
+    return fs
+  }, [validEntities.length, mode])
+
+  // Current mapping derived from state — empty strings are omitted so ColumnMapper
+  // correctly treats them as unmapped drop-zones.
+  const obMapping: Record<string, string> = {}
+  if (ob.entityCol) obMapping.entity = ob.entityCol
+  if (obProfile?.account_col) obMapping.account_number = obProfile.account_col
+  if (obProfile?.amount_col) obMapping.amount = obProfile.amount_col
+  if (obProfile?.fiscal_year_col) obMapping.fiscal_year = obProfile.fiscal_year_col
+
+  // Translate the mapper's full-next-mapping output back to existing state
+  // handlers. Only fires a handler when the value actually changed, avoiding
+  // redundant dispatches.
+  function handleObMappingChange(next: Record<string, string>) {
+    if ((next.entity ?? '') !== (ob.entityCol ?? '')) handleEntityColChange(next.entity ?? '')
+    if ((next.account_number ?? '') !== (obProfile?.account_col ?? '')) handleProfileChange('account_col', next.account_number ?? '')
+    if ((next.amount ?? '') !== (obProfile?.amount_col ?? '')) handleProfileChange('amount_col', next.amount ?? '')
+    if ((next.fiscal_year ?? '') !== (obProfile?.fiscal_year_col ?? '')) handleProfileChange('fiscal_year_col', next.fiscal_year ?? '')
+  }
 
   return (
     <StepCard
@@ -1712,9 +2153,20 @@ function StepOpeningBalances({
         </div>
 
         {/* ------------------------------------------------------------------ */}
-        {/* File upload — shown for first_year and all modes                    */}
+        {/* Entity source selector — how OB data is split across entities       */}
         {/* ------------------------------------------------------------------ */}
-        {needsFile && (
+        {needsFile && validEntities.length > 0 && (
+          <EntitySourceSelector
+            value={entitySource}
+            onChange={handleEntitySourceChange}
+            dataLabel="opening balances"
+          />
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* File upload — shown for first_year and all modes (combined path)   */}
+        {/* ------------------------------------------------------------------ */}
+        {needsFile && (!validEntities.length || entitySource === 'combined') && (
           <div className="space-y-4">
             <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
               <p className="text-sm font-semibold text-slate-700">
@@ -1783,39 +2235,48 @@ function StepOpeningBalances({
               )}
             </div>
 
-            {/* Column mapping for account + amount */}
+            {/* Column mapping — drag-and-drop */}
             {ob.obFileId && columns.length > 0 && (
-              <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-3">
-                <p className="text-sm font-semibold text-slate-700">Map account and amount columns</p>
+              <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-4">
+                <p className="text-sm font-semibold text-slate-700">Map columns to target fields</p>
                 <p className="text-xs text-slate-500">
-                  Select which column holds the account number and which holds the opening balance
-                  amount. These two fields are the minimum required for ingestion.
+                  Drag a column chip from the left panel and drop it onto the target field.
+                  Required fields are highlighted in amber until mapped.
                 </p>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {(
-                    [
-                      ['account_col', 'Account number column', true],
-                      ['amount_col', 'Amount column', true],
-                    ] as [keyof NonNullable<WizardObState['obProfile']>, string, boolean][]
-                  ).map(([field, label, required]) => (
-                    <div key={field} className="space-y-1">
-                      <label className="text-xs font-medium text-slate-700">
-                        {label}
-                        {required && <span className="ml-0.5 text-red-500" aria-hidden>*</span>}
-                      </label>
-                      <select
-                        value={obProfile?.[field] ?? ''}
-                        onChange={e => handleProfileChange(field, e.target.value)}
-                        className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      >
-                        <option value="">-- Select column --</option>
-                        {columns.map(c => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
+
+                {/* Drag-and-drop column mapper */}
+                <ColumnMapper
+                  sourceColumns={columns}
+                  sample={ob.obSample ?? []}
+                  mapping={obMapping}
+                  onChange={handleObMappingChange}
+                  fields={obFields}
+                />
+
+                {/* Entity column content type — shown when the project has entities (combined mode) */}
+                {validEntities.length > 0 && entitySource === 'combined' && (
+                  <div className="space-y-1">
+                    <p className="text-xs font-medium text-slate-700">The Entity column contains:</p>
+                    <div className="flex gap-4">
+                      {([
+                        ['names',    'Entity names (e.g. Atlas, Calypto)'],
+                        ['prefixes', 'Entity prefixes (e.g. 01, 02)'],
+                      ] as const).map(([val, label]) => (
+                        <label key={val} className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="entityColKind"
+                            value={val}
+                            checked={(ob.entityColKind ?? 'names') === val}
+                            onChange={() => handleEntityColKindChange(val)}
+                            className="accent-blue-600"
+                          />
+                          {label}
+                        </label>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </div>
+                )}
 
                 {/* Sample preview */}
                 {ob.obSample && ob.obSample.length > 0 && (
@@ -1848,12 +2309,23 @@ function StepOpeningBalances({
             )}
 
             {/* Staged status */}
-            {ob.obFileId && obProfile?.account_col && obProfile?.amount_col && (
+            {ob.obFileId && obProfile?.account_col && obProfile?.amount_col &&
+              (mode !== 'file_all' || !!obProfile?.fiscal_year_col) && (
               <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
                 <strong>Opening balance file staged.</strong>{' '}
                 Account column: <span className="font-mono">{obProfile.account_col}</span>,
-                amount column: <span className="font-mono">{obProfile.amount_col}</span>.
+                amount column: <span className="font-mono">{obProfile.amount_col}</span>
+                {mode === 'file_all' && obProfile.fiscal_year_col && (
+                  <>, fiscal year column: <span className="font-mono">{obProfile.fiscal_year_col}</span></>
+                )}.
                 The file will be committed with scope "{mode === 'file_first_year' ? 'first_year' : 'all'}" at the Finish step.
+              </div>
+            )}
+            {ob.obFileId && obProfile?.account_col && obProfile?.amount_col &&
+              mode === 'file_all' && !obProfile?.fiscal_year_col && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                <strong>Fiscal year column not mapped.</strong>{' '}
+                Select a fiscal year column above to complete the mapping for multi-year opening balances.
               </div>
             )}
 
@@ -1864,6 +2336,162 @@ function StepOpeningBalances({
                 without a file — it can be added later.
               </WarnBox>
             )}
+          </div>
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Per-entity upload blocks — one per legal entity                    */}
+        {/* ------------------------------------------------------------------ */}
+        {needsFile && entitySource === 'per_entity' && validEntities.length > 0 && (
+          <div className="space-y-4">
+            <p className="text-xs text-slate-500">
+              Upload one opening balance file per legal entity. The entity prefix is injected
+              automatically at commit time — no entity column is needed in these files.
+            </p>
+            <PerEntityPager
+              entities={validEntities}
+              stagedCount={validEntities.filter(e => !!ob.perEntity?.[e.code]?.obFileId).length}
+              renderEntity={entity => {
+                const code = entity.code
+                const perState = ob.perEntity?.[code]
+                const perCols = perState?.obColumns ?? []
+                const isUploading = perEntityUploading[code] ?? false
+                const uploadErr = perEntityErrors[code] ?? null
+                return (
+                  <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold text-slate-700">{entity.name || entity.code}</p>
+                      <span className="font-mono text-xs text-slate-400 bg-slate-100 rounded px-1.5 py-0.5">
+                        prefix: {entity.prefix || entity.code}
+                      </span>
+                    </div>
+
+                    <div
+                      onClick={() => perEntityInputRefs.current[code]?.click()}
+                      onDragOver={e => e.preventDefault()}
+                      onDrop={e => {
+                        e.preventDefault()
+                        const f = e.dataTransfer.files[0]
+                        if (f) void handlePerEntityFileSelected(code, f)
+                      }}
+                      className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-8 cursor-pointer transition ${
+                        isUploading
+                          ? 'border-blue-400 bg-blue-50'
+                          : perState?.obFileId
+                          ? 'border-emerald-300 bg-emerald-50'
+                          : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
+                      }`}
+                    >
+                      <input
+                        ref={el => { perEntityInputRefs.current[code] = el }}
+                        type="file"
+                        accept=".xlsx,.xls,.csv"
+                        className="hidden"
+                        onChange={e => {
+                          const f = e.target.files?.[0]
+                          if (f) void handlePerEntityFileSelected(code, f)
+                        }}
+                      />
+                      {isUploading ? (
+                        <p className="text-sm font-medium text-blue-600">Processing file…</p>
+                      ) : perState?.obFileId ? (
+                        <div className="text-center">
+                          <p className="text-sm font-semibold text-emerald-700">File staged</p>
+                          <p className="text-xs text-slate-500 mt-0.5 font-mono">{perState.obFileId}</p>
+                          {perCols.length > 0 && (
+                            <p className="text-xs text-slate-400 mt-0.5">{perCols.length} columns detected</p>
+                          )}
+                          <p className="text-xs text-slate-400 mt-1 italic">Click or drop to replace</p>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="text-3xl text-slate-300 mb-2">&#128196;</div>
+                          <p className="text-sm font-semibold text-slate-700">Drop a file here or click to browse</p>
+                          <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
+                        </>
+                      )}
+                    </div>
+
+                    {uploadErr && (
+                      <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                        {uploadErr}
+                      </div>
+                    )}
+
+                    {perState?.obFileId && perCols.length > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-semibold text-slate-700">Map account and amount columns</p>
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          {(
+                            [
+                              ['account_col', 'Account number column', true],
+                              ['amount_col', 'Amount column', true],
+                            ] as [keyof NonNullable<WizardObState['obProfile']>, string, boolean][]
+                          ).map(([field, label, required]) => (
+                            <div key={field} className="space-y-1">
+                              <label className="text-xs font-medium text-slate-700">
+                                {label}
+                                {required && <span className="ml-0.5 text-red-500" aria-hidden>*</span>}
+                              </label>
+                              <select
+                                value={perState?.obProfile?.[field] ?? ''}
+                                onChange={e => handlePerEntityProfileChange(code, field, e.target.value)}
+                                className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              >
+                                <option value="">-- Select column --</option>
+                                {perCols.map(c => (
+                                  <option key={c} value={c}>{c}</option>
+                                ))}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                        {/* Fiscal year column — required for multi-year OB files */}
+                        {mode === 'file_all' && (
+                          <div className="space-y-1">
+                            <label className="text-xs font-medium text-slate-700">
+                              Fiscal year column
+                              <span className="ml-0.5 text-red-500" aria-hidden>*</span>
+                            </label>
+                            <select
+                              value={perState?.obProfile?.fiscal_year_col ?? ''}
+                              onChange={e => handlePerEntityProfileChange(code, 'fiscal_year_col', e.target.value)}
+                              className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            >
+                              <option value="">-- Select column --</option>
+                              {perCols.map(c => (
+                                <option key={c} value={c}>{c}</option>
+                              ))}
+                            </select>
+                            <p className="text-xs text-slate-400">
+                              Required for multi-year opening balances; maps which fiscal year each opening row belongs to.
+                            </p>
+                          </div>
+                        )}
+                        {perState.obProfile?.account_col && perState.obProfile?.amount_col &&
+                          (mode !== 'file_all' || !!perState.obProfile?.fiscal_year_col) && (
+                          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                            <strong>Staged.</strong>{' '}
+                            Account: <span className="font-mono">{perState.obProfile.account_col}</span>{' '}
+                            · Amount: <span className="font-mono">{perState.obProfile.amount_col}</span>
+                            {mode === 'file_all' && perState.obProfile.fiscal_year_col && (
+                              <>{' '}· Fiscal year: <span className="font-mono">{perState.obProfile.fiscal_year_col}</span></>
+                            )}.
+                          </div>
+                        )}
+                        {perState.obProfile?.account_col && perState.obProfile?.amount_col &&
+                          mode === 'file_all' && !perState.obProfile?.fiscal_year_col && (
+                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            <strong>Fiscal year column not mapped.</strong>{' '}
+                            Select a fiscal year column above to complete the mapping.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              }}
+            />
           </div>
         )}
 
@@ -1885,51 +2513,321 @@ function StepOpeningBalances({
 // Step 5 — Partner master (Phase 4 — COMPLETE)
 // ---------------------------------------------------------------------------
 
-function StepPartnerMaster({
-  partner,
+/**
+ * PerEntityPartnerBlock — upload + column-mapping panel for one legal entity
+ * in per-entity mode. Does NOT render the "Entity assignment" sub-control;
+ * the entity prefix is injected automatically at Finish time.
+ */
+function PerEntityPartnerBlock({
+  entityCode,
+  entityName,
+  entityPrefix,
+  side,
+  perState,
+  allPerEntity,
   dispatch,
 }: {
-  partner: WizardPartnerState
+  entityCode: string
+  entityName: string
+  entityPrefix: string
+  side: 'customer' | 'supplier'
+  perState: NonNullable<PartnerSideState['perEntity']>[string] | undefined
+  allPerEntity: PartnerSideState['perEntity'] | undefined
+  dispatch: Dispatch<WizardAction>
+}) {
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [joinKeyCol, setJoinKeyCol] = useState(perState?.profile?.join_key?.column ?? '')
+  const [nameCol, setNameCol] = useState(perState?.profile?.columns?.name_line_1 ?? '')
+  const [nameLine2Col, setNameLine2Col] = useState(perState?.profile?.columns?.name_line_2 ?? '')
+  const [countryCol, setCountryCol] = useState(perState?.profile?.columns?.country_code ?? '')
+  const [cityCol, setCityCol] = useState(perState?.profile?.columns?.city ?? '')
+  const [postalCol, setPostalCol] = useState(perState?.profile?.columns?.postal_code ?? '')
+
+  const columns = perState?.columns ?? []
+
+  function persistProfile(overrides: Partial<{
+    joinKeyCol: string; nameCol: string; nameLine2Col: string
+    countryCol: string; cityCol: string; postalCol: string
+  }> = {}) {
+    const jk = overrides.joinKeyCol ?? joinKeyCol
+    const nc = overrides.nameCol ?? nameCol
+    if (!jk || !nc) return
+    const nl2 = overrides.nameLine2Col ?? nameLine2Col
+    const cc = overrides.countryCol ?? countryCol
+    const ci = overrides.cityCol ?? cityCol
+    const po = overrides.postalCol ?? postalCol
+    const profile: PartnerMappingProfile = {
+      side,
+      entity: { mode: 'fixed', value: entityPrefix || entityCode }, // overridden at Finish
+      join_key: { column: jk },
+      columns: {
+        name_line_1: nc,
+        ...(nl2 ? { name_line_2: nl2 } : {}),
+        ...(cc ? { country_code: cc } : {}),
+        ...(ci ? { city: ci } : {}),
+        ...(po ? { postal_code: po } : {}),
+      },
+    }
+    dispatch({
+      type: 'PATCH_PARTNER',
+      side,
+      patch: {
+        perEntity: {
+          ...allPerEntity,
+          [entityCode]: { ...(allPerEntity?.[entityCode] ?? {}), profile },
+        },
+      },
+    })
+  }
+
+  async function handleFileSelected(file: File) {
+    setUploading(true)
+    setUploadError(null)
+    try {
+      const res = await uploadPartnerMaster(file)
+      const cols = res.columns
+      const joinGuess = cols.find(c => /debtor|creditor|kred|deb|partner.?no|kunden.?nr|lief.?nr|number/i.test(c)) ?? ''
+      const nameGuess = cols.find(c => /name|firma|bezeichnung/i.test(c)) ?? ''
+      setJoinKeyCol(joinGuess)
+      setNameCol(nameGuess)
+      dispatch({
+        type: 'PATCH_PARTNER',
+        side,
+        patch: {
+          perEntity: {
+            ...allPerEntity,
+            [entityCode]: {
+              ...(allPerEntity?.[entityCode] ?? {}),
+              fileId: res.file_id,
+              columns: res.columns,
+              sample: res.sample,
+              profile: undefined,
+            },
+          },
+        },
+      })
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : 'Upload failed')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-4">
+      {/* Entity header */}
+      <div className="flex items-center gap-2">
+        <p className="text-sm font-semibold text-slate-700">{entityName || entityCode}</p>
+        <span className="font-mono text-xs text-slate-400 bg-slate-100 rounded px-1.5 py-0.5">
+          prefix: {entityPrefix || entityCode}
+        </span>
+      </div>
+
+      {/* Dropzone */}
+      <div
+        onClick={() => fileInputRef.current?.click()}
+        onDragOver={e => e.preventDefault()}
+        onDrop={e => {
+          e.preventDefault()
+          const f = e.dataTransfer.files[0]
+          if (f) void handleFileSelected(f)
+        }}
+        className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-8 cursor-pointer transition ${
+          uploading
+            ? 'border-blue-400 bg-blue-50'
+            : perState?.fileId
+            ? 'border-emerald-300 bg-emerald-50'
+            : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
+        }`}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".xlsx,.xls,.csv"
+          className="hidden"
+          onChange={e => {
+            const f = e.target.files?.[0]
+            if (f) void handleFileSelected(f)
+          }}
+        />
+        {uploading ? (
+          <p className="text-sm font-medium text-blue-600">Processing file…</p>
+        ) : perState?.fileId ? (
+          <div className="text-center">
+            <p className="text-sm font-semibold text-emerald-700">File staged</p>
+            <p className="text-xs text-slate-500 mt-0.5 font-mono">{perState.fileId}</p>
+            {columns.length > 0 && (
+              <p className="text-xs text-slate-400 mt-0.5">{columns.length} columns detected</p>
+            )}
+            <p className="text-xs text-slate-400 mt-1 italic">Click or drop to replace</p>
+          </div>
+        ) : (
+          <>
+            <div className="text-3xl text-slate-300 mb-2">&#128196;</div>
+            <p className="text-sm font-semibold text-slate-700">Drop a file here or click to browse</p>
+            <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
+          </>
+        )}
+      </div>
+
+      {uploadError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {uploadError}
+        </div>
+      )}
+
+      {/* Column mapping */}
+      {perState?.fileId && columns.length > 0 && (
+        <div className="space-y-3">
+          <p className="text-sm font-semibold text-slate-700">Column mapping</p>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-slate-700">
+                Join key column
+                <span className="ml-0.5 text-red-500" aria-hidden>*</span>
+                <span className="ml-1 font-normal text-slate-400">
+                  ({side === 'customer' ? 'debtor' : 'creditor'} number)
+                </span>
+              </label>
+              <select
+                value={joinKeyCol}
+                onChange={e => { setJoinKeyCol(e.target.value); persistProfile({ joinKeyCol: e.target.value }) }}
+                className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">-- Select column --</option>
+                {columns.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-slate-700">
+                Primary name column
+                <span className="ml-0.5 text-red-500" aria-hidden>*</span>
+              </label>
+              <select
+                value={nameCol}
+                onChange={e => { setNameCol(e.target.value); persistProfile({ nameCol: e.target.value }) }}
+                className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">-- Select column --</option>
+                {columns.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-slate-600">Optional address fields</p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">Name line 2</label>
+                <select
+                  value={nameLine2Col}
+                  onChange={e => { setNameLine2Col(e.target.value); persistProfile({ nameLine2Col: e.target.value }) }}
+                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">-- Not mapped --</option>
+                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">Country code</label>
+                <select
+                  value={countryCol}
+                  onChange={e => { setCountryCol(e.target.value); persistProfile({ countryCol: e.target.value }) }}
+                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">-- Not mapped --</option>
+                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">City</label>
+                <select
+                  value={cityCol}
+                  onChange={e => { setCityCol(e.target.value); persistProfile({ cityCol: e.target.value }) }}
+                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">-- Not mapped --</option>
+                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">Postal code</label>
+                <select
+                  value={postalCol}
+                  onChange={e => { setPostalCol(e.target.value); persistProfile({ postalCol: e.target.value }) }}
+                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">-- Not mapped --</option>
+                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {perState.profile && (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+              <strong>Staged.</strong>{' '}
+              Join key: <span className="font-mono">{joinKeyCol}</span> ·
+              Name: <span className="font-mono">{nameCol}</span>.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * CombinedPartnerBlock — upload + column-mapping panel for a single side
+ * (customer or supplier) in combined (non-per-entity) mode.
+ * Rendered with key={activeSide} so it remounts on side switch, picking up
+ * fresh local state from sideState.
+ */
+function CombinedPartnerBlock({
+  side,
+  sideState,
+  dispatch,
+}: {
+  side: 'customer' | 'supplier'
+  sideState: PartnerSideState
   dispatch: Dispatch<WizardAction>
 }) {
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Local profile — initialise from persisted state
-  const [side, setSide] = useState<'customer' | 'supplier'>(
-    partner.profile?.side ?? 'customer',
-  )
+  // Local form state — initialised from persisted side state
   const [entityMode, setEntityMode] = useState<'fixed' | 'column'>(
-    partner.profile?.entity.mode ?? 'fixed',
+    sideState.profile?.entity.mode ?? 'fixed',
   )
   const [entityValue, setEntityValue] = useState<string>(
-    partner.profile?.entity.value ?? '',
+    sideState.profile?.entity.value ?? '',
   )
   const [joinKeyCol, setJoinKeyCol] = useState<string>(
-    partner.profile?.join_key.column ?? '',
+    sideState.profile?.join_key.column ?? '',
   )
   const [nameCol, setNameCol] = useState<string>(
-    partner.profile?.columns.name_line_1 ?? '',
+    sideState.profile?.columns.name_line_1 ?? '',
   )
   const [nameLine2Col, setNameLine2Col] = useState<string>(
-    partner.profile?.columns.name_line_2 ?? '',
+    sideState.profile?.columns.name_line_2 ?? '',
   )
   const [countryCol, setCountryCol] = useState<string>(
-    partner.profile?.columns.country_code ?? '',
+    sideState.profile?.columns.country_code ?? '',
   )
   const [cityCol, setCityCol] = useState<string>(
-    partner.profile?.columns.city ?? '',
+    sideState.profile?.columns.city ?? '',
   )
   const [postalCol, setPostalCol] = useState<string>(
-    partner.profile?.columns.postal_code ?? '',
+    sideState.profile?.columns.postal_code ?? '',
   )
 
-  const columns = partner.columns ?? []
+  const columns = sideState.columns ?? []
 
-  // Build and persist profile whenever any mapping field changes
   function persistProfile(overrides: Partial<{
-    side: 'customer' | 'supplier'
     entityMode: 'fixed' | 'column'
     entityValue: string
     joinKeyCol: string
@@ -1939,7 +2837,6 @@ function StepPartnerMaster({
     cityCol: string
     postalCol: string
   }> = {}) {
-    const s = overrides.side ?? side
     const em = overrides.entityMode ?? entityMode
     const ev = overrides.entityValue ?? entityValue
     const jk = overrides.joinKeyCol ?? joinKeyCol
@@ -1952,7 +2849,7 @@ function StepPartnerMaster({
     if (!jk || !nc) return   // don't persist partial required-field state
 
     const profile: PartnerMappingProfile = {
-      side: s,
+      side,
       entity: { mode: em, value: ev },
       join_key: { column: jk },
       columns: {
@@ -1963,7 +2860,7 @@ function StepPartnerMaster({
         ...(po ? { postal_code: po } : {}),
       },
     }
-    dispatch({ type: 'PATCH_PARTNER', patch: { profile } })
+    dispatch({ type: 'PATCH_PARTNER', side, patch: { profile } })
   }
 
   async function handleFileSelected(file: File) {
@@ -1972,18 +2869,17 @@ function StepPartnerMaster({
     try {
       const res = await uploadPartnerMaster(file)
       const cols = res.columns
-      // Auto-suggest join key and name columns
       const joinGuess = cols.find(c => /debtor|creditor|kred|deb|partner.?no|kunden.?nr|lief.?nr|number/i.test(c)) ?? ''
       const nameGuess = cols.find(c => /name|firma|bezeichnung/i.test(c)) ?? ''
       setJoinKeyCol(joinGuess)
       setNameCol(nameGuess)
       dispatch({
         type: 'PATCH_PARTNER',
+        side,
         patch: {
           fileId: res.file_id,
           columns: res.columns,
           sample: res.sample,
-          // reset profile on new upload so stale column refs are cleared
           profile: undefined,
         },
       })
@@ -1997,11 +2893,326 @@ function StepPartnerMaster({
   const profileComplete = Boolean(joinKeyCol && nameCol)
 
   return (
+    <>
+      {/* ------------------------------------------------------------------ */}
+      {/* File upload                                                          */}
+      {/* ------------------------------------------------------------------ */}
+      <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
+        <p className="text-sm font-semibold text-slate-700">
+          Upload the {side === 'customer' ? 'customer' : 'supplier'} master file
+        </p>
+        <p className="text-xs text-slate-500">
+          The file must contain at minimum the partner number (join key) and a name column.
+          Address fields (country, city, postal code) are optional but improve reporting quality.
+        </p>
+
+        <div
+          onClick={() => fileInputRef.current?.click()}
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => {
+            e.preventDefault()
+            const f = e.dataTransfer.files[0]
+            if (f) void handleFileSelected(f)
+          }}
+          className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-8 py-10 cursor-pointer transition ${
+            uploading
+              ? 'border-blue-400 bg-blue-50'
+              : sideState.fileId
+              ? 'border-emerald-300 bg-emerald-50'
+              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
+          }`}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv,.txt"
+            className="hidden"
+            onChange={e => {
+              const f = e.target.files?.[0]
+              if (f) void handleFileSelected(f)
+            }}
+          />
+          {uploading ? (
+            <p className="text-sm font-medium text-blue-600">Processing file…</p>
+          ) : sideState.fileId ? (
+            <div className="text-center">
+              <p className="text-sm font-semibold text-emerald-700">File staged</p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                File ID: <span className="font-mono">{sideState.fileId}</span>
+              </p>
+              {columns.length > 0 && (
+                <p className="text-xs text-slate-400 mt-0.5">
+                  {columns.length} columns detected
+                </p>
+              )}
+              <p className="text-xs text-slate-400 mt-1.5 italic">Click or drop to replace</p>
+            </div>
+          ) : (
+            <>
+              <div className="text-3xl text-slate-300 mb-2">&#128196;</div>
+              <p className="text-sm font-semibold text-slate-700">Drop a file here or click to browse</p>
+              <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
+            </>
+          )}
+        </div>
+
+        {uploadError && (
+          <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {uploadError}
+          </div>
+        )}
+      </div>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Column mapping — shown once a file is staged                        */}
+      {/* ------------------------------------------------------------------ */}
+      {sideState.fileId && columns.length > 0 && (
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-4">
+          <p className="text-sm font-semibold text-slate-700">Column mapping</p>
+          <p className="text-xs text-slate-500">
+            Map the columns from your file to the standard target fields.
+            The join key and primary name are required; all other fields are optional.
+          </p>
+
+          {/* Entity assignment */}
+          <div className="rounded-md border border-slate-100 bg-slate-50 px-3 py-3 space-y-3">
+            <p className="text-xs font-semibold text-slate-600">Entity assignment</p>
+            <div className="flex gap-3 flex-wrap">
+              <label className={`flex items-center gap-2 cursor-pointer rounded-md border px-3 py-2 text-xs transition ${
+                entityMode === 'fixed' ? 'border-blue-400 bg-blue-50 text-blue-800' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+              }`}>
+                <input
+                  type="radio"
+                  name={`entityMode-${side}`}
+                  value="fixed"
+                  checked={entityMode === 'fixed'}
+                  onChange={() => {
+                    setEntityMode('fixed')
+                    persistProfile({ entityMode: 'fixed' })
+                  }}
+                  className="accent-blue-600"
+                />
+                Fixed entity code
+              </label>
+              <label className={`flex items-center gap-2 cursor-pointer rounded-md border px-3 py-2 text-xs transition ${
+                entityMode === 'column' ? 'border-blue-400 bg-blue-50 text-blue-800' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+              }`}>
+                <input
+                  type="radio"
+                  name={`entityMode-${side}`}
+                  value="column"
+                  checked={entityMode === 'column'}
+                  onChange={() => {
+                    setEntityMode('column')
+                    persistProfile({ entityMode: 'column' })
+                  }}
+                  className="accent-blue-600"
+                />
+                From column
+              </label>
+            </div>
+            {entityMode === 'fixed' ? (
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">Entity code (e.g. "DE" or "01")</label>
+                <input
+                  type="text"
+                  value={entityValue}
+                  onChange={e => {
+                    setEntityValue(e.target.value)
+                    persistProfile({ entityValue: e.target.value })
+                  }}
+                  placeholder="e.g. DE"
+                  className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-40 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <label className="text-xs text-slate-600">Entity column</label>
+                <select
+                  value={entityValue}
+                  onChange={e => {
+                    setEntityValue(e.target.value)
+                    persistProfile({ entityValue: e.target.value })
+                  }}
+                  className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">-- Select column --</option>
+                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            )}
+          </div>
+
+          {/* Required fields: join key + name */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-slate-700">
+                Join key column
+                <span className="ml-0.5 text-red-500" aria-hidden>*</span>
+                <span className="ml-1 font-normal text-slate-400">
+                  ({side === 'customer' ? 'debtor' : 'creditor'} number)
+                </span>
+              </label>
+              <select
+                value={joinKeyCol}
+                onChange={e => {
+                  setJoinKeyCol(e.target.value)
+                  persistProfile({ joinKeyCol: e.target.value })
+                }}
+                className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">-- Select column --</option>
+                {columns.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <p className="text-xs text-slate-400">
+                Must match the {side === 'customer' ? 'debtor' : 'creditor'} number
+                stored in your GL data.
+              </p>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-slate-700">
+                Primary name column
+                <span className="ml-0.5 text-red-500" aria-hidden>*</span>
+              </label>
+              <select
+                value={nameCol}
+                onChange={e => {
+                  setNameCol(e.target.value)
+                  persistProfile({ nameCol: e.target.value })
+                }}
+                className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">-- Select column --</option>
+                {columns.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <p className="text-xs text-slate-400">
+                Company name or first name — displayed in drill-downs and exports.
+              </p>
+            </div>
+          </div>
+
+          {/* Optional fields */}
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-slate-600">Optional address fields</p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {(
+                [
+                  ['nameLine2Col', setNameLine2Col, nameLine2Col, 'Name line 2', 'name_line_2'],
+                  ['countryCol', setCountryCol, countryCol, 'Country code', 'country_code'],
+                  ['cityCol', setCityCol, cityCol, 'City', 'city'],
+                  ['postalCol', setPostalCol, postalCol, 'Postal code', 'postal_code'],
+                ] as [string, (v: string) => void, string, string, string][]
+              ).map(([key, setter, val, label]) => (
+                <div key={key} className="space-y-1">
+                  <label className="text-xs text-slate-600">{label}</label>
+                  <select
+                    value={val}
+                    onChange={e => {
+                      setter(e.target.value)
+                      persistProfile({ [key]: e.target.value } as Parameters<typeof persistProfile>[0])
+                    }}
+                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="">-- Not mapped --</option>
+                    {columns.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Sample preview */}
+          {sideState.sample && sideState.sample.length > 0 && (
+            <div className="overflow-x-auto rounded-md border border-slate-100">
+              <table className="min-w-full text-xs">
+                <thead className="bg-slate-50">
+                  <tr>
+                    {columns.slice(0, 6).map(c => (
+                      <th key={c} className="px-2 py-1.5 text-left font-medium text-slate-600 whitespace-nowrap">
+                        {c}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {sideState.sample.slice(0, 3).map((row, i) => (
+                    <tr key={i} className="even:bg-slate-50/50">
+                      {columns.slice(0, 6).map(c => (
+                        <td key={c} className="px-2 py-1.5 text-slate-700 whitespace-nowrap">
+                          {String(row[c] ?? '')}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Staged status */}
+          {profileComplete && (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+              <strong>Partner master staged.</strong>{' '}
+              Side: {side} · Join key: <span className="font-mono">{joinKeyCol}</span> ·
+              Name: <span className="font-mono">{nameCol}</span>.
+              Will populate{' '}
+              <span className="font-mono text-xs">
+                {side === 'customer' ? 'dim_customer' : 'dim_supplier'}
+              </span>{' '}
+              at the Finish step.
+            </div>
+          )}
+
+          {!profileComplete && (
+            <WarnBox>
+              Select the join key column and primary name column to complete the mapping.
+              You can proceed without completing the mapping — the partner master can be
+              uploaded separately after the initial project commit.
+            </WarnBox>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
+function StepPartnerMaster({
+  partner,
+  dispatch,
+  entities,
+}: {
+  partner: WizardPartnerState
+  dispatch: Dispatch<WizardAction>
+  entities: WizardState['entities']
+}) {
+  const validEntities = entities.filter(e => e.code.trim())
+  const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
+  const [activeSide, setActiveSide] = useState<'customer' | 'supplier'>('customer')
+  const [editorTab, setEditorTab] = useState<'customers' | 'suppliers'>('customers')
+
+  const sideState = partner.sides[activeSide]
+  const entitySource = sideState.entitySource ?? defaultEntitySource
+
+  function handleEntitySourceChange(val: EntitySource) {
+    dispatch({ type: 'PATCH_PARTNER', side: activeSide, patch: { entitySource: val } })
+  }
+
+  return (
     <StepCard
       title="Partner master"
       subtitle="Upload customer or supplier master data and map the join key and name fields."
     >
       <div className="space-y-6">
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Entity source selector — shown always as a pre-step                 */}
+        {/* ------------------------------------------------------------------ */}
+        <EntitySourceSelector
+          value={entitySource}
+          onChange={handleEntitySourceChange}
+          dataLabel="partner masters"
+        />
 
         {/* ------------------------------------------------------------------ */}
         {/* Explanation box                                                      */}
@@ -2037,7 +3248,7 @@ function StepPartnerMaster({
               <label
                 key={val}
                 className={`flex-1 min-w-[200px] flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
-                  side === val
+                  activeSide === val
                     ? 'border-blue-400 bg-blue-50'
                     : 'border-slate-200 bg-white hover:bg-slate-50'
                 }`}
@@ -2046,11 +3257,8 @@ function StepPartnerMaster({
                   type="radio"
                   name="partnerSide"
                   value={val}
-                  checked={side === val}
-                  onChange={() => {
-                    setSide(val)
-                    persistProfile({ side: val })
-                  }}
+                  checked={activeSide === val}
+                  onChange={() => setActiveSide(val)}
                   className="mt-0.5 accent-blue-600"
                 />
                 <div>
@@ -2061,288 +3269,593 @@ function StepPartnerMaster({
             ))}
           </div>
           <p className="text-xs text-slate-400">
-            To load both customers and suppliers, complete this step for one side, then return
-            and re-upload for the other side before the Finish step.
+            Upload and map both customers and suppliers here — switching sides keeps each
+            side's file and mapping. Both are committed at Finish.
           </p>
         </div>
 
         {/* ------------------------------------------------------------------ */}
-        {/* File upload                                                          */}
+        {/* Combined upload + mapping block (remounts on side switch via key)  */}
         {/* ------------------------------------------------------------------ */}
-        <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-3">
-          <p className="text-sm font-semibold text-slate-700">
-            Upload the {side === 'customer' ? 'customer' : 'supplier'} master file
-          </p>
-          <p className="text-xs text-slate-500">
-            The file must contain at minimum the partner number (join key) and a name column.
-            Address fields (country, city, postal code) are optional but improve reporting quality.
-          </p>
+        {entitySource !== 'per_entity' && (
+          <CombinedPartnerBlock
+            key={activeSide}
+            side={activeSide}
+            sideState={sideState}
+            dispatch={dispatch}
+          />
+        )}
 
-          <div
-            onClick={() => fileInputRef.current?.click()}
-            onDragOver={e => e.preventDefault()}
-            onDrop={e => {
-              e.preventDefault()
-              const f = e.dataTransfer.files[0]
-              if (f) void handleFileSelected(f)
-            }}
-            className={`flex flex-col items-center justify-center rounded-xl border-2 border-dashed px-8 py-10 cursor-pointer transition ${
-              uploading
-                ? 'border-blue-400 bg-blue-50'
-                : partner.fileId
-                ? 'border-emerald-300 bg-emerald-50'
-                : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-slate-50'
-            }`}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              className="hidden"
-              onChange={e => {
-                const f = e.target.files?.[0]
-                if (f) void handleFileSelected(f)
-              }}
+        {/* ------------------------------------------------------------------ */}
+        {/* Per-entity upload blocks — one per legal entity                    */}
+        {/* ------------------------------------------------------------------ */}
+        {entitySource === 'per_entity' && validEntities.length > 0 && (
+          <div className="space-y-4">
+            <p className="text-xs text-slate-500">
+              Upload one partner master file per legal entity. The entity prefix is injected
+              automatically at commit time — no entity column is needed in these files.
+            </p>
+            <PerEntityPager
+              entities={validEntities}
+              stagedCount={validEntities.filter(e => !!sideState.perEntity?.[e.code]?.profile).length}
+              renderEntity={(entity) => (
+                <PerEntityPartnerBlock
+                  key={`${activeSide}-${entity.code}`}
+                  entityCode={entity.code}
+                  entityName={entity.name}
+                  entityPrefix={entity.prefix}
+                  side={activeSide}
+                  perState={sideState.perEntity?.[entity.code]}
+                  allPerEntity={sideState.perEntity}
+                  dispatch={dispatch}
+                />
+              )}
             />
-            {uploading ? (
-              <p className="text-sm font-medium text-blue-600">Processing file…</p>
-            ) : partner.fileId ? (
-              <div className="text-center">
-                <p className="text-sm font-semibold text-emerald-700">File staged</p>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  File ID: <span className="font-mono">{partner.fileId}</span>
-                </p>
-                {columns.length > 0 && (
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    {columns.length} columns detected
-                  </p>
-                )}
-                <p className="text-xs text-slate-400 mt-1.5 italic">Click or drop to replace</p>
-              </div>
-            ) : (
-              <>
-                <div className="text-3xl text-slate-300 mb-2">&#128196;</div>
-                <p className="text-sm font-semibold text-slate-700">Drop a file here or click to browse</p>
-                <p className="mt-1 text-xs text-slate-400">XLSX · XLS · CSV</p>
-              </>
-            )}
+          </div>
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Inline editor — manage records directly without a file              */}
+        {/* ------------------------------------------------------------------ */}
+        <div className="space-y-3 pt-2">
+          <div className="flex items-center gap-3">
+            <div className="h-px flex-1 bg-slate-200" />
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+              or manage records inline
+            </span>
+            <div className="h-px flex-1 bg-slate-200" />
           </div>
 
-          {uploadError && (
-            <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-              {uploadError}
-            </div>
-          )}
+          <p className="text-xs text-slate-500">
+            Add, edit, or delete individual customer and supplier records directly —
+            no file needed. Records saved here are immediately visible in drill-downs.
+          </p>
+
+          {/* Customer / Supplier tab toggle */}
+          <div className="flex gap-2">
+            {(['customers', 'suppliers'] as const).map(t => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setEditorTab(t)}
+                className={`rounded-md px-4 py-1.5 text-xs font-semibold transition ${
+                  editorTab === t
+                    ? 'text-white'
+                    : 'border border-slate-300 text-slate-600 hover:bg-slate-50'
+                }`}
+                style={editorTab === t ? { backgroundColor: '#1E3A5F' } : undefined}
+              >
+                {t === 'customers' ? 'Customers' : 'Suppliers'}
+              </button>
+            ))}
+          </div>
+
+          <PartnerMasterEditor side={editorTab} compact showBulkImport={false} />
         </div>
 
-        {/* ------------------------------------------------------------------ */}
-        {/* Column mapping — shown once a file is staged                        */}
-        {/* ------------------------------------------------------------------ */}
-        {partner.fileId && columns.length > 0 && (
-          <div className="rounded-lg border border-slate-200 bg-white px-4 py-4 space-y-4">
-            <p className="text-sm font-semibold text-slate-700">Column mapping</p>
-            <p className="text-xs text-slate-500">
-              Map the columns from your file to the standard target fields.
-              The join key and primary name are required; all other fields are optional.
-            </p>
+      </div>
+    </StepCard>
+  )
+}
 
-            {/* Entity assignment */}
-            <div className="rounded-md border border-slate-100 bg-slate-50 px-3 py-3 space-y-3">
-              <p className="text-xs font-semibold text-slate-600">Entity assignment</p>
+// ---------------------------------------------------------------------------
+// Step 6 — Additional information (optional FTE / personnel-cost provisioning)
+// ---------------------------------------------------------------------------
+
+function StepAdditionalInformation({
+  fte,
+  anlagen,
+  opos,
+  entities,
+  glYears,
+  fyEndMonth,
+  additionalDatasets,
+  dispatch,
+}: {
+  fte: WizardFteState
+  anlagen: WizardAnlagenState
+  opos: WizardOposState
+  entities: WizardState['entities']
+  glYears: number[]
+  fyEndMonth: number
+  additionalDatasets: WizardState['additionalDatasets']
+  dispatch: Dispatch<WizardAction>
+}) {
+  const validEntities = entities.filter(e => e.code.trim())
+  const [uploading, setUploading] = useState<Record<string, boolean>>({})
+  const [uploadError, setUploadError] = useState<Record<string, string>>({})
+  const [customDraft, setCustomDraft] = useState({ source_col: '', output_label: '' })
+
+  // Derive FY labels from GL years using the fiscal-year label helper (mirrors GL step).
+  // Fall back to a 4-year default range when no GL years are selected yet.
+  const fyLabels = glYears.length > 0
+    ? glYears.map(y => glFiscalYearLabel(y, fyEndMonth))
+    : ['FY2022', 'FY2023', 'FY2024', 'FY2025']
+
+  const patch = (p: Partial<WizardFteState>) =>
+    dispatch({ type: 'PATCH_FTE', patch: p })
+
+  /** Get the upload slot for a specific {entity_index, fy_label} combination. */
+  const getSlotUpload = (entityIndex: number, fyLabel: string) =>
+    fte.uploads.find(u => u.entity_index === entityIndex && u.fy_label === fyLabel)
+
+  /** True when at least one FY slot for the given entity has a staged file. */
+  const isEntityStaged = (entityIndex: number) =>
+    fte.uploads.some(u => u.entity_index === entityIndex && u.file_ids.length > 0)
+
+  const hasUploads = fte.uploads.some(u => u.file_ids.length > 0)
+
+  async function handleFileUpload(
+    entityIndex: number,
+    entityName: string,
+    fyLabel: string,
+    file: File,
+  ) {
+    const slotKey = `${entityIndex}__${fyLabel}`
+    setUploading(prev => ({ ...prev, [slotKey]: true }))
+    setUploadError(prev => ({ ...prev, [slotKey]: '' }))
+    try {
+      const result = await uploadFddFile(fte.sessionId, file)
+      const newEntry: WizardFteUpload = {
+        entity_index: entityIndex,
+        entity_name: entityName,
+        fy_label: fyLabel,
+        file_ids: [result.file_id],
+      }
+      // Replace the existing entry for this exact {entity_index, fy_label} slot.
+      const rest = fte.uploads.filter(
+        u => !(u.entity_index === entityIndex && u.fy_label === fyLabel),
+      )
+      const allUploads = [...rest, newEntry]
+      const previewFileId =
+        [...allUploads].sort((a, b) => a.entity_index - b.entity_index)[0]?.file_ids[0] ??
+        result.file_id
+      patch({ uploads: allUploads, previewFileId, provided: true })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Upload failed'
+      setUploadError(prev => ({ ...prev, [slotKey]: msg }))
+    } finally {
+      setUploading(prev => ({ ...prev, [slotKey]: false }))
+    }
+  }
+
+  /** Render a single upload drop-zone for one {entity_index, fy_label} slot. */
+  function renderUploadZone(entityIndex: number, entityName: string, fyLabel: string) {
+    const slotKey = `${entityIndex}__${fyLabel}`
+    const existing = getSlotUpload(entityIndex, fyLabel)
+    const isUploading = uploading[slotKey] ?? false
+    const err = uploadError[slotKey] ?? ''
+    return (
+      <div key={slotKey} className="space-y-1.5">
+        <label
+          className={`flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-6 cursor-pointer transition ${
+            existing
+              ? 'border-emerald-300 bg-emerald-50'
+              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50/50'
+          }`}
+        >
+          <input
+            type="file"
+            accept=".xlsx"
+            className="sr-only"
+            disabled={isUploading}
+            onChange={e => {
+              const f = e.target.files?.[0]
+              if (f) void handleFileUpload(entityIndex, entityName, fyLabel, f)
+              e.target.value = ''
+            }}
+          />
+          {isUploading ? (
+            <span className="text-sm text-blue-600">Uploading…</span>
+          ) : existing ? (
+            <>
+              <svg className="h-5 w-5 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+              <span className="text-sm text-emerald-700 font-medium">File uploaded — {fyLabel}</span>
+              <span className="text-xs text-slate-500">Click to replace</span>
+            </>
+          ) : (
+            <>
+              <svg className="h-6 w-6 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+              </svg>
+              <span className="text-sm text-slate-600">Drop .xlsx or click to browse</span>
+            </>
+          )}
+        </label>
+        {err && <p className="text-xs text-red-600">{err}</p>}
+      </div>
+    )
+  }
+
+  // AdaptiveCardInput shape required by FtePexGrid
+  const pexInput: AdaptiveCardInput = {
+    id: 'fte_pex_values',
+    type: 'fte_pex_grid',
+    label: 'Personnel expenses (EURk)',
+    options: fyLabels.map(fy => ({ label: fy, value: fy })),
+    entity_count:
+      fte.pexViewMode === 'per_entity' ? Math.max(1, validEntities.length) : 1,
+    default_entity_names:
+      fte.pexViewMode === 'per_entity'
+        ? validEntities.map(e => e.name || e.code)
+        : [validEntities[0]?.name || validEntities[0]?.code || 'Entity 1'],
+  }
+
+  return (
+    <StepCard
+      title="Additional information"
+      subtitle="Select which additional datasets to provide. All datasets are optional — skip this step by clicking Next."
+    >
+      <div className="space-y-8">
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Dataset selector                                                    */}
+        {/* ------------------------------------------------------------------ */}
+        <DatasetSelector
+          selection={additionalDatasets}
+          onToggle={(dataset, value) => dispatch({ type: 'TOGGLE_DATASET', dataset, value })}
+        />
+
+        {/* ------------------------------------------------------------------ */}
+        {/* FTE provisioning — visible only when additionalDatasets.fte is true */}
+        {/* ------------------------------------------------------------------ */}
+        {additionalDatasets.fte && (
+          <div className="space-y-8">
+
+            {/* a. Intro */}
+            <InfoBox>
+              <strong>FTE and payroll data is optional.</strong> If you provide a personnel file,
+              a formula-linked FTE Development workbook will be generated at the end of setup.
+            </InfoBox>
+
+            {/* b. Data layout: consolidated vs per-entity */}
+            <div className="space-y-3">
+              <p className="text-sm font-medium text-slate-700">Data layout</p>
               <div className="flex gap-3 flex-wrap">
-                <label className={`flex items-center gap-2 cursor-pointer rounded-md border px-3 py-2 text-xs transition ${
-                  entityMode === 'fixed' ? 'border-blue-400 bg-blue-50 text-blue-800' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                }`}>
-                  <input
-                    type="radio"
-                    name="entityMode"
-                    value="fixed"
-                    checked={entityMode === 'fixed'}
-                    onChange={() => {
-                      setEntityMode('fixed')
-                      persistProfile({ entityMode: 'fixed' })
-                    }}
-                    className="accent-blue-600"
-                  />
-                  Fixed entity code
-                </label>
-                <label className={`flex items-center gap-2 cursor-pointer rounded-md border px-3 py-2 text-xs transition ${
-                  entityMode === 'column' ? 'border-blue-400 bg-blue-50 text-blue-800' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                }`}>
-                  <input
-                    type="radio"
-                    name="entityMode"
-                    value="column"
-                    checked={entityMode === 'column'}
-                    onChange={() => {
-                      setEntityMode('column')
-                      persistProfile({ entityMode: 'column' })
-                    }}
-                    className="accent-blue-600"
-                  />
-                  From column
-                </label>
-              </div>
-              {entityMode === 'fixed' ? (
-                <div className="space-y-1">
-                  <label className="text-xs text-slate-600">Entity code (e.g. "DE" or "01")</label>
-                  <input
-                    type="text"
-                    value={entityValue}
-                    onChange={e => {
-                      setEntityValue(e.target.value)
-                      persistProfile({ entityValue: e.target.value })
-                    }}
-                    placeholder="e.g. DE"
-                    className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-40 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              ) : (
-                <div className="space-y-1">
-                  <label className="text-xs text-slate-600">Entity column</label>
-                  <select
-                    value={entityValue}
-                    onChange={e => {
-                      setEntityValue(e.target.value)
-                      persistProfile({ entityValue: e.target.value })
-                    }}
-                    className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                {(
+                  [
+                    ['consolidated', 'All entities combined',  'Upload one file per fiscal year — the file covers all entities'] as const,
+                    ['per_entity',   'One file per entity',    'Upload one file per entity per fiscal year']                     as const,
+                  ] as const
+                ).map(([val, label, hint]) => (
+                  <label
+                    key={val}
+                    className={`flex-1 min-w-[200px] flex items-start gap-3 cursor-pointer rounded-lg border p-3.5 transition ${
+                      fte.viewMode === val
+                        ? 'border-blue-400 bg-blue-50'
+                        : 'border-slate-200 bg-white hover:bg-slate-50'
+                    }`}
                   >
-                    <option value="">-- Select column --</option>
-                    {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
+                    <input
+                      type="radio"
+                      name="fteViewMode"
+                      value={val}
+                      checked={fte.viewMode === val}
+                      onChange={() => patch({ viewMode: val, uploads: [], previewFileId: '' })}
+                      className="mt-0.5 accent-blue-600"
+                    />
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800">{label}</p>
+                      <p className="text-xs text-slate-500 mt-0.5">{hint}</p>
+                    </div>
+                  </label>
+                ))}
+              </div>
+              <p className="text-xs text-slate-400">
+                FY range auto-derived from GL step: {fyLabels.join(', ')}.
+                {validEntities.length > 0 && (
+                  <> Entities: {validEntities.map(e => e.name || e.code).join(', ')}.</>
+                )}
+              </p>
+            </div>
+
+            {/* c. File upload zone(s) — one per FY (combined) or per entity×FY (per_entity) */}
+            <div className="space-y-3">
+              <p className="text-sm font-medium text-slate-700">
+                Upload personnel data file{fyLabels.length > 1 ? 's' : ''}
+              </p>
+              <p className="text-xs text-slate-500">
+                Excel (.xlsx) file with one row per employee. Upload one file per fiscal year
+                {fte.viewMode === 'per_entity' ? ' per entity' : ''}.
+                {fyLabels.length > 0 && ` FY range: ${fyLabels[0]}–${fyLabels[fyLabels.length - 1]}.`}
+              </p>
+
+              {/* Combined mode: year pager — one upload slot per FY for all entities */}
+              {fte.viewMode === 'consolidated' && (
+                <PerYearPager
+                  fyLabels={fyLabels}
+                  stagedCount={fyLabels.filter(fy => Boolean(getSlotUpload(0, fy))).length}
+                  renderYear={(fyLabel) => renderUploadZone(0, 'All entities (combined)', fyLabel)}
+                />
+              )}
+
+              {/* Per-entity mode: entity pager wrapping a year pager per entity */}
+              {fte.viewMode === 'per_entity' && (
+                <PerEntityPager
+                  entities={validEntities}
+                  stagedCount={validEntities.filter((_, i) => isEntityStaged(i)).length}
+                  renderEntity={(entity, idx) => (
+                    <PerYearPager
+                      fyLabels={fyLabels}
+                      stagedCount={fyLabels.filter(fy => Boolean(getSlotUpload(idx, fy))).length}
+                      renderYear={(fyLabel) => renderUploadZone(idx, entity.name || entity.code, fyLabel)}
+                    />
+                  )}
+                />
               )}
             </div>
 
-            {/* Required fields: join key + name */}
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-700">
-                  Join key column
-                  <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-                  <span className="ml-1 font-normal text-slate-400">
-                    ({side === 'customer' ? 'debtor' : 'creditor'} number)
-                  </span>
-                </label>
-                <select
-                  value={joinKeyCol}
-                  onChange={e => {
-                    setJoinKeyCol(e.target.value)
-                    persistProfile({ joinKeyCol: e.target.value })
-                  }}
-                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="">-- Select column --</option>
-                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-                <p className="text-xs text-slate-400">
-                  Must match the {side === 'customer' ? 'debtor' : 'creditor'} number
-                  stored in your GL data.
-                </p>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-700">
-                  Primary name column
-                  <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-                </label>
-                <select
-                  value={nameCol}
-                  onChange={e => {
-                    setNameCol(e.target.value)
-                    persistProfile({ nameCol: e.target.value })
-                  }}
-                  className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="">-- Select column --</option>
-                  {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-                <p className="text-xs text-slate-400">
-                  Company name or first name — displayed in drill-downs and exports.
-                </p>
-              </div>
-            </div>
-
-            {/* Optional fields */}
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-slate-600">Optional address fields</p>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {(
-                  [
-                    ['nameLine2Col', setNameLine2Col, nameLine2Col, 'Name line 2', 'name_line_2'],
-                    ['countryCol', setCountryCol, countryCol, 'Country code', 'country_code'],
-                    ['cityCol', setCityCol, cityCol, 'City', 'city'],
-                    ['postalCol', setPostalCol, postalCol, 'Postal code', 'postal_code'],
-                  ] as [string, (v: string) => void, string, string, string][]
-                ).map(([key, setter, val, label]) => (
-                  <div key={key} className="space-y-1">
-                    <label className="text-xs text-slate-600">{label}</label>
-                    <select
-                      value={val}
-                      onChange={e => {
-                        setter(e.target.value)
-                        persistProfile({ [key]: e.target.value } as Parameters<typeof persistProfile>[0])
-                      }}
-                      className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                      <option value="">-- Not mapped --</option>
-                      {columns.map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
+            {/* Sections d–h — visible only after at least one file is uploaded */}
+            {hasUploads && fte.previewFileId && (
+              <>
+                {/* d. FTE column mapping */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                      FTE column mapping
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
                   </div>
-                ))}
-              </div>
-            </div>
+                  <p className="text-xs text-slate-500">
+                    Map source columns for FTE tenure calculation (headcount months or entry/exit dates).
+                  </p>
+                  <FteColumnMapper
+                    sessionId={fte.sessionId}
+                    previewFileId={fte.previewFileId}
+                    mode="fte"
+                    uploadMode={fte.uploadMode}
+                    initialTenureMode={fte.tenureMode}
+                    onSubmit={(mapping: FteMappingPayload) => {
+                      patch({
+                        fteMapping: mapping as Record<string, unknown>,
+                        tenureMode: mapping.tenure_mode ?? fte.tenureMode,
+                        provided: true,
+                      })
+                    }}
+                  />
+                </div>
 
-            {/* Sample preview */}
-            {partner.sample && partner.sample.length > 0 && (
-              <div className="overflow-x-auto rounded-md border border-slate-100">
-                <table className="min-w-full text-xs">
-                  <thead className="bg-slate-50">
-                    <tr>
-                      {columns.slice(0, 6).map(c => (
-                        <th key={c} className="px-2 py-1.5 text-left font-medium text-slate-600 whitespace-nowrap">
-                          {c}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {partner.sample.slice(0, 3).map((row, i) => (
-                      <tr key={i} className="even:bg-slate-50/50">
-                        {columns.slice(0, 6).map(c => (
-                          <td key={c} className="px-2 py-1.5 text-slate-700 whitespace-nowrap">
-                            {String(row[c] ?? '')}
-                          </td>
-                        ))}
-                      </tr>
+                {/* e. Payroll column mapping */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                      Payroll column mapping
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Map source columns for personnel cost (payroll) per employee.
+                  </p>
+                  <FteColumnMapper
+                    sessionId={fte.sessionId}
+                    previewFileId={fte.previewFileId}
+                    mode="payroll"
+                    uploadMode={fte.uploadMode}
+                    initialPayrollMode={fte.payrollMode}
+                    onSubmit={(mapping: FteMappingPayload) => {
+                      patch({
+                        payrollMapping: mapping as Record<string, unknown>,
+                        payrollMode: mapping.payroll_mode ?? fte.payrollMode,
+                        provided: true,
+                      })
+                    }}
+                  />
+                </div>
+
+                {/* f. Breakdown dimensions */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                      Breakdown dimensions (optional, max 3)
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Select up to 3 columns to use as breakdown dimensions in the output workbook.
+                  </p>
+                  <FteDimensionPicker
+                    sessionId={fte.sessionId}
+                    previewFileId={fte.previewFileId}
+                    onSubmit={(dims: FteDimension[]) => {
+                      patch({ dimensions: dims })
+                    }}
+                  />
+                </div>
+
+                {/* g. Output metrics */}
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                      Output metrics
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
+
+                  {/* Preset metrics */}
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-slate-600">Preset metrics</p>
+                    {FTE_PRESET_METRIC_OPTIONS.map(opt => (
+                      <label key={opt.value} className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="accent-blue-600 h-4 w-4"
+                          checked={fte.presetMetrics.includes(opt.value)}
+                          onChange={e => {
+                            const next = e.target.checked
+                              ? [...fte.presetMetrics, opt.value]
+                              : fte.presetMetrics.filter(m => m !== opt.value)
+                            patch({ presetMetrics: next })
+                          }}
+                        />
+                        <span className="text-sm text-slate-800">{opt.label}</span>
+                      </label>
                     ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+                  </div>
 
-            {/* Staged status */}
-            {profileComplete && (
-              <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-                <strong>Partner master staged.</strong>{' '}
-                Side: {side} · Join key: <span className="font-mono">{joinKeyCol}</span> ·
-                Name: <span className="font-mono">{nameCol}</span>.
-                Will populate{' '}
-                <span className="font-mono text-xs">
-                  {side === 'customer' ? 'dim_customer' : 'dim_supplier'}
-                </span>{' '}
-                at the Finish step.
-              </div>
-            )}
+                  {/* Custom output columns */}
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-slate-600">
+                      Custom output columns (source column → output label)
+                    </p>
+                    {fte.customMetrics.map((m, i) => (
+                      <div key={m.source_col || i} className="flex items-center gap-2 text-sm">
+                        <span className="font-mono bg-slate-100 rounded px-2 py-0.5 text-xs text-slate-700">
+                          {m.source_col}
+                        </span>
+                        <span className="text-slate-400">→</span>
+                        <span className="text-slate-800">{m.output_label}</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            patch({ customMetrics: fte.customMetrics.filter((_, j) => j !== i) })
+                          }
+                          className="ml-auto text-xs text-red-500 hover:text-red-700 transition"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Source column name"
+                        value={customDraft.source_col}
+                        onChange={e => setCustomDraft(d => ({ ...d, source_col: e.target.value }))}
+                        className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Output label"
+                        value={customDraft.output_label}
+                        onChange={e => setCustomDraft(d => ({ ...d, output_label: e.target.value }))}
+                        className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      />
+                      <button
+                        type="button"
+                        disabled={!customDraft.source_col.trim() || !customDraft.output_label.trim()}
+                        onClick={() => {
+                          if (!customDraft.source_col.trim() || !customDraft.output_label.trim()) return
+                          patch({ customMetrics: [...fte.customMetrics, { ...customDraft }] })
+                          setCustomDraft({ source_col: '', output_label: '' })
+                        }}
+                        className="rounded border border-blue-300 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-40 transition"
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                </div>
 
-            {!profileComplete && (
-              <WarnBox>
-                Select the join key column and primary name column to complete the mapping.
-                You can proceed without completing the mapping — the partner master can be
-                uploaded separately after the initial project commit.
-              </WarnBox>
+                {/* h. PEX — GL personnel expenses grid */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="h-px flex-1 bg-slate-200" />
+                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                      Personnel expenses from GL (PEX) — optional
+                    </span>
+                    <div className="h-px flex-1 bg-slate-200" />
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Enter GL personnel expense totals in EURk per entity and fiscal year.
+                    Used for variance analysis between GL and payroll data. Leave blank if unavailable.
+                  </p>
+                  <div className="flex gap-4 mb-2">
+                    {(
+                      [['consolidated', 'Consolidated'], ['per_entity', 'Per entity']] as const
+                    ).map(([val, label]) => (
+                      <label key={val} className="flex items-center gap-2 cursor-pointer text-sm">
+                        <input
+                          type="radio"
+                          name="pexViewMode"
+                          value={val}
+                          checked={fte.pexViewMode === val}
+                          onChange={() => patch({ pexViewMode: val })}
+                          className="accent-blue-600"
+                        />
+                        <span className="text-slate-700">{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <FtePexGrid
+                    input={pexInput}
+                    values={{ fte_pex_values: fte.pexValues }}
+                    onChange={(vals: Record<string, number | string>) => {
+                      const numVals: Record<string, number> = {}
+                      for (const [k, v] of Object.entries(vals)) {
+                        if (v !== '' && !Number.isNaN(Number(v))) numVals[k] = Number(v)
+                      }
+                      patch({ pexValues: numVals })
+                    }}
+                  />
+                </div>
+              </>
             )}
+          </div>
+        )}
+
+        {/* Anlagen provisioning — visible only when additionalDatasets.anlagen is true */}
+        {additionalDatasets.anlagen && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <div className="h-px flex-1 bg-slate-200" />
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Fixed-Asset Register
+              </span>
+              <div className="h-px flex-1 bg-slate-200" />
+            </div>
+            <AnlagenStep
+              anlagen={anlagen}
+              entities={entities}
+              glYears={glYears}
+              fyEndMonth={fyEndMonth}
+              onPatch={patch => dispatch({ type: 'PATCH_ANLAGEN', patch })}
+            />
+          </div>
+        )}
+
+        {/* OPOS provisioning — visible only when additionalDatasets.opos is true */}
+        {additionalDatasets.opos && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <div className="h-px flex-1 bg-slate-200" />
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                Open-Items Lists (OPOS)
+              </span>
+              <div className="h-px flex-1 bg-slate-200" />
+            </div>
+            <OposStep
+              opos={opos}
+              entities={entities}
+              glYears={glYears}
+              fyEndMonth={fyEndMonth}
+              onPatch={patch => dispatch({ type: 'PATCH_OPOS', patch })}
+            />
           </div>
         )}
 
@@ -2352,7 +3865,7 @@ function StepPartnerMaster({
 }
 
 // ---------------------------------------------------------------------------
-// Step 6 — Review & Finish (Phase 5 — full orchestration)
+// Step 7 — Review & Finish (Phase 5 — full orchestration)
 // ---------------------------------------------------------------------------
 
 /** Status of one commit step in the Finish sequence. */
@@ -2362,7 +3875,8 @@ interface CommitStepState {
   id: string
   label: string
   status: StepStatus
-  detail?: string   // counts / reason for skip / error message
+  detail?: string        // counts / reason for skip / error message
+  unmapped?: GlUnmappedDetail  // present when GL commit returns gl_accounts_unmapped 422
 }
 
 /** Spinner SVG — inline to avoid any icon-library dep. */
@@ -2387,14 +3901,55 @@ function StepStatusIcon({ status }: { status: StepStatus }) {
   return <span className="inline-block h-4 w-4 rounded-full bg-red-500 text-white flex items-center justify-center text-[10px]">&#10007;</span>
 }
 
-const INITIAL_COMMIT_STEPS: CommitStepState[] = [
-  { id: 'config',  label: 'Save project config',   status: 'pending' },
-  { id: 'gl',      label: 'Commit GL bookings',     status: 'pending' },
-  { id: 'coa',     label: 'Commit Chart of Accounts', status: 'pending' },
-  { id: 'ob',      label: 'Commit opening balances', status: 'pending' },
-  { id: 'partner', label: 'Commit partner master',  status: 'pending' },
-  { id: 'rebuild', label: 'Full rebuild',            status: 'pending' },
-]
+/** Returns true when the wizard partner state has at least one file+profile pair ready to commit. */
+function hasPartnerData(state: WizardState): boolean {
+  const validEntities = state.entities.filter(e => e.code.trim())
+  const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
+  for (const side of ['customer', 'supplier'] as const) {
+    const sideState = state.partner.sides[side]
+    const entitySource = sideState.entitySource ?? defaultEntitySource
+    if (entitySource === 'per_entity') {
+      for (const e of validEntities) {
+        const perState = sideState.perEntity?.[e.code]
+        if (perState?.fileId && perState?.profile) return true
+      }
+    } else if (sideState.fileId && sideState.profile) {
+      return true
+    }
+  }
+  return false
+}
+
+/** Returns true when the wizard has FTE data staged and ready to commit. */
+function hasFteData(state: WizardState): boolean {
+  return (
+    state.additionalDatasets.fte &&
+    state.fte.uploads.length > 0 &&
+    state.fte.uploads.some(u => u.file_ids.length > 0)
+  )
+}
+
+/**
+ * Build the commit-step list for the Finish sequence, conditionally including
+ * 'partner' and 'fte' only when the relevant data has been staged.
+ * patchStep() is .map-based, so omitted step ids are harmless no-ops.
+ */
+function buildInitialCommitSteps(state: WizardState): CommitStepState[] {
+  const steps: CommitStepState[] = [
+    { id: 'config',  label: 'Save project config',      status: 'pending' },
+    { id: 'coa',     label: 'Commit Chart of Accounts', status: 'pending' },
+    { id: 'gl',      label: 'Commit GL bookings',       status: 'pending' },
+    { id: 'ob',      label: 'Commit opening balances',  status: 'pending' },
+  ]
+  if (hasPartnerData(state)) {
+    steps.push({ id: 'partner', label: 'Commit partner master',       status: 'pending' })
+  }
+  if (hasFteData(state)) {
+    steps.push({ id: 'fte',     label: 'Build FTE Development table', status: 'pending' })
+  }
+  steps.push({ id: 'rebuild', label: 'Full rebuild', status: 'pending' })
+  return steps
+}
 
 function StepReview({
   state,
@@ -2407,21 +3962,16 @@ function StepReview({
   const [runRebuild, setRunRebuild] = useState(false)
 
   const glSummary = (() => {
-    if (!state.gl.fileId) return 'Not yet uploaded'
-    const parts: string[] = [`File ID: ${state.gl.fileId}`]
-    if (state.gl.kontext?.entityMode === 'fixed' && state.gl.kontext.entityValue)
-      parts.push(`Entity: ${state.gl.kontext.entityValue}`)
-    if (state.gl.kontext?.entityMode === 'column' && state.gl.kontext.entityValue)
-      parts.push(`Entity column: ${state.gl.kontext.entityValue}`)
-    if (state.gl.partnerColumnsMode)
-      parts.push(`Partner columns: ${state.gl.partnerColumnsMode}`)
-    if (state.gl.opts?.linking)
-      parts.push(`AR/AP linking: ${state.gl.opts.linking}`)
-    if (state.gl.validationOk === true)
-      parts.push('Validation: passed')
-    else if (state.gl.validationOk === false)
-      parts.push('Validation: warnings present')
-    return parts.join(' · ')
+    if (state.gl.years.length === 0) return 'No fiscal years selected'
+    const yearsLabel = state.gl.years.map(y => `FY${y}`).join(', ')
+    const entitySummaries = state.gl.entities.map((e, i) => {
+      const name = e.entityCode.trim() || `Entity ${i + 1}`
+      const filesUploaded = state.gl.years.filter(y => e.yearFiles[y] !== undefined).length
+      const combined = e.combinedFileId ? ' · combined' : ''
+      const val = e.validationOk === true ? 'validated' : e.validationOk === false ? 'warnings' : 'not validated'
+      return `${name} (${filesUploaded}/${state.gl.years.length} files${combined} · ${val})`
+    })
+    return `Years: ${yearsLabel}  |  ${entitySummaries.join('  |  ')}`
   })()
 
   const rows: Array<{ label: string; value: string }> = [
@@ -2434,20 +3984,23 @@ function StepReview({
     {
       label: 'Chart of accounts',
       value: (() => {
-        if (!state.coa.source) return 'Not yet configured'
-        if (state.coa.source === 'library') {
-          const variantLabel =
-            LIBRARY_VARIANTS.find(v => v.value === state.coa.libraryVariant)?.label ??
-            state.coa.libraryVariant ??
-            '—'
-          return `Library — ${variantLabel}`
+        const { groups, accountMappingMode, assigned } = state.coa
+        if (groups.length === 0 || !assigned) return 'Not yet configured'
+        const uploadGroups = groups.filter(g => g.method === 'upload')
+        if (uploadGroups.length === 0) {
+          // All groups use library
+          const variants = [...new Set(groups.map(g => {
+            const vl = LIBRARY_VARIANTS.find(v => v.value === (g.libraryVariant ?? 'skr03'))?.label
+            return vl ?? (g.libraryVariant ?? 'skr03')
+          }))]
+          return `Library (${variants.join(', ')}) · fill mode: ${accountMappingMode}`
         }
-        if (state.coa.source === 'upload') {
-          if (!state.coa.masterFileId) return 'Upload — no file staged yet'
-          const fmt = state.coa.isBsPlMaster ? 'bs_pl_master format' : 'generic CoA (column-mapped)'
-          return `Upload — File ID: ${state.coa.masterFileId} · ${fmt}`
-        }
-        return state.coa.source
+        const stagedSlots = uploadGroups.flatMap(g => [
+          g.bs?.fileId ? `${g.label} BS (${g.bs.isMaster ? 'master' : 'generic'})` : null,
+          g.pl?.fileId ? `${g.label} PL (${g.pl.isMaster ? 'master' : 'generic'})` : null,
+        ]).filter(Boolean)
+        if (stagedSlots.length === 0) return 'Upload — no files staged yet'
+        return `Upload — ${stagedSlots.join(', ')} · fill mode: ${accountMappingMode}`
       })(),
     },
     {
@@ -2467,10 +4020,50 @@ function StepReview({
     {
       label: 'Partner master',
       value: (() => {
-        if (!state.partner.fileId) return 'Not uploaded (optional)'
-        if (!state.partner.profile) return `File staged (ID: ${state.partner.fileId}) — mapping incomplete`
-        const p = state.partner.profile
-        return `${p.side === 'customer' ? 'Customers' : 'Suppliers'} · Join key: ${p.join_key.column} · Name: ${p.columns.name_line_1}`
+        const validEntities = state.entities.filter(e => e.code.trim())
+        const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
+        const parts: string[] = []
+        for (const side of ['customer', 'supplier'] as const) {
+          const ss = state.partner.sides[side]
+          const label = side === 'customer' ? 'Customers' : 'Suppliers'
+          const entitySource = ss.entitySource ?? defaultEntitySource
+          if (entitySource === 'per_entity') {
+            const staged = validEntities.filter(
+              e => ss.perEntity?.[e.code]?.fileId && ss.perEntity?.[e.code]?.profile
+            ).length
+            if (staged > 0) {
+              parts.push(`${label} — ${staged} ${staged === 1 ? 'entity' : 'entities'} staged (per-entity)`)
+            }
+          } else if (ss.profile && ss.fileId) {
+            parts.push(`${label} staged · Join key: ${ss.profile.join_key.column}`)
+          } else if (ss.fileId) {
+            parts.push(`${label} file staged — mapping incomplete`)
+          }
+        }
+        return parts.length ? parts.join(' | ') : 'Not uploaded (optional)'
+      })(),
+    },
+    {
+      label: 'Additional information',
+      value: (() => {
+        const { uploads, presetMetrics, customMetrics, pexValues } = state.fte
+        if (uploads.length === 0 || !uploads.some(u => u.file_ids.length > 0)) {
+          return 'Not provided (optional)'
+        }
+        const entityCount = new Set(uploads.map(u => u.entity_index)).size
+        const pexCount = Object.values(pexValues).filter(v => v > 0).length
+        const metricLabels = [
+          ...presetMetrics.map(m =>
+            m === 'avg_cost_per_fte' ? 'Avg cost per FTE' : m === 'fte' ? 'FTE' : 'Payroll'
+          ),
+          ...customMetrics.map(m => m.output_label),
+        ]
+        const fySet = new Set(uploads.map(u => u.fy_label))
+        return (
+          `${entityCount} entity slot(s) · ${fySet.size} FY labels` +
+          ` · Metrics: ${metricLabels.join(', ') || 'none'}` +
+          (pexCount > 0 ? ` · PEX entries: ${pexCount}` : '')
+        )
       })(),
     },
   ]
@@ -2539,18 +4132,131 @@ function StepReview({
 // Step 6 — Finish panel (shown after "Run Setup" is clicked)
 // ---------------------------------------------------------------------------
 
+/** Compact table for unmapped GL accounts (Account / Year / Entity / Label columns). */
+function UnmappedAccountsTable({ rows }: { rows: GlUnmappedAccount[] }) {
+  return (
+    <div className="rounded border border-red-200 overflow-x-auto">
+      <table className="w-full text-xs text-left">
+        <thead className="bg-red-100 text-red-700">
+          <tr>
+            <th className="px-3 py-2 font-semibold">Account</th>
+            <th className="px-3 py-2 font-semibold">Year</th>
+            <th className="px-3 py-2 font-semibold">Entity</th>
+            <th className="px-3 py-2 font-semibold">Label</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-red-100 bg-white">
+          {rows.map((u, i) => (
+            <tr key={i} className="odd:bg-white even:bg-red-50/30">
+              <td className="px-3 py-1.5 font-mono">{u.account}</td>
+              <td className="px-3 py-1.5">{u.fiscal_year}</td>
+              <td className="px-3 py-1.5">{u.entity_prefix}</td>
+              <td className="px-3 py-1.5 text-slate-600">{u.line_note ?? ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function FinishPanel({
   steps,
   done,
   errorStepId,
   onRetry,
+  onBack,
+  coaGroups,
+  onApplyLibrary,
+  onRerun,
 }: {
   steps: CommitStepState[]
   done: boolean
   errorStepId: string | null
   onRetry: () => void
+  /** Navigate back to StepReview so the user can fix the issue in an earlier step. */
+  onBack: () => void
+  coaGroups: CoaMappingGroup[]
+  onApplyLibrary: (
+    library: string,
+    keys: Array<{ account_number_group: string; fiscal_year: number }>,
+  ) => Promise<ApplyLibraryResponse>
+  onRerun: () => void
 }) {
   const allSucceeded = done && errorStepId === null
+
+  // Local state for the library-apply recovery flow
+  const [applyBusy, setApplyBusy] = useState(false)
+  const [applyError, setApplyError] = useState<string | null>(null)
+  const [applyUnresolved, setApplyUnresolved] = useState<GlUnmappedAccount[] | null>(null)
+
+  // ---------------------------------------------------------------------------
+  // Elapsed-time tracker — one interval per running step, stored in a ref so
+  // interval ids survive re-renders without being part of React state.
+  // Does NOT modify CommitStepState; purely cosmetic / local to FinishPanel.
+  // ---------------------------------------------------------------------------
+  const [elapsedByStepId, setElapsedByStepId] = useState<Record<string, number>>({})
+  const elapsedIntervalsRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
+
+  // Start / stop intervals as step statuses change.
+  useEffect(() => {
+    for (const s of steps) {
+      if (s.status === 'running' && !elapsedIntervalsRef.current[s.id]) {
+        // Initialise counter to 0 (non-destructive — don't reset if already counting)
+        setElapsedByStepId(prev => ({ ...prev, [s.id]: prev[s.id] ?? 0 }))
+        elapsedIntervalsRef.current[s.id] = setInterval(() => {
+          setElapsedByStepId(prev => ({ ...prev, [s.id]: (prev[s.id] ?? 0) + 1 }))
+        }, 1000)
+      } else if (s.status !== 'running' && elapsedIntervalsRef.current[s.id]) {
+        clearInterval(elapsedIntervalsRef.current[s.id])
+        delete elapsedIntervalsRef.current[s.id]
+      }
+    }
+  }, [steps])
+
+  // Clear ALL remaining intervals on unmount to prevent setState-after-unmount warnings.
+  useEffect(() => {
+    return () => {
+      for (const id of Object.keys(elapsedIntervalsRef.current)) {
+        clearInterval(elapsedIntervalsRef.current[id])
+      }
+      elapsedIntervalsRef.current = {}
+    }
+  }, [])
+
+  // Find failed step and its unmapped detail (if any)
+  const failedStep = errorStepId !== null ? steps.find(s => s.id === errorStepId) : null
+  const unmappedDetail = failedStep?.unmapped ?? null
+
+  // Library detection: any group that is NOT upload-based uses a library variant
+  const libraryGroup = coaGroups.find(g => g.method !== 'upload')
+  const hasLibrary = libraryGroup != null
+  const libraryVariant = libraryGroup?.libraryVariant ?? 'skr03'
+
+  async function handleApplyClick() {
+    if (!unmappedDetail) return
+    setApplyBusy(true)
+    setApplyError(null)
+    setApplyUnresolved(null)
+    try {
+      const keys = unmappedDetail.unmapped.map(u => ({
+        account_number_group: u.account_number_group,
+        fiscal_year: u.fiscal_year,
+      }))
+      const result = await onApplyLibrary(libraryVariant, keys)
+      if (result.unresolved.length > 0) {
+        setApplyUnresolved(result.unresolved)
+      } else {
+        // All accounts resolved — re-run the full setup automatically
+        onRerun()
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setApplyError(`Could not apply library mapping: ${msg}`)
+    } finally {
+      setApplyBusy(false)
+    }
+  }
 
   return (
     <StepCard
@@ -2576,11 +4282,25 @@ function FinishPanel({
                   {s.label}
                   {s.status === 'skipped' && <span className="ml-1 font-normal text-slate-400">(skipped)</span>}
                 </p>
-                {s.detail && (
-                  <p className={`text-xs mt-0.5 ${s.status === 'failed' ? 'text-red-600' : 'text-slate-500'}`}>
-                    {s.detail}
-                  </p>
-                )}
+                {(() => {
+                  // When running, append elapsed time to whatever sub-label is in s.detail.
+                  // When done/failed/skipped, render s.detail as-is.
+                  let displayDetail: string | undefined
+                  if (s.status === 'running') {
+                    const secs = elapsedByStepId[s.id] ?? 0
+                    const m = Math.floor(secs / 60)
+                    const sec = secs % 60
+                    const timeStr = `${m}:${String(sec).padStart(2, '0')} elapsed`
+                    displayDetail = s.detail ? `${s.detail} — ${timeStr}` : timeStr
+                  } else {
+                    displayDetail = s.detail
+                  }
+                  return displayDetail ? (
+                    <p className={`text-xs mt-0.5 ${s.status === 'failed' ? 'text-red-600' : 'text-slate-500'}`}>
+                      {displayDetail}
+                    </p>
+                  ) : null
+                })()}
               </div>
               <div className="shrink-0 text-xs font-medium uppercase tracking-wide">
                 {s.status === 'pending' && <span className="text-slate-300">Pending</span>}
@@ -2607,13 +4327,72 @@ function FinishPanel({
               Fix the underlying issue and click Retry. All commit operations are idempotent —
               re-running will not duplicate data.
             </p>
-            <button
-              type="button"
-              onClick={onRetry}
-              className="mt-3 rounded-md border border-red-300 bg-white px-4 py-1.5 text-sm font-semibold text-red-700 hover:bg-red-50 transition"
-            >
-              Retry from failed step
-            </button>
+
+            {/* Unmapped-accounts recovery panel — shown for GL 422 gl_accounts_unmapped */}
+            {unmappedDetail && (
+              <div className="mt-4 space-y-3">
+                <p className="text-xs font-semibold text-red-800 uppercase tracking-wide">
+                  Unmapped accounts ({unmappedDetail.total_unmapped} total)
+                </p>
+
+                <UnmappedAccountsTable rows={unmappedDetail.unmapped} />
+
+                {unmappedDetail.truncated && (
+                  <p className="text-xs text-red-600">
+                    Showing 50 of {unmappedDetail.total_unmapped} unmapped accounts.
+                  </p>
+                )}
+
+                {/* Library apply button — only when at least one CoA group uses a library */}
+                {hasLibrary && applyUnresolved === null && (
+                  <button
+                    type="button"
+                    disabled={applyBusy}
+                    onClick={handleApplyClick}
+                    className="inline-flex items-center gap-2 rounded-md border border-red-300 bg-white px-4 py-1.5 text-sm font-semibold text-red-700 hover:bg-red-50 transition disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {applyBusy && <SpinnerIcon />}
+                    Apply library mapping to these accounts
+                  </button>
+                )}
+                {applyError && (
+                  <p className="text-xs text-red-700">{applyError}</p>
+                )}
+
+                {/* Accounts that the library could not resolve */}
+                {applyUnresolved && applyUnresolved.length > 0 && (
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-red-800 uppercase tracking-wide">
+                      Accounts not found in the library ({applyUnresolved.length})
+                    </p>
+                    <UnmappedAccountsTable rows={applyUnresolved} />
+                    <p className="text-xs text-red-700">
+                      These accounts are not covered by the selected library. Go back to the
+                      Chart of Accounts step and upload a mapping file that includes these
+                      account numbers, then retry.
+                    </p>
+                  </div>
+                )}
+
+              </div>
+            )}
+
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={onRetry}
+                className="rounded-md border border-red-300 bg-white px-4 py-1.5 text-sm font-semibold text-red-700 hover:bg-red-50 transition"
+              >
+                Retry from failed step
+              </button>
+              <button
+                type="button"
+                onClick={onBack}
+                className="rounded-md border border-slate-300 bg-white px-4 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition"
+              >
+                Back to steps
+              </button>
+            </div>
           </div>
         )}
         {!done && errorStepId === null && (
@@ -2624,6 +4403,285 @@ function FinishPanel({
       </div>
     </StepCard>
   )
+}
+
+// ---------------------------------------------------------------------------
+// Danger Zone — Reset all ingested data (admin-only, non-live stacks only)
+// ---------------------------------------------------------------------------
+
+/**
+ * ResetConfirmModal — two-factor confirmation:
+ *   1. Checkbox "I understand this deletes all ingested data"
+ *   2. Red "Reset all data" button (enabled only when checkbox is checked)
+ *
+ * Calls onConfirm() when the user proceeds.
+ */
+function ResetConfirmModal({
+  onConfirm,
+  onCancel,
+  busy,
+}: {
+  onConfirm: () => void
+  onCancel: () => void
+  busy: boolean
+}) {
+  const [understood, setUnderstood] = useState(false)
+
+  return (
+    /* Backdrop */
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+      aria-modal="true"
+      role="dialog"
+      aria-labelledby="reset-modal-title"
+    >
+      <div className="w-full max-w-lg rounded-xl border border-red-200 bg-white shadow-xl">
+        {/* Header */}
+        <div className="flex items-start gap-3 border-b border-red-100 bg-red-50 px-6 py-4 rounded-t-xl">
+          <svg
+            className="h-5 w-5 text-red-600 mt-0.5 shrink-0"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 9v3m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+            />
+          </svg>
+          <div>
+            <h2
+              id="reset-modal-title"
+              className="text-base font-semibold text-red-800"
+            >
+              Reset all ingested data
+            </h2>
+            <p className="text-xs text-red-700 mt-0.5">
+              This action is permanent and cannot be undone.
+            </p>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5 space-y-4">
+          <p className="text-sm text-slate-700">
+            This will <strong>permanently delete</strong> all ingested data from this project,
+            including:
+          </p>
+          <ul className="list-disc pl-5 text-sm text-slate-700 space-y-1">
+            <li>All GL booking lines and journal entries</li>
+            <li>Account mappings (Chart of Accounts)</li>
+            <li>Legal entity definitions</li>
+            <li>Customer and supplier partner masters</li>
+            <li>Opening balance rows</li>
+            <li>Version history snapshots</li>
+          </ul>
+          <p className="text-sm text-slate-700">
+            <strong>Preserved:</strong> libraries, system structure, users and roles,
+            and project configuration settings.
+          </p>
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+            After the reset the project returns to a blank baseline. You will need to
+            re-run the full setup wizard to reload data.
+          </div>
+
+          {/* Explicit confirm checkbox */}
+          <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white px-4 py-3 hover:bg-slate-50 transition select-none">
+            <input
+              type="checkbox"
+              checked={understood}
+              onChange={e => setUnderstood(e.target.checked)}
+              disabled={busy}
+              className="mt-0.5 h-4 w-4 accent-red-600 shrink-0"
+            />
+            <span className="text-sm text-slate-800">
+              I understand this permanently deletes all ingested data and cannot be undone.
+            </span>
+          </label>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-3 border-t border-slate-100 px-6 py-4">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40 transition"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!understood || busy}
+            className="inline-flex items-center gap-2 rounded-md px-5 py-2 text-sm font-semibold text-white transition disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ backgroundColor: '#B91C1C' }}
+          >
+            {busy ? (
+              <>
+                <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                </svg>
+                Resetting…
+              </>
+            ) : (
+              'Reset all data'
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * DangerZone — rendered below the wizard when data_reset_allowed === true
+ * (non-live stack) AND the current user is an admin.
+ *
+ * On live stacks (data_reset_allowed === false) this component is never mounted,
+ * so there is zero risk of accidental exposure.
+ */
+function DangerZone({
+  projectId,
+  onResetComplete,
+}: {
+  projectId: string
+  onResetComplete: () => void
+}) {
+  const [showModal, setShowModal] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<ResetProjectDataResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleConfirm() {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await resetProjectData(projectId)
+      setResult(r)
+      setShowModal(false)
+      onResetComplete()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // Surface friendly messages for known status codes
+      if (/403|forbidden|not allowed/i.test(msg)) {
+        setError('Access denied — only admins can reset project data, and this endpoint is disabled on live stacks.')
+      } else if (/422|confirm/i.test(msg)) {
+        setError('The server rejected the request (422) — confirm payload missing. Please try again.')
+      } else {
+        setError(msg)
+      }
+      setShowModal(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      {showModal && (
+        <ResetConfirmModal
+          onConfirm={handleConfirm}
+          onCancel={() => setShowModal(false)}
+          busy={busy}
+        />
+      )}
+
+      {/* Danger zone card */}
+      <div className="mt-10 rounded-xl border-2 border-red-200 bg-white shadow-sm overflow-hidden">
+        {/* Header stripe */}
+        <div className="flex items-center gap-3 border-b border-red-100 bg-red-50 px-6 py-3">
+          <svg
+            className="h-4 w-4 text-red-600 shrink-0"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 9v3m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
+            />
+          </svg>
+          <span className="text-xs font-bold uppercase tracking-wider text-red-700">
+            Administrative actions
+          </span>
+          <span className="ml-auto rounded-full border border-red-200 bg-white px-2 py-0.5 text-xs font-semibold text-red-600">
+            Admin only
+          </span>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5 space-y-4">
+          <div className="flex items-start justify-between gap-6 flex-wrap">
+            <div className="space-y-1 min-w-0">
+              <p className="text-sm font-semibold text-slate-900">
+                Reset all ingested data
+              </p>
+              <p className="text-xs text-slate-500 max-w-lg">
+                Permanently deletes all project-related data. This action cannot be undone.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => { setResult(null); setError(null); setShowModal(true) }}
+              disabled={busy}
+              className="shrink-0 inline-flex items-center gap-2 rounded-md border-2 border-red-300 bg-white px-5 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 transition disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <svg
+                className="h-4 w-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7h6m-7 0a2 2 0 012-2h4a2 2 0 012 2m-9 0H5m14 0h-2"
+                />
+              </svg>
+              Reset all ingested data
+            </button>
+          </div>
+
+          {/* Success toast */}
+          {result && (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+              <p className="font-semibold">Reset complete.</p>
+            </div>
+          )}
+
+          {/* Error panel */}
+          {error && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+              <p className="font-semibold">Reset failed.</p>
+              <p className="mt-1 text-xs">{error}</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// GL combine helper — mirrors hasSyntheticHeaders in GlEntityCard (not exported)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when every non-fiscal_year column in the combined file is a
+ * synthetic positional label ("Column 1", "Column 2", …), indicating the source
+ * files had no header row and the user must assign GoBD labels manually.
+ */
+function glHasSyntheticHeaders(columns: string[]): boolean {
+  const dataColumns = columns.filter(c => c !== 'fiscal_year')
+  if (dataColumns.length === 0) return false
+  return dataColumns.every(c => /^Column \d+$/.test(c))
 }
 
 // ---------------------------------------------------------------------------
@@ -2657,9 +4715,12 @@ function LoadingScreen() {
 // ---------------------------------------------------------------------------
 
 export default function ProjectSetupWizard() {
+  const { isAdmin } = useAuth()
   const [step, setStep] = useState(0)
   const [state, dispatch] = useReducer(wizardReducer, undefined, defaultState)
   const [loading, setLoading] = useState(true)
+  /** Mirrors data_reset_allowed from GET /projects/{id}. Only true on non-live stacks. */
+  const [dataResetAllowed, setDataResetAllowed] = useState(false)
 
   const totalSteps = WIZARD_STEPS.length
 
@@ -2677,6 +4738,10 @@ export default function ProjectSetupWizard() {
         const fyStartMonth = data.fy_start_month ?? cfg.fy_start_month ?? 1
         const fyEnd = fyEndFromStartMonth(fyStartMonth)
 
+        // Capture data_reset_allowed — only render Danger Zone when the backend
+        // explicitly signals this stack allows resets.
+        setDataResetAllowed(data.data_reset_allowed === true)
+
         dispatch({
           type: 'PREFILL',
           partial: {
@@ -2691,6 +4756,7 @@ export default function ProjectSetupWizard() {
       })
       .catch(() => {
         // Backend not yet live or 404 — start with defaults, no error shown
+        setDataResetAllowed(false)
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -2701,22 +4767,148 @@ export default function ProjectSetupWizard() {
   }, [])
 
   // ---------------------------------------------------------------------------
+  // Keep state.entities in sync with the GL entity cards.
+  // Once the user has typed at least one real entityCode the GL-derived list is
+  // authoritative. Guard with projectEntitiesEqual to avoid infinite dispatch.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    const derived = deriveProjectEntities(state.gl.entities)
+    if (derived.length === 0) return   // no real GL entities yet — preserve PREFILL/default
+    if (projectEntitiesEqual(derived, state.entities)) return
+    dispatch({ type: 'SET_ENTITIES', entities: derived })
+  }, [state.gl.entities, state.entities])
+
+  // ---------------------------------------------------------------------------
+  // GL sub-phase — mirrors the computation inside StepGlBookings so the
+  // NavButtons can vary their behaviour per sub-phase without prop drilling.
+  // ---------------------------------------------------------------------------
+  const glAllCombined =
+    state.gl.years.length > 0 &&
+    state.gl.entities.length > 0 &&
+    state.gl.entities.every(e => !!e.combinedFileId)
+  const glAllAssigned = state.gl.entities.every(e => !!e.formatGroupId)
+  const glSubPhase: 'collect' | 'assign' | 'configure' = !glAllCombined
+    ? 'collect'
+    : state.gl.entities.length === 1 || glAllAssigned
+    ? 'configure'
+    : 'assign'
+
+  /** True when every entity has at least one year-slot filled (gaps in years are allowed). */
+  const allEntitiesReadyToCombine =
+    state.gl.years.length > 0 &&
+    state.gl.entities.length > 0 &&
+    state.gl.entities.every(e =>
+      state.gl.years.some(y => e.yearFiles[y] !== undefined)
+    )
+
+  // ---------------------------------------------------------------------------
+  // Batch combine state — driven from the footer Next button in collect phase
+  // ---------------------------------------------------------------------------
+  const [batchCombining, setBatchCombining] = useState(false)
+  const [batchCombineErrors, setBatchCombineErrors] = useState<
+    Array<{ index: number; entityCode: string; error: string }>
+  >([])
+
+  /**
+   * Combine all entities in one pass.  Replicates the groupingMode==='external'
+   * branch of GlEntityCard.handleCombine for each entity that has all year-slots
+   * filled.  Dispatches PATCH_GL_ENTITY for each success; collects failures and
+   * returns false if any entity failed (so the footer does not advance).
+   */
+  const batchCombineGlEntities = useCallback(async (): Promise<boolean> => {
+    setBatchCombineErrors([])
+    setBatchCombining(true)
+    const errors: Array<{ index: number; entityCode: string; error: string }> = []
+
+    const { years, entities } = state.gl
+    for (let i = 0; i < entities.length; i++) {
+      const entity = entities[i]
+
+      try {
+        const inputs = years
+          .filter(y => entity.yearFiles[y] !== undefined)
+          .map(y => ({ file_id: entity.yearFiles[y]!.fileId, fiscal_year: y }))
+        // Guard: should never happen because Next is gated on ≥1 file per entity,
+        // but skip safely if an entity somehow has no filled years.
+        if (inputs.length === 0) continue
+        const result = await combineGlFiles({ inputs })
+
+        const isSynthetic = glHasSyntheticHeaders(result.columns)
+        const colWarning = result.column_warning ?? undefined
+
+        let patch: Partial<GlEntityState>
+        if (isSynthetic) {
+          // Headerless path — user will assign GoBD labels in the configure phase
+          patch = {
+            combinedFileId: result.file_id,
+            combinedColumns: result.columns,
+            combinedSample: result.sample,
+            combinedDialect: result.dialect,
+            combinedColumnWarning: colWarning,
+            combinedSuggestedHeaders: result.suggested_headers ?? {},
+            headersConfirmed: false,
+            validationOk: undefined,
+            assembledProfile: undefined,
+            entityAssignments: undefined,
+          }
+        } else {
+          // Headered path in external (wizard) mode: never auto-confirm; defer header
+          // confirmation to the configure phase where the group representative does it.
+          const preFill = Object.fromEntries(
+            result.columns.filter(c => c !== 'fiscal_year').map(c => [c, c])
+          )
+          patch = {
+            combinedFileId: result.file_id,
+            combinedColumns: result.columns,
+            combinedSample: result.sample,
+            combinedDialect: result.dialect,
+            combinedColumnWarning: colWarning,
+            combinedSuggestedHeaders: preFill,
+            headersConfirmed: false,
+            validationOk: undefined,
+            assembledProfile: undefined,
+            entityAssignments: undefined,
+          }
+        }
+
+        dispatch({ type: 'PATCH_GL_ENTITY', index: i, patch })
+      } catch (e) {
+        errors.push({
+          index: i,
+          entityCode: entity.entityCode || `Entity ${i + 1}`,
+          error: e instanceof Error ? e.message : 'Combine failed',
+        })
+      }
+    }
+
+    setBatchCombining(false)
+    setBatchCombineErrors(errors)
+    return errors.length === 0
+  }, [state.gl, dispatch])
+
+  // ---------------------------------------------------------------------------
   // Per-step Next-disabled validation
   // ---------------------------------------------------------------------------
   function isNextDisabled(): boolean {
     if (step === 0) return state.projectName.trim().length === 0
     if (step === 1) return state.fyEndMonth < 1 || state.fyEndMonth > 12
-    // Step 2 (GL): block Next until validation has run (passed or soft-confirmed).
-    // validationOk is set to true (hard pass) or false (soft warnings present but
-    // user has seen results). undefined means validation has not yet been attempted.
-    if (step === 2) return state.gl.validationOk === undefined
-    // Step 3 (CoA): library path always ok once a variant is chosen (default 'skr03').
-    // Upload path: ok once a file is staged (column mapping issues show a warning but
-    // don't block — user can proceed and fix post-commit in the CoA Editor).
+    // Step 2 (GL): sub-phase-aware gate.
+    if (step === 2) {
+      if (state.gl.years.length === 0) return true
+      // collect — Next triggers batch combine; enabled once every entity has all year-slots filled
+      if (glSubPhase === 'collect') return !allEntitiesReadyToCombine || batchCombining
+      // assign — user must complete GlFormatAssignmentStep before advancing
+      if (glSubPhase === 'assign') return true
+      // configure — all entities must pass validation
+      return state.gl.entities.some(e => e.validationOk === undefined)
+    }
+    // Step 3 (CoA): blocked only for multi-entity projects that haven't confirmed
+    // the group assignment yet. Once assigned (or single entity), the step is always
+    // passable — per-group config warnings show inline but don't hard-block.
     if (step === 3) {
-      if (!state.coa.source) return true   // source not yet chosen
-      if (state.coa.source === 'library') return !state.coa.libraryVariant
-      if (state.coa.source === 'upload') return false  // allow proceed even without file
+      const configurableEntities = state.entities.filter(e => e.code.trim())
+      if (configurableEntities.length > 1 && !state.coa.assigned) return true
+      return false
     }
     // Step 4 (OB): in_data → always ok. file_first_year/file_all → ok even without a
     // file staged (warn shown inline; user can proceed and upload later).
@@ -2725,17 +4917,29 @@ export default function ProjectSetupWizard() {
     }
     // Step 5 (Partner): entirely optional step — never blocks Next.
     if (step === 5) return false
+    // Step 6 (Additional information): optional — allow Next when no uploads provided.
+    // If the user started uploading, require at least one upload with a file_id + both mappings.
+    if (step === 6) {
+      const { uploads, fteMapping, payrollMapping } = state.fte
+      const hasUpload = uploads.some(u => u.file_ids.length > 0)
+      if (!hasUpload) return false  // nothing provided — always allow Next
+      const hasFteMapping    = Object.keys(fteMapping).length > 0
+      const hasPayrollMapping = Object.keys(payrollMapping).length > 0
+      return !(hasFteMapping && hasPayrollMapping)
+    }
     return false
   }
 
   // ---------------------------------------------------------------------------
   // Phase 5 — Finish orchestration state
   // ---------------------------------------------------------------------------
-  const [commitSteps, setCommitSteps] = useState<CommitStepState[]>(INITIAL_COMMIT_STEPS)
+  const [commitSteps, setCommitSteps] = useState<CommitStepState[]>(() => buildInitialCommitSteps(state))
   const [finishDone, setFinishDone] = useState(false)
   const [finishErrorStepId, setFinishErrorStepId] = useState<string | null>(null)
   /** true once the user has clicked "Run Setup" — switches Review to FinishPanel */
   const [finishStarted, setFinishStarted] = useState(false)
+  /** Captures the runRebuild choice so recovery re-runs can repeat the same flag. */
+  const runRebuildRef = useRef(false)
 
   /** Mutate one step in the checklist by id. */
   const patchStep = useCallback((id: string, patch: Partial<CommitStepState>) => {
@@ -2746,22 +4950,27 @@ export default function ProjectSetupWizard() {
   // Finish handler — sequential COLLECT-THEN-COMMIT orchestration
   // ---------------------------------------------------------------------------
   const handleRunSetup = useCallback(async (runRebuild: boolean) => {
+    runRebuildRef.current = runRebuild
     setFinishStarted(true)
     setFinishDone(false)
     setFinishErrorStepId(null)
     // Reset all steps to pending so a retry starts fresh from step 1
-    setCommitSteps(INITIAL_COMMIT_STEPS.map(s =>
+    setCommitSteps(buildInitialCommitSteps(state).map(s =>
       s.id === 'rebuild' ? { ...s, status: runRebuild ? 'pending' : 'skipped', detail: runRebuild ? undefined : 'Rebuild checkbox not selected' } : s
     ))
 
-    const { gl, coa, ob, partner, projectName, fyEndMonth, entities } = state
+    const { gl, coa, ob, partner, fte, projectName, fyEndMonth, entities: wizardEntities } = state
     const fyStart = fyStartFromEndMonth(fyEndMonth)
 
     // ---- Helper: run one async step, mark done/failed, return false on failure ----
+    // Pass an optional `humanize` function to translate raw error messages into
+    // plain English before storing them in the step detail. GL/OB/Partner steps
+    // leave this unset and receive the raw message as before; CoA opts in below.
     async function runStep<T>(
       id: string,
       fn: () => Promise<T>,
       formatDetail: (result: T) => string,
+      humanize?: (rawMessage: string) => string,
     ): Promise<T | null> {
       patchStep(id, { status: 'running' })
       try {
@@ -2769,74 +4978,351 @@ export default function ProjectSetupWizard() {
         patchStep(id, { status: 'done', detail: formatDetail(result) })
         return result
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        patchStep(id, { status: 'failed', detail: msg })
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        const msg = humanize ? humanize(rawMsg) : rawMsg
+        const unmapped = glUnmappedDetail(err)
+        patchStep(id, { status: 'failed', detail: msg, ...(unmapped ? { unmapped } : {}) })
         setFinishErrorStepId(id)
         setFinishDone(true)
         return null
       }
     }
 
-    // ---- Step 1: Save config ----
+    // -------------------------------------------------------------------------
+    // Plain-language error translator (finish flow only).
+    // Ensures non-programmers never see raw Python exception text in the UI.
+    // All finish steps (CoA, GL, OB, Partner, FTE, Rebuild) pass their caught
+    // error through this function before storing it in the step detail.
+    //
+    // Rules (checked in order):
+    //  1. "have no account number" — GL backend contract: preserve + prepend entity.
+    //  2. "invalid literal for int()" — fiscal year not set.
+    //  3. column not found / KeyError — column mapping problem.
+    //  4. Traceback / psycopg2 / sqlalchemy / transaction text — per-step generic.
+    //  5. Other Python exception names — per-step generic.
+    //  6. Otherwise pass through (backend already returned plain English).
+    // -------------------------------------------------------------------------
+    function friendlyFinishError(
+      raw: string,
+      opts?: {
+        /** Descriptive label for this step, e.g. "GL bookings", "opening balances". */
+        stepLabel?: string
+        /** Entity code or display name shown in the message (e.g. "ENT1"). */
+        entityCode?: string
+      },
+    ): string {
+      const { stepLabel = 'data', entityCode } = opts ?? {}
+      const entityPart = entityCode ? ` for entity ${entityCode}` : ''
+
+      // 1. Backend contract: GL 422 "have no account number" — preserve and prepend entity.
+      if (/have no account number/i.test(raw)) {
+        return entityCode ? `Entity ${entityCode}: ${raw}` : raw
+      }
+
+      // 2. Fiscal year missing (Python int('') → ValueError: invalid literal for int()).
+      if (/invalid literal.*int|int\(.*\).*base 10/i.test(raw)) {
+        return (
+          `Couldn't import the ${stepLabel}${entityPart}: no fiscal year was set for the project. ` +
+          `Go back to the Fiscal Year step and add at least one year.`
+        )
+      }
+
+      // 3a-new. Humanized backend wording (2026-06+):
+      //   GoBD header columns end with "…in the GL header step, then re-validate."
+      //   Sign/amount columns end with "…Select it in the Options step, then re-validate."
+      // The captured label is already friendly — use it directly, no key lookup needed.
+      {
+        const m = /The '([^']+)' column is not mapped/i.exec(raw)
+        if (m) {
+          const label = m[1]
+          if (/Options step/i.test(raw)) {
+            return (
+              `The '${label}' column isn't mapped${entityPart}. ` +
+              `Select it in the Options step, then re-validate.`
+            )
+          }
+          return (
+            `The '${label}' column isn't mapped${entityPart}. ` +
+            `Go back to the GL header step and assign a column as '${label}', then re-validate.`
+          )
+        }
+      }
+
+      // 3a. GoBD required column missing — backend apply_profile 422 (legacy wording):
+      //   "posting_date is required; map it in profile.columns['posting_date']"
+      // Kept for backward compatibility; translates snake_case key to a friendly label.
+      {
+        const GOBD_FIELD_LABELS: Record<string, string> = {
+          posting_date: 'Posting date',
+          journal_entry_number: 'Transaction/journal number',
+          account_number: 'Account number',
+          amount: 'Amount',
+        }
+        const m = /^(\w+) is required; map it in profile\.columns/i.exec(raw)
+        if (m) {
+          const fieldKey = m[1].toLowerCase()
+          const label = GOBD_FIELD_LABELS[fieldKey] ?? fieldKey
+          return (
+            `The '${label}' column isn't mapped${entityPart}. ` +
+            `Go back to the GL header step and assign a source column as '${label}', then re-validate.`
+          )
+        }
+      }
+
+      // 3b. Sign/amount column missing — backend ValueError:
+      //   "signAmount column is required — select it in the Options step"
+      if (/column is required.*Options step/i.test(raw)) {
+        return (
+          `A required amount column isn't configured${entityPart}. ` +
+          `Go back to the GL configuration step and set the amount sign options, then re-validate.`
+        )
+      }
+
+      // 3. Column not found or required field missing (generic fallback).
+      if (/column not found|missing.*required|required.*field|missing.*column|column.*missing|\bKeyError\b/i.test(raw)) {
+        return `A required column couldn't be found${entityPart} — check the column mapping for this step and try again.`
+      }
+
+      // 4. Python/SQL internals — never show these raw.
+      if (/Traceback|psycopg2|NotNullViolation|sqlalchemy|transaction rolled back|Load failed/i.test(raw)) {
+        return (
+          `Something went wrong importing the ${stepLabel} data${entityPart} — ` +
+          `please check the validation step and try again.`
+        )
+      }
+
+      // 5. Other Python exception class names.
+      if (/\bValueError\b|\bTypeError\b|\bAttributeError\b/i.test(raw)) {
+        return (
+          `Something went wrong importing the ${stepLabel} data${entityPart} — ` +
+          `please check the validation step and try again.`
+        )
+      }
+
+      // Backend already returned plain English; pass through unchanged.
+      return raw
+    }
+
+    // ---- Step 1: Save config (also creates the project's legal entities) ----
+    // The PUT /projects backend upserts `entities` into dim_legal_entity up front,
+    // so the Step-2 CoA (bs_pl_master) commit can resolve entity references on a
+    // fresh project (order: config → entities → CoA → GL).
     const configResult = await runStep(
       'config',
       () => api.putProject(PROJECT_ID, {
         name: projectName,
         fy_start_month: fyStart,
-        entities: entities.filter(e => e.code.trim() !== ''),
+        entities: wizardEntities.filter(e => e.code.trim() !== ''),
         opening_balance_mode: ob.mode === 'in_data' ? 'in_data' : 'file',
-        mapping_source: coa.source === 'library' ? 'library' : 'client_coa',
+        mapping_source: coa.groups.some(g => g.method === 'upload') ? 'client_coa' : 'library',
         partner_master_source: 'files',
         net_profit_source: 'report_inject',
         sales_label: 'Sales',
         cost_label: 'Cost of materials',
+        account_mapping_mode: coa.accountMappingMode,
       }),
-      () => `Project "${projectName}" saved (fy_start_month=${fyStart})`,
+      () => `Project "${projectName}" saved (fy_start_month=${fyStart}, account_mapping_mode=${coa.accountMappingMode})`,
     )
     if (configResult === null) return
 
-    // ---- Step 2: GL commit ----
-    if (!gl.fileId || !gl.assembledProfile) {
-      patchStep('gl', { status: 'skipped', detail: 'No GL file staged — skipped' })
-    } else {
-      const glResult = await runStep(
-        'gl',
-        () => commitIngest({
-          file_id: gl.fileId!,
-          sheet: gl.sheet,
-          profile: gl.assembledProfile!,
-          dataset: 'gl',
-          confirm_soft: true,
-          exclude_line_ids: [],
-          commit_mode: 'replace',
-        }),
-        (r: CommitResponse) =>
-          `${r.entries} entries, ${r.lines} lines loaded (AR: ${r.ar}, AP: ${r.ap}, skipped: ${r.skipped})`,
-      )
-      if (glResult === null) return
-    }
-
-    // ---- Step 3: CoA commit ----
-    if (coa.source === 'library') {
+    // ---- Step 2: CoA commit loop (must run BEFORE GL so dim_gl_account is populated) ----
+    // NOTE: library groups are skipped here — library classification runs at rebuild.
+    // Upload groups commit one call per (group × statement × entity) triple.
+    // replace_mode: first commit overall = 'replace' (wipes prior CoA scope);
+    // all subsequent commits = 'append'.
+    const uploadGroups = coa.groups.filter(g => g.method === 'upload')
+    if (uploadGroups.length === 0) {
+      const libraryInfo = [
+        ...new Set(coa.groups.map(g => g.libraryVariant ?? 'skr03')),
+      ].join(', ')
       patchStep('coa', {
         status: 'skipped',
-        detail: `Library classification (${coa.libraryVariant ?? 'skr03'}) — applied at rebuild; no file to commit`,
+        detail: `Library classification (${libraryInfo || 'skr03'}) — applied at rebuild; no file to commit`,
       })
-    } else if (!coa.masterFileId) {
-      patchStep('coa', { status: 'skipped', detail: 'No CoA file staged — skipped' })
     } else {
-      const coaResult = await runStep(
-        'coa',
-        () => commitAccountMapping({
-          file_id: coa.masterFileId!,
-          format: coa.isBsPlMaster ? 'bs_pl_master' : 'generic',
-          replace_mode: 'replace',
-          ...(coa.isBsPlMaster ? {} : { profile: undefined }),
-        }),
-        (r: MappingCommitResponse) =>
-          `${r.accounts} accounts loaded (NA: ${r.na ?? 0}, CF: ${r.cf ?? 0})`,
-      )
-      if (coaResult === null) return
+      // Flatten into ordered (group × statement × entity) items.
+      // buildCoaItems is an exported pure helper (coaAssignment.ts) so it can be
+      // unit-tested at the commit-emission level without JSX.
+      const coaItems: CoaItem[] = buildCoaItems(coa.groups, wizardEntities)
+
+      if (coaItems.length === 0) {
+        patchStep('coa', { status: 'skipped', detail: 'No CoA file staged — skipped' })
+      } else {
+        // Expand the single 'coa' placeholder into per-item checklist entries
+        if (coaItems.length > 1) {
+          setCommitSteps(prev => prev.map(s => s.id === 'coa'
+            ? { id: 'coa_0', label: `CoA — ${coaItems[0].group.label} ${coaItems[0].stmt.toUpperCase()}`, status: 'pending' as const }
+            : s
+          ))
+        }
+
+        // Guard: CoA commits are replicated across all project fiscal years.
+        // If no years have been configured yet the backend would receive an empty
+        // fiscal_year value and crash (Python int('') → ValueError). Fail fast with
+        // a plain-English message so the user knows exactly what to fix.
+        if (state.gl.years.length === 0) {
+          const noYearsMsg = 'Select at least one fiscal year before finishing.'
+          const firstStepId = coaItems.length === 1 ? 'coa' : 'coa_0'
+          patchStep(firstStepId, { status: 'failed', detail: noYearsMsg })
+          setFinishErrorStepId(firstStepId)
+          setFinishDone(true)
+          return
+        }
+
+        let totalCoaAccounts = 0
+        for (let i = 0; i < coaItems.length; i++) {
+          const item = coaItems[i]
+          const stepId = coaItems.length === 1 ? 'coa' : `coa_${i}`
+          // entity_prefixes covers all member entities; fall back to group label when none set.
+          const entityTag = item.entityPrefixes.length > 0 ? item.entityPrefixes.join(', ') : 'all'
+          const stepLabel = `CoA — ${item.group.label} ${item.stmt.toUpperCase()} (${entityTag})`
+
+          if (i > 0) {
+            setCommitSteps(prev => {
+              const insertIdx = prev.findIndex(s => s.id === `coa_${i - 1}`)
+              const next = [...prev]
+              next.splice(insertIdx + 1, 0, { id: stepId, label: stepLabel, status: 'pending' as const })
+              return next
+            })
+          } else if (coaItems.length > 1) {
+            setCommitSteps(prev => prev.map(s => s.id === 'coa_0' ? { ...s, label: stepLabel } : s))
+          }
+
+          // Always replace: one atomic call per group×stmt covers all member entities.
+          const replace_mode = 'replace' as const
+
+          // For generic (non-master) slots attach the column mapping profile.
+          // CoA files do not have a fiscal_year column; entity is scoped via entity_prefixes.
+          // fiscal_year value is the first project FY (never empty after the guard above);
+          // the backend overrides it per-year when fiscal_years[] is supplied.
+          // Use the first member entity code as the fixed entity value (the profile is for
+          // file parsing; scoping is handled by entity_prefixes on the commit call).
+          const firstMemberCode = item.group.memberEntityCodes[0] ?? ''
+          const profile: AccountMappingProfile | undefined =
+            !item.slot.isMaster && item.slot.mapping && Object.keys(item.slot.mapping).length > 0
+              ? {
+                  entity: { mode: 'fixed' as const, value: firstMemberCode },
+                  fiscal_year: { mode: 'fixed' as const, value: String(state.gl.years[0] ?? '') },
+                  columns: item.slot.mapping,
+                }
+              : undefined
+
+          // Build display strings used by the CoA error humanizer below.
+          const humanEntityTag = entityTag
+          const stmtLabel = item.stmt === 'bs' ? 'Balance Sheet' : 'Profit & Loss'
+
+          const coaResult = await runStep(
+            stepId,
+            () => commitAccountMapping({
+              file_id: item.slot.fileId!,
+              format: item.slot.isMaster ? 'bs_pl_master' : 'generic',
+              statement: item.stmt,
+              entity_prefixes: item.entityPrefixes.length > 0 ? item.entityPrefixes : undefined,
+              replace_mode,
+              // Replicate this account mapping across all project fiscal years.
+              fiscal_years: state.gl.years,
+              ...(profile ? { profile } : {}),
+            }),
+            (r: MappingCommitResponse) => {
+              totalCoaAccounts += r.accounts
+              return `${r.accounts} accounts (NA: ${r.na ?? 0}, CF: ${r.cf ?? 0}, mode: ${replace_mode})`
+            },
+            // CoA humanizer: non-programmers must never see raw exception text.
+            (raw) => friendlyFinishError(raw, { stepLabel: `${stmtLabel} account mapping`, entityCode: humanEntityTag }),
+          )
+          if (coaResult === null) return
+        }
+
+        if (coaItems.length > 1) {
+          const lastId = `coa_${coaItems.length - 1}`
+          setCommitSteps(prev => prev.map(s =>
+            s.id === lastId
+              ? { ...s, detail: (s.detail ?? '') + ` | Total: ${totalCoaAccounts} accounts` }
+              : s
+          ))
+        }
+      }
+    }
+
+    // ---- Step 3: GL commit loop (one call per validated entity) ----
+    // CoA (dim_gl_account) must be committed first — the backend 422s otherwise.
+    // Each entity uses its combined file_id (all years concatenated with fiscal_year column).
+    // Entity profiles always use entity: fixed + fiscal_year: column — so each entity is a
+    // distinct scope; first occurrence → replace, subsequent → append (shouldn't happen in
+    // normal flow but guarded anyway).
+    const stagedGlEntities = gl.entities.filter(e => e.combinedFileId && e.assembledProfile)
+    if (stagedGlEntities.length === 0) {
+      patchStep('gl', { status: 'skipped', detail: 'No GL entity staged — skipped' })
+    } else {
+      const committedScopes = new Set<string>()
+      let totalEntries = 0, totalLines = 0
+
+      for (let i = 0; i < stagedGlEntities.length; i++) {
+        const entity = stagedGlEntities[i]
+        const entityCode = entity.entityCode.trim() || `entity_${i}`
+        const commit_mode: 'replace' | 'append' = committedScopes.has(entityCode) ? 'append' : 'replace'
+        committedScopes.add(entityCode)
+
+        const stepId = `gl_${i}`
+        const stepLabel = `GL — ${entityCode} (entity ${i + 1} of ${stagedGlEntities.length})`
+
+        setCommitSteps(prev => {
+          if (i === 0) {
+            return prev.map(s => s.id === 'gl'
+              ? { id: stepId, label: stepLabel, status: 'pending' as const }
+              : s
+            )
+          }
+          const insertIdx = prev.findIndex(s => s.id === `gl_${i - 1}`)
+          const next = [...prev]
+          next.splice(insertIdx + 1, 0, { id: stepId, label: stepLabel, status: 'pending' as const })
+          return next
+        })
+
+        // Optimistic sub-status labels — purely advisory (the POST is atomic).
+        // These are cleared immediately when runStep resolves, so they never
+        // overwrite the final done/failed detail.
+        patchStep(stepId, { detail: 'Parsing & validating…' })
+        const glSubTimers: ReturnType<typeof setTimeout>[] = [
+          setTimeout(() => patchStep(stepId, { detail: 'Writing GL bookings…' }), 3000),
+          setTimeout(() => patchStep(stepId, { detail: 'Deriving AR / AP / sales…' }), 8000),
+        ]
+
+        const glResult = await runStep(
+          stepId,
+          () => commitIngest({
+            file_id: entity.combinedFileId!,
+            sheet: undefined,
+            profile: entity.assembledProfile!,
+            dataset: 'gl',
+            confirm_soft: true,
+            // F-1 fix: propagate exclusions confirmed during validation so the
+            // excluded rows are not written to the DB at commit time.
+            exclude_line_ids: entity.excludedLineIds ?? [],
+            commit_mode,
+          }),
+          (r: CommitResponse) => {
+            totalEntries += r.entries
+            totalLines += r.lines
+            if (r.unchanged === true) {
+              return 'Already up to date — no changes written'
+            }
+            return `${r.entries} entries, ${r.lines} lines (mode: ${commit_mode}, AR: ${r.ar}, AP: ${r.ap}, skipped: ${r.skipped})`
+          },
+          (raw) => friendlyFinishError(raw, { stepLabel: 'GL bookings', entityCode }),
+        )
+        glSubTimers.forEach(clearTimeout)
+        if (glResult === null) return
+      }
+
+      if (stagedGlEntities.length > 1) {
+        const lastId = `gl_${stagedGlEntities.length - 1}`
+        setCommitSteps(prev => prev.map(s =>
+          s.id === lastId
+            ? { ...s, detail: (s.detail ?? '') + ` | Total: ${totalEntries} entries, ${totalLines} lines` }
+            : s
+        ))
+      }
     }
 
     // ---- Step 4: Opening balances commit ----
@@ -2845,64 +5331,266 @@ export default function ProjectSetupWizard() {
         status: 'skipped',
         detail: 'Opening balances are included in the GL data — no separate file needed',
       })
-    } else if (!ob.obFileId || !ob.obProfile?.account_col || !ob.obProfile?.amount_col) {
+    } else if (ob.mode === 'file_first_year' && state.gl.years.length === 0) {
+      // Guard: first-year scope requires at least one GL fiscal year to be configured
       patchStep('ob', {
         status: 'skipped',
-        detail: ob.obFileId
-          ? 'OB file staged but column mapping incomplete — skipped'
-          : 'No OB file staged — skipped',
+        detail: 'No GL fiscal years configured — OB first-year commit requires at least one GL year; skipped',
       })
-    } else {
-      // Build a minimal GL-style profile for the OB commit (only account + amount columns needed)
-      const obProfile = {
-        entity: { mode: 'fixed' as const, value: entities[0]?.code ?? '' },
-        fiscal_year: { mode: 'from_date' as const, value: '' },
-        sign: { mode: 'signed' as const, amount: ob.obProfile.amount_col },
-        decimal: ',',
-        thousands: '.',
-        date_dayfirst: true,
-        columns: {
-          account_number: ob.obProfile.account_col,
-          amount: ob.obProfile.amount_col,
-        },
-        linking_strategy: 'none' as const,
-        entry_type: 'actual' as const,
+    } else if (ob.entitySource === 'per_entity') {
+      // Per-entity mode: commit one file per entity
+      const perObItems = wizardEntities
+        .filter(e => e.code.trim())
+        .map(e => ({ entity: e, perState: ob.perEntity?.[e.code] }))
+        .filter(({ perState }) =>
+          perState?.obFileId && perState?.obProfile?.account_col && perState?.obProfile?.amount_col &&
+          (ob.mode !== 'file_all' || !!perState?.obProfile?.fiscal_year_col)
+        )
+
+      if (perObItems.length === 0) {
+        patchStep('ob', {
+          status: 'skipped',
+          detail: ob.mode === 'file_all'
+            ? 'OB all-years needs a fiscal-year column mapping — skipped'
+            : 'No per-entity OB files staged with complete mapping — skipped',
+        })
+      } else {
+        // Expand single 'ob' checklist item into 'ob_0', 'ob_1', … like the CoA loop
+        if (perObItems.length > 1) {
+          setCommitSteps(prev => prev.map(s => s.id === 'ob'
+            ? { id: 'ob_0', label: `OB — ${perObItems[0].entity.name || perObItems[0].entity.code}`, status: 'pending' as const }
+            : s
+          ))
+        }
+        for (let i = 0; i < perObItems.length; i++) {
+          const { entity: e, perState } = perObItems[i]
+          const stepId = perObItems.length === 1 ? 'ob' : `ob_${i}`
+          const stepLabel = `OB — ${e.name || e.code} (${e.prefix || e.code})`
+          if (i > 0) {
+            setCommitSteps(prev => {
+              const insertIdx = prev.findIndex(s => s.id === `ob_${i - 1}`)
+              const next = [...prev]
+              next.splice(insertIdx + 1, 0, { id: stepId, label: stepLabel, status: 'pending' as const })
+              return next
+            })
+          } else if (perObItems.length > 1) {
+            setCommitSteps(prev => prev.map(s => s.id === 'ob_0' ? { ...s, label: stepLabel } : s))
+          }
+
+          const entityValue = e.prefix || e.code
+          const perObProfile = {
+            entity: { mode: 'fixed' as const, value: entityValue },
+            fiscal_year: ob.mode === 'file_first_year'
+              ? { mode: 'fixed' as const, value: String(state.gl.years[0] ?? '') }
+              : { mode: 'column' as const, value: perState!.obProfile!.fiscal_year_col! },
+            sign: { mode: 'signed' as const, amount: perState!.obProfile!.amount_col! },
+            date_dayfirst: true,
+            columns: {
+              account_number: perState!.obProfile!.account_col!,
+              amount: perState!.obProfile!.amount_col!,
+            },
+            linking_strategy: 'none' as const,
+            entry_type: 'actual' as const,
+          }
+          const obResult = await runStep(
+            stepId,
+            () => commitOpeningBalance({
+              file_id: perState!.obFileId!,
+              profile: perObProfile,
+              scope: ob.mode === 'file_first_year' ? 'first_year' : 'all',
+            }),
+            (r: ObCommitResponse) =>
+              `${r.lines} lines loaded, scope="${r.scope}", fiscal years: ${r.fiscal_years.join(', ') || 'n/a'}`,
+            (raw) => friendlyFinishError(raw, { stepLabel: 'opening balances', entityCode: e.code }),
+          )
+          if (obResult === null) return
+        }
       }
-      const obResult = await runStep(
-        'ob',
-        () => commitOpeningBalance({
-          file_id: ob.obFileId!,
-          profile: obProfile,
-          scope: ob.mode === 'file_first_year' ? 'first_year' : 'all',
-        }),
-        (r: ObCommitResponse) =>
-          `${r.lines} lines loaded, scope="${r.scope}", fiscal years: ${r.fiscal_years.join(', ') || 'n/a'}`,
-      )
-      if (obResult === null) return
+    } else {
+      // Combined or undefined (back-compat): single-file behavior
+      if (!ob.obFileId || !ob.obProfile?.account_col || !ob.obProfile?.amount_col) {
+        patchStep('ob', {
+          status: 'skipped',
+          detail: ob.obFileId
+            ? 'OB file staged but column mapping incomplete — skipped'
+            : 'No OB file staged — skipped',
+        })
+      } else if (ob.mode === 'file_all' && !ob.obProfile?.fiscal_year_col) {
+        patchStep('ob', {
+          status: 'skipped',
+          detail: 'OB all-years needs a fiscal-year column mapping — skipped',
+        })
+      } else {
+        // entity mode: column when combined+entityCol provided, else fixed to first entity (back-compat)
+        const entityConfig = (ob.entitySource === 'combined' && ob.entityCol)
+          ? { mode: 'column' as const, value: ob.entityCol }
+          : { mode: 'fixed' as const, value: wizardEntities[0]?.code ?? '' }
+        // Build label→prefix map so the backend resolves both entity names and codes
+        const entityAssignments = Object.fromEntries(
+          wizardEntities.filter(e => e.code.trim()).flatMap(e => {
+            const pfx = e.prefix || e.code
+            return [[e.name || e.code, pfx], [e.code, pfx]]
+          })
+        )
+        const obProfile = {
+          entity: entityConfig,
+          entity_assignments: entityAssignments,
+          fiscal_year: ob.mode === 'file_first_year'
+            ? { mode: 'fixed' as const, value: String(state.gl.years[0] ?? '') }
+            : { mode: 'column' as const, value: ob.obProfile.fiscal_year_col! },
+          sign: { mode: 'signed' as const, amount: ob.obProfile.amount_col },
+          date_dayfirst: true,
+          columns: {
+            account_number: ob.obProfile.account_col,
+            amount: ob.obProfile.amount_col,
+          },
+          linking_strategy: 'none' as const,
+          entry_type: 'actual' as const,
+        }
+        const obResult = await runStep(
+          'ob',
+          () => commitOpeningBalance({
+            file_id: ob.obFileId!,
+            profile: obProfile,
+            scope: ob.mode === 'file_first_year' ? 'first_year' : 'all',
+          }),
+          (r: ObCommitResponse) =>
+            `${r.lines} lines loaded, scope="${r.scope}", fiscal years: ${r.fiscal_years.join(', ') || 'n/a'}`,
+          (raw) => friendlyFinishError(raw, { stepLabel: 'opening balances' }),
+        )
+        if (obResult === null) return
+      }
     }
 
     // ---- Step 5: Partner master commit ----
-    if (!partner.fileId || !partner.profile) {
+    // Build a flat list across both sides (each side can be combined or per-entity independently)
+    type _PartnerItem =
+      | { kind: 'combined'; side: 'customer' | 'supplier'; fileId: string; profile: PartnerMappingProfile }
+      | { kind: 'per_entity'; side: 'customer' | 'supplier'; entity: { code: string; name: string; prefix: string }; fileId: string; profile: PartnerMappingProfile }
+    const partnerItems: _PartnerItem[] = []
+    const _validEntities = wizardEntities.filter(e => e.code.trim())
+    const _defaultEntitySource = _validEntities.length > 1 ? 'per_entity' : 'combined'
+    for (const side of ['customer', 'supplier'] as const) {
+      const sideState = partner.sides[side]
+      const entitySource = sideState.entitySource ?? _defaultEntitySource
+      if (entitySource === 'per_entity') {
+        for (const e of _validEntities) {
+          const perState = sideState.perEntity?.[e.code]
+          if (perState?.fileId && perState?.profile) {
+            partnerItems.push({ kind: 'per_entity', side, entity: e, fileId: perState.fileId, profile: perState.profile })
+          }
+        }
+      } else if (sideState.fileId && sideState.profile) {
+        partnerItems.push({ kind: 'combined', side, fileId: sideState.fileId, profile: sideState.profile })
+      }
+    }
+    if (partnerItems.length === 0) {
       patchStep('partner', {
         status: 'skipped',
-        detail: partner.fileId
-          ? 'Partner file staged but mapping incomplete — skipped. Upload separately after initial commit.'
-          : 'No partner master file staged (optional step) — skipped',
+        detail: 'No partner master files staged with complete mapping — skipped (optional)',
       })
     } else {
-      const partnerResult = await runStep(
-        'partner',
-        () => commitPartnerMaster({
-          file_id: partner.fileId!,
-          profile: partner.profile!,
-        }),
-        (r: PartnerCommitResponse) =>
-          `${r.upserted} ${r.side === 'customer' ? 'customers' : 'suppliers'} upserted into dim_${r.side}`,
-      )
-      if (partnerResult === null) return
+      if (partnerItems.length > 1) {
+        const first = partnerItems[0]
+        const firstLabel = first.kind === 'per_entity'
+          ? `Partner — ${first.side} / ${first.entity.name || first.entity.code}`
+          : `Partner — ${first.side}`
+        setCommitSteps(prev => prev.map(s => s.id === 'partner'
+          ? { id: 'partner_0', label: firstLabel, status: 'pending' as const }
+          : s
+        ))
+      }
+      for (let i = 0; i < partnerItems.length; i++) {
+        const item = partnerItems[i]
+        const stepId = partnerItems.length === 1 ? 'partner' : `partner_${i}`
+        const stepLabel = item.kind === 'per_entity'
+          ? `Partner — ${item.side} / ${item.entity.name || item.entity.code} (${item.entity.prefix || item.entity.code})`
+          : `Partner — ${item.side}`
+        if (i > 0) {
+          setCommitSteps(prev => {
+            const insertIdx = prev.findIndex(s => s.id === `partner_${i - 1}`)
+            const next = [...prev]
+            next.splice(insertIdx + 1, 0, { id: stepId, label: stepLabel, status: 'pending' as const })
+            return next
+          })
+        } else if (partnerItems.length > 1) {
+          setCommitSteps(prev => prev.map(s => s.id === 'partner_0' ? { ...s, label: stepLabel } : s))
+        }
+        const commitProfile = item.kind === 'per_entity'
+          ? { ...item.profile, entity: { mode: 'fixed' as const, value: item.entity.prefix || item.entity.code } }
+          : item.profile
+        const partnerEntityCode = item.kind === 'per_entity' ? (item.entity.prefix || item.entity.code) : undefined
+        const partnerResult = await runStep(
+          stepId,
+          () => commitPartnerMaster({ file_id: item.fileId, profile: commitProfile }),
+          (r: PartnerCommitResponse) =>
+            `${r.upserted} ${r.side === 'customer' ? 'customers' : 'suppliers'} upserted into dim_${r.side}`,
+          (raw) => friendlyFinishError(raw, { stepLabel: `partner master (${item.side})`, entityCode: partnerEntityCode }),
+        )
+        if (partnerResult === null) return
+      }
     }
 
-    // ---- Step 6: Rebuild (optional) ----
+    // ---- Step 6: FTE Development (optional — non-blocking on failure) ----
+    if (!state.additionalDatasets.fte || fte.uploads.length === 0 || !fte.uploads.some(u => u.file_ids.length > 0)) {
+      patchStep('fte', { status: 'skipped', detail: 'No FTE data provided — skipped (optional)' })
+    } else {
+      const glYears = gl.years
+      const firstFy = glYears.length > 0 ? Math.min(...glYears) : 2022
+      const lastFy  = glYears.length > 0 ? Math.max(...glYears) : 2025
+      const entityNames = wizardEntities.filter(e => e.code.trim()).map(e => e.name || e.code)
+
+      // fte.uploads already has one entry per entity×FY (expanded at upload time in
+      // StepAdditionalInformation.handleFileUpload), so they map directly to entity_year_files.
+      const entity_year_files: FteDevelopmentRequest['entity_year_files'] = fte.uploads
+
+      const fteReq: FteDevelopmentRequest = {
+        session_id:      fte.sessionId,
+        entity_year_files,
+        entity_names:    entityNames,
+        output_folder:   '',
+        view_mode:       fte.viewMode,
+        upload_mode:     fte.uploadMode,
+        first_fy:        firstFy,
+        last_fy:         lastFy,
+        fte_mapping:     fte.fteMapping,
+        fte_tenure_mode: fte.tenureMode,
+        payroll_mapping: fte.payrollMapping,
+        fte_payroll_mode: fte.payrollMode,
+        dimensions:      fte.dimensions,
+        preset_metrics:  fte.presetMetrics,
+        custom_metrics:  fte.customMetrics,
+        pex_view_mode:   fte.pexViewMode,
+        pex_values:      fte.pexValues,
+        fy_end_month:    fyEndMonth,
+        fy_end_day:      31,
+        formula_mode:    true,
+      }
+
+      patchStep('fte', { status: 'running' })
+      try {
+        const r = await runFteDevelopment(fteReq)
+        // Resolve filename: prefer output_filename, fall back to output_file, then construct.
+        const filename =
+          r.output_filename ??
+          r.output_file ??
+          `${fte.sessionId}_FTE_Development.xlsx`
+        patchStep('fte', {
+          status: r.success ? 'done' : 'failed',
+          detail: r.success
+            ? `FTE Development workbook built: ${filename}`
+            : `Run completed with errors: ${r.message}`,
+        })
+        // A non-success response is surfaced as 'failed' detail but does NOT abort Finish.
+      } catch (err) {
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        patchStep('fte', { status: 'failed', detail: friendlyFinishError(rawMsg, { stepLabel: 'FTE development' }) })
+        // Intentionally do NOT set finishErrorStepId here — FTE failure is non-blocking.
+        // The Finish sequence continues to rebuild.
+      }
+    }
+
+    // ---- Step 7: Rebuild (optional) ----
     if (!runRebuild) {
       // already marked skipped in initial reset above
     } else {
@@ -2911,15 +5599,15 @@ export default function ProjectSetupWizard() {
         await api.rebuildProject(PROJECT_ID)
         patchStep('rebuild', { status: 'done', detail: 'Rebuild triggered successfully' })
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
+        const rawMsg = err instanceof Error ? err.message : String(err)
         // 503 = rebuild_on_commit disabled — treat as info, not hard failure
-        if (/503|rebuild_on_commit|disabled/i.test(msg)) {
+        if (/503|rebuild_on_commit|disabled/i.test(rawMsg)) {
           patchStep('rebuild', {
             status: 'skipped',
             detail: 'Rebuild endpoint returned 503 — rebuild_on_commit is disabled on this server. Trigger a rebuild manually from the Admin panel.',
           })
         } else {
-          patchStep('rebuild', { status: 'failed', detail: msg })
+          patchStep('rebuild', { status: 'failed', detail: friendlyFinishError(rawMsg, { stepLabel: 'rebuild' }) })
           setFinishErrorStepId('rebuild')
           setFinishDone(true)
           return
@@ -2935,8 +5623,36 @@ export default function ProjectSetupWizard() {
     setFinishStarted(false)
     setFinishDone(false)
     setFinishErrorStepId(null)
-    setCommitSteps(INITIAL_COMMIT_STEPS)
+    setCommitSteps(buildInitialCommitSteps(state))
+  }, [state])
+
+  /**
+   * Return from FinishPanel to StepReview so the user can navigate back to an
+   * earlier step, fix the issue (e.g. exclude rows in GL validation), and
+   * return.  Intentionally does NOT reset commitSteps / finishDone — a fresh
+   * "Run Setup" call from StepReview resets those when needed.  Wizard reducer
+   * state (entities, gl.excludedLineIds, CoA mapping, etc.) is never touched
+   * here so all collected data survives the round-trip.
+   */
+  const handleGoBack = useCallback(() => {
+    setFinishStarted(false)
   }, [])
+
+  /** Forward the apply-library call from FinishPanel to the backend. */
+  const handleApplyLibrary = useCallback(async (
+    library: string,
+    keys: Array<{ account_number_group: string; fiscal_year: number }>,
+  ): Promise<ApplyLibraryResponse> => {
+    return applyLibraryMapping({ library, keys })
+  }, [])
+
+  /**
+   * Re-run the full setup after a successful library-mapping apply.
+   * Repeats the same rebuild flag that the user originally chose.
+   */
+  const handleRerunAfterApply = useCallback(() => {
+    handleRunSetup(runRebuildRef.current)
+  }, [handleRunSetup])
 
   if (loading) {
     return <LoadingScreen />
@@ -2962,46 +5678,134 @@ export default function ProjectSetupWizard() {
           </p>
         </div>
 
-        {/* Stepper */}
-        <Stepper current={step} steps={WIZARD_STEPS} />
+        {/* Stepper — completed steps are clickable for back-navigation.
+            Navigation is blocked while a finish run is actively in progress
+            (finishStarted && !finishDone and no error yet). */}
+        <Stepper
+          current={step}
+          steps={WIZARD_STEPS}
+          onStepClick={(idx) => {
+            // Block mid-run navigation; allow once done or stopped on error.
+            const isRunning = finishStarted && !finishDone && finishErrorStepId === null
+            if (isRunning) return
+            setFinishStarted(false)
+            setStep(idx)
+          }}
+        />
 
         {/* Step content */}
         <div className="mt-2">
           {step === 0 && <StepProjectName state={state} dispatch={dispatch} />}
           {step === 1 && <StepFiscalYear state={state} dispatch={dispatch} />}
-          {step === 2 && <StepGlBookings gl={state.gl} dispatch={dispatch} />}
+          {step === 2 && (
+            <StepGlBookings
+              gl={state.gl}
+              fyEndMonth={state.fyEndMonth}
+              dispatch={dispatch}
+              batchCombining={batchCombining}
+              batchCombineErrors={batchCombineErrors}
+            />
+          )}
           {step === 3 && (
             <StepChartOfAccounts
               coa={state.coa}
+              gl={state.gl}
               dispatch={dispatch}
-              fyEndMonth={state.fyEndMonth}
               entities={state.entities}
             />
           )}
-          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} />}
-          {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} />}
-          {step === 6 && !finishStarted && (
+          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} />}
+          {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} entities={state.entities} />}
+          {step === 6 && (
+            <StepAdditionalInformation
+              fte={state.fte}
+              anlagen={state.anlagen}
+              opos={state.opos}
+              entities={state.entities}
+              glYears={state.gl.years}
+              fyEndMonth={state.fyEndMonth}
+              additionalDatasets={state.additionalDatasets}
+              dispatch={dispatch}
+            />
+          )}
+          {step === 7 && !finishStarted && (
             <StepReview state={state} onRunSetup={handleRunSetup} />
           )}
-          {step === 6 && finishStarted && (
+          {step === 7 && finishStarted && (
             <FinishPanel
               steps={commitSteps}
               done={finishDone}
               errorStepId={finishErrorStepId}
               onRetry={handleRetry}
+              onBack={handleGoBack}
+              coaGroups={state.coa.groups}
+              onApplyLibrary={handleApplyLibrary}
+              onRerun={handleRerunAfterApply}
             />
           )}
         </div>
 
         {/* Navigation — hide Back/Next while finish is running or done */}
-        {!(step === 6 && finishStarted) && (
+        {!(step === 7 && finishStarted) && (
           <NavButtons
             step={step}
             totalSteps={totalSteps}
-            onBack={() => setStep(s => Math.max(0, s - 1))}
-            onNext={() => setStep(s => Math.min(totalSteps - 1, s + 1))}
+            onBack={() => {
+              // From GL assign or configure sub-phase: Back resets combined state and
+              // returns to collect so the user can add/remove entities or re-upload.
+              if (step === 2 && (glSubPhase === 'assign' || glSubPhase === 'configure')) {
+                if (window.confirm(
+                  'Going back will clear all combined files and format groups. ' +
+                  'You can re-upload or add/remove entities and combine again. Continue?'
+                )) {
+                  dispatch({ type: 'RESET_GL_COMBINE' })
+                  setBatchCombineErrors([])
+                }
+                // Stay on step 2 regardless — don't go to step 1
+                return
+              }
+              setStep(s => Math.max(0, s - 1))
+            }}
+            onNext={() => {
+              // GL collect phase: Next triggers batch combine instead of advancing the step.
+              // The phase transition (collect → assign/configure) happens automatically via
+              // derived glSubPhase once entities get their combinedFileId set.
+              if (step === 2 && glSubPhase === 'collect') {
+                void batchCombineGlEntities()
+                return
+              }
+              setStep(s => Math.min(totalSteps - 1, s + 1))
+            }}
             nextDisabled={isNextDisabled()}
-            nextLabel={step === totalSteps - 2 ? 'Review' : 'Next'}
+            nextLoading={step === 2 && glSubPhase === 'collect' && batchCombining}
+            nextLabel={
+              step === 2 && glSubPhase === 'collect'
+                ? 'Combine files & continue'
+                : step === 2 && glSubPhase === 'assign'
+                ? 'Complete format assignment above'
+                : step === totalSteps - 2
+                ? 'Review'
+                : 'Next'
+            }
+          />
+        )}
+
+        {/* Danger Zone — only on non-live stacks (data_reset_allowed=true) and for admins.
+            The backend enforces admin + ALLOW_DATA_RESET server-side too; this is a UI gate only.
+            On the live 5176 stack data_reset_allowed is always false, so this never renders. */}
+        {step === 0 && dataResetAllowed && isAdmin && (
+          <DangerZone
+            projectId={PROJECT_ID}
+            onResetComplete={() => {
+              // Reset wizard local state back to the blank default so the UI
+              // reflects the now-empty project without requiring a page reload.
+              dispatch({ type: 'PREFILL', partial: defaultState() })
+              setStep(0)
+              setFinishStarted(false)
+              setFinishDone(false)
+              setFinishErrorStepId(null)
+              setCommitSteps(buildInitialCommitSteps(defaultState()))
+            }}
           />
         )}
       </div>

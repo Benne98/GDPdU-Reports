@@ -21,6 +21,15 @@ slots:
     mappings:
       - type: custom
 
+  # Data source for databook build: "upload" (default, existing upload flow) or
+  # "pipeline" (build databook from already-loaded GL data). Set at greet time
+  # from the value the frontend sends with /greet; defaults to "upload".
+  data_source_mode:
+    type: text
+    influence_conversation: false
+    mappings:
+      - type: custom
+
   # ── Main topic ──
   project_name:
     type: text
@@ -664,6 +673,91 @@ slots:
     mappings:
       - type: custom
 
+  fte_first_fy:
+    type: float
+    mappings:
+      - type: custom
+
+  fte_last_fy:
+    type: float
+    mappings:
+      - type: custom
+
+  fte_view_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_entity_count:
+    type: float
+    mappings:
+      - type: custom
+
+  fte_entity_year_files_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_department_map_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_input_layout:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_single_file_id:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_tenure_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_mapping_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_payroll_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_payroll_mapping_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_dimensions_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_preset_metrics:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_custom_metrics_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_pex_view_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_pex_values_json:
+    type: text
+    mappings:
+      - type: custom
+
   db_output_folder:
     type: text
     mappings:
@@ -735,6 +829,20 @@ slots:
       - type: custom
 
   db_next_step:
+    type: text
+    mappings:
+      - type: custom
+
+  # ── GL-based Databook (pipeline data source) ──
+  # Available scope from /gl/data-status, stored so the scope-processing action can
+  # default to "all" when the card submits an empty multi-select (frontend cannot
+  # yet pre-select multi_select values).
+  db_gl_entities_json:
+    type: text
+    mappings:
+      - type: custom
+
+  db_gl_fiscal_years_json:
     type: text
     mappings:
       - type: custom
@@ -1039,6 +1147,21 @@ actions:
   - action_process_filter_rule
   - action_finish_filters
   - action_run_databook
+  - action_run_fte_development
+  - action_process_fte_entity_mode
+  - action_process_fte_scope
+  - action_process_fte_entity_count
+  - action_process_fte_files
+  - action_process_fte_single_file
+  - action_process_fte_fte_mapping
+  - action_process_fte_payroll_mapping
+  - action_process_fte_dimensions
+  - action_process_fte_metrics
+  - action_process_fte_pex_grid
+  - action_show_fte_review
+  - action_run_fte_development_final
+  - action_run_gl_databook
+  - action_process_gl_databook_scope
   - action_process_databook_susa_format
   - action_process_databook_entity_count
   - action_show_databook_entity_count

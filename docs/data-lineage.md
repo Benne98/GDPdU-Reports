@@ -31,14 +31,14 @@
  └──────────────────┘  └─────┬──────┘  │  mapping   │
          ▲                    │         └─────▲──────┘
          │                    │ NA key        │ filled from workbook OR
- dim_pl_structure             └──────────────►│ cf_mapping_library (key=NA / PL level_3)
- (sort_order, row_type,       cf_mapping_library  ← reusable, accumulates per project
+ dim_pl_structure             └──────────────►│ lib_cf_mapping (key=NA / PL level_3)
+ (sort_order, row_type,       lib_cf_mapping      ← reusable, accumulates per project
   level_2/3/4, kpi_code)
          │
          │  (3) versioning          etl/versioning.py:capture_gl_snapshot(load_id)
          ▼      immutable copy of fact_* + dim_* per load_id
  snap_fact_gl_entry / snap_fact_gl_line / snap_dim_gl_account / snap_dim_gl_na / snap_dim_gl_cf
-         │            (meta_dataset_load = audit trail + content_hash dedup + restore)
+         │            (org_meta_dataset_load = audit trail + content_hash dedup + restore)
          │
          │  (4) derive facts        etl/derive.py + etl/derive_facts_sql.py:derive_all_facts()
          ▼      classify by level_3 / level_2, link partners
@@ -79,7 +79,7 @@ account_number_group, amount, vat_amount, line_note, customer_id, supplier_id, p
 
 **Sign (canonical, everywhere):** `amount = +debit (Soll) / −credit (Haben)`.
 
-**Dedup:** `meta_dataset_load.content_hash` (SHA-256) — re-uploading the same file is skipped
+**Dedup:** `org_meta_dataset_load.content_hash` (SHA-256) — re-uploading the same file is skipped
 (`dedup_check()`).
 
 ---
@@ -102,12 +102,12 @@ account_number_group, amount, vat_amount, line_note, customer_id, supplier_id, p
 | Table | Key | Role |
 |---|---|---|
 | `dim_pl_structure` | sort_order (UNIQUE) | The IS/BS/CF **report skeleton**: `row_type` ∈ {mapping, subtotal, calc, kpi, grandtotal, title}, `balance_title`, `level_2/3/4`, `kpi_code` (`CF:*` for CF leaves), `calc_type`, `invert_delta`, `is_bold`. `sort_order` drives statement order. Seeded by `scripts/seed_bs_structure.py` (+ CF rows). |
-| `cf_mapping_library` *(migration 0017)* | (key_kind, key_1, key_2) | **Reusable, accumulating** CF mapping. `key_kind='na'` → keyed by (l6_na_mapping, l7_na_description) for BS accounts; `key_kind='pl_level3'` → keyed by P&L `level_3` for EBITDA/Taxes/D&A/Financial-result. New projects auto-match by classification; new mappings added here once and reused. Loaders: `scripts/load_cf_mapping_library.py` → `scripts/populate_dim_gl_cf.py`. |
+| `lib_cf_mapping` *(migration 0017; renamed from `cf_mapping_library` in 0019)* | (key_kind, key_1, key_2) | **Reusable, accumulating** CF mapping. `key_kind='na'` → keyed by (l6_na_mapping, l7_na_description) for BS accounts; `key_kind='pl_level3'` → keyed by P&L `level_3` for EBITDA/Taxes/D&A/Financial-result. New projects auto-match by classification; new mappings added here once and reused. Loaders: `scripts/load_cf_mapping_library.py` → `scripts/populate_dim_gl_cf.py`. |
 
 **How an account gets classified:** the mapping file assigns each `account_number_group`
 its P&L/BS hierarchy (`dim_gl_account.level_0..4` + sort), its NA class (`dim_gl_na`), and —
 when present — its CF mapping (`dim_gl_cf`). The CF mapping is what was missing (empty
-`dim_gl_cf`) and is now produced via `cf_mapping_library` keyed on the NA / PL-level_3 class.
+`dim_gl_cf`) and is now produced via `lib_cf_mapping` keyed on the NA / PL-level_3 class.
 
 ---
 
@@ -121,7 +121,7 @@ live fact + dim rows **in scope** into `snap_*` tables, tagged by `load_id`.
 | `snap_fact_gl_entry` / `snap_fact_gl_line` | fact_gl_entry / fact_gl_line | (load_id, …live PK) |
 | `snap_dim_gl_account` / `snap_dim_gl_na` / `snap_dim_gl_cf` | the three dims | (load_id, ang, fiscal_year) |
 
-`meta_dataset_load` (PK `load_id`) is the audit trail: `dataset, legal_entity_code, fiscal_year,
+`org_meta_dataset_load` (PK `load_id`) is the audit trail: `dataset, legal_entity_code, fiscal_year,
 row_count, content_hash, scope_entity_prefixes[], scope_fiscal_years[], commit_mode,
 snapshot_captured, superseded_by_load_id, restored_from_load_id`. Enables dedup, restore-to-load,
 and scope tracking.
@@ -194,7 +194,7 @@ reset per section). **KPIs:** ratios from `kpi_code` (e.g. `GROSS_MARGIN_PCT`, `
 1. **Ingest GL** — `load_canonical()` → `fact_gl_entry`, `fact_gl_line` (+ dedup).
 2. **Ingest account mapping** — `apply_account_mapping()` → `dim_gl_account` / `dim_gl_na` / `dim_gl_cf`.
 3. **Link partners + derive facts** — `derive.py` / `derive_facts_sql.derive_all_facts()` → `fact_sales/com/ar/ap`.
-4. **Capture snapshots** — `capture_gl_snapshot(load_id)` → `snap_*` (+ `meta_dataset_load`).
+4. **Capture snapshots** — `capture_gl_snapshot(load_id)` → `snap_*` (+ `org_meta_dataset_load`).
 5. **Rebuild** — `etl/rebuild.py:rebuild_project(scope)`: CoA overrides → backfill partner links → re-derive facts → opening balances → net profit → refresh structure/recon.
 6. **Populate CF mapping** — `load_cf_mapping_library.py` → `populate_dim_gl_cf.py` (idempotent; **required for non-zero CF**).
 7. **Plan/forecast (optional)** — `plan_synth.py` → `fact_gl_plan`, `fact_sales_plan`.
@@ -207,7 +207,7 @@ reset per section). **KPIs:** ratios from `kpi_code` (e.g. `GROSS_MARGIN_PCT`, `
 
 1. **Empty `dim_gl_cf` → CF all-zero** (the recent incident). CF depends entirely on a per-account
    mapping that is *separate* from the P&L/BS hierarchy. **Mitigation:** make the CF-populate step
-   (`cf_mapping_library` → `dim_gl_cf`) a mandatory, idempotent, monitored stage of every load;
+   (`lib_cf_mapping` → `dim_gl_cf`) a mandatory, idempotent, monitored stage of every load;
    assert coverage (every NA/PL-level_3 class has a library match) and fail loud.
 2. **Hard-coded `level_3` classification** for derived facts — a renamed label silently drops
    `fact_sales/com/ar/ap`. **Mitigation:** make classification config/data-driven per project.
@@ -253,10 +253,10 @@ raw sign and flips the credit side **once** in `_flip_row_tree()`. Derived `fact
 **Facts:** `fact_gl_entry`, `fact_gl_line`, `fact_sales`, `fact_com`, `fact_ar`, `fact_ap`,
 `fact_gl_plan`, `fact_sales_plan`, `fact_position_plan`.
 **Dims / mapping / sorting:** `dim_gl_account`, `dim_gl_na`, `dim_gl_cf`, `dim_pl_structure`,
-`cf_mapping_library`, `dim_legal_entity`, `dim_customer`, `dim_supplier`.
+`lib_cf_mapping`, `dim_legal_entity`, `dim_customer`, `dim_supplier`.
 **Snapshots:** `snap_fact_gl_entry`, `snap_fact_gl_line`, `snap_dim_gl_account`, `snap_dim_gl_na`,
 `snap_dim_gl_cf`.
-**Audit/auth:** `meta_dataset_load`, `dim_user`, `dim_role`, `user_role`, `role_entity_visibility`,
+**Audit/auth:** `org_meta_dataset_load`, `dim_user`, `dim_role`, `user_role`, `admin_role_entity_visibility`,
 `auth_session`.
 
 ---

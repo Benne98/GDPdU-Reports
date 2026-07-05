@@ -95,12 +95,15 @@ from app.services.fin_compat_cf_sql import (
 )
 from app.services.fin_compat_pl import (
     _ER_FLOW_KEYS,
+    _attach_plan,
     _deltas,
     _er_flow_deltas,
     _er_row_amounts,
     _round_am,
     _row_amounts,
     _row_dict,
+    load_position_plan_map,
+    load_position_plan_map_pref,
 )
 
 _CF_HIER_KEYS = ["cf_l11_1", "cf_l11_2", "cf_l11_3", "cf_mapping"]
@@ -430,7 +433,10 @@ def build_cf_statement_compat(
 
     grains = [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
     struct_cf = _cf_struct_rows(session)
-    rows_out = _build_cf_rows(struct_cf, grains, keys, is_week=is_week)
+    cf_plan_map = load_position_plan_map_pref(session, "CF", yr, mo, ent_frag)
+    rows_out = _build_cf_rows(
+        struct_cf, grains, keys, is_week=is_week, plan_map=cf_plan_map or None,
+    )
 
     out: dict[str, Any] = {
         "statement": "cf",
@@ -520,6 +526,7 @@ def _build_cf_rows(
     use_er: bool = False,
     use_direct: bool = False,
     id_prefix: str = "cf",
+    plan_map: Optional[dict[str, dict[str, float]]] = None,
 ) -> list[dict[str, Any]]:
     """Pure builder (DB-free): dim_pl_structure order, cf_mapping match, section subtotals."""
     zero = {k: 0.0 for k in keys}
@@ -568,6 +575,9 @@ def _build_cf_rows(
             continue
 
         am = {k: float(line_vals.get(rc, zero).get(k, 0.0)) for k in keys}
+        if plan_map and rt != "title":
+            am = _attach_plan(am, plan_map, rc)
+
         accounts: list[dict] = []
         drill: Optional[dict] = None
         if rt == "mapping":
@@ -1249,13 +1259,30 @@ def build_cf_narrative(
         except Exception:
             pass
 
+    # Plan overlay (golden-safe): cm_vs_plan on the headline 'Net cash flow' line =
+    # actual net_cm − plan_cm.  ONLY populated when the manual CF budget has signal;
+    # with no budget rows load_position_plan_map returns {} → cm_vs_plan stays 0.0 →
+    # byte-identical to the pre-plan behaviour.  CF plan_cm is already presented via
+    # position_plan_grain_sql's single * -1 (== dim_gl_cf's flip), so no re-flip.
+    cm_vs_plan = 0.0
+    try:
+        cf_plan_map = load_position_plan_map_pref(
+            session, "CF", yr, mo, entity_sql_fragment(resolve_entity_prefix(session, entity)),
+        )
+        if cf_plan_map and net_row is not None:
+            npm = cf_plan_map.get(net_row.get("line_code"))
+            if npm:
+                cm_vs_plan = round(net_cm - float(npm.get("plan_cm") or 0.0), 2)
+    except Exception:
+        cm_vs_plan = 0.0  # graceful — never break the narrative on a plan-read error
+
     return {
         "headline": headline,
         "intro": intro,
         "intro_facts": {
             "period_label": cm_label, "group_label": group_label,
             "net_profit_ytd": 0.0, "coverage_pct": None,
-            "cm_month_label": cm_label, "cm_vs_plan": 0.0, "cm_vs_plan_qualifier": "",
+            "cm_month_label": cm_label, "cm_vs_plan": cm_vs_plan, "cm_vs_plan_qualifier": "",
             "primary_drivers": primary_drivers, "entity_split": None,
         },
         "bullets": bullets,

@@ -68,7 +68,7 @@ def _make_session(
         result = MagicMock()
         rows: list[Any] = []
 
-        if "role_entity_visibility" in sql:
+        if "admin_role_entity_visibility" in sql:
             rows = [_DictRow((c,)) for c in (visibility_codes or [])]
         elif "fiscal_year" in sql and "dim_gl_account" in sql:
             # DISTINCT fiscal_year query (may also join dim_legal_entity when scoped).
@@ -178,7 +178,7 @@ class TestEntityVisibility:
         assert params == {"codes": ["AT"]}
 
     def test_user_with_no_grants_sees_nothing(self):
-        # M1 regression: a non-admin with ZERO role_entity_visibility rows must be
+        # M1 regression: a non-admin with ZERO admin_role_entity_visibility rows must be
         # denied all entities (fail-closed), NOT treated as unrestricted.
         session = _make_session(
             entity_rows=[("AT", "Austria GmbH"), ("DE", "Germany GmbH")],

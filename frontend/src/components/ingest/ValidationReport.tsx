@@ -3,8 +3,11 @@
  */
 
 import { useEffect, useState } from "react";
-import type { CheckOffender, CheckResult, ValidationResponse } from "../../lib/gdpduApi";
+import { v4Label } from "../../lib/dataUpdateMode";
+import type { CheckOffender, CheckResult, IssueRowsResponse, ValidationResponse } from "../../lib/gdpduApi";
+import { fetchIssueRows } from "../../lib/gdpduApi";
 import S1IssueExplorer, { type ValidateContext } from "./S1IssueExplorer";
+import B1BookingLinesPanel from "./B1BookingLinesPanel";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -15,7 +18,7 @@ interface ValidationReportProps {
   onCommit: (confirmSoft: boolean) => void;
   committing: boolean;
   excluding?: boolean;
-  onExcludeLines?: (lineIds: number[]) => void | Promise<void>;
+  onExcludeLines?: (lineIds: string[]) => void | Promise<void>;
   onClearExclusions?: () => void | Promise<void>;
   validateContext?: ValidateContext;
   /**
@@ -352,14 +355,14 @@ function StatusPill({
 
 type ExampleView = "hidden" | 1 | "more" | "all";
 
-function SourceRowTable({ row, lineNumber }: { row: Record<string, unknown>; lineNumber?: number }) {
+function SourceRowTable({ row, lineNumber }: { row: Record<string, unknown>; lineNumber?: number | string }) {
   const entries = Object.entries(row);
   if (entries.length === 0) return null;
 
   return (
     <div className="mt-2 rounded-md border border-slate-200 bg-slate-50 overflow-hidden">
       <div className="px-3 py-1.5 border-b border-slate-200 bg-white text-xs font-medium text-slate-600">
-        Source file{lineNumber != null ? ` · line ${lineNumber.toLocaleString("en-US")}` : ""}
+        Source file{lineNumber != null ? ` · line ${typeof lineNumber === "number" ? lineNumber.toLocaleString("en-US") : lineNumber}` : ""}
         <span className="font-normal text-slate-400 ml-1">(all columns as uploaded)</span>
       </div>
       <div className="max-h-64 overflow-auto">
@@ -391,17 +394,59 @@ function ExampleCard({
   offender,
   onExcludeLine,
   excluding,
+  validateContext,
 }: {
   check: CheckResult;
   offender: CheckOffender;
-  onExcludeLine?: (lineId: number) => void;
+  onExcludeLine?: (lineId: string) => void;
   excluding?: boolean;
+  validateContext?: ValidateContext;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [showB1Lines, setShowB1Lines] = useState(false);
+  const [b1Lines, setB1Lines] = useState<IssueRowsResponse | null>(null);
+  const [loadingB1, setLoadingB1] = useState(false);
+  const [b1Error, setB1Error] = useState<string | null>(null);
+
   const sourceRow = offender.source_row;
   const hasSource = sourceRow != null && Object.keys(sourceRow).length > 0;
   const lineId =
-    typeof offender.booking_line_id === "number" ? offender.booking_line_id : undefined;
+    typeof offender.booking_line_id === "string" ? offender.booking_line_id : undefined;
+
+  const canDrillB1 =
+    check.id === "B1" &&
+    validateContext != null &&
+    typeof offender.journal_entry_group_number === "string" &&
+    offender.journal_entry_group_number.length > 0;
+
+  async function loadB1Lines() {
+    if (!validateContext || !offender.journal_entry_group_number) return;
+    setLoadingB1(true);
+    setB1Error(null);
+    try {
+      const res = await fetchIssueRows({
+        check_id: "B1",
+        file_id: validateContext.file_id,
+        sheet: validateContext.sheet,
+        profile: validateContext.profile,
+        exclude_line_ids: validateContext.exclude_line_ids,
+        journal_entry_group_number: offender.journal_entry_group_number,
+        ...(typeof offender.fiscal_year === "number" ? { fiscal_year: offender.fiscal_year } : {}),
+      });
+      setB1Lines(res);
+    } catch (e) {
+      setB1Error(e instanceof Error ? e.message : "Failed to load booking lines");
+    } finally {
+      setLoadingB1(false);
+    }
+  }
+
+  function toggleB1Lines() {
+    if (!showB1Lines && !b1Lines && !loadingB1) {
+      void loadB1Lines();
+    }
+    setShowB1Lines((v) => !v);
+  }
 
   return (
     <li className="rounded-md border border-slate-200 bg-white overflow-hidden">
@@ -417,6 +462,20 @@ function ExampleCard({
               {expanded ? "Hide source columns" : "Show all source columns"}
             </button>
           )}
+          {canDrillB1 && (
+            <button
+              type="button"
+              disabled={loadingB1}
+              onClick={toggleB1Lines}
+              className="text-xs font-medium text-blue-600 hover:underline disabled:opacity-50"
+            >
+              {loadingB1
+                ? "Loading…"
+                : showB1Lines
+                ? "Hide booking lines"
+                : "View booking lines"}
+            </button>
+          )}
           {lineId != null && onExcludeLine && (
             <button
               type="button"
@@ -429,6 +488,18 @@ function ExampleCard({
           )}
         </div>
       </div>
+
+      {/* B1 booking lines drill-down — shared panel component */}
+      {showB1Lines && (
+        <B1BookingLinesPanel
+          offender={offender}
+          data={b1Lines}
+          error={b1Error}
+          loading={loadingB1}
+          onRetry={() => void loadB1Lines()}
+        />
+      )}
+
       {expanded && hasSource && (
         <div className="px-3 pb-3">
           <SourceRowTable
@@ -436,7 +507,7 @@ function ExampleCard({
             lineNumber={
               typeof offender.source_line_number === "number"
                 ? offender.source_line_number
-                : typeof offender.booking_line_id === "number"
+                : typeof offender.booking_line_id === "string"
                 ? offender.booking_line_id
                 : undefined
             }
@@ -451,10 +522,12 @@ function ProgressiveExamples({
   check,
   onExcludeLine,
   excluding,
+  validateContext,
 }: {
   check: CheckResult;
-  onExcludeLine?: (lineId: number) => void;
+  onExcludeLine?: (lineId: string) => void;
   excluding?: boolean;
+  validateContext?: ValidateContext;
 }) {
   const offenders = normalizeOffenders(check.offenders);
   const total = check.offender_count ?? offenders.length;
@@ -484,6 +557,7 @@ function ProgressiveExamples({
             offender={o}
             onExcludeLine={onExcludeLine}
             excluding={excluding}
+            validateContext={validateContext}
           />
         ))}
       </ul>
@@ -491,7 +565,7 @@ function ProgressiveExamples({
       {check.id === "B1" && visible[0]?.line_count === 1 && (
         <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-md px-3 py-2">
           Most failing bookings have only one line. In the column mapping step, map{" "}
-          <strong>Journal Entry Number</strong> to <strong>Transaction number</strong> (not document
+          <strong>{v4Label('Journal Entry Number', 'Booking ID')}</strong> to <strong>Transaction number</strong> (not document
           number or row id). For GoBD exports you may also proceed without fixing B1.
         </p>
       )}
@@ -583,7 +657,7 @@ function CheckCard({
 }: {
   check: CheckResult;
   warningAction: WarningAction | null;
-  onExcludeLines?: (lineIds: number[]) => void | Promise<void>;
+  onExcludeLines?: (lineIds: string[]) => void | Promise<void>;
   excluding?: boolean;
   validateContext?: ValidateContext;
 }) {
@@ -656,6 +730,7 @@ function CheckCard({
             <ProgressiveExamples
               check={check}
               excluding={excluding}
+              validateContext={validateContext}
               onExcludeLine={
                 onExcludeLines
                   ? (lineId) => {

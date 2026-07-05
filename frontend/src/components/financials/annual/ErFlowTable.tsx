@@ -27,6 +27,7 @@ import {
 } from '../../../lib/periodColumnLabels'
 import { buildAnnualFlowReportColumns } from './annualFlowReportColumns'
 import { shouldDisplayErStatementRow } from './annualRowVisibility'
+import { IS_OVERVIEW_V2 } from '../../../lib/overviewV2Mode'
 
 type FlowCol = 'fy1' | 'fy2' | 'fy3' | 'ytd' | 'ltm' | 'ytd_py' | 'ltm_py'
 type ErViewMode = PlViewMode
@@ -117,9 +118,9 @@ function collectNumericRows(rows: ErStatementRow[]): ErStatementRow[] {
 }
 
 function resolveForecastAmount(amounts: Record<string, number> | null | undefined): number {
-  const am = amounts ?? {}
-  const forecast = Number(am.fy_f ?? am.ltm ?? NaN)
-  return Number.isFinite(forecast) ? forecast : 0
+  void amounts
+  // Forecast column intentionally left blank (forecast methodology parked).
+  return NaN
 }
 
 function resolveCoveragePct(amounts: Record<string, number> | null | undefined): number {
@@ -355,6 +356,9 @@ export default function ErFlowTable({
                   onClick={row.drill && col.flowCol ? () => openDrill(row, col.flowCol!, col.labelLine1) : undefined}
                 />
               )
+            }
+            if (IS_OVERVIEW_V2 && isKpi && col.id === 'coverage_pct') {
+              return <td key={`${row.id}-${col.id}`} className="px-2.5 py-2" style={{ background: '#F8FAFC' }} />
             }
             const value = col.id === 'coverage_pct'
               ? resolveCoveragePct(am)

@@ -68,6 +68,15 @@ def _line(
 
 
 # ===========================================================================
+# Prose helpers
+# ===========================================================================
+def test_lower_first_preserves_all_caps_acronyms():
+    assert core.lower_first("EBITDA") == "EBITDA"
+    assert core.lower_first("D&A") == "D&A"
+    assert core.lower_first("Net sales") == "net sales"
+
+
+# ===========================================================================
 # Stage 1 — FACTS
 # ===========================================================================
 def test_compute_line_facts_formula():

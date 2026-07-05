@@ -12,14 +12,22 @@ NEGLIGIBLE_S1_REASON = (
 )
 
 
-def apply_line_exclusions(lines: pd.DataFrame, exclude_line_ids: list[int] | set[int]) -> pd.DataFrame:
-    """Drop rows whose booking_line_id is in exclude_line_ids."""
+def apply_line_exclusions(
+    lines: pd.DataFrame, exclude_line_ids: list[str | int] | set[str | int]
+) -> pd.DataFrame:
+    """Drop rows whose booking_line_id is in exclude_line_ids.
+
+    booking_line_id is a 62-bit BLAKE2b hash (> 2**53). Matching is done by STRING
+    comparison on the exact digit sequence so an id is NEVER routed through
+    float64 / pd.to_numeric (which would round a huge id to the wrong value and
+    exclude the wrong row). Items may be str or int — both are normalised to str.
+    """
     if not exclude_line_ids or "booking_line_id" not in lines.columns:
         return lines
-    ids = {int(x) for x in exclude_line_ids}
+    ids = {str(x) for x in exclude_line_ids}
     if not ids:
         return lines
-    return lines.loc[~lines["booking_line_id"].astype(int).isin(ids)].copy()
+    return lines.loc[~lines["booking_line_id"].astype("int64").astype(str).isin(ids)].copy()
 
 
 def negligible_s1_exclusion_mask(lines: pd.DataFrame) -> pd.Series:
@@ -43,26 +51,39 @@ def negligible_s1_exclusion_mask(lines: pd.DataFrame) -> pd.Series:
     return empty_account & zero_amount
 
 
-def suggest_negligible_s1_exclusions(lines: pd.DataFrame) -> list[int]:
-    """booking_line_ids that can be excluded to clear typical S1 noise rows."""
+def suggest_negligible_s1_exclusions(lines: pd.DataFrame) -> list[str]:
+    """booking_line_ids that can be excluded to clear typical S1 noise rows.
+
+    Returned as exact digit STRINGS. booking_line_id is a 62-bit BLAKE2b hash
+    (> 2**53); a JSON number would lose precision on the JavaScript float64
+    boundary, so the UI must receive — and later echo back in exclude_line_ids —
+    the exact id string (never a Number). Sorted numerically for determinism.
+    """
     if "booking_line_id" not in lines.columns:
         return []
     mask = negligible_s1_exclusion_mask(lines)
     if not mask.any():
         return []
-    return sorted(int(x) for x in lines.loc[mask, "booking_line_id"].astype(int).tolist())
+    ids = lines.loc[mask, "booking_line_id"].astype("int64").astype(str).tolist()
+    return sorted(ids, key=int)
 
 
 def exclusion_summary(
     lines: pd.DataFrame,
-    exclude_line_ids: list[int] | set[int],
+    exclude_line_ids: list[str | int] | set[str | int],
 ) -> dict:
-    """Counts for validation UI."""
-    active = sorted({int(x) for x in (exclude_line_ids or [])})
+    """Counts for validation UI.
+
+    ``active_line_ids`` and ``suggested.line_ids`` are exact digit STRINGS so a
+    62-bit booking_line_id (> 2**53) survives the JSON -> JavaScript float64
+    boundary intact (see ``suggest_negligible_s1_exclusions``). Inputs may be str
+    or int — both are normalised to str. Sorted numerically for determinism.
+    """
+    active = sorted({str(x) for x in (exclude_line_ids or [])}, key=int)
     suggested = suggest_negligible_s1_exclusions(lines)
     suggested_set = set(suggested)
     active_set = set(active)
-    still_suggested = sorted(suggested_set - active_set)
+    still_suggested = sorted(suggested_set - active_set, key=int)
     return {
         "active_count": len(active),
         "active_line_ids": active,

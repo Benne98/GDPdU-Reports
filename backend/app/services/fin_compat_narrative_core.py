@@ -137,6 +137,9 @@ def lower_first(s: str) -> str:
     s = (s or "").strip()
     if not s or s[0] in ("∆", "Δ"):
         return s
+    # All-caps acronyms (EBITDA, EBIT, D&A, …) stay unchanged in mid-sentence prose.
+    if s == s.upper() and any(c.isalpha() for c in s):
+        return s
     return s[:1].lower() + s[1:] if len(s) > 1 else s.lower()
 
 

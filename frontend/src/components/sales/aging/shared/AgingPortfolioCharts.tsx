@@ -11,7 +11,7 @@ export default function AgingPortfolioCharts({
   distributionDonut,
 }: {
   periodLabel: string
-  reconciliation: 'subledger' | 'scaled' | 'synthetic'
+  reconciliation: 'subledger' | 'scaled' | 'synthetic' | 'opos_method_a'
   reconciliationGlLabel: string
   statusSplit?: boolean
   statusDonut: ReactNode

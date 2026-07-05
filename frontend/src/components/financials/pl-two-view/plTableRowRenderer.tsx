@@ -19,11 +19,16 @@ import type { MonthlyResponse } from '../../../lib/api'
 import PlCommentIndexBadge from './PlCommentIndexBadge'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
 
-/** Expandable children/accounts: largest current-month (CM) amount first. */
+/** Expandable children/accounts: largest CM first (PL); BS/WC keep backend order. */
 function sortRowsByCmDesc(rows: FinancialStatementRow[]): FinancialStatementRow[] {
   return [...rows].sort(
     (a, b) => Math.abs(b.amounts?.cm ?? 0) - Math.abs(a.amounts?.cm ?? 0),
   )
+}
+
+function sortChildRows(statement: string | undefined, rows: FinancialStatementRow[]): FinancialStatementRow[] {
+  if (statement === 'bs' || statement === 'wc') return rows
+  return sortRowsByCmDesc(rows)
 }
 
 export interface PlTableRenderCtx {
@@ -234,14 +239,14 @@ export function computePlTableMaxima(data: FinancialStatementResponse | null) {
   }
 }
 
-function renderKpiSectionHeader(ctx: PlTableRenderCtx, columns: PlTableColumnDef[]): ReactNode {
+function renderKpiSectionHeader(ctx: PlTableRenderCtx, columns: PlTableColumnDef[], label: string): ReactNode {
   return (
     <tr key="kpi-section-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
       <td
         className="px-3 py-2 text-xs font-semibold"
         style={{ color: '#1E3A5F', fontStyle: 'italic', background: '#F8FAFC' }}
       >
-        KPIs — as % of total output
+        {label}
       </td>
       {ctx.commentMarkersByLineCode && <td style={{ background: '#F8FAFC' }} />}
       {columns.map(col => (
@@ -249,6 +254,12 @@ function renderKpiSectionHeader(ctx: PlTableRenderCtx, columns: PlTableColumnDef
       ))}
     </tr>
   )
+}
+
+function kpiSectionHeaderLabel(statement?: string): string {
+  if (statement === 'wc') return 'KPIs — working capital days'
+  if (statement === 'bs') return 'KPIs'
+  return 'KPIs — as % of total output'
 }
 
 export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatementRow[], depth: number): ReactNode[] {
@@ -260,6 +271,23 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
   let kpiHeaderInserted = depth === 0 ? false : true
 
   for (const row of rows) {
+    if (row.row_kind === 'kpi_header') {
+      kpiHeaderInserted = true
+      const kpiHeaderCols: PlTableColumnDef[] = useDynamic
+        ? ctx.columns
+        : [
+            { id: 'py_cm', kind: 'py_cm', labelLine1: '' },
+            { id: 'pm', kind: 'pm', labelLine1: '' },
+            { id: 'cm', kind: 'cm', labelLine1: '' },
+            { id: 'mom', kind: 'mom', labelLine1: '' },
+            { id: 'yoy', kind: 'yoy', labelLine1: '' },
+            { id: 'ytd', kind: 'ytd', labelLine1: '' },
+            { id: 'ytd_py', kind: 'ytd_py', labelLine1: '' },
+            { id: 'ytd_delta', kind: 'ytd_delta', labelLine1: '' },
+          ]
+      nodes.push(renderKpiSectionHeader(ctx, kpiHeaderCols, row.label || kpiSectionHeaderLabel(ctx.data.statement)))
+      continue
+    }
     if (row.row_kind === 'kpi' && !kpiHeaderInserted) {
       kpiHeaderInserted = true
       const kpiHeaderCols: PlTableColumnDef[] = useDynamic
@@ -274,7 +302,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
             { id: 'ytd_py', kind: 'ytd_py', labelLine1: '' },
             { id: 'ytd_delta', kind: 'ytd_delta', labelLine1: '' },
           ]
-      nodes.push(renderKpiSectionHeader(ctx, kpiHeaderCols))
+      nodes.push(renderKpiSectionHeader(ctx, kpiHeaderCols, kpiSectionHeaderLabel(ctx.data.statement)))
     }
 
     if (row.row_kind === 'title') {
@@ -353,12 +381,12 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
 
     if (!isOpen) continue
     if (row.children?.length) {
-      for (const ch of sortRowsByCmDesc(row.children)) {
+      for (const ch of sortChildRows(ctx.data.statement, row.children)) {
         nodes.push(...renderPlTableRows(ctx, [ch], depth + 1))
       }
     }
     if (row.accounts?.length) {
-      for (const acc of sortRowsByCmDesc(row.accounts)) {
+      for (const acc of sortChildRows(ctx.data.statement, row.accounts)) {
         nodes.push(...renderPlTableRows(ctx, [acc], depth + 1))
       }
     }

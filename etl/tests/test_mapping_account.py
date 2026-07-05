@@ -471,3 +471,118 @@ class TestFixtureConsistency:
     def test_canonical_mapping_fiscal_year(self):
         mapping_df = canonical_account_mapping(fiscal_year=2023)
         assert (mapping_df["fiscal_year"] == 2023).all()
+
+
+# --------------------------------------------------------------------------- #
+# Regression guard — single group CoA must fan out to every member entity
+# --------------------------------------------------------------------------- #
+
+class TestSingleCoaFansOutToAllMemberEntities:
+    """Regression guard: a single group CoA (bare account numbers, no entity-prefix
+    column) passed to apply_account_mapping MUST produce a DISTINCT dim_gl_account
+    primary-key set for every member entity it is applied to.
+
+    Bug context (2026-06): a single-file group CoA was committed only for entity '01'
+    instead of for every member entity (01, 02, ...).  The frontend assignment grouping
+    was the defect trigger and is fixed separately.  This test locks the BACKEND
+    mapping math: the same raw CoA DataFrame, applied twice with different
+    entity_prefix values, must produce fully disjoint account_number_group key sets.
+
+    Formula  : account_number_group = entity_prefix(2) + zfill(account_number, 6)
+    Example  : account 11701, prefix '01'  ->  '01' + '011701'  =  '01011701'  (8 chars)
+               account 11701, prefix '02'  ->  '02' + '011701'  =  '02011701'  (8 chars, disjoint)
+               account  4400, prefix '01'  ->  '01' + '004400'  =  '01004400'
+               account  4400, prefix '02'  ->  '02' + '004400'  =  '02004400'
+
+    A regression at the mapping layer would manifest as one of:
+      - both prefixes returning identical account_number_group values (no fan-out)
+      - the key sets overlapping (wrong prefix applied)
+      - the source gl_account_id being lost or corrupted
+    All three are asserted here.
+    """
+
+    # Two bare account numbers as they appear in a typical German group Kontenrahmen
+    _ACCOUNTS = ["11701", "4400"]
+
+    @staticmethod
+    def _build_raw_coa() -> pd.DataFrame:
+        """Single-source CoA DataFrame with bare account numbers and NO entity-prefix
+        column — exactly how a group Kontenrahmen arrives for a multi-entity scope."""
+        return pd.DataFrame({
+            "Konto":  ["11701", "4400"],
+            "Ebene0": ["BS", "PL"],
+            "Ebene1": ["Umlaufvermögen", "Erträge"],
+            "Ebene2": ["Forderungen", "Umsatzerlöse"],
+            "Ebene3": ["Trade receivables", "Net sales"],
+        })
+
+    @staticmethod
+    def _build_profile() -> AccountMappingProfile:
+        """Profile for the bare-account CoA; entity is resolved via entity_prefix= kwarg
+        at call time (the group-scope fan-out pattern)."""
+        p = AccountMappingProfile()
+        p.entity = {"mode": "fixed", "value": "01"}  # overridden per-entity at call time
+        p.fiscal_year = {"mode": "fixed", "value": 2024}
+        p.columns = {
+            "account_number": "Konto",
+            "level_0":        "Ebene0",
+            "level_1":        "Ebene1",
+            "level_2":        "Ebene2",
+            "level_3":        "Ebene3",
+        }
+        p.source_system = "group_coa_regression_guard"
+        return p
+
+    def test_single_coa_fans_out_to_all_member_entities(self):
+        """One raw CoA file applied with entity_prefix='01' and entity_prefix='02'
+        must yield DISJOINT account_number_group key sets, each containing the
+        correctly zero-padded, entity-prefixed keys for both source accounts.
+
+        Regression guard: this math was correct before the 2026-06 bug; this test
+        ensures it cannot silently regress at the mapping layer in the future.
+        """
+        raw = self._build_raw_coa()
+        profile = self._build_profile()
+
+        out_01 = apply_account_mapping(raw, profile, entity_prefix="01", fiscal_year=2024)
+        out_02 = apply_account_mapping(raw, profile, entity_prefix="02", fiscal_year=2024)
+
+        keys_01 = set(out_01["account_number_group"].tolist())
+        keys_02 = set(out_02["account_number_group"].tolist())
+
+        # 11701 -> zfill(6) -> 011701 -> '01' + '011701' = '01011701'
+        # 4400  -> zfill(6) -> 004400 -> '01' + '004400' = '01004400'
+        assert keys_01 == {"01011701", "01004400"}, (
+            f"prefix '01' yielded unexpected account_number_group set: {keys_01}"
+        )
+        # Same source -> prefix '02': '02011701', '02004400'
+        assert keys_02 == {"02011701", "02004400"}, (
+            f"prefix '02' yielded unexpected account_number_group set: {keys_02}"
+        )
+
+        # THE CORE GUARD: the two prefixes must produce fully disjoint key sets
+        # from the SAME source file.  Any overlap means the prefix was not applied.
+        assert keys_01.isdisjoint(keys_02), (
+            f"entity key collision detected — the same CoA produced shared keys "
+            f"across entity '01' and '02': {keys_01 & keys_02}"
+        )
+
+        # Source gl_account_id must be preserved unchanged for both expansions
+        assert set(out_01["gl_account_id"].tolist()) == {"11701", "4400"}, (
+            "entity '01' output lost or corrupted gl_account_id values"
+        )
+        assert set(out_02["gl_account_id"].tolist()) == {"11701", "4400"}, (
+            "entity '02' output lost or corrupted gl_account_id values"
+        )
+
+        # Row count must equal the source CoA (no duplication, no loss)
+        assert len(out_01) == len(raw), "entity '01' output row count does not match source"
+        assert len(out_02) == len(raw), "entity '02' output row count does not match source"
+
+        # All account_number_group keys must be exactly 8 characters
+        assert (out_01["account_number_group"].str.len() == 8).all(), (
+            "entity '01': account_number_group contains non-8-char keys"
+        )
+        assert (out_02["account_number_group"].str.len() == 8).all(), (
+            "entity '02': account_number_group contains non-8-char keys"
+        )
