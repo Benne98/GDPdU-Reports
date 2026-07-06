@@ -16,6 +16,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { motion } from 'framer-motion';
 import BudgetChat from '../components/budget/chat/BudgetChat';
 import ChatSummaryBar from '../components/budget/chat/ChatSummaryBar';
 import SaveProgress from '../components/budget/chat/SaveProgress';
@@ -1142,17 +1143,25 @@ export default function BudgetChatPage() {
 
   return (
     <div className="min-h-screen" style={{ background: '#F4F6F9' }}>
-      <div className="mx-auto w-full max-w-[1680px] px-6 py-8">
+      <div className="mx-auto w-full max-w-[1680px] px-6 lg:px-8 py-8">
 
-        {/* Page header */}
-        <div className="mb-6">
+        {/* Page header — aligned with the FDD-Bot format (eyebrow · h1 · subtitle, fade-in) */}
+        <motion.div
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4 }}
+          className="mb-5"
+        >
           <p className="text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: '#1E3A5F' }}>
             Admin · Planning
           </p>
           <h1 className="text-2xl font-bold tracking-tight" style={{ color: '#111827' }}>
             Budget Planning
           </h1>
-        </div>
+          <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
+            Build the budget and forecast that feed the reporting plan columns — guided step by step.
+          </p>
+        </motion.div>
 
         {entityError && (
           <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 flex items-center justify-between gap-3">

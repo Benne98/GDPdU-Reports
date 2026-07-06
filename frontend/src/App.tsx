@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import GdpduFooter from "./components/GdpduFooter";
 import AppHeader from "./components/AppHeader";
+import Sidebar from "./components/Sidebar";
 import { AuthProvider } from "./context/AuthContext";
 import { ActionNotesProvider } from "./components/action-notes/ActionNotesContext";
 import ProtectedRoute from "./components/ProtectedRoute";
@@ -29,9 +30,13 @@ import BudgetChatPage from "./pages/BudgetChatPage";
 
 function Shell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="min-h-full flex flex-col">
+    <div className="min-h-screen flex flex-col" style={{ background: '#F4F6F9' }}>
       <AppHeader />
-      <main className="w-full flex-1">{children}</main>
+      <div className="flex-1 flex min-w-0">
+        <Sidebar />
+        <main className="flex-1 w-full min-w-0">{children}</main>
+      </div>
+      {/* Footer/credentials span full width BELOW the rail — the sidebar stops before it. */}
       <GdpduFooter />
     </div>
   );

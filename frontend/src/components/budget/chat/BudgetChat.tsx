@@ -791,10 +791,24 @@ export default function BudgetChat({
   onRedo,
 }: BudgetChatProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
-
-  // Scroll to bottom whenever currentStepId changes
+  // Auto-advance only while the user sits near the bottom of the page; track that via a
+  // scroll listener so a new step doesn't yank the whole page down when they've scrolled up.
+  const autoScrollRef = useRef(true);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const onScroll = () => {
+      autoScrollRef.current =
+        window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 240;
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // Bring the newest step into view (minimally) only when the user is already at the bottom.
+  useEffect(() => {
+    if (autoScrollRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
   }, [currentStepId]);
 
   const visible = visibleSteps(draft);

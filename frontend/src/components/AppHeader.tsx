@@ -1,15 +1,15 @@
 /**
- * AppHeader — sticky top navigation bar.
- * Replaces the inline header that was previously in Shell (App.tsx).
+ * AppHeader — full-width top bar spanning ABOVE the sidebar rail and content.
  *
- * - Logo always visible (links to /)
- * - Reporting routes: logo left; pages + divider + user + logout grouped on the right
- * - No HealthBadge
+ * Calm, refined deep-navy bar (recedes so the analyses stay the focus). Crisp text.
+ * - Brand/logo on the LEFT — always visible, left edge flush with the sidebar icon column.
+ * - Reporting/Anomaly nav pills on the right; reporting pages with sub-pages reveal a
+ *   subpage popover on hover (deep-links to /parent?sub=<id>). Right: user + logout.
  */
 
-import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
+import { NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import {
-  BarChart3,
   LayoutDashboard,
   BookOpen,
   Scale,
@@ -19,25 +19,39 @@ import {
   TrendingUp,
   CalendarRange,
   Search,
+  BarChart3,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
 // ---------------------------------------------------------------------------
-// Reporting nav definition
+// Nav definitions
 // ---------------------------------------------------------------------------
 
-const REPORTING_NAV = [
-  { to: '/overview',            label: 'Overview',            Icon: LayoutDashboard },
-  { to: '/income-statement',    label: 'Income statement',    Icon: BookOpen        },
-  { to: '/balance-sheet',       label: 'Balance sheet',       Icon: Scale           },
-  { to: '/working-capital',     label: 'Working capital',     Icon: RefreshCw       },
-  { to: '/cash-flow',           label: 'Cash flow',           Icon: Banknote        },
-  { to: '/account-statement',   label: 'Export',              Icon: FileText        },
-] as const
+type SubPage = { id: string; label: string }
 
-/** Exact paths that belong to the financial-reporting section.
- *  '/anomaly-detection' is deliberately NOT included: it is reached only via the home
- *  tile and must show an EMPTY page-selection nav (it is not a reporting page). */
+const REPORTING_NAV: { to: string; label: string; Icon: typeof LayoutDashboard; sub?: SubPage[] }[] = [
+  { to: '/overview',          label: 'Overview',          Icon: LayoutDashboard },
+  { to: '/income-statement',  label: 'Income statement',  Icon: BookOpen, sub: [
+    { id: 'pl-statement', label: 'P&L statement' },
+    { id: 'profitability', label: 'Profitability' },
+    { id: 'payroll', label: 'Payroll' },
+  ] },
+  { to: '/balance-sheet',     label: 'Balance sheet',     Icon: Scale, sub: [
+    { id: 'balance-sheet', label: 'Balance sheet' },
+    { id: 'receivables-aging', label: 'Receivables Aging' },
+    { id: 'payables-aging', label: 'Payables Aging' },
+    { id: 'fixed-assets', label: 'Fixed assets' },
+  ] },
+  { to: '/working-capital',   label: 'Working capital',   Icon: RefreshCw },
+  { to: '/cash-flow',         label: 'Cash flow',         Icon: Banknote, sub: [
+    { id: 'cash-flow', label: 'Cash flow statement' },
+    { id: 'cash-debt', label: 'Cash & debt' },
+  ] },
+  { to: '/account-statement', label: 'Export',            Icon: FileText },
+]
+
+/** '/anomaly-detection' is intentionally excluded from primary nav (dropped from the rail +
+ *  home redirect); ANOMALY_NAV still renders when already on an /anomaly-detection* route. */
 const REPORTING_PATHS: ReadonlySet<string> = new Set(REPORTING_NAV.map(n => n.to))
 
 const ANOMALY_NAV = [
@@ -47,43 +61,68 @@ const ANOMALY_NAV = [
   { to: '/anomaly-detection/forensic',    label: 'Forensic',    Icon: Search          },
 ] as const
 
+const IDLE = '#B8C8DC'  // crisp light steel-blue on navy (idle nav)
+
 // ---------------------------------------------------------------------------
-// Logo
+// Nav pill (+ optional hover subpage popover)
 // ---------------------------------------------------------------------------
 
-function Logo() {
+function NavPill({ to, label, Icon, isActive, sub }: {
+  to: string; label: string; Icon: typeof LayoutDashboard; isActive: boolean; sub?: SubPage[]
+}) {
+  const [open, setOpen] = useState(false)
+
   return (
-    <Link to="/" className="flex items-center gap-3 flex-shrink-0 group">
-      <div
-        className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
-        style={{ background: '#1E3A5F' }}
+    <div
+      className="relative"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+    >
+      <NavLink
+        to={to}
+        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium"
+        style={{
+          color: isActive ? '#FFFFFF' : IDLE,
+          background: isActive ? 'rgba(255,255,255,0.11)' : 'transparent',
+          border: isActive ? '1px solid rgba(255,255,255,0.16)' : '1px solid transparent',
+          transition: 'color 0.15s, background 0.15s',
+        }}
+        onMouseEnter={e => { if (!isActive) { (e.currentTarget as HTMLElement).style.color = '#FFFFFF'; (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.06)' } }}
+        onMouseLeave={e => { if (!isActive) { (e.currentTarget as HTMLElement).style.color = IDLE; (e.currentTarget as HTMLElement).style.background = 'transparent' } }}
       >
-        <BarChart3 size={16} style={{ color: '#FFFFFF' }} />
-      </div>
-      <div className="flex flex-col leading-none">
-        <span className="font-bold text-lg tracking-tight" style={{ color: '#1E3A5F' }}>
-          Finssentials
-        </span>
-        <span
-          className="font-medium tracking-widest uppercase"
-          style={{ color: '#94A3B8', fontSize: '0.6rem' }}
+        <Icon size={13} aria-hidden />
+        {label}
+      </NavLink>
+
+      {sub && sub.length > 0 && open && (
+        <div
+          className="absolute left-0 top-full pt-2 z-50"
+          style={{ minWidth: 190 }}
         >
-          Financial Intelligence
-        </span>
-      </div>
-    </Link>
+          <div
+            className="rounded-xl overflow-hidden py-1"
+            style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 10px 30px rgba(15,30,50,0.14)' }}
+          >
+            <p className="px-3 pt-1.5 pb-1 text-[10px] font-semibold uppercase tracking-widest" style={{ color: '#94A3B8' }}>
+              {label}
+            </p>
+            {sub.map(sp => (
+              <Link
+                key={sp.id}
+                to={`${to}?sub=${sp.id}`}
+                className="block px-3 py-1.5 text-sm font-medium"
+                style={{ color: '#475569', transition: 'background 0.12s, color 0.12s' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(30,58,95,0.06)'; (e.currentTarget as HTMLElement).style.color = '#1E3A5F' }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = '#475569' }}
+              >
+                {sp.label}
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   )
-}
-
-// ---------------------------------------------------------------------------
-// Pill nav item styles
-// ---------------------------------------------------------------------------
-
-function pillStyle(isActive: boolean): React.CSSProperties {
-  return {
-    color:      isActive ? '#1E3A5F' : '#475569',
-    background: isActive ? 'rgba(30,58,95,0.08)' : 'transparent',
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,103 +144,80 @@ export default function AppHeader() {
 
   return (
     <header
-      className="sticky top-0 z-40 bg-white"
-      style={{ borderBottom: '1px solid #E2E8F0', boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }}
+      className="sticky top-0 z-40"
+      style={{
+        background: 'linear-gradient(180deg, #1E3A5F 0%, #1B3453 100%)',
+        borderBottom: '1px solid rgba(255,255,255,0.06)',
+        boxShadow: '0 1px 8px rgba(15,30,50,0.20)',
+        WebkitFontSmoothing: 'antialiased',
+        MozOsxFontSmoothing: 'grayscale',
+      }}
     >
-      <div className="max-w-[1680px] mx-auto px-6 lg:px-8 h-16 flex items-center">
-        <Logo />
+      {/* left pad 20px = sidebar icon column (item margin 8 + padding 12) → brand is flush with the icons */}
+      <div className="h-16 flex items-center gap-6" style={{ paddingLeft: 20, paddingRight: 28 }}>
+        {/* Brand — always fully visible, left edge flush with sidebar icons */}
+        <Link to="/overview" className="flex items-center gap-3 flex-shrink-0 min-w-0" title="Finssentials">
+          <div
+            className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0"
+            style={{ background: 'rgba(255,255,255,0.13)', border: '1px solid rgba(255,255,255,0.18)' }}
+          >
+            <BarChart3 size={16} style={{ color: '#FFFFFF' }} />
+          </div>
+          <div className="flex flex-col leading-tight min-w-0">
+            <span className="font-semibold text-base tracking-tight" style={{ color: '#FFFFFF' }}>
+              Finssentials
+            </span>
+            <span className="font-medium tracking-[0.14em] uppercase" style={{ color: '#8AA2BE', fontSize: '0.58rem' }}>
+              Financial Intelligence
+            </span>
+          </div>
+        </Link>
+
         <div className="flex-1 min-w-0" aria-hidden />
 
+        {/* Right group: page nav + account */}
         <div className="flex items-center flex-shrink-0">
           {isReportingRoute && (
             <nav className="flex flex-wrap items-center justify-end gap-0.5">
-              {REPORTING_NAV.map(({ to, label, Icon }) => {
-                const isActive = location.pathname === to
-                return (
-                  <NavLink
-                    key={to}
-                    to={to}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all duration-150"
-                    style={({ isActive: navActive }) => pillStyle(navActive || isActive)}
-                    onMouseEnter={e => {
-                      if (!isActive) {
-                        ;(e.currentTarget as HTMLElement).style.color = '#1E3A5F'
-                        ;(e.currentTarget as HTMLElement).style.background = 'rgba(30,58,95,0.05)'
-                      }
-                    }}
-                    onMouseLeave={e => {
-                      if (!isActive) {
-                        ;(e.currentTarget as HTMLElement).style.color = '#475569'
-                        ;(e.currentTarget as HTMLElement).style.background = 'transparent'
-                      }
-                    }}
-                  >
-                    <Icon size={13} aria-hidden />
-                    {label}
-                  </NavLink>
-                )
-              })}
+              {REPORTING_NAV.map(({ to, label, Icon, sub }) => (
+                <NavPill key={to} to={to} label={label} Icon={Icon} sub={sub} isActive={location.pathname === to} />
+              ))}
             </nav>
           )}
 
           {isAnomalyRoute && (
             <nav className="flex flex-wrap items-center justify-end gap-0.5">
-              {ANOMALY_NAV.map(({ to, label, Icon }) => {
-                const isActive = to === '/anomaly-detection'
-                  ? location.pathname === '/anomaly-detection'
-                  : location.pathname === to
-                return (
-                  <NavLink
-                    key={to}
-                    to={to}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-all duration-150"
-                    style={() => pillStyle(isActive)}
-                    onMouseEnter={e => {
-                      if (!isActive) {
-                        ;(e.currentTarget as HTMLElement).style.color = '#1E3A5F'
-                        ;(e.currentTarget as HTMLElement).style.background = 'rgba(30,58,95,0.05)'
-                      }
-                    }}
-                    onMouseLeave={e => {
-                      if (!isActive) {
-                        ;(e.currentTarget as HTMLElement).style.color = '#475569'
-                        ;(e.currentTarget as HTMLElement).style.background = 'transparent'
-                      }
-                    }}
-                  >
-                    <Icon size={13} aria-hidden />
-                    {label}
-                  </NavLink>
-                )
-              })}
+              {ANOMALY_NAV.map(({ to, label, Icon }) => (
+                <NavPill
+                  key={to}
+                  to={to}
+                  label={label}
+                  Icon={Icon}
+                  isActive={to === '/anomaly-detection'
+                    ? location.pathname === '/anomaly-detection'
+                    : location.pathname === to}
+                />
+              ))}
             </nav>
           )}
 
           {user && (
             <>
               {(isReportingRoute || isAnomalyRoute) && (
-                <div
-                  className="mx-4 w-px h-5 flex-shrink-0"
-                  style={{ background: '#CBD5E1' }}
-                  aria-hidden
-                />
+                <div className="mx-4 w-px h-5 flex-shrink-0" style={{ background: 'rgba(255,255,255,0.16)' }} aria-hidden />
               )}
 
-              <span className="text-xs font-medium" style={{ color: '#64748B' }}>
+              <span className="text-xs font-medium" style={{ color: '#AFC3DB' }}>
                 {user.display_name}
               </span>
 
               <button
                 type="button"
                 onClick={handleLogout}
-                className="ml-2.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors"
-                style={{ borderColor: '#CBD5E1', color: '#1E3A5F' }}
-                onMouseEnter={e => {
-                  ;(e.currentTarget as HTMLElement).style.background = '#EEF3FA'
-                }}
-                onMouseLeave={e => {
-                  ;(e.currentTarget as HTMLElement).style.background = 'transparent'
-                }}
+                className="ml-2.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
+                style={{ border: '1px solid rgba(255,255,255,0.22)', color: '#FFFFFF', background: 'rgba(255,255,255,0.05)' }}
+                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.14)' }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.05)' }}
               >
                 Log out
               </button>

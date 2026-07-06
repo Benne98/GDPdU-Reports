@@ -7,7 +7,7 @@ export default function WorkingCapitalPage() {
       statement="wc"
       kicker="Working capital"
       title="Working capital"
-      description="Trade and other working capital with timeline and DSO/DIO/DPO/CCC for {period}. Click a value to drill into GL lines."
+      description="Trade and other working capital with timeline and DSO/DIO/DPO/CCC for {period}."
     />
   )
 }

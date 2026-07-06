@@ -18,6 +18,8 @@ export interface AuthUser {
   email: string;
   display_name: string;
   is_admin: boolean;
+  /** Role page_keys returned by /api/v1/auth/me (optional — absent = no restriction, fail-open). */
+  page_keys?: string[];
 }
 
 interface AuthContextValue {

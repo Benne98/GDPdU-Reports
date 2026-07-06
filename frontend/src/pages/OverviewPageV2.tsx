@@ -12,7 +12,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { api, Entity, type FinPeriodParams } from '../lib/api'
-import CollapsibleModuleFiltersCard from '../components/ui/CollapsibleModuleFiltersCard'
+import ModulePeriodFilterBar from '../components/ui/ModulePeriodFilterBar'
+import { SlidersHorizontal, ChevronDown } from 'lucide-react'
 import {
   defaultAnnualPeriodFromLatest,
   periodAnchorYearMonth,
@@ -88,6 +89,7 @@ export default function OverviewPageV2() {
   const [periodReady, setPeriodReady] = useState(false)
   const [bootError, setBootError] = useState<string | null>(null)
   const [drill, setDrill] = useState<DrillDownRequest | null>(null)
+  const [filtersOpen, setFiltersOpen] = useState(false)
 
   const pageContentRef = useRef<HTMLDivElement>(null)
 
@@ -180,20 +182,47 @@ export default function OverviewPageV2() {
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.4 }}
-            className="mb-6"
+            className="mb-6 flex items-start justify-between gap-4"
           >
-            <div
-              className="text-xs font-semibold uppercase tracking-widest mb-1.5"
-              style={{ color: '#1E3A5F' }}
-            >
-              Reporting
+            <div className="min-w-0">
+              <div
+                className="text-xs font-semibold uppercase tracking-widest mb-1.5"
+                style={{ color: '#1E3A5F' }}
+              >
+                Reporting
+              </div>
+              <h1 className="text-2xl font-bold tracking-tight" style={{ color: '#111827' }}>
+                Overview
+              </h1>
+              <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
+                Decision-first briefing · {periodLabel}
+              </p>
             </div>
-            <h1 className="text-2xl font-bold tracking-tight" style={{ color: '#111827' }}>
-              Overview
-            </h1>
-            <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
-              Decision-first briefing · {periodLabel}
-            </p>
+
+            {/* Filters trigger — aligned to the page title, top-right (matches statements) */}
+            <button
+              type="button"
+              onClick={() => setFiltersOpen(v => !v)}
+              className="shrink-0 mt-1 flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors"
+              style={{
+                background: filtersOpen ? 'rgba(30,58,95,0.1)' : '#FFFFFF',
+                color: '#1E3A5F',
+                border: `1px solid ${filtersOpen ? 'rgba(30,58,95,0.25)' : '#E2E8F0'}`,
+                boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+              }}
+              title={filtersOpen ? 'Hide period filters' : 'Show period filters'}
+              aria-expanded={filtersOpen}
+              aria-label={filtersOpen ? 'Hide filters' : 'Show filters'}
+            >
+              <SlidersHorizontal size={15} strokeWidth={2} aria-hidden />
+              <span className="hidden sm:inline">Filters</span>
+              <ChevronDown
+                size={14}
+                className="transition-transform duration-200"
+                style={{ transform: filtersOpen ? 'rotate(180deg)' : 'none' }}
+                aria-hidden
+              />
+            </button>
           </motion.div>
 
           {/* Boot error banner */}
@@ -211,18 +240,20 @@ export default function OverviewPageV2() {
             </div>
           )}
 
-          {/* Filters — UNCHANGED structure and props */}
-          <CollapsibleModuleFiltersCard
-            entities={entities}
-            entity={entity}
-            onEntityChange={setEntity}
-            grain={grain}
-            onGrainChange={setGrain}
-            period={period}
-            onPeriodChange={setPeriod}
-            latest={latest}
-            showYearGrain
-          />
+          {/* Period filter window — opens beneath the title row (matches statements) */}
+          {filtersOpen && (
+            <ModulePeriodFilterBar
+              entities={entities}
+              entity={entity}
+              onEntityChange={setEntity}
+              grain={grain}
+              onGrainChange={setGrain}
+              period={period}
+              onPeriodChange={setPeriod}
+              latest={latest}
+              showYearGrain
+            />
+          )}
 
           <div className="space-y-6">
 

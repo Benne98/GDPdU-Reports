@@ -51,7 +51,9 @@ export default function BotConversation({
     sessionEpoch,
   } = bot
   const [freeText, setFreeText] = useState('')
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  // Whether new messages should auto-scroll — true only while the user sits near the bottom.
+  const autoScrollRef = useRef(true)
   const hasInitiated = useRef(false)
   const hasPreloadedFile = useRef(false)
   const preloadComplete = useRef(false)
@@ -67,8 +69,12 @@ export default function BotConversation({
       : { skipUserBubble: true }
   }
 
+  // Keep the conversation pinned to the latest message — but ONLY scroll the chat
+  // container itself (never the page/window), and only when the user is already near the
+  // bottom, so reading earlier messages isn't interrupted by a yank to the end.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = scrollRef.current
+    if (el && autoScrollRef.current) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
   }, [messages, loading, scriptJobLoading])
 
   useEffect(() => {
@@ -145,6 +151,11 @@ export default function BotConversation({
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <div
+        ref={scrollRef}
+        onScroll={e => {
+          const el = e.currentTarget
+          autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140
+        }}
         className={`flex-1 overflow-y-auto py-4 ${wide ? 'px-6' : 'px-4'}`}
         style={{ overscrollBehavior: 'contain' }}
       >
@@ -199,7 +210,6 @@ export default function BotConversation({
           </div>
         )}
 
-        <div ref={bottomRef} />
         </div>
       </div>
 

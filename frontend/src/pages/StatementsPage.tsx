@@ -86,6 +86,8 @@ export type StatementSubTab = {
   label: string
   disabled?: boolean
   note?: string
+  /** Optional per-sub-page subheading; supports the {period} placeholder. Falls back to the page description. */
+  description?: string
 }
 
 export type StatementSubTabRenderContext = {
@@ -241,7 +243,6 @@ export default function StatementsPage({
   description,
   subTabs,
   activeSubTab,
-  onSubTabChange,
   subTabContent,
   renderSubTabContent,
 }: Props) {
@@ -292,6 +293,11 @@ export default function StatementsPage({
   const altSubActive = Boolean(
     subTabs?.length && activeSubTab && defaultSubTabId && activeSubTab !== defaultSubTabId,
   )
+  // Page title + subheading reflect the active sub-page (e.g. "Profitability"); the kicker
+  // keeps the main-page header (e.g. "Income statement"). Both fall back to the page props.
+  const activeSub = subTabs?.find(t => t.id === activeSubTab)
+  const pageTitle = activeSub?.label ?? title
+  const pageDescription = activeSub?.description ?? description
   const altContent = altSubActive
     ? (renderSubTabContent?.({ period, entity, periodReady, entityId: ent })
       ?? subTabContent)
@@ -574,18 +580,68 @@ export default function StatementsPage({
           initial={{ opacity: 0, y: 16 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.4 }}
-          className="mb-6"
+          className="mb-6 flex items-start justify-between gap-4"
         >
-          <div className="text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: '#1E3A5F' }}>
-            {kicker}
+          <div className="min-w-0">
+            <div className="text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: '#1E3A5F' }}>
+              {kicker}
+            </div>
+            <h1 className="text-2xl font-bold tracking-tight" style={{ color: '#111827' }}>
+              {pageTitle}
+            </h1>
+            <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
+              {pageDescription.replace('{period}', periodLabel)}
+            </p>
           </div>
-          <h1 className="text-2xl font-bold tracking-tight" style={{ color: '#111827' }}>
-            {title}
-          </h1>
-          <p className="text-sm mt-1" style={{ color: '#94A3B8' }}>
-            {description.replace('{period}', periodLabel)}
-          </p>
+
+          {/* Filters trigger — aligned to the page title, top-right */}
+          <button
+            type="button"
+            onClick={() => setFiltersOpen(v => !v)}
+            className="shrink-0 mt-1 flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-medium transition-colors"
+            style={{
+              background: filtersOpen ? 'rgba(30,58,95,0.1)' : '#FFFFFF',
+              color: '#1E3A5F',
+              border: `1px solid ${filtersOpen ? 'rgba(30,58,95,0.25)' : '#E2E8F0'}`,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+            }}
+            title={filtersOpen ? 'Hide period filters' : 'Show period filters'}
+            aria-expanded={filtersOpen}
+            aria-label={filtersOpen ? 'Hide filters' : 'Show filters'}
+          >
+            <SlidersHorizontal size={15} strokeWidth={2} aria-hidden />
+            <span className="hidden sm:inline">Filters</span>
+            <ChevronDown
+              size={14}
+              className="transition-transform duration-200"
+              style={{ transform: filtersOpen ? 'rotate(180deg)' : 'none' }}
+              aria-hidden
+            />
+          </button>
         </motion.div>
+
+        {/* Period filter window — opens beneath the title row */}
+        {filtersOpen && (
+          <ModulePeriodFilterBar
+            entities={entities}
+            entity={entity}
+            onEntityChange={e => {
+              setEntity(e)
+              setDrill(null)
+            }}
+            grain={grain}
+            onGrainChange={setGrain}
+            period={period}
+            onPeriodChange={p => {
+              setPeriod(p)
+              setDrill(null)
+            }}
+            latest={latest}
+            loading={loading}
+            onRefresh={loadStatement}
+            showYearGrain={true}
+          />
+        )}
 
         {error && statementActive && (
           <div
@@ -610,75 +666,8 @@ export default function StatementsPage({
           <FinSectionErrorCard label="Annual consolidation" error={annualConsolError} onRetry={loadAnnualConsol} />
         )}
 
-        <div
-          className="rounded-xl mb-5 px-2 py-2 flex items-center gap-2"
-          style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
-        >
-          <div className="flex flex-wrap gap-1 flex-1 min-w-0">
-            {(subTabs ?? []).map(t => (
-              <button
-                key={t.id}
-                type="button"
-                disabled={t.disabled}
-                onClick={() => !t.disabled && onSubTabChange?.(t.id)}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5"
-                style={{
-                  background: activeSubTab === t.id ? 'rgba(30,58,95,0.1)' : 'transparent',
-                  color: t.disabled ? '#CBD5E1' : activeSubTab === t.id ? '#1E3A5F' : '#64748B',
-                  border: activeSubTab === t.id ? '1px solid rgba(30,58,95,0.2)' : '1px solid transparent',
-                  cursor: t.disabled ? 'not-allowed' : 'pointer',
-                }}
-                title={t.note}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-          <button
-            type="button"
-            onClick={() => setFiltersOpen(v => !v)}
-            className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
-            style={{
-              background: filtersOpen ? 'rgba(30,58,95,0.1)' : '#F4F6F9',
-              color: '#1E3A5F',
-              border: `1px solid ${filtersOpen ? 'rgba(30,58,95,0.25)' : '#E2E8F0'}`,
-            }}
-            title={filtersOpen ? 'Hide period filters' : 'Show period filters'}
-            aria-expanded={filtersOpen}
-            aria-label={filtersOpen ? 'Hide filters' : 'Show filters'}
-          >
-            <SlidersHorizontal size={14} strokeWidth={2} aria-hidden />
-            <span className="hidden sm:inline">Filters</span>
-            <ChevronDown
-              size={14}
-              className="transition-transform duration-200"
-              style={{ transform: filtersOpen ? 'rotate(180deg)' : 'none' }}
-              aria-hidden
-            />
-          </button>
-        </div>
-
-        {filtersOpen && (
-          <ModulePeriodFilterBar
-            entities={entities}
-            entity={entity}
-            onEntityChange={e => {
-              setEntity(e)
-              setDrill(null)
-            }}
-            grain={grain}
-            onGrainChange={setGrain}
-            period={period}
-            onPeriodChange={p => {
-              setPeriod(p)
-              setDrill(null)
-            }}
-            latest={latest}
-            loading={loading}
-            onRefresh={loadStatement}
-            showYearGrain={true}
-          />
-        )}
+        {/* Sub-page navigation moved to the top-bar hover menu; the active sub-page is
+            driven by ?sub=… so no in-page sub-tab bar is rendered here anymore. */}
 
         {!statementActive ? (
           altContent

@@ -62,12 +62,41 @@ class UserOut(BaseModel):
     email: str
     display_name: str | None
     is_admin: bool
+    page_keys: list[str] = []
 
 
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+
+
+# ---------------------------------------------------------------------------
+# Page-visibility helper
+# ---------------------------------------------------------------------------
+
+def _load_page_keys(session: Session, user_id: int) -> list[str]:
+    """Return the DISTINCT union of page_keys across all of the user's roles.
+
+    Drives role-based module visibility on the frontend. **Fail-open**: returns
+    an empty list on any error or when the user has no page-visibility rows
+    (the frontend treats absent/empty as "no restriction"). Never raises —
+    page_keys is advisory metadata, not an authorization gate.
+    """
+    try:
+        rows = session.execute(
+            text(
+                "SELECT DISTINCT rpv.page_key "
+                "FROM user_role ur "
+                "JOIN admin_role_page_visibility rpv ON rpv.role_id = ur.role_id "
+                "WHERE ur.user_id = :uid AND rpv.page_key IS NOT NULL"
+            ),
+            {"uid": user_id},
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as exc:  # noqa: BLE001 — page_keys is fail-open advisory metadata
+        logger.warning("_load_page_keys failed for user_id=%s: %s", user_id, exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +174,7 @@ def login(
             email=email,
             display_name=display_name,
             is_admin=is_admin,
+            page_keys=_load_page_keys(session, user_id),
         ),
     )
 
@@ -156,6 +186,7 @@ def login(
 @router.get("/me", response_model=UserOut)
 def me(
     user: Annotated[User, Depends(current_user)],
+    session: Annotated[Session, Depends(get_session)],
 ) -> UserOut:
     """Return the currently authenticated user."""
     return UserOut(
@@ -163,6 +194,7 @@ def me(
         email=user.email,
         display_name=user.display_name,
         is_admin=user.is_admin,
+        page_keys=_load_page_keys(session, user.user_id),
     )
 
 

@@ -966,9 +966,9 @@ export default function RoleManagementPage() {
       submessage="Roles, users, and page permissions are loading."
     >
     <div className="min-h-screen" style={{ background: SURF }}>
-      <div className="max-w-[1400px] mx-auto px-6 py-8">
+      <div className="max-w-[1680px] mx-auto px-6 lg:px-8 py-8">
 
-        {/* Page header */}
+        {/* Page header — aligned with the other pages (eyebrow · h1 · subtitle) */}
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
@@ -976,18 +976,18 @@ export default function RoleManagementPage() {
           className="mb-6"
         >
           <p
-            className="text-xs font-semibold uppercase tracking-widest mb-2"
+            className="text-xs font-semibold uppercase tracking-widest mb-1.5"
             style={{ color: NAVY }}
           >
             Administration
           </p>
           <h1
-            className="text-3xl font-bold tracking-tight"
+            className="text-2xl font-bold tracking-tight"
             style={{ color: TEXT1 }}
           >
             Role management
           </h1>
-          <p className="text-sm mt-1.5" style={{ color: TEXT2 }}>
+          <p className="text-sm mt-1" style={{ color: TEXT2 }}>
             Control which pages each role can open and which entities' data they can see.
           </p>
         </motion.div>
