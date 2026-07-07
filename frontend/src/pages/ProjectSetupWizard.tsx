@@ -5113,7 +5113,18 @@ export default function ProjectSetupWizard() {
         name: projectName,
         fy_start_month: fyStart,
         entities: wizardEntities.filter(e => e.code.trim() !== ''),
-        opening_balance_mode: ob.mode === 'in_data' ? 'in_data' : 'file',
+        // Map the wizard's 3 OB states to the 3 backend rebuild modes:
+        //   in_data         → 'in_data'       (OBs already in the GL)
+        //   file_first_year → 'carry_forward' (first-year OB file loaded, later years
+        //                     synthesised from prior-year closings — exactly what the
+        //                     file_first_year UI promises: "subsequent years carry forward")
+        //   file_all        → 'file'          (every year's OB loaded from file, no synthesis)
+        opening_balance_mode:
+          ob.mode === 'in_data'
+            ? 'in_data'
+            : ob.mode === 'file_first_year'
+              ? 'carry_forward'
+              : 'file',
         mapping_source: coa.groups.some(g => g.method === 'upload') ? 'client_coa' : 'library',
         partner_master_source: 'files',
         net_profit_source: 'report_inject',
