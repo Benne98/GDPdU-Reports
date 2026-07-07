@@ -9,14 +9,21 @@ type ExpandableRow = { id: string; label: string; children?: ExpandableRow[] }
 /**
  * Default expanded row ids — same rules as FinancialStatementTable / MonthlyTable.
  * BS: depth 0–1 open; WC: TWC/OWC + mapping lines visible (depth 1); CF: depth 0; PL: none.
+ *
+ * @param maxDepthOverride - When provided, replaces the per-statement maxDepth computation.
+ *   Useful for opt-in callers (e.g. PL group consolidation) that need non-default expansion.
+ *   All existing callers omit this parameter and are unaffected.
  */
 export function computeAutoExpandedIds(
   rows: ExpandableRow[] | undefined,
   statement: string | undefined,
+  maxDepthOverride?: number,
 ): Set<string> {
   if (!rows?.length) return new Set<string>()
   const stmt = statement ?? 'pl'
-  const maxDepth = stmt === 'bs' ? 2 : stmt === 'wc' ? 1 : stmt === 'cf' ? 1 : 0
+  const maxDepth = maxDepthOverride !== undefined
+    ? maxDepthOverride
+    : stmt === 'bs' ? 2 : stmt === 'wc' ? 1 : stmt === 'cf' ? 1 : 0
   if (maxDepth === 0) return new Set<string>()
 
   function collectIds(rs: ExpandableRow[], depth: number): string[] {

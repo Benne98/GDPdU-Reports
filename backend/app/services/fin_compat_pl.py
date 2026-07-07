@@ -1640,6 +1640,55 @@ def _build_annual_consolidation_rows(
             sums[lec] = sums.get(lec, 0.0) + float(g.get("ytd") or 0)
         return sums
 
+    def _annual_child_row(row_id: str, label: str, am: dict[str, float]) -> dict:
+        """Build a DISPLAY-ONLY L4 detail child in the annual flat-row shape."""
+        agg = sum(am.get(ec, 0.0) for ec in entity_codes)
+        return {
+            "id": row_id, "label": label, "row_kind": "detail", "is_bold": False,
+            "entity_amounts": {ec: round(am.get(ec, 0.0), 2) for ec in entity_codes},
+            "aggregated": round(agg, 2),
+            "ic_eliminations": 0.0,
+            "consolidation": round(agg, 2),
+            "has_children": False, "children": [],
+        }
+
+    def _annual_l4_children(r_line: dict, base_rc: str) -> list[dict]:
+        """L4 detail children for an L3-only mapping row (mirrors the monthly builder).
+
+        Groups the SAME grains that feed the parent's ``entity_amounts`` by their
+        non-empty ``level_4``.  Because an L3-only structure row also matches grains
+        that LACK a level_4 (see ``_match_grain``: with l4 empty it returns True on
+        an l2/l3 match regardless of the grain's l4), those grains would otherwise
+        be dropped and the children would not reconcile to the parent.  We capture
+        them in a residual ``(no L4)`` bucket so, per entity column,
+        Σ children == parent — but only when a real L4 breakdown exists (otherwise
+        there is nothing to break down and we stay flat, like the monthly builder).
+        """
+        matched = [g for g in grains if _match_grain(g, r_line)]
+        l4_dict: dict[str, list[dict]] = {}
+        no_l4: list[dict] = []
+        for g in matched:
+            l4v = (g.get("level_4") or "").strip()
+            if l4v:
+                l4_dict.setdefault(l4v, []).append(g)
+            else:
+                no_l4.append(g)
+        kids: list[dict] = []
+        for l4v, l4g in sorted(l4_dict.items()):
+            kids.append(_annual_child_row(
+                f"pl-{base_rc}-l4-{abs(hash(l4v)) % 100000}", l4v, _consl_ytd(l4g),
+            ))
+        # Collapse a single self-referential child (matches monthly behaviour).
+        if len(kids) == 1 and kids[0]["label"] == r_line["balance_title"]:
+            kids = []
+        # Residual bucket: only when a real L4 breakdown exists, so children
+        # reconcile to the parent per entity without emitting a lone "(no L4)".
+        if kids and no_l4:
+            res_am = _consl_ytd(no_l4)
+            if any(abs(v) > 1e-9 for v in res_am.values()):
+                kids.append(_annual_child_row(f"pl-{base_rc}-l4-none", "(no L4)", res_am))
+        return kids
+
     # Per-entity mapping values, then running-sum per entity column.
     mapping_entity: dict[str, dict[str, float]] = {}
     for r in struct_pl:
@@ -1707,6 +1756,18 @@ def _build_annual_consolidation_rows(
             continue  # skip presentation-only 'title' rows (flat table)
         am = line_entity.get(rc, {ec: 0.0 for ec in entity_codes})
         agg = sum(am.get(ec, 0.0) for ec in entity_codes)
+        # L4 detail children for L3-only mapping rows — same gate as the monthly
+        # builder (see ``build_pl_monthly``): an L3 mapping row that carries no
+        # level_4 / gl_account_id of its own.  The children reconcile to the
+        # parent per entity column (residual "(no L4)" bucket, see helper docstring).
+        l3 = (r.get("level_3") or "").strip()
+        l4 = (r.get("level_4") or "").strip()
+        gid = (r.get("gl_account_id") or "").strip() or None
+        kids = (
+            _annual_l4_children(r, rc)
+            if (rt == "mapping" and l3 and not l4 and not gid)
+            else []
+        )
         rows_out.append({
             "id": f"pl-{rc}",
             "label": r["balance_title"],
@@ -1716,8 +1777,8 @@ def _build_annual_consolidation_rows(
             "aggregated": round(agg, 2),
             "ic_eliminations": 0.0,
             "consolidation": round(agg, 2),
-            "has_children": False,
-            "children": [],
+            "has_children": len(kids) > 0,
+            "children": kids,
         })
 
     return {

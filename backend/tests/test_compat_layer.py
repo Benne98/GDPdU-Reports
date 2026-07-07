@@ -1269,3 +1269,98 @@ class TestOverviewYearGrain:
                 params={"period_grain": "year", "year": 2025, "month": 7},
             )
         assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# (n) Annual consolidation — L4 detail children under L3-only mapping rows
+#
+# Feature: the annual (group) consolidation P&L now drills an L3-only mapping row
+# into per-level_4 detail children, mirroring the monthly/BS view.  The financial
+# INVARIANT that must hold: per entity column and in the aggregate,
+#     Σ children == parent
+# guaranteed by partitioning the SAME matched grain set into level_4 buckets plus
+# a residual "(no L4)" bucket for grains that match the L3 row but carry no L4.
+# ---------------------------------------------------------------------------
+
+def _cons_struct(line_code, sort_order, row_type, *,
+                 level_2=None, level_3=None, level_4=None, is_bold=False):
+    return {
+        "pl_line_id": sort_order, "sort_order": sort_order, "line_code": line_code,
+        "row_type": row_type, "balance_title": line_code.replace("_", " ").title(),
+        "details": None, "calc_type": None,
+        "level_2": level_2, "level_3": level_3, "level_4": level_4,
+        "gl_account_id": None, "invert_delta": False, "is_bold": is_bold,
+        "kpi_code": None,
+    }
+
+
+def _cons_grain(entity_prefix, level_2, level_3, level_4, ytd):
+    return {
+        "level_2": level_2, "level_3": level_3, "level_4": level_4,
+        "gl_account_id": None, "account_number_group": None,
+        "account_name": level_4 or level_3, "entity_prefix": entity_prefix,
+        "py_cm": 0.0, "pm": 0.0, "cm": ytd, "ytd": ytd, "ytd_py": 0.0,
+    }
+
+
+class TestAnnualConsolidationL4Children:
+
+    # One L3-only mapping row (Personnel) that should fan out into L4 children,
+    # across two entities.  AT has a residual (no-L4) grain; DE has one too.
+    _STRUCT = [
+        _cons_struct("PERSONNEL", 1, "mapping", level_2="Expense", level_3="Personnel"),
+        _cons_struct("NET_PROFIT", 2, "subtotal", is_bold=True),
+    ]
+    _ENT = [("AT", "AT", "Austria GmbH"), ("DE", "DE", "Germany GmbH")]
+    _GRAIN = [
+        _cons_grain("AT", "Expense", "Personnel", "Wages", -100.0),
+        _cons_grain("AT", "Expense", "Personnel", "Salaries", -50.0),
+        _cons_grain("AT", "Expense", "Personnel", None, -10.0),   # residual (no L4)
+        _cons_grain("DE", "Expense", "Personnel", "Wages", -200.0),
+        _cons_grain("DE", "Expense", "Personnel", None, -5.0),    # residual (no L4)
+    ]
+
+    def _build(self):
+        from app.services.fin_compat_pl import _build_annual_consolidation_rows
+        out = _build_annual_consolidation_rows(
+            self._STRUCT, self._GRAIN, self._ENT, year=2025, month=12,
+        )
+        parent = next(r for r in out["rows"] if r["id"] == "pl-PERSONNEL")
+        return out, parent
+
+    def test_l3_only_mapping_row_gets_children(self):
+        _out, parent = self._build()
+        assert parent["has_children"] is True
+        assert len(parent["children"]) >= 1
+        # Labels: the two real L4 groups + the residual bucket.
+        labels = {c["label"] for c in parent["children"]}
+        assert {"Wages", "Salaries", "(no L4)"} <= labels
+
+    def test_children_reconcile_to_parent_per_entity(self):
+        _out, parent = self._build()
+        for ec in ("AT", "DE"):
+            child_sum = round(sum(c["entity_amounts"][ec] for c in parent["children"]), 2)
+            assert child_sum == parent["entity_amounts"][ec], (
+                f"entity {ec}: Σ children {child_sum} != parent {parent['entity_amounts'][ec]}"
+            )
+        # Expected column totals: AT = -160, DE = -205.
+        assert parent["entity_amounts"]["AT"] == -160.0
+        assert parent["entity_amounts"]["DE"] == -205.0
+
+    def test_children_reconcile_to_parent_aggregate(self):
+        _out, parent = self._build()
+        child_agg = round(sum(c["aggregated"] for c in parent["children"]), 2)
+        assert child_agg == parent["aggregated"] == -365.0
+
+    def test_residual_bucket_omitted_when_all_l4_present(self):
+        """No residual '(no L4)' child when every matching grain has a level_4."""
+        from app.services.fin_compat_pl import _build_annual_consolidation_rows
+        grain = [g for g in self._GRAIN if g["level_4"] is not None]
+        out = _build_annual_consolidation_rows(
+            self._STRUCT, grain, self._ENT, year=2025, month=12,
+        )
+        parent = next(r for r in out["rows"] if r["id"] == "pl-PERSONNEL")
+        assert "(no L4)" not in {c["label"] for c in parent["children"]}
+        for ec in ("AT", "DE"):
+            child_sum = round(sum(c["entity_amounts"][ec] for c in parent["children"]), 2)
+            assert child_sum == parent["entity_amounts"][ec]

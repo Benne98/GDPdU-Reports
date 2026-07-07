@@ -103,9 +103,13 @@ export default function AnnualConsolidationReportView({
 
   const expansionStatement =
     statement === 'wc' ? 'wc' : statement === 'bs' ? 'bs' : statement === 'cf' ? 'cf' : 'pl'
+  // PL group report: auto-expand depth 0+1 so L4 detail children under L3 mapping rows are
+  // visible by default — matches BS visual parity. All other statements use their own defaults.
+  const plGroupMaxDepth = statement === 'pl' ? 2 : undefined
   const { checkOpen, toggle } = usePlRowExpansion(
     consol.rows as unknown as FinancialStatementRow[],
     expansionStatement,
+    plGroupMaxDepth,
   )
 
   const bullets = useMemo((): PlNarrativeBullet[] => {

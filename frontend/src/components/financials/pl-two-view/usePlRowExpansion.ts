@@ -4,16 +4,20 @@ import { computeAutoExpandedIds } from '../statementRowExpansion'
 
 /**
  * Row expand/collapse (XOR with user toggles) — matches FinancialStatementTable defaults per statement.
+ *
+ * @param maxDepthOverride - Forwarded to computeAutoExpandedIds. Omit to preserve per-statement
+ *   default behavior. All existing callers omit this parameter and are unaffected.
  */
 export function usePlRowExpansion(
   rows: FinancialStatementRow[] | undefined,
   statement?: string,
+  maxDepthOverride?: number,
 ) {
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
 
   const autoExpandedIds = useMemo(
-    () => computeAutoExpandedIds(rows, statement),
-    [rows, statement],
+    () => computeAutoExpandedIds(rows, statement, maxDepthOverride),
+    [rows, statement, maxDepthOverride],
   )
 
   const checkOpen = useCallback(
