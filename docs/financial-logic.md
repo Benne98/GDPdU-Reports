@@ -2052,3 +2052,64 @@ forecast/coverage columns change to reflect the active version — this is the i
 un-parking, not a regression. The default backfilled `v1` is active+included, so a DB
 whose forecast≈budget is numerically unchanged. Un-migrated DBs (no table) are exactly
 byte-identical via the `legacy` escape hatch.
+
+## Phase 5 — Auto-extension of the statement structure (decision 2)
+
+Not a *formula* change — a **data-classification** change to the presentation
+structure (`dim_pl_structure` / `dim_bs_structure` / `dim_cf_structure`) that drives
+every statement. Documented here because it must preserve the split invariant
+(decision 1) and must not silently drop or double-count a position.
+Code: `backend/app/services/structure_autoextend.py`; endpoints
+`POST /api/v1/ingest/structure/unknown-positions` (detect) and
+`.../structure/extend` (place). Tests: `backend/tests/test_structure_autoextend.py`.
+
+### What is an "unknown position"?
+The statement builders group GL into *grains* keyed by
+`(level_2, level_3, level_4)` on `dim_gl_account` and match each grain to a
+structure **mapping** row via `fin_compat_pl._match_grain` (pin by `gl_account_id`
+if the structure row has one, else a `level_2/3/4` prefix match). A grain that
+matches NO mapping row "falls through classification" — today it lands in the
+statement's residual `unmapped_total` bucket. Detection reuses that **exact**
+matcher, so a position is "unknown" here **iff** the reader would fail to classify
+it (detection can never drift from presentation).
+
+The correct statement for an account is its `level_0` ('BS' | 'PL'). CF is a
+derived statement (its own `cf_mapping`), so CF is never the *suggested* statement.
+
+### Placement rules — how a placed position flows into exactly one statement
+1. **Split invariant (no cross-statement leak).** `TABLE_BY_STATEMENT` is the sole
+   router: `PL→dim_pl_structure`, `BS→dim_bs_structure`, `CF→dim_cf_structure`. A
+   placement's `statement` alone picks the table; a CF position therefore can
+   **never** land in the Income Statement.
+2. **Leaf only, counted once.** Every placement is one `row_type='mapping'` leaf.
+   A leaf is summed into exactly one section and into the running-sum subtotals
+   *below* its anchor position — so it flows into exactly one statement total and
+   is counted exactly once (never double-counted, never dropped once placed).
+3. **Reader-faithful markers.** A physically-inserted row is filtered back out by
+   the reader unless it carries that reader's statement marker, so placement stamps
+   them: PL `line_code` has no `BS_`/`CF_` prefix and `sort_order < 1000`; BS uses a
+   `BS_` prefix (or `sort_order ≥ 1000`) plus `kpi_code` `BS:asset`/`BS:credit` for
+   the sign section; CF uses a `CF_` prefix + `kpi_code CF:detail`.
+4. **Ordering.** The new leaf is inserted directly after the user-chosen anchor
+   (`after_line_code`), shifting later rows `+1` top-down (collision-free) when no
+   gap exists; otherwise it appends at the section end. The PL `sort_order < 1000`
+   ceiling is guarded (422 if the band is full).
+5. **Idempotent.** A placement whose `line_code` (or identical `level_2/3/4 +
+   gl_account_id` mapping) already exists is **skipped**, never duplicated — so a
+   re-run inserts zero and a batch is internally idempotent.
+
+### No-drop / no-double-count proof
+- *No double-count:* before placement the position matched no mapping row, so it
+  contributed only to `unmapped_total`. After placement it matches exactly one new
+  leaf (idempotency prevents two leaves for the same path) and leaves the residual
+  bucket — Σ presented is unchanged, it just moves from "unmapped" to a named line.
+- *No drop:* placement never deletes or edits existing rows (only inserts + a
+  pure `sort_order` shift), so every previously-classified position is untouched.
+
+### Golden-safety (no-unknown-positions = no-op)
+Detect is read-only. On a fresh project (`dim_gl_account` empty) or a legacy DB
+(split structure tables absent) it returns `structure_available=false` / zero
+positions, and the wizard step **auto-passes** without ever calling extend — so an
+existing project with no unknown positions behaves exactly as before. The `0032`
+provenance column is additive with `DEFAULT 'seed'` and is not in any reader's
+`SELECT` list, so it is invisible to presentation.

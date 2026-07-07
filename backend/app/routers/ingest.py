@@ -89,6 +89,7 @@ from etl.bs_pl_master import (
     read_bs_pl_master,
 )
 from etl.mapping_account import AccountMappingProfile, REQUIRED_FIELDS as _AM_REQUIRED, account_profile_from_dict, apply_account_mapping
+from app.services import structure_autoextend as _autoextend
 
 logger = logging.getLogger(__name__)
 
@@ -3124,6 +3125,141 @@ def mapping_apply_library(
         resolved_keys=len(rows),
         unresolved=unresolved,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 (decision 2) — auto-extension of the statement structure
+# --------------------------------------------------------------------------- #
+# Detect CoA positions that classify nowhere in the (correct per-statement)
+# structure, then let the Project-Setup wizard place them before commit. See
+# app/services/structure_autoextend.py + docs/financial-logic.md "Phase 5".
+
+
+class StructureUnknownRequest(BaseModel):
+    project_id: str = "default"
+    fiscal_years: list[int] = Field(default_factory=list)
+    entity_prefixes: list[str] = Field(default_factory=list)
+    # Optional: restrict to accounts present in the uploaded GL file.
+    account_number_groups: list[str] = Field(default_factory=list)
+
+
+class UnknownPositionAccountOut(BaseModel):
+    gl_account_id: str
+    account_name: str | None = None
+    account_number_group: str
+
+
+class UnknownPositionOut(BaseModel):
+    id: str
+    statement: str            # 'PL' | 'BS' | 'UNKNOWN' (suggested from level_0)
+    level_1: str | None = None
+    level_2: str | None = None
+    level_3: str | None = None
+    level_4: str | None = None
+    account_count: int
+    accounts: list[UnknownPositionAccountOut] = Field(default_factory=list)
+    suggested_statement: str  # 'PL' | 'BS'
+    suggested_parent_line_code: str | None = None
+    suggested_after_line_code: str | None = None
+    suggested_sort_order: int | None = None
+
+
+class StructureUnknownResponse(BaseModel):
+    positions: list[UnknownPositionOut] = Field(default_factory=list)
+    total: int = 0
+    counts_by_statement: dict[str, int] = Field(default_factory=dict)
+    # False when the split structure tables are absent (legacy DB) → wizard step
+    # auto-passes (golden-safety: no structure to extend).
+    structure_available: bool = True
+
+
+class StructurePlacement(BaseModel):
+    statement: Literal["PL", "BS", "CF"]
+    level_2: str | None = None
+    level_3: str | None = None
+    level_4: str | None = None
+    row_type: str = "mapping"
+    balance_title: str | None = None
+    line_code: str | None = None
+    after_line_code: str | None = None
+    gl_account_id: str | None = None
+    section: Literal["asset", "credit"] | None = None
+
+
+class StructureExtendRequest(BaseModel):
+    project_id: str = "default"
+    placements: list[StructurePlacement] = Field(..., min_length=1)
+
+
+class StructureExtendResponse(BaseModel):
+    inserted: list[str] = Field(default_factory=list)
+    skipped: list[str] = Field(default_factory=list)
+    table_counts: dict[str, int] = Field(default_factory=dict)
+
+
+@router.post("/structure/unknown-positions", response_model=StructureUnknownResponse)
+def structure_unknown_positions(
+    body: StructureUnknownRequest,
+    session: Session = Depends(get_session),
+    _user: User = Depends(current_user),
+) -> StructureUnknownResponse:
+    """Positions in the committed CoA that resolve to NO structure row.
+
+    Read-only.  On a fresh project (no ``dim_gl_account`` rows yet) or a legacy DB
+    (no split structure tables) this returns zero positions so the wizard step
+    auto-passes — golden-safety."""
+    struct_by_stmt = {
+        stmt: _autoextend.load_structure_rows(session, stmt)
+        for stmt in ("PL", "BS", "CF")
+    }
+    structure_available = any(struct_by_stmt[s] for s in ("PL", "BS", "CF"))
+
+    accounts = _autoextend.load_coa_accounts(
+        session,
+        fiscal_years=body.fiscal_years or None,
+        entity_prefixes=body.entity_prefixes or None,
+        account_number_groups=body.account_number_groups or None,
+    )
+    positions = _autoextend.detect_unknown_positions(accounts, struct_by_stmt)
+
+    counts: dict[str, int] = {}
+    for p in positions:
+        counts[p["statement"]] = counts.get(p["statement"], 0) + 1
+
+    return StructureUnknownResponse(
+        positions=[UnknownPositionOut(**p) for p in positions],
+        total=len(positions),
+        counts_by_statement=counts,
+        structure_available=structure_available,
+    )
+
+
+@router.post("/structure/extend", response_model=StructureExtendResponse)
+def structure_extend(
+    body: StructureExtendRequest,
+    session: Session = Depends(get_session),
+    _admin: User = Depends(require_admin),
+) -> StructureExtendResponse:
+    """Insert user placements as mapping leaves into the correct structure table.
+
+    The target table is chosen by ``statement`` alone (PL→dim_pl_structure,
+    BS→dim_bs_structure, CF→dim_cf_structure) so the split invariant holds — a CF
+    position can never land in the Income Statement.  Idempotent."""
+    placements = [p.model_dump() for p in body.placements]
+    try:
+        result = _autoextend.extend_structure(session, placements)
+    except _autoextend.PlacementError as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover — defensive
+        session.rollback()
+        logger.error("structure_extend failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=500,
+            detail="Extending the statement structure failed; transaction rolled back.",
+        ) from exc
+    session.commit()
+    return StructureExtendResponse(**result)
 
 
 def _replicate_dim_across_entities(

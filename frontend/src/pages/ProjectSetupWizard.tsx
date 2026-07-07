@@ -60,6 +60,7 @@ import {
 } from '../components/ingest/glFormatGroups'
 import GlFormatAssignmentStep from '../components/ingest/GlFormatAssignmentStep'
 import CoaMappingAssignmentStep from '../components/ingest/CoaMappingAssignmentStep'
+import StatementStructureStep from '../components/ingest/StatementStructureStep'
 import PerEntityPager from '../components/ingest/PerEntityPager'
 import { glFiscalYearLabel } from '../lib/fiscalYear'
 import {
@@ -706,7 +707,8 @@ const WIZARD_STEPS = [
   'Opening balances',       // 4
   'Partner master',         // 5
   'Additional information', // 6 — optional FTE/personnel-cost provisioning
-  'Review & Finish',        // 7 (was 6)
+  'Statement structure',    // 7 — unknown CoA position classification
+  'Review & Finish',        // 8
 ] as const
 
 /** Preset metric options for FTE Development — exact string values from rasa/actions/fte_flow.py. */
@@ -4721,6 +4723,8 @@ export default function ProjectSetupWizard() {
   const [loading, setLoading] = useState(true)
   /** Mirrors data_reset_allowed from GET /projects/{id}. Only true on non-live stacks. */
   const [dataResetAllowed, setDataResetAllowed] = useState(false)
+  /** True once the Statement Structure step has resolved (auto-pass or explicit apply). */
+  const [structureResolved, setStructureResolved] = useState(false)
 
   const totalSteps = WIZARD_STEPS.length
 
@@ -4927,6 +4931,8 @@ export default function ProjectSetupWizard() {
       const hasPayrollMapping = Object.keys(payrollMapping).length > 0
       return !(hasFteMapping && hasPayrollMapping)
     }
+    // Step 7 (Statement structure): blocked until the step self-resolves (auto-pass or explicit apply).
+    if (step === 7) return !structureResolved
     return false
   }
 
@@ -5739,10 +5745,18 @@ export default function ProjectSetupWizard() {
               dispatch={dispatch}
             />
           )}
-          {step === 7 && !finishStarted && (
+          {step === 7 && (
+            <StatementStructureStep
+              projectId={PROJECT_ID}
+              fiscalYears={state.gl.years}
+              entityPrefixes={state.entities.filter(e => e.code.trim()).map(e => e.prefix || e.code)}
+              onResolvedChange={setStructureResolved}
+            />
+          )}
+          {step === 8 && !finishStarted && (
             <StepReview state={state} onRunSetup={handleRunSetup} />
           )}
-          {step === 7 && finishStarted && (
+          {step === 8 && finishStarted && (
             <FinishPanel
               steps={commitSteps}
               done={finishDone}
@@ -5757,7 +5771,7 @@ export default function ProjectSetupWizard() {
         </div>
 
         {/* Navigation — hide Back/Next while finish is running or done */}
-        {!(step === 7 && finishStarted) && (
+        {!(step === 8 && finishStarted) && (
           <NavButtons
             step={step}
             totalSteps={totalSteps}

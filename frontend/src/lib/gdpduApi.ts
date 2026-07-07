@@ -2491,3 +2491,114 @@ export async function commitOpos(
   if (!res.ok) await throwApiError(res);
   return res.json() as Promise<OposCommitResponse>;
 }
+
+// ---------------------------------------------------------------------------
+// Statement Structure — detect unknown CoA positions and extend structure
+// (Phase 5 — Project Setup Wizard "Statement structure" step)
+// ---------------------------------------------------------------------------
+
+/** One GL account referenced by an unknown position. */
+export interface UnknownPositionAccount {
+  gl_account_id: string;
+  account_name: string | null;
+  account_number_group: string;
+}
+
+/**
+ * One CoA position that doesn't resolve to any row in the L1–L4 PL/BS/CF
+ * structure.  Returned by POST /api/v1/ingest/structure/unknown-positions.
+ */
+export interface UnknownPosition {
+  /** Stable key used for the placements[] lookup. */
+  id: string;
+  statement: "PL" | "BS" | "UNKNOWN";
+  level_1: string | null;
+  level_2: string | null;
+  level_3: string | null;
+  level_4: string | null;
+  account_count: number;
+  accounts: UnknownPositionAccount[];
+  suggested_statement: "PL" | "BS";
+  suggested_parent_line_code: string | null;
+  suggested_after_line_code: string | null;
+  suggested_sort_order: number | null;
+}
+
+/** Full response from POST /api/v1/ingest/structure/unknown-positions. */
+export interface StructureUnknownResponse {
+  positions: UnknownPosition[];
+  total: number;
+  counts_by_statement: Record<string, number>;
+  /**
+   * false on a legacy DB that has no structure tables yet — treat as zero
+   * unknowns and auto-pass the wizard step.
+   */
+  structure_available: boolean;
+}
+
+/**
+ * One placement sent to POST /api/v1/ingest/structure/extend.
+ * Determines which structure table receives the new row.
+ */
+export interface StructurePlacement {
+  /** REQUIRED — determines the target table (PL / BS / CF). */
+  statement: "PL" | "BS" | "CF";
+  level_2: string | null;
+  level_3: string | null;
+  level_4: string | null;
+  /** Only "mapping" is supported. */
+  row_type: "mapping";
+  /** Display label; backend derives one from the level path when omitted. */
+  balance_title?: string;
+  /** Optional; backend generates a line_code when omitted. */
+  line_code?: string;
+  /** Anchor for sort order — carry from detected suggested_after_line_code. */
+  after_line_code?: string | null;
+  gl_account_id?: string | null;
+  /** BS only: which side of the balance sheet. */
+  section?: "asset" | "credit";
+}
+
+/** Response from POST /api/v1/ingest/structure/extend. */
+export interface StructureExtendResponse {
+  inserted: string[];
+  skipped: string[];
+  table_counts: Record<string, number>;
+}
+
+/**
+ * POST /api/v1/ingest/structure/unknown-positions
+ * Returns CoA positions that do not resolve to any row in the L1–L4 statement
+ * structure.  Call with the wizard's project_id, fiscal_years, and entity prefixes.
+ */
+export async function detectUnknownPositions(payload: {
+  project_id: string;
+  fiscal_years: number[];
+  entity_prefixes: string[];
+}): Promise<StructureUnknownResponse> {
+  const res = await apiFetch("/api/v1/ingest/structure/unknown-positions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<StructureUnknownResponse>;
+}
+
+/**
+ * POST /api/v1/ingest/structure/extend
+ * Insert unknown CoA positions into the PL / BS / CF structure tables.
+ * Admin-only.  Idempotent — duplicates are returned in skipped[].
+ */
+export async function extendStructure(payload: {
+  project_id: string;
+  placements: StructurePlacement[];
+}): Promise<StructureExtendResponse> {
+  const res = await apiFetch("/api/v1/ingest/structure/extend", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<StructureExtendResponse>;
+}
