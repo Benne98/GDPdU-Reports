@@ -94,11 +94,11 @@ function CurrentLabel({ x = 0, y = 0, width = 0, value = 0, index = 0, data }: a
   const cx = x + width / 2
   return (
     <g>
-      <text x={cx} y={y - (hasD ? 20 : 8)} textAnchor="middle" fontSize={10} fontWeight="600" fill="#111827">
+      <text x={cx} y={y - (hasD ? 20 : 8)} textAnchor="middle" fontSize={11} fontWeight="600" fill="#111827">
         {kv}
       </text>
       {hasD && (
-        <text x={cx} y={y - 7} textAnchor="middle" fontSize={10} fill={dColor}>
+        <text x={cx} y={y - 7} textAnchor="middle" fontSize={11} fill={dColor}>
           {fmtPct(delta)}
         </text>
       )}
@@ -313,7 +313,7 @@ export default function L4TrendChart({
           </div>
         )}
         {!loading && chartData.length > 0 && (
-          <ResponsiveContainer width="100%" height={235}>
+          <ResponsiveContainer width="100%" height={260}>
             <BarChart
               data={chartData}
               margin={{ top: 34, right: 8, left: 0, bottom: 0 }}
@@ -324,14 +324,14 @@ export default function L4TrendChart({
               <CartesianGrid vertical={false} stroke="#F1F5F9" />
               <XAxis
                 dataKey="label"
-                tick={{ fontSize: 11, fill: '#94A3B8' }}
+                tick={{ fontSize: 12, fill: '#94A3B8' }}
                 axisLine={false}
                 tickLine={false}
                 interval={grain === 'month' ? 4 : 0}
               />
               <YAxis
                 tickFormatter={yFmt}
-                tick={{ fontSize: 11, fill: '#94A3B8' }}
+                tick={{ fontSize: 12, fill: '#94A3B8' }}
                 axisLine={false}
                 tickLine={false}
                 width={48}

@@ -110,7 +110,7 @@ function ColumnFilterMenu<T>({
         <div className="py-1 border-b" style={{ borderColor: '#F1F5F9' }}>
           <button
             type="button"
-            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] hover:bg-slate-50"
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-slate-50"
             style={{ color: sort?.id === col.id && sort.dir === 'asc' ? '#1E3A5F' : '#334155' }}
             onClick={() => { onSort('asc'); onClose() }}
           >
@@ -119,7 +119,7 @@ function ColumnFilterMenu<T>({
           </button>
           <button
             type="button"
-            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] hover:bg-slate-50"
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-slate-50"
             style={{ color: sort?.id === col.id && sort.dir === 'desc' ? '#1E3A5F' : '#334155' }}
             onClick={() => { onSort('desc'); onClose() }}
           >
@@ -137,7 +137,7 @@ function ColumnFilterMenu<T>({
               value={optionSearch}
               onChange={e => onOptionSearchChange(e.target.value)}
               placeholder={col.textPlaceholder ?? 'Search values…'}
-              className="w-full rounded border px-2 py-1 text-[11px]"
+              className="w-full rounded border px-2 py-1 text-[12px]"
               style={{ borderColor: '#E2E8F0', color: '#334155' }}
               autoFocus
             />
@@ -150,12 +150,12 @@ function ColumnFilterMenu<T>({
                 onChange={e => onSelectAll(e.target.checked)}
                 className="shrink-0"
               />
-              <span className="text-[11px] font-medium" style={{ color: '#64748B' }}>
+              <span className="text-[12px] font-medium" style={{ color: '#64748B' }}>
                 (Select all)
               </span>
             </label>
             {visibleOptions.length === 0 ? (
-              <p className="px-3 py-2 text-[11px]" style={{ color: '#94A3B8' }}>No values</p>
+              <p className="px-3 py-2 text-[12px]" style={{ color: '#94A3B8' }}>No values</p>
             ) : (
               visibleOptions.map(opt => (
                 <label
@@ -168,7 +168,7 @@ function ColumnFilterMenu<T>({
                     onChange={() => onToggleValue(opt)}
                     className="shrink-0"
                   />
-                  <span className="text-[11px] truncate" title={opt} style={{ color: '#334155' }}>
+                  <span className="text-[12px] truncate" title={opt} style={{ color: '#334155' }}>
                     {opt || '(Blank)'}
                   </span>
                 </label>
@@ -181,7 +181,7 @@ function ColumnFilterMenu<T>({
       <div className="py-1 border-t" style={{ borderColor: '#F1F5F9' }}>
         <button
           type="button"
-          className="w-full px-3 py-1.5 text-[11px] text-left hover:bg-slate-50 disabled:opacity-40"
+          className="w-full px-3 py-1.5 text-[12px] text-left hover:bg-slate-50 disabled:opacity-40"
           style={{ color: '#64748B' }}
           disabled={filters.select[col.id] === undefined && !filters.text[col.id]?.trim()}
           onClick={() => { onClearColumn(); onClose() }}

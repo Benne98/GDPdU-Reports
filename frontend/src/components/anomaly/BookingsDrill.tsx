@@ -45,7 +45,7 @@ function BookingTooltip({ active, payload }: { active?: boolean; payload?: Array
   const p = payload[0].payload
   return (
     <div
-      className="rounded-lg px-3 py-2 text-[11px] leading-snug shadow-lg"
+      className="rounded-lg px-3 py-2 text-[12px] leading-snug shadow-lg"
       style={{ background: '#1E293B', color: '#F1F5F9', maxWidth: 260, pointerEvents: 'none' }}
     >
       <p className="font-semibold mb-0.5">{p.date}</p>
@@ -108,22 +108,22 @@ export default function BookingsDrill({ accountNumberGroup, accountLabel }: Prop
           <p className="text-xs font-semibold mb-2" style={{ color: '#475569' }}>
             Bookings scatter ({bookings.length} entries) — amber = large booking
           </p>
-          <ResponsiveContainer width="100%" height={200}>
+          <ResponsiveContainer width="100%" height={220}>
             <ScatterChart margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" />
               <XAxis
                 dataKey="x"
                 type="number"
                 name="Index"
-                tick={{ fontSize: 10, fill: '#94A3B8' }}
+                tick={{ fontSize: 11, fill: '#94A3B8' }}
                 tickFormatter={v => String(v + 1)}
-                label={{ value: 'Booking #', position: 'insideBottom', offset: -2, fontSize: 9, fill: '#94A3B8' }}
+                label={{ value: 'Booking #', position: 'insideBottom', offset: -2, fontSize: 10, fill: '#94A3B8' }}
               />
               <YAxis
                 dataKey="y"
                 type="number"
                 name="Amount"
-                tick={{ fontSize: 10, fill: '#94A3B8' }}
+                tick={{ fontSize: 11, fill: '#94A3B8' }}
                 unit=" k"
                 width={52}
               />

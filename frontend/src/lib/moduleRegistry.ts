@@ -64,7 +64,7 @@ export const MODULES: Module[] = [
     description: 'Plan BS/PL positions per Debtor / Creditor.',
     icon: CalendarRange,
     path: '/budget',
-    group: 'main',
+    group: 'settings',
     adminOnly: true,
     pageKey: undefined,
   },

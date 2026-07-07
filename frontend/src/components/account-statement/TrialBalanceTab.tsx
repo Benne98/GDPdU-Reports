@@ -154,7 +154,7 @@ export default function TrialBalanceTab() {
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           <label className="block space-y-1">
-            <span className="text-[11px] font-medium text-slate-500">Entity</span>
+            <span className="text-[12px] font-medium text-slate-500">Entity</span>
             <select className={selectClass} value={entity} onChange={e => setEntity(e.target.value)}>
               <option value={ALL}>All</option>
               {entities.map(e => (
@@ -165,7 +165,7 @@ export default function TrialBalanceTab() {
             </select>
           </label>
           <label className="block space-y-1">
-            <span className="text-[11px] font-medium text-slate-500">Anchor year</span>
+            <span className="text-[12px] font-medium text-slate-500">Anchor year</span>
             <input
               type="number"
               className={selectClass}
@@ -176,7 +176,7 @@ export default function TrialBalanceTab() {
             />
           </label>
           <label className="block space-y-1">
-            <span className="text-[11px] font-medium text-slate-500">Anchor month</span>
+            <span className="text-[12px] font-medium text-slate-500">Anchor month</span>
             <select className={selectClass} value={month} onChange={e => setMonth(Number(e.target.value))}>
               {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
                 <option key={m} value={m}>
@@ -294,7 +294,7 @@ export default function TrialBalanceTab() {
           </table>
         </div>
         {activeSheet && activeSheet.rows.length > 500 && (
-          <p className="px-5 py-3 text-[11px] text-slate-400 border-t border-slate-100">
+          <p className="px-5 py-3 text-[12px] text-slate-400 border-t border-slate-100">
             Preview limited to 500 rows. Export includes all{' '}
             {activeSheet.row_count.toLocaleString('en-US')} accounts.
           </p>

@@ -208,7 +208,7 @@ export default function SalesChurnBridge({
             <div className="grid min-w-0" style={{ gridTemplateColumns: gridTemplate }}>
               <div aria-hidden />
               <div className="min-w-0" style={{ gridColumn: '2 / -1' }}>
-                <ResponsiveContainer width="100%" height={250}>
+                <ResponsiveContainer width="100%" height={275}>
                   <ComposedChart
                     data={entries}
                     margin={{ top: 18, right: 8, left: 0, bottom: 4 }}
@@ -219,14 +219,14 @@ export default function SalesChurnBridge({
                     <CartesianGrid vertical={false} strokeDasharray="3 3" stroke="#F1F5F9" />
                     <XAxis
                       dataKey="name"
-                      tick={{ fontSize: 10, fill: '#64748B' }}
+                      tick={{ fontSize: 11, fill: '#64748B' }}
                       axisLine={false}
                       tickLine={false}
                       interval={0}
                     />
                     <YAxis
                       tickFormatter={v => fmtChartKpi(v)}
-                      tick={{ fontSize: 11, fill: '#94A3B8' }}
+                      tick={{ fontSize: 12, fill: '#94A3B8' }}
                       axisLine={false}
                       tickLine={false}
                       width={48}
@@ -246,7 +246,7 @@ export default function SalesChurnBridge({
                           if (e?.isTotal) return fmtChartKpi(v)
                           return (v >= 0 ? '+' : '') + fmtChartKpi(v)
                         }}
-                        style={{ fontSize: 9, fill: '#475569' }}
+                        style={{ fontSize: 10, fill: '#475569' }}
                       />
                     </Bar>
                   </ComposedChart>

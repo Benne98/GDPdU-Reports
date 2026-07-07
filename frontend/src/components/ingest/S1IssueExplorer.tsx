@@ -482,7 +482,7 @@ function IssueGroupPanel({
                 onToggle={toggleLine}
                 onToggleAll={toggleAll}
               />
-              <p className="text-[11px] text-slate-500">
+              <p className="text-[12px] text-slate-500">
                 Source file columns as uploaded. Select rows to exclude from this import, then re-run
                 checks.
               </p>

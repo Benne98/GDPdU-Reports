@@ -237,10 +237,10 @@ export default function AccountStatementPage() {
 
   return (
     <AnalyticsPageShell bootReady={!loadingMeta} bootLoading={loadingMeta}>
-      <div className="mx-auto w-full max-w-[1680px] px-6 py-8 space-y-6">
+      <div className="mx-auto w-full max-w-[1920px] px-6 py-8 space-y-6">
         {/* Header */}
         <div>
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          <p className="text-[12px] font-semibold uppercase tracking-wider text-slate-400">
             Reporting
           </p>
           <h1 className="text-2xl font-semibold text-slate-900 mt-1">Export</h1>
@@ -310,7 +310,7 @@ export default function AccountStatementPage() {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">Entity</span>
+              <span className="text-[12px] font-medium text-slate-500">Entity</span>
               <select
                 className={selectClass}
                 value={draft.entity}
@@ -326,7 +326,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">Account type</span>
+              <span className="text-[12px] font-medium text-slate-500">Account type</span>
               <select
                 className={selectClass}
                 value={draft.statementType}
@@ -341,7 +341,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">P&amp;L / BS item</span>
+              <span className="text-[12px] font-medium text-slate-500">P&amp;L / BS item</span>
               <select
                 className={selectClass}
                 value={draft.plBsItem}
@@ -365,7 +365,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1 md:col-span-2">
-              <span className="text-[11px] font-medium text-slate-500">Account</span>
+              <span className="text-[12px] font-medium text-slate-500">Account</span>
               <select
                 className={selectClass}
                 value={draft.glAccountId}
@@ -381,7 +381,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">Booking number</span>
+              <span className="text-[12px] font-medium text-slate-500">Booking number</span>
               <input
                 type="text"
                 className={selectClass}
@@ -392,7 +392,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">Period from</span>
+              <span className="text-[12px] font-medium text-slate-500">Period from</span>
               <input
                 type="date"
                 className={selectClass}
@@ -404,7 +404,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1">
-              <span className="text-[11px] font-medium text-slate-500">Period to</span>
+              <span className="text-[12px] font-medium text-slate-500">Period to</span>
               <input
                 type="date"
                 className={selectClass}
@@ -416,7 +416,7 @@ export default function AccountStatementPage() {
             </label>
 
             <label className="block space-y-1 md:col-span-2">
-              <span className="text-[11px] font-medium text-slate-500">Booking text</span>
+              <span className="text-[12px] font-medium text-slate-500">Booking text</span>
               <div className="relative">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
@@ -448,7 +448,7 @@ export default function AccountStatementPage() {
               Reset
             </button>
             {meta?.date_min && meta?.date_max && (
-              <span className="text-[11px] text-slate-400">
+              <span className="text-[12px] text-slate-400">
                 Data range {fmtIsoToDe(meta.date_min.slice(0, 10))} – {fmtIsoToDe(meta.date_max.slice(0, 10))}
               </span>
             )}
@@ -567,7 +567,7 @@ export default function AccountStatementPage() {
 
           {(hasMore || rows.length > PAGE_SIZE) && (
             <div className="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50">
-              <span className="text-[11px] text-slate-400">
+              <span className="text-[12px] text-slate-400">
                 Showing {rows.length.toLocaleString('en-US')}
                 {totalCount != null ? ` / ${totalCount.toLocaleString('en-US')}` : ''} bookings
               </span>
@@ -587,7 +587,7 @@ export default function AccountStatementPage() {
           )}
         </section>
 
-        <p className="text-[11px] text-slate-400 text-right pb-2">
+        <p className="text-[12px] text-slate-400 text-right pb-2">
           Export · Finssentials © {new Date().getFullYear()}
         </p>
           </>

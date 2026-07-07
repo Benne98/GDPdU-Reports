@@ -78,7 +78,7 @@ export default function BridgeDimensionGroupAxis({
               y={labelY}
               textAnchor="middle"
               fill={CHART_TICK_STYLE.fill}
-              fontSize={10}
+              fontSize={11}
               fontWeight={600}
             >
               <title>{group.label}</title>

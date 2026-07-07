@@ -70,7 +70,7 @@ export default function DatasetSelector({ selection, onToggle }: DatasetSelector
                 <p className="text-sm font-semibold text-slate-800">{title}</p>
                 <p className="text-xs text-slate-500 mt-0.5">{description}</p>
                 {comingSoon && (
-                  <span className="mt-1.5 inline-block rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">
+                  <span className="mt-1.5 inline-block rounded-full bg-slate-100 px-2 py-0.5 text-[12px] font-medium text-slate-500">
                     Coming soon
                   </span>
                 )}

@@ -187,7 +187,7 @@ export default function SalesProfitMarginScatterChart({ data, dim, onDimChange, 
           <div className="flex flex-1 items-center justify-center text-xs" style={{ color: BRAND.textMuted }}>No data</div>
         ) : (
           <div className="flex-1 flex items-center w-full min-h-[280px]">
-            <div className="w-full h-[280px]">
+            <div className="w-full h-[308px]">
               <ResponsiveContainer width="100%" height="100%">
                 <ScatterChart margin={CHART_MARGIN}>
                   <CartesianGrid {...SALES_CHART_GRID_PROPS} />

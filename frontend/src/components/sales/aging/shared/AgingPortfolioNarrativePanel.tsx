@@ -27,7 +27,7 @@ export default function AgingPortfolioNarrativePanel({ narrative }: { narrative:
     <div className="flex flex-col gap-4">
       <div>
         <p
-          className="text-[11px] font-semibold uppercase tracking-wider mb-1.5"
+          className="text-[12px] font-semibold uppercase tracking-wider mb-1.5"
           style={{ color: '#94A3B8' }}
         >
           {narrative.eyebrow}
@@ -35,7 +35,7 @@ export default function AgingPortfolioNarrativePanel({ narrative }: { narrative:
         <h4 className="text-base font-semibold leading-snug mb-2" style={{ color: '#1E3A5F' }}>
           {narrative.headline}
         </h4>
-        <p className="text-[13px] leading-[1.65]" style={{ color: '#64748B' }}>
+        <p className="text-[14px] leading-[1.65]" style={{ color: '#64748B' }}>
           {narrative.summary}
         </p>
       </div>
@@ -60,11 +60,11 @@ export default function AgingPortfolioNarrativePanel({ narrative }: { narrative:
                 >
                   {s.chipLabel}
                 </span>
-                <p className="text-[13px] font-semibold leading-snug" style={{ color: '#1E3A5F' }}>
+                <p className="text-[14px] font-semibold leading-snug" style={{ color: '#1E3A5F' }}>
                   {insight.title}
                 </p>
               </div>
-              <p className="text-[13px] leading-[1.65]" style={{ color: '#64748B' }}>
+              <p className="text-[14px] leading-[1.65]" style={{ color: '#64748B' }}>
                 {insight.body}
               </p>
             </div>

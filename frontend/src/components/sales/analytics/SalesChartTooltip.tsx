@@ -54,7 +54,7 @@ export function SalesChartTooltipCard({ title, rows, footer }: Props) {
       </div>
       {footer && (
         <div
-          className="mt-2 pt-2 text-[11px]"
+          className="mt-2 pt-2 text-[12px]"
           style={{ borderTop: `1px solid ${BRAND.borderLight}`, color: BRAND.textMuted }}
         >
           {footer}

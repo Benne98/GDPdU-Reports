@@ -37,7 +37,7 @@ function PayrollValueLabel({ data }: { data: Row[] }) {
         const labelY = Number(y) + Number(height) / 2
         const delta = row.delta_pct
         return (
-          <text x={labelX} y={labelY} dominantBaseline="middle" fontSize={10} fontWeight={600}>
+          <text x={labelX} y={labelY} dominantBaseline="middle" fontSize={11} fontWeight={600}>
             <tspan fill="#111827">{fmtChartKpi(row.anchor)}</tspan>
             {delta != null && (
               <tspan fill={delta >= 0 ? '#16A34A' : '#DC2626'} dx={8}>
@@ -132,7 +132,7 @@ export default function PayrollByDimensionChart({
                 {...salesChartTooltipProps}
               />
               <Legend
-                wrapperStyle={{ fontSize: 11, paddingTop: 4 }}
+                wrapperStyle={{ fontSize: 12, paddingTop: 4 }}
                 formatter={value => <span style={{ color: BRAND.textSecondary }}>{value}</span>}
               />
               <Bar

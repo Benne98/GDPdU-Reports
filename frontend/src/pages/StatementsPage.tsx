@@ -575,7 +575,7 @@ export default function StatementsPage({
         loading={statementActive ? bootLoading : false}
         error={error}
       />
-      <div ref={pageContentRef} className="max-w-[1680px] mx-auto px-6 lg:px-8 py-8">
+      <div ref={pageContentRef} className="max-w-[1920px] mx-auto px-6 lg:px-8 py-8">
         <motion.div
           initial={{ opacity: 0, y: 16 }}
           animate={{ opacity: 1, y: 0 }}

@@ -44,7 +44,7 @@ export default function PlDetailAccountMultiples({ accounts, highlightPeriodLabe
                 <YAxis tick={{ fontSize: 7, fill: '#64748B' }} width={32} />
                 <Tooltip
                   formatter={(v: number) => [`€ ${v.toLocaleString('de-DE')}k`, 'Balance']}
-                  contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }}
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }}
                 />
                 <Bar dataKey="value_keur" radius={[3, 3, 0, 0]}>
                   {acc.series.map(p => (

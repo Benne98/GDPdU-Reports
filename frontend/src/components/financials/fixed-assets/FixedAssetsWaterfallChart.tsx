@@ -193,7 +193,7 @@ export default function FixedAssetsWaterfallChart({ bridges, loading, actions }:
                           x={Number(x) + Number(width) / 2}
                           y={Number(y) - 4}
                           textAnchor="middle"
-                          fontSize={9}
+                          fontSize={10}
                           fontWeight={600}
                           fill={barColor(p.barType)}
                         >

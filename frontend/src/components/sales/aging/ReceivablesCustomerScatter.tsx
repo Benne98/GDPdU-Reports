@@ -472,7 +472,7 @@ export default function ReceivablesCustomerScatter({
                     value: `${fmtChartKpi(midBalanceKeur)} kEUR`,
                     position: 'insideTopRight',
                     fill: BRAND.slateMuted,
-                    fontSize: 9,
+                    fontSize: 10,
                   }}
                 />
                 <ReferenceLine
@@ -484,7 +484,7 @@ export default function ReceivablesCustomerScatter({
                     value: `${midOverduePct.toFixed(0)}%`,
                     position: 'insideTopLeft',
                     fill: BRAND.slateMuted,
-                    fontSize: 9,
+                    fontSize: 10,
                   }}
                 />
 
@@ -492,7 +492,7 @@ export default function ReceivablesCustomerScatter({
                   type="number"
                   dataKey="balanceKeur"
                   domain={[0, maxBalanceKeur + xPad]}
-                  tick={{ fontSize: 10, fill: BRAND.slate }}
+                  tick={{ fontSize: 11, fill: BRAND.slate }}
                   tickLine={false}
                   axisLine={{ stroke: BRAND.border }}
                   tickFormatter={v => fmtChartKpi(Number(v))}
@@ -503,7 +503,7 @@ export default function ReceivablesCustomerScatter({
                       : 'Open trade receivables per customer (kEUR)'}
                     position="bottom"
                     offset={12}
-                    style={{ fontSize: 11, fontWeight: 600, fill: BRAND.textSecondary }}
+                    style={{ fontSize: 12, fontWeight: 600, fill: BRAND.textSecondary }}
                   />
                 </XAxis>
 
@@ -511,7 +511,7 @@ export default function ReceivablesCustomerScatter({
                   type="number"
                   dataKey="overdue_pct"
                   domain={[0, maxOverduePct + yPad]}
-                  tick={{ fontSize: 10, fill: BRAND.slate }}
+                  tick={{ fontSize: 11, fill: BRAND.slate }}
                   tickLine={false}
                   axisLine={{ stroke: BRAND.border }}
                   unit="%"
@@ -524,7 +524,7 @@ export default function ReceivablesCustomerScatter({
                     angle={-90}
                     position="left"
                     offset={12}
-                    style={{ fontSize: 11, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
+                    style={{ fontSize: 12, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
                   />
                 </YAxis>
 

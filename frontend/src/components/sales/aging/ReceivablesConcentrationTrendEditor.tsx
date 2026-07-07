@@ -56,7 +56,7 @@ export default function ReceivablesConcentrationTrendEditor({
                 key={opt.id}
                 type="button"
                 onClick={() => onChange({ agingBucket: opt.id as ConcentrationAgingBucketId })}
-                className={`${PL_TOOLBAR_BTN} w-full text-left px-2.5 py-1.5 text-[11px] rounded-lg`}
+                className={`${PL_TOOLBAR_BTN} w-full text-left px-2.5 py-1.5 text-[12px] rounded-lg`}
                 style={{
                   ...PL_TOOLBAR_BTN_STYLE,
                   background: active ? 'rgba(30,58,95,0.1)' : 'transparent',

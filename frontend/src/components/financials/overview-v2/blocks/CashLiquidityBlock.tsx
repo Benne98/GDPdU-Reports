@@ -325,7 +325,7 @@ function FindingChip({ finding }: { finding: Finding }) {
         style={{ color: accent, flexShrink: 0, marginTop: 2 }}
       />
       <p
-        className="flex-1 text-[11px] leading-snug"
+        className="flex-1 text-[12px] leading-snug"
         style={{ color: '#374151' }}
       >
         {finding.text}

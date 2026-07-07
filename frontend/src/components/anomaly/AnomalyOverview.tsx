@@ -44,12 +44,12 @@ function SparkLine({ data, threshold }: SparkLineProps) {
   }))
 
   return (
-    <div style={{ height: 120 }}>
+    <div style={{ height: 132 }}>
       <ResponsiveContainer width="100%" height="100%">
         <ComposedChart data={chartData} margin={{ top: 6, right: 6, bottom: 4, left: 4 }}>
           <XAxis
             dataKey="label"
-            tick={{ fontSize: 9, fill: '#94A3B8' }}
+            tick={{ fontSize: 10, fill: '#94A3B8' }}
             {...tickProps}
           />
           <YAxis hide />
@@ -61,9 +61,9 @@ function SparkLine({ data, threshold }: SparkLineProps) {
               return `${monthLabel}A`
             }}
             formatter={(v: number, name: string) => [`${(v).toFixed(1)} kEUR`, name]}
-            contentStyle={{ fontSize: 10, borderRadius: 6, border: '1px solid #E2E8F0' }}
+            contentStyle={{ fontSize: 11, borderRadius: 6, border: '1px solid #E2E8F0' }}
           />
-          <Legend wrapperStyle={{ fontSize: 9 }} />
+          <Legend wrapperStyle={{ fontSize: 10 }} />
           <Line
             type="monotone"
             dataKey="value"
@@ -110,7 +110,7 @@ function CardView({ card, threshold }: { card: AnomalyOverviewCard; threshold: n
     >
       {card.spark_series && card.spark_series.length > 0 && (
         <div className="mb-3">
-          <p className="text-[11px] mb-1" style={{ color: '#94A3B8' }}>Monthly trend</p>
+          <p className="text-[12px] mb-1" style={{ color: '#94A3B8' }}>Monthly trend</p>
           <SparkLine data={card.spark_series} threshold={threshold} />
         </div>
       )}
@@ -158,7 +158,7 @@ function Section({
       <div className="flex items-center gap-3 mb-4">
         <h2 className="text-base font-semibold" style={{ color: '#1E3A5F' }}>{title}</h2>
         <span
-          className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
+          className="rounded-full px-2 py-0.5 text-[12px] font-semibold"
           style={{ background: 'rgba(30,58,95,0.08)', color: '#1E3A5F' }}
         >
           {sectionCards.length}

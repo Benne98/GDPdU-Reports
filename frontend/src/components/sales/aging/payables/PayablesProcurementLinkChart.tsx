@@ -13,27 +13,27 @@ import { fmtAmount } from '../../../../lib/fmt'
 export default function PayablesProcurementLinkChart({ points }: { points: PayablesProcurementLinkPoint[] }) {
   if (!points.length) {
     return (
-      <div className="h-[240px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+      <div className="h-[264px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
         No procurement link data
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={240}>
+    <ResponsiveContainer width="100%" height={264}>
       <ComposedChart data={points} margin={{ top: 12, right: 48, left: 4, bottom: 8 }}>
         <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" vertical={false} />
-        <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#64748B' }} />
+        <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#64748B' }} />
         <YAxis
           yAxisId="left"
-          tick={{ fontSize: 10, fill: '#94A3B8' }}
+          tick={{ fontSize: 11, fill: '#94A3B8' }}
           tickFormatter={v => fmtAmount(Number(v))}
           width={52}
         />
         <YAxis
           yAxisId="right"
           orientation="right"
-          tick={{ fontSize: 10, fill: '#D97706' }}
+          tick={{ fontSize: 11, fill: '#D97706' }}
           unit="%"
           width={40}
         />

@@ -14,7 +14,7 @@ export const CHART_SCATTER_LABEL_FONT_FAMILY = "'Inter', system-ui, -apple-syste
 
 export const CHART_SCATTER_LABEL_STYLE = {
   fontFamily: CHART_SCATTER_LABEL_FONT_FAMILY,
-  fontSize: 10,
+  fontSize: 11,
   fontWeight: 500,
   fill: '#475569',
   letterSpacing: '0.01em',

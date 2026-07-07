@@ -505,7 +505,7 @@ export default function ForensicTab({ periodParams, entity }: Props) {
         <p className="text-xs font-medium" style={{ color: '#64748B' }}>
           No forensic findings for this period.
         </p>
-        <p className="text-[11px] mt-1" style={{ color: '#94A3B8' }}>
+        <p className="text-[12px] mt-1" style={{ color: '#94A3B8' }}>
           No unexpected counter-account pairs, material "other" positions, or suspicious booking
           texts detected.
         </p>
@@ -529,7 +529,7 @@ export default function ForensicTab({ periodParams, entity }: Props) {
           <span className="font-semibold" style={{ color: '#DC2626' }}>{totalFindings}</span>{' '}
           finding{totalFindings === 1 ? '' : 's'} across all three forensic checks
         </span>
-        <span className="ml-auto text-[11px]" style={{ color: '#94A3B8' }}>
+        <span className="ml-auto text-[12px]" style={{ color: '#94A3B8' }}>
           {data.period.label} · {data.entity}
         </span>
       </div>

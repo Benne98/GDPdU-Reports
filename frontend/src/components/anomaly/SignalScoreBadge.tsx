@@ -43,7 +43,7 @@ function InfoTooltipPortal({ anchorRef, visible }: { anchorRef: React.RefObject<
         color: '#F1F5F9',
         borderRadius: 8,
         padding: '8px 12px',
-        fontSize: 11,
+        fontSize: 12,
         lineHeight: '1.4',
         width: 240,
         pointerEvents: 'none',
@@ -78,7 +78,7 @@ export default function SignalScoreBadge({ score, band, size = 'md' }: Props) {
           ref={btnRef}
           type="button"
           className="rounded-full flex items-center justify-center"
-          style={{ width: 14, height: 14, background: 'rgba(100,116,139,0.15)', color: '#64748B', fontSize: 9, lineHeight: 1 }}
+          style={{ width: 14, height: 14, background: 'rgba(100,116,139,0.15)', color: '#64748B', fontSize: 10, lineHeight: 1 }}
           onMouseEnter={() => setTooltipVisible(true)}
           onMouseLeave={() => setTooltipVisible(false)}
           onFocus={() => setTooltipVisible(true)}

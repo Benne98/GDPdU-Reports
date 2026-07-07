@@ -316,34 +316,34 @@ function StatusPill({
   const isWarning = !check.passed && check.severity === "SOFT";
   if (check.passed) {
     return (
-      <span className="inline-flex rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
+      <span className="inline-flex rounded-full bg-emerald-100 px-2 py-0.5 text-[12px] font-medium text-emerald-800">
         Passed
       </span>
     );
   }
   if (isWarning && warningAction === "acknowledged") {
     return (
-      <span className="inline-flex rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700">
+      <span className="inline-flex rounded-full bg-slate-200 px-2 py-0.5 text-[12px] font-medium text-slate-700">
         Acknowledged
       </span>
     );
   }
   if (isWarning && warningAction === "ignored") {
     return (
-      <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">
+      <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[12px] font-medium text-slate-500">
         Ignored
       </span>
     );
   }
   if (isWarning) {
     return (
-      <span className="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800">
+      <span className="inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[12px] font-medium text-amber-800">
         Warning
       </span>
     );
   }
   return (
-    <span className="inline-flex rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-medium text-red-800">
+    <span className="inline-flex rounded-full bg-red-100 px-2 py-0.5 text-[12px] font-medium text-red-800">
       Must fix first
     </span>
   );

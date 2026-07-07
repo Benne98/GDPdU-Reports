@@ -11,7 +11,7 @@ function ValCell({ value, bold, highlighted }: { value: number; bold?: boolean; 
     <td
       className="px-2 py-1.5 text-right whitespace-nowrap tabular-nums"
       style={{
-        fontSize: '0.7rem',
+        fontSize: '0.8125rem',
         fontWeight: bold ? 600 : 400,
         background: highlighted ? 'rgba(30,58,95,0.06)' : undefined,
         color: '#111827',
@@ -38,7 +38,7 @@ function renderRow(
       <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '1px solid #E2E8F0' }}>
         <td
           colSpan={colSpan}
-          className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide"
+          className="px-3 py-1.5 text-[12px] font-bold uppercase tracking-wide"
           style={{ color: '#1E3A5F' }}
         >
           {row.label}
@@ -57,7 +57,7 @@ function renderRow(
       }}
     >
       <td
-        className="py-1.5 text-left whitespace-nowrap text-[11px]"
+        className="py-1.5 text-left whitespace-nowrap text-[12px]"
         style={{
           paddingLeft: 12 + depth * 14,
           paddingRight: 12,
@@ -123,7 +123,7 @@ export default function ErConsolidationTable({ data, loading }: ErConsolidationT
           </span>
           <div className="flex items-center gap-2 mt-1">
             <span
-              className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium"
+              className="inline-flex items-center px-2 py-0.5 rounded-full text-[12px] font-medium"
               style={{ background: 'rgba(30,58,95,0.08)', color: '#1E3A5F' }}
             >
               {data.col_label}
@@ -135,7 +135,7 @@ export default function ErConsolidationTable({ data, loading }: ErConsolidationT
         </div>
       </div>
 
-      <table className="w-full border-collapse text-[11px]">
+      <table className="w-full border-collapse text-[12px]">
         <thead>
           <tr
             style={{

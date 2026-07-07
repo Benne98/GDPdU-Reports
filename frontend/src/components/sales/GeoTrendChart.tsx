@@ -104,15 +104,15 @@ export default function GeoTrendChart({
     >
       <div className={SALES_CHART_BODY_CLASS}>
         {loading ? (
-          <div className="flex items-center justify-center h-[250px] text-xs" style={{ color: '#94A3B8' }}>
+          <div className="flex items-center justify-center h-[275px] text-xs" style={{ color: '#94A3B8' }}>
             Loading…
           </div>
         ) : !chartData.periods.length ? (
-          <div className="flex items-center justify-center h-[250px] text-xs" style={{ color: '#94A3B8' }}>
+          <div className="flex items-center justify-center h-[275px] text-xs" style={{ color: '#94A3B8' }}>
             No data
           </div>
         ) : (
-          <ResponsiveContainer width="100%" height={250}>
+          <ResponsiveContainer width="100%" height={275}>
             <BarChart data={chartData.periods} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
               <CartesianGrid {...SALES_CHART_GRID_PROPS} />
               <XAxis dataKey="label" tick={CHART_TICK_STYLE} axisLine={false} tickLine={false} />
@@ -128,7 +128,7 @@ export default function GeoTrendChart({
                 cursor={SALES_CHART_CURSOR}
                 {...salesChartTooltipProps}
               />
-              <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} iconType="square" iconSize={9} />
+              <Legend wrapperStyle={{ fontSize: 12, paddingTop: 8 }} iconType="square" iconSize={9} />
               {segments.map((seg, i) => (
                 <Bar
                   key={seg}

@@ -50,7 +50,7 @@ function TrendBarLabel({ metricId }: { metricId: string }) {
       dataKey="value"
       position="top"
       formatter={(v: number) => formatValue(metricId, v)}
-      style={{ fontSize: 10, fontWeight: 600, fill: '#111827' }}
+      style={{ fontSize: 11, fontWeight: 600, fill: '#111827' }}
     />
   )
 }
@@ -98,15 +98,15 @@ export default function PayrollFteTrendChart({
     >
       <div className={SALES_CHART_BODY_CLASS}>
         {loading ? (
-          <div className="flex items-center justify-center h-[280px] text-xs" style={{ color: BRAND.textMuted }}>
+          <div className="flex items-center justify-center h-[308px] text-xs" style={{ color: BRAND.textMuted }}>
             Loading…
           </div>
         ) : isEmpty ? (
-          <div className="flex items-center justify-center h-[280px] text-xs" style={{ color: BRAND.textMuted }}>
+          <div className="flex items-center justify-center h-[308px] text-xs" style={{ color: BRAND.textMuted }}>
             No trend data for this period — restart the API and reload.
           </div>
         ) : (
-          <ResponsiveContainer width="100%" height={280}>
+          <ResponsiveContainer width="100%" height={308}>
             <BarChart data={rows} margin={{ top: 24, right: 12, left: 4, bottom: 4 }} barGap={4} barCategoryGap="20%">
               <CartesianGrid {...SALES_CHART_GRID_PROPS} />
               <XAxis
@@ -149,7 +149,7 @@ export default function PayrollFteTrendChart({
                 {...salesChartTooltipProps}
               />
               <Legend
-                wrapperStyle={{ fontSize: 11, paddingTop: 4 }}
+                wrapperStyle={{ fontSize: 12, paddingTop: 4 }}
                 formatter={value => <span style={{ color: BRAND.textSecondary }}>{value}</span>}
               />
               <Bar

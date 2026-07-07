@@ -268,7 +268,7 @@ export default function TopEntityTable({
         </table>
       </div>
       {rows.length > limit && (
-        <div className="px-4 py-2 text-[11px]" style={{ color: '#94A3B8', borderTop: '1px solid #F1F5F9' }}>
+        <div className="px-4 py-2 text-[12px]" style={{ color: '#94A3B8', borderTop: '1px solid #F1F5F9' }}>
           Showing top {limit} of {rows.length} {kind}s by current-period sales · totals reflect all {rows.length}.
         </div>
       )}

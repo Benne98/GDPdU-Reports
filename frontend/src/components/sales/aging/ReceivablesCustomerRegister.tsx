@@ -18,7 +18,7 @@ function formatDocDate(iso: string | null): string {
 
 function DocumentLinesTable({ docs }: { docs: ReceivablesCustomerRegisterDocument[] }) {
   return (
-    <table className="w-full text-[11px]">
+    <table className="w-full text-[12px]">
       <thead>
         <tr>
           <th className="px-2 py-1.5 text-left font-semibold" style={{ color: BRAND.slate }}>Document</th>
@@ -100,7 +100,7 @@ function DocumentDetailPanel({
 
   if (loading) {
     return (
-      <p className="text-[11px] py-2 px-2" style={{ color: BRAND.textMuted }}>
+      <p className="text-[12px] py-2 px-2" style={{ color: BRAND.textMuted }}>
         Loading open documents…
       </p>
     )
@@ -108,7 +108,7 @@ function DocumentDetailPanel({
 
   if (error) {
     return (
-      <p className="text-[11px] py-2 px-2" style={{ color: '#D97706' }}>
+      <p className="text-[12px] py-2 px-2" style={{ color: '#D97706' }}>
         {error}
       </p>
     )
@@ -116,7 +116,7 @@ function DocumentDetailPanel({
 
   if (!docs.length) {
     return (
-      <p className="text-[11px] py-2 px-2" style={{ color: BRAND.textMuted }}>
+      <p className="text-[12px] py-2 px-2" style={{ color: BRAND.textMuted }}>
         No open document lines
       </p>
     )

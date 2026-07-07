@@ -286,7 +286,7 @@ export default function ErFlowTable({
     if (isTitle) {
       return (
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '1px solid #E2E8F0' }}>
-          <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide" style={{ color: '#1E3A5F' }}>
+          <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[12px] font-bold uppercase tracking-wide" style={{ color: '#1E3A5F' }}>
             {row.label}
           </td>
         </tr>
@@ -309,7 +309,7 @@ export default function ErFlowTable({
                 <ChevronRight size={14} style={{ transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }} />
               </button>
             ) : <span style={{ width: 22 }} />}
-            <span className="text-[11px]" style={{
+            <span className="text-[12px]" style={{
               fontWeight: row.is_bold || isSubtotal ? 600 : 500,
               fontStyle: isKpi ? 'italic' : undefined,
               color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
@@ -333,7 +333,7 @@ export default function ErFlowTable({
                   className="px-2.5 py-2 text-right whitespace-nowrap tabular-nums"
                   style={{
                     background: 'rgba(30,58,95,0.04)',
-                    fontSize: '0.7rem',
+                    fontSize: '0.8125rem',
                     fontWeight: row.is_bold && !isKpi ? 600 : 400,
                     color: cagr == null || cagr === 0 ? '#94A3B8' : cagr > 0 ? '#10B981' : '#DC2626',
                     fontStyle: 'italic',
@@ -403,7 +403,7 @@ export default function ErFlowTable({
         kpiHeaderInserted = true
         nodes.push(
           <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[11px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
+            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
               KPIs — as % of total output
             </td>
           </tr>,
@@ -414,7 +414,7 @@ export default function ErFlowTable({
         kpiHeaderInserted = true
         nodes.push(
           <tr key="er-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[11px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
+            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
               KPIs — as % of total output
             </td>
           </tr>,
@@ -538,7 +538,7 @@ export default function ErFlowTable({
           fy3Label={fy3BaseLabel}
         />
       ) : (
-        <table className="w-full border-collapse text-[11px]">
+        <table className="w-full border-collapse text-[12px]">
           <thead>
             <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
               <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>

@@ -175,7 +175,7 @@ function AlertChip({ alert }: { alert: OverviewSummaryAlert }) {
     >
       <AlertTriangle size={11} aria-hidden style={{ color: accent, flexShrink: 0, marginTop: 2 }} />
       <div className="flex-1 min-w-0">
-        <p className="text-[11px] leading-snug" style={{ color: '#374151' }}>
+        <p className="text-[12px] leading-snug" style={{ color: '#374151' }}>
           {text}
         </p>
         <span className="text-[9px] font-medium" style={{ color: accent }}>

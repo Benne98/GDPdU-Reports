@@ -139,7 +139,7 @@ export default function WorldMap({
           >
             <span
               className="font-bold text-xs w-5 h-5 flex items-center justify-center rounded-full shrink-0"
-              style={{ background: '#1E3A5F', color: '#FFFFFF', fontSize: 9 }}
+              style={{ background: '#1E3A5F', color: '#FFFFFF', fontSize: 10 }}
             >
               {i + 1}
             </span>
@@ -183,14 +183,14 @@ export default function WorldMap({
           <XAxis
             type="number"
             tickFormatter={v => fmtChartKpi(v)}
-            tick={{ fontSize: 10, fill: '#94A3B8' }}
+            tick={{ fontSize: 11, fill: '#94A3B8' }}
             axisLine={false} tickLine={false}
           />
           <YAxis
             type="category"
             dataKey="country"
             width={100}
-            tick={{ fontSize: 11, fill: '#475569' }}
+            tick={{ fontSize: 12, fill: '#475569' }}
             axisLine={false} tickLine={false}
           />
           <Tooltip
@@ -216,7 +216,7 @@ export default function WorldMap({
             label={{
               position: 'right',
               formatter: (v: number) => fmtChartKpi(v),
-              style: { fontSize: 10, fill: '#64748B' },
+              style: { fontSize: 11, fill: '#64748B' },
             }}
           >
             {visible.map((entry, i) => (

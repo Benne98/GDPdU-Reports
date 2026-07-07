@@ -334,7 +334,7 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
 
       {/* DRAFT notice */}
       <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-        <span className="shrink-0 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-amber-700">
+        <span className="shrink-0 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[12px] font-semibold uppercase tracking-wide text-amber-700">
           Draft
         </span>
         <p className="text-sm text-amber-900">

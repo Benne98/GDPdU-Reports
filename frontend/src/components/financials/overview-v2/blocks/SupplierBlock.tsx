@@ -133,7 +133,7 @@ function FindingChip({
     >
       <Info size={11} aria-hidden style={{ color: iconColor, flexShrink: 0 }} />
       <p
-        className="flex-1 text-[11px] leading-snug"
+        className="flex-1 text-[12px] leading-snug"
         style={{ color: '#374151' }}
       >
         {text}
@@ -263,7 +263,7 @@ export default function SupplierBlock({ suppliers, loading, error }: Props) {
                     #{row.rank}
                   </span>
                   <span
-                    className="text-[11px] truncate shrink-0"
+                    className="text-[12px] truncate shrink-0"
                     style={{ color: '#374151', width: '5.5rem' }}
                     title={name}
                   >
@@ -284,7 +284,7 @@ export default function SupplierBlock({ suppliers, loading, error }: Props) {
                     />
                   </div>
                   <span
-                    className="text-[11px] tabular-nums shrink-0 text-right"
+                    className="text-[12px] tabular-nums shrink-0 text-right"
                     style={{ color: '#374151', minWidth: '3.5rem' }}
                   >
                     {fmtK(row.cost_ytd_keur)}

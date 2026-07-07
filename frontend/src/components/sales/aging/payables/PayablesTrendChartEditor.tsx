@@ -62,7 +62,7 @@ export default function PayablesTrendChartEditor({
                 key={opt.id}
                 type="button"
                 onClick={() => onChange({ ...config, grain: opt.id })}
-                className={`${PL_TOOLBAR_BTN} px-2.5 py-1 text-[11px] rounded-lg`}
+                className={`${PL_TOOLBAR_BTN} px-2.5 py-1 text-[12px] rounded-lg`}
                 style={{
                   ...PL_TOOLBAR_BTN_STYLE,
                   background: active ? 'rgba(30,58,95,0.1)' : 'transparent',
@@ -86,7 +86,7 @@ export default function PayablesTrendChartEditor({
                 key={opt.value}
                 type="button"
                 onClick={() => onChange({ ...config, periodsBack: opt.value })}
-                className={`${PL_TOOLBAR_BTN} px-2.5 py-1 text-[11px] rounded-lg`}
+                className={`${PL_TOOLBAR_BTN} px-2.5 py-1 text-[12px] rounded-lg`}
                 style={{
                   ...PL_TOOLBAR_BTN_STYLE,
                   background: active ? 'rgba(30,58,95,0.1)' : 'transparent',

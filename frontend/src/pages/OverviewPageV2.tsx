@@ -175,7 +175,7 @@ export default function OverviewPageV2() {
         submessage="Briefing and analysis blocks loading."
       >
         <ChartLoadReporter chartId="overview-page" loading={!periodReady} error={bootError} />
-        <div ref={pageContentRef} className="mx-auto w-full max-w-[1680px] px-6 py-8">
+        <div ref={pageContentRef} className="mx-auto w-full max-w-[1920px] px-6 py-8">
 
           {/* Page header */}
           <motion.div

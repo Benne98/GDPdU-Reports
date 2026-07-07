@@ -143,7 +143,7 @@ export default function SalesMetricDimensionBridgeChart({
         </div>
       )}
     >
-      <p className="text-[11px] -mt-1 mb-1 px-1" style={{ color: BRAND.textMuted }}>
+      <p className="text-[12px] -mt-1 mb-1 px-1" style={{ color: BRAND.textMuted }}>
         {rangeFrom} → {rangeTo}
         {data?.period_grain === 'week' ? ' · last 3 weeks' : ' · last 3 months'}
       </p>
@@ -159,7 +159,7 @@ export default function SalesMetricDimensionBridgeChart({
             No data
           </div>
         ) : (
-          <ResponsiveContainer width="100%" height={320}>
+          <ResponsiveContainer width="100%" height={352}>
             <ComposedChart
               data={entries}
               margin={{ top: 22, right: 12, left: 4, bottom: 4 }}
@@ -201,7 +201,7 @@ export default function SalesMetricDimensionBridgeChart({
                     if (e.isTotal) return fmtChartKpi(v)
                     return (v >= 0 ? '+' : '') + fmtChartKpi(v)
                   }}
-                  style={{ fontSize: 11, fill: BRAND.textSecondary, fontWeight: 600 }}
+                  style={{ fontSize: 12, fill: BRAND.textSecondary, fontWeight: 600 }}
                 />
               </Bar>
             </ComposedChart>

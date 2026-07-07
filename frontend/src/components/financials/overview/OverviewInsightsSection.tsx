@@ -73,7 +73,7 @@ function CustomerConcentrationInsight({
   if (loading) {
     return (
       <InsightShell headline="Loading customer concentration…">
-        <div className="h-[220px] animate-pulse rounded-lg" style={{ background: '#F8FAFC' }} />
+        <div className="h-[242px] animate-pulse rounded-lg" style={{ background: '#F8FAFC' }} />
       </InsightShell>
     )
   }
@@ -81,23 +81,23 @@ function CustomerConcentrationInsight({
   return (
     <InsightShell headline={headline}>
       {!chartRows.length ? (
-        <div className="h-[220px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+        <div className="h-[242px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
           No customer data for this period
         </div>
       ) : (
-        <ResponsiveContainer width="100%" height={220}>
+        <ResponsiveContainer width="100%" height={242}>
           <BarChart data={chartRows} margin={{ top: 8, right: 12, left: 4, bottom: 24 }}>
             <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" vertical={false} />
             <XAxis
               dataKey="name"
-              tick={{ fontSize: 10, fill: '#64748B' }}
+              tick={{ fontSize: 11, fill: '#64748B' }}
               interval={0}
               angle={-18}
               textAnchor="end"
               height={48}
             />
             <YAxis
-              tick={{ fontSize: 10, fill: '#94A3B8' }}
+              tick={{ fontSize: 11, fill: '#94A3B8' }}
               tickFormatter={v => fmtChartKpi(Number(v))}
               width={48}
             />
@@ -130,14 +130,14 @@ function MarginSnapshotInsight({ data }: { data: FinancialsOverviewResponse }) {
           <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" horizontal={false} />
           <XAxis
             type="number"
-            tick={{ fontSize: 10, fill: '#94A3B8' }}
+            tick={{ fontSize: 11, fill: '#94A3B8' }}
             tickFormatter={v => fmtPct(Number(v))}
             domain={[0, 'auto']}
           />
           <YAxis
             type="category"
             dataKey="label"
-            tick={{ fontSize: 11, fill: '#64748B' }}
+            tick={{ fontSize: 12, fill: '#64748B' }}
             width={96}
           />
           <Tooltip formatter={(v: number) => fmtPct(v)} />

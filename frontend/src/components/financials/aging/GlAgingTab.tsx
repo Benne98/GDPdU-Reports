@@ -67,8 +67,8 @@ function AgingPanel({
       <div className="p-4 h-64">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={chartData} margin={{ top: 8, right: 8, left: 0, bottom: 48 }}>
-            <XAxis dataKey="name" tick={{ fontSize: 10 }} angle={-28} textAnchor="end" height={56} interval={0} />
-            <YAxis tick={{ fontSize: 10 }} tickFormatter={(v) => `${v}k`} />
+            <XAxis dataKey="name" tick={{ fontSize: 11 }} angle={-28} textAnchor="end" height={56} interval={0} />
+            <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `${v}k`} />
             <Tooltip formatter={(v: number) => [fmtKeur(v), 'Amount']} />
             <Bar dataKey="amount" radius={[4, 4, 0, 0]}>
               {chartData.map((_, i) => (

@@ -22,28 +22,28 @@ export default function PayablesSupplierScatter({
 }) {
   if (!data.length) {
     return (
-      <div className="h-[280px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+      <div className="h-[308px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
         No scatter data
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={280}>
+    <ResponsiveContainer width="100%" height={308}>
       <ScatterChart margin={{ top: 12, right: 16, left: 8, bottom: 8 }}>
         <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" />
         <XAxis
           type="number"
           dataKey="balance"
           name="Balance"
-          tick={{ fontSize: 10, fill: '#94A3B8' }}
+          tick={{ fontSize: 11, fill: '#94A3B8' }}
           tickFormatter={v => fmtAmount(Number(v))}
         />
         <YAxis
           type="number"
           dataKey="overdue_pct"
           name="Overdue %"
-          tick={{ fontSize: 10, fill: '#94A3B8' }}
+          tick={{ fontSize: 11, fill: '#94A3B8' }}
           unit="%"
         />
         <ZAxis type="number" dataKey="balance" range={[40, 400]} />

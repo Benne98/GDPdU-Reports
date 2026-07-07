@@ -20,7 +20,7 @@ import { CHART_AXIS_TICK_STYLE } from '../../sales/analytics/salesChartTypograph
  * Wide enough for the label and the grouped bars (Additions / Disposals / D&A).
  */
 const CATEGORY_SLOT_PX = 100
-const CHART_HEIGHT = 300
+const CHART_HEIGHT = 330
 
 const COLOR_ADDITIONS = '#16A34A'
 const COLOR_DISPOSALS = '#DC2626'
@@ -101,7 +101,7 @@ export default function FixedAssetsAddDispChart({ rows, dimension, loading, acti
                   width={52}
                 />
                 <Tooltip formatter={(v: number) => fmtChartKpi(v)} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="additions"   name="Additions" fill={COLOR_ADDITIONS} radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} />
                 <Bar dataKey="disposals"   name="Disposals" fill={COLOR_DISPOSALS} radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} />
                 <Bar dataKey="depreciation" name="D&A"      fill={COLOR_DA}        radius={[4, 4, 0, 0]} maxBarSize={40} isAnimationActive={false} />

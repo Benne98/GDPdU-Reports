@@ -62,7 +62,7 @@ function ChartTooltip({ active, payload, label }: any) {
   return (
     <div className="rounded-lg px-3 py-2 text-xs shadow-lg" style={{ background: '#1E3A5F', color: '#F8FAFC', minWidth: 172 }}>
       <div className="font-semibold mb-1.5">{label}</div>
-      <div className="mb-1" style={{ color: '#94A3B8', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Bars</div>
+      <div className="mb-1" style={{ color: '#94A3B8', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Bars</div>
       {[
         { key: 'inventories',       label: 'Inventories',        color: COLORS.inventories },
         { key: 'trade_receivables', label: 'Trade Receivables',  color: COLORS.trade_receivables },
@@ -74,7 +74,7 @@ function ChartTooltip({ active, payload, label }: any) {
           <span style={{ color, fontWeight: 600 }}>{fmtKpi(get(key))}</span>
         </div>
       ))}
-      <div className="mt-1.5 mb-1" style={{ color: '#94A3B8', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Lines</div>
+      <div className="mt-1.5 mb-1" style={{ color: '#94A3B8', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Lines</div>
       {[
         { key: 'twc', label: 'Trade WC', color: COLORS.twc },
         { key: 'nwc', label: 'Net WC',   color: COLORS.nwc },
@@ -102,7 +102,7 @@ function ChartLegend() {
     { color: COLORS.nwc, label: 'Net WC',    dashed: true  },
   ]
   return (
-    <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 pt-2" style={{ fontSize: 11, color: '#64748B' }}>
+    <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 pt-2" style={{ fontSize: 12, color: '#64748B' }}>
       {bars.map(({ color, label }) => (
         <span key={label} className="flex items-center gap-1">
           <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: color, flexShrink: 0 }} />
@@ -150,7 +150,7 @@ function AvgLabel(props: any) {
         fill="#F8FAFC" stroke="#CBD5E1" strokeWidth={1}
       />
       <text
-        x={x} y={16} textAnchor="middle" fontSize={10} fill="#64748B"
+        x={x} y={16} textAnchor="middle" fontSize={11} fill="#64748B"
       >
         {text}
       </text>
@@ -330,7 +330,7 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
           </div>
         )}
         {!loading && !error && chartData.length > 0 && (
-          <ResponsiveContainer width="100%" height={280}>
+          <ResponsiveContainer width="100%" height={308}>
             <ComposedChart
               data={chartData}
               margin={{ top: 28, right: 24, left: 0, bottom: 0 }}
@@ -344,7 +344,7 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
                 tick={({ x, y, payload, index }) => {
                   if (!sparseTick(index, chartData.length)) return <g />
                   return (
-                    <text x={x} y={y + 12} textAnchor="middle" fontSize={10} fill="#94A3B8">
+                    <text x={x} y={y + 12} textAnchor="middle" fontSize={11} fill="#94A3B8">
                       {payload.value}
                     </text>
                   )
@@ -355,7 +355,7 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
               />
               <YAxis
                 tickFormatter={yFmt}
-                tick={{ fontSize: 11, fill: '#94A3B8' }}
+                tick={{ fontSize: 12, fill: '#94A3B8' }}
                 axisLine={false}
                 tickLine={false}
                 width={52}

@@ -154,7 +154,7 @@ export default function OverviewPage() {
         submessage="DuPont and top partners are loading."
       >
         <ChartLoadReporter chartId="overview-page" loading={!periodReady} error={bootError} />
-        <div ref={pageContentRef} className="mx-auto w-full max-w-[1680px] px-6 py-8">
+        <div ref={pageContentRef} className="mx-auto w-full max-w-[1920px] px-6 py-8">
           <motion.div
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}

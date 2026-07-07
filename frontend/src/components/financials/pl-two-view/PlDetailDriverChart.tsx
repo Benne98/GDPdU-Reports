@@ -65,7 +65,7 @@ function DeltaEndLabel(
         x={boxX + padX}
         y={boxY + boxH / 2 + 3}
         fill={fill}
-        fontSize={9}
+        fontSize={10}
         fontWeight={600}
         textAnchor="start"
       >
@@ -118,7 +118,7 @@ export default function PlDetailDriverChart({
             type="category"
             dataKey="name"
             width={112}
-            tick={{ fontSize: 9, fill: '#475569' }}
+            tick={{ fontSize: 10, fill: '#475569' }}
             tickFormatter={(v: string) => (v.length > 20 ? `${v.slice(0, 18)}…` : v)}
           />
           <Tooltip
@@ -126,7 +126,7 @@ export default function PlDetailDriverChart({
               `€ ${v.toLocaleString('de-DE')}k`,
               name === 'priorAbs' ? priorPeriodLabel : currentPeriodLabel,
             ]}
-            contentStyle={{ fontSize: 11, borderRadius: 8 }}
+            contentStyle={{ fontSize: 12, borderRadius: 8 }}
           />
           <Bar
             dataKey="priorAbs"

@@ -67,24 +67,24 @@ function OutlierChart({ account, sigma }: { account: FlaggedAccount; sigma: numb
         <h4 className="text-sm font-semibold" style={{ color: '#1E3A5F' }}>
           {account.account_name || account.gl_account_id}
         </h4>
-        <span className="text-[11px]" style={{ color: '#94A3B8' }}>
+        <span className="text-[12px]" style={{ color: '#94A3B8' }}>
           {account.gl_account_id} · {account.entity_prefix} · {account.statement.toUpperCase()}
         </span>
-        <span className="ml-auto text-[11px]" style={{ color: '#64748B' }}>
+        <span className="ml-auto text-[12px]" style={{ color: '#64748B' }}>
           mean {fmtKEur(stats.mean_keur)} · std {fmtKEur(stats.std_keur)} kEUR · n={stats.n}
         </span>
       </div>
-      <ResponsiveContainer width="100%" height={280}>
+      <ResponsiveContainer width="100%" height={308}>
         <ComposedChart data={data} margin={{ top: 10, right: 16, bottom: 4, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" />
-          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94A3B8' }} interval="preserveStartEnd" />
-          <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} width={56}
+          <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94A3B8' }} interval="preserveStartEnd" />
+          <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} width={56}
                  tickFormatter={(v: number) => fmtKEur(v)} />
           <Tooltip
             formatter={(v: number | string, name: string) =>
               [typeof v === 'number' ? `${fmtKEur(v)} kEUR` : v, name]}
             labelStyle={{ color: '#1E3A5F', fontWeight: 600 }}
-            contentStyle={{ fontSize: 11, borderColor: '#E2E8F0' }}
+            contentStyle={{ fontSize: 12, borderColor: '#E2E8F0' }}
           />
           {/* mean ± σ·std band */}
           {stats.std_keur > 0 && firstLabel != null && lastLabel != null && (
@@ -289,7 +289,7 @@ export default function OutliersTab({ periodParams, entity, statement = 'all' }:
           {' '}flagged month{totalFlags === 1 ? '' : 's'} across{' '}
           {accounts.length} account{accounts.length === 1 ? '' : 's'}
         </span>
-        <span className="ml-auto text-[11px]" style={{ color: '#94A3B8' }}>
+        <span className="ml-auto text-[12px]" style={{ color: '#94A3B8' }}>
           {data.period.label} · {data.entity} · z-score on monthly series
         </span>
       </div>

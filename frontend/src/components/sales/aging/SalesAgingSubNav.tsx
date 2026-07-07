@@ -41,7 +41,7 @@ export default function SalesAgingSubNav({ view, onChange }: Props) {
             <span className="block font-semibold">
               {opt.label}
             </span>
-            <span className="block text-[11px] mt-0.5" style={{ color: active ? '#64748B' : '#94A3B8' }}>
+            <span className="block text-[12px] mt-0.5" style={{ color: active ? '#64748B' : '#94A3B8' }}>
               {opt.description}
             </span>
           </button>

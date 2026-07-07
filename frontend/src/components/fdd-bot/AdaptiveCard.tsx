@@ -109,7 +109,7 @@ function FolderPickerInput({
 
   return (
     <div className={dense ? 'flex flex-col gap-0.5' : 'flex flex-col gap-1'}>
-      <label className={dense ? 'text-[11px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
+      <label className={dense ? 'text-[12px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
         {input.label}
         {input.required !== false && <span style={{ color: '#EF4444' }}> *</span>}
       </label>
@@ -136,7 +136,7 @@ function FolderPickerInput({
           disabled={picking}
           className={
             dense
-              ? 'shrink-0 rounded-md px-2.5 py-1 text-[11px] font-semibold'
+              ? 'shrink-0 rounded-md px-2.5 py-1 text-[12px] font-semibold'
               : 'shrink-0 rounded-lg px-3 py-2 text-xs font-semibold'
           }
           style={{
@@ -183,14 +183,14 @@ function FileAttachmentCard({ payload }: { payload: AdaptiveCardPayload }) {
           <p className="text-xs font-semibold truncate" style={{ color: '#1E3A5F' }}>
             {payload.title || 'Output ready'}
           </p>
-          <p className="text-[11px] truncate" style={{ color: '#64748B' }}>
+          <p className="text-[12px] truncate" style={{ color: '#64748B' }}>
             {filename}
           </p>
         </div>
         <a
           href={href}
           download={filename}
-          className="text-[11px] font-semibold rounded-md px-2 py-1 shrink-0"
+          className="text-[12px] font-semibold rounded-md px-2 py-1 shrink-0"
           style={{ background: '#1E3A5F', color: '#FFFFFF' }}
         >
           Download
@@ -221,7 +221,7 @@ function FileAttachmentCard({ payload }: { payload: AdaptiveCardPayload }) {
           <p className="text-xs mt-0.5 truncate" style={{ color: '#64748B' }}>
             {filename}
           </p>
-          <p className="text-[11px] mt-1" style={{ color: '#94A3B8' }}>
+          <p className="text-[12px] mt-1" style={{ color: '#94A3B8' }}>
             Drag this card to your Desktop, or download below.
           </p>
           <a
@@ -248,7 +248,7 @@ function TextInput({ input, value, onChange, dense }: {
 }) {
   return (
     <div className={dense ? 'flex flex-col gap-0.5' : 'flex flex-col gap-1'}>
-      <label className={dense ? 'text-[11px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
+      <label className={dense ? 'text-[12px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
         {input.label}
         {input.required !== false && <span style={{ color: '#EF4444' }}> *</span>}
       </label>
@@ -284,7 +284,7 @@ function DropdownInput({ input, value, onChange, dense }: {
       : baseOpts
   return (
     <div className={dense ? 'flex flex-col gap-0.5' : 'flex flex-col gap-1'}>
-      <label className={dense ? 'text-[11px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
+      <label className={dense ? 'text-[12px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
         {input.label}
       </label>
       <div className="relative">
@@ -324,7 +324,7 @@ function RadioInput({ input, value, onChange, dense }: {
     return (
       <div className="flex flex-row gap-2 items-start w-full min-w-0">
         <span
-          className={dense ? 'text-[11px] font-medium shrink-0 pt-1' : 'text-xs font-medium shrink-0 pt-1.5'}
+          className={dense ? 'text-[12px] font-medium shrink-0 pt-1' : 'text-xs font-medium shrink-0 pt-1.5'}
           style={{ color: '#475569', maxWidth: '38%' }}
         >
           {input.label}
@@ -333,7 +333,7 @@ function RadioInput({ input, value, onChange, dense }: {
           {input.options?.map(opt => (
             <label
               key={opt.value}
-              className="flex items-center gap-1 cursor-pointer rounded-md px-2 py-1 text-[11px] transition-colors"
+              className="flex items-center gap-1 cursor-pointer rounded-md px-2 py-1 text-[12px] transition-colors"
               style={{
                 border: `1px solid ${value === opt.value ? '#1E3A5F' : '#E2E8F0'}`,
                 background: value === opt.value ? 'rgba(30,58,95,0.05)' : '#F8FAFC',
@@ -356,7 +356,7 @@ function RadioInput({ input, value, onChange, dense }: {
   }
   return (
     <div className={dense ? 'flex flex-col gap-1' : 'flex flex-col gap-1.5'}>
-      <label className={dense ? 'text-[11px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
+      <label className={dense ? 'text-[12px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>
         {input.label}
       </label>
       <div className="flex flex-col gap-1.5">
@@ -479,13 +479,13 @@ function MonthPickerInput({ input, value, onChange, dense }: {
 
   return (
     <div className={dense ? 'flex flex-col gap-1' : 'flex flex-col gap-1.5'}>
-      <label className={dense ? 'text-[11px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>{input.label}</label>
+      <label className={dense ? 'text-[12px] font-medium' : 'text-xs font-medium'} style={{ color: '#475569' }}>{input.label}</label>
       <div className={`flex items-center justify-between ${dense ? 'mb-0.5' : 'mb-1'}`}>
         <button type="button" onClick={() => bumpYear(-1)}
-          className={dense ? 'text-[11px] px-1.5 py-0.5 rounded' : 'text-xs px-2 py-1 rounded'} style={{ color: '#64748B' }}>‹</button>
-        <span className={dense ? 'text-[11px] font-semibold' : 'text-xs font-semibold'} style={{ color: '#1E293B' }}>{year}</span>
+          className={dense ? 'text-[12px] px-1.5 py-0.5 rounded' : 'text-xs px-2 py-1 rounded'} style={{ color: '#64748B' }}>‹</button>
+        <span className={dense ? 'text-[12px] font-semibold' : 'text-xs font-semibold'} style={{ color: '#1E293B' }}>{year}</span>
         <button type="button" onClick={() => bumpYear(1)}
-          className={dense ? 'text-[11px] px-1.5 py-0.5 rounded' : 'text-xs px-2 py-1 rounded'} style={{ color: '#64748B' }}>›</button>
+          className={dense ? 'text-[12px] px-1.5 py-0.5 rounded' : 'text-xs px-2 py-1 rounded'} style={{ color: '#64748B' }}>›</button>
       </div>
       <div className={dense ? 'grid grid-cols-3 gap-0.5' : 'grid grid-cols-3 gap-1'}>
         {MONTHS.map((name, i) => (
@@ -493,7 +493,7 @@ function MonthPickerInput({ input, value, onChange, dense }: {
             key={name}
             type="button"
             onClick={() => select(i)}
-            className={dense ? 'text-[11px] py-1 rounded-md transition-colors' : 'text-xs py-1.5 rounded-lg transition-colors'}
+            className={dense ? 'text-[12px] py-1 rounded-md transition-colors' : 'text-xs py-1.5 rounded-lg transition-colors'}
             style={{
               background: month === i ? '#1E3A5F' : '#F1F5F9',
               color: month === i ? '#fff' : '#475569',
@@ -718,7 +718,7 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
     <div className="flex flex-col gap-3">
       <label className="text-xs font-medium" style={{ color: '#475569' }}>{input.label}</label>
       <div style={{ overflowX: 'auto' }}>
-        <table style={{ borderCollapse: 'collapse', minWidth: '100%', fontSize: 11 }}>
+        <table style={{ borderCollapse: 'collapse', minWidth: '100%', fontSize: 12 }}>
           <thead>
             <tr>
               <th className="text-left pr-3 pb-2" style={{ color: '#64748B', fontWeight: 600, whiteSpace: 'nowrap' }}>
@@ -779,7 +779,7 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange }:
                           className="text-center"
                           style={{
                             color: uploaded ? '#10B981' : '#94A3B8',
-                            fontSize: 10,
+                            fontSize: 11,
                             whiteSpace: 'nowrap',
                             maxWidth: 92,
                             overflow: 'hidden',
@@ -1353,7 +1353,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
       >
         <p className={compact ? 'text-xs font-semibold' : 'text-sm font-semibold'} style={{ color: '#111827' }}>{payload.title}</p>
         {payload.subtitle && (
-          <p className={`${compact ? 'text-[11px] mt-0.5' : 'text-xs mt-0.5'} leading-snug`} style={{ color: '#64748B' }}>
+          <p className={`${compact ? 'text-[12px] mt-0.5' : 'text-xs mt-0.5'} leading-snug`} style={{ color: '#64748B' }}>
             {payload.subtitle}
           </p>
         )}
@@ -1403,7 +1403,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
         <div
           className={
             compact
-              ? 'px-3 py-2 grid grid-cols-2 gap-x-2 gap-y-1.5 [&_label]:text-[11px] [&_input]:text-xs [&_select]:text-xs [&_button]:text-[11px]'
+              ? 'px-3 py-2 grid grid-cols-2 gap-x-2 gap-y-1.5 [&_label]:text-[12px] [&_input]:text-xs [&_select]:text-xs [&_button]:text-[12px]'
               : 'px-4 py-4 flex flex-col gap-4'
           }
         >
@@ -1424,7 +1424,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
                 key={chunk.map(c => c.id).join('-')}
                 className={
                   compact
-                    ? 'col-span-2 flex flex-row gap-2 w-full min-w-0 [&_label]:text-[11px]'
+                    ? 'col-span-2 flex flex-row gap-2 w-full min-w-0 [&_label]:text-[12px]'
                     : 'flex flex-row gap-2 w-full min-w-0'
                 }
               >

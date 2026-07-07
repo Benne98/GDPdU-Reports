@@ -8,7 +8,7 @@ export default function SensitivitySlider({ value, onChange }: Props) {
     <div className="flex items-center gap-4 rounded-xl px-4 py-3 mb-6" style={{ background: 'rgba(30,58,95,0.04)', border: '1px solid #E2E8F0' }}>
       <div className="flex-shrink-0">
         <p className="text-xs font-semibold" style={{ color: '#1E3A5F' }}>Signal threshold</p>
-        <p className="text-[11px] mt-0.5" style={{ color: '#94A3B8' }}>Lower = show more, including minor signals</p>
+        <p className="text-[12px] mt-0.5" style={{ color: '#94A3B8' }}>Lower = show more, including minor signals</p>
       </div>
       <input
         type="range"

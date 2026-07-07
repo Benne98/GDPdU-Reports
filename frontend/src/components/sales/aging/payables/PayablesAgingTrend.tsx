@@ -92,13 +92,13 @@ export default function PayablesAgingTrend({
         <CartesianGrid stroke={COLORS.grid} strokeDasharray="4 6" vertical={false} />
         <XAxis
           dataKey="label"
-          tick={{ fontSize: 10, fill: COLORS.label }}
+          tick={{ fontSize: 11, fill: COLORS.label }}
           tickLine={false}
           axisLine={{ stroke: COLORS.grid }}
         />
         <YAxis
           yAxisId="left"
-          tick={{ fontSize: 10, fill: COLORS.axis }}
+          tick={{ fontSize: 11, fill: COLORS.axis }}
           tickLine={false}
           axisLine={false}
           tickFormatter={formatAxisMoney}
@@ -107,7 +107,7 @@ export default function PayablesAgingTrend({
         <YAxis
           yAxisId="right"
           orientation="right"
-          tick={{ fontSize: 10, fill: '#D97706' }}
+          tick={{ fontSize: 11, fill: '#D97706' }}
           tickLine={false}
           axisLine={false}
           width={40}

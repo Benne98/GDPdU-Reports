@@ -74,7 +74,7 @@ function AnomalyRow({ item }: { item: AnomalyItem }) {
             {toKEur(item.magnitude_eur)}
           </span>
         </div>
-        <p className="text-[11px] leading-relaxed" style={{ color: 'inherit', opacity: 0.85 }}>
+        <p className="text-[12px] leading-relaxed" style={{ color: 'inherit', opacity: 0.85 }}>
           {item.description}
         </p>
         {item.period_label && (

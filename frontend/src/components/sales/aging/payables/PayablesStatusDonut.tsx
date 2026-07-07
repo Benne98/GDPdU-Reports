@@ -58,7 +58,7 @@ export default function PayablesStatusDonut({
               background: '#1E293B',
               border: '1px solid rgba(255,255,255,0.08)',
               borderRadius: 12,
-              fontSize: 11,
+              fontSize: 12,
             }}
           />
         </PieChart>

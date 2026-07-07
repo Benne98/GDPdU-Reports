@@ -84,7 +84,7 @@ export default function FtePexGrid({ input, values, disabled, onChange }: Props)
           ))}
         </tbody>
       </table>
-      <p className="text-[11px] text-slate-500 mt-1">Values in EURk (thousands). Leave blank where unknown.</p>
+      <p className="text-[12px] text-slate-500 mt-1">Values in EURk (thousands). Leave blank where unknown.</p>
     </div>
   )
 }

@@ -21,9 +21,11 @@
     scroll-behavior: smooth;
   }
 
+  /* Pin the root to 16px so every rem-based Tailwind size lands on a whole pixel
+     (a 17px base pushed text/heights onto half-pixels → app-wide softness). */
   @media (min-width: 1280px) {
     html {
-      font-size: 17px;
+      font-size: 16px;
     }
   }
 
@@ -59,14 +61,15 @@
 }
 
 @layer utilities {
-  /* Slight global readability uplift across dashboards and landing content. */
+  /* Slight global readability uplift — sizes chosen to be exact whole pixels at
+     the 16px root (14px / 16px) so glyph edges stay on the pixel grid. */
   .text-xs {
-    font-size: 0.8rem;
+    font-size: 0.875rem; /* 14px */
     line-height: 1.35;
   }
 
   .text-sm {
-    font-size: 0.94rem;
+    font-size: 1rem; /* 16px */
     line-height: 1.45;
   }
 }

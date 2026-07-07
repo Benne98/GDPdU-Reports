@@ -576,7 +576,7 @@ export default function ReceivablesDimensionBarChart({
 
             <Legend
 
-              wrapperStyle={{ fontSize: 11, paddingTop: 4 }}
+              wrapperStyle={{ fontSize: 12, paddingTop: 4 }}
 
               iconType="square"
 

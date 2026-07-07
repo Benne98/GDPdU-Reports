@@ -61,13 +61,13 @@ export default function SalesGrossSalesTrendChart({ data, dim, onDimChange, load
     >
       <div className={`${SALES_CHART_BODY_CLASS} pb-3`}>
         {loading ? (
-          <div className="flex items-center justify-center h-[220px] text-xs" style={{ color: '#94A3B8' }}>Loading…</div>
+          <div className="flex items-center justify-center h-[242px] text-xs" style={{ color: '#94A3B8' }}>Loading…</div>
         ) : error ? (
-          <div className="flex items-center justify-center h-[220px] text-xs text-red-600">{error}</div>
+          <div className="flex items-center justify-center h-[242px] text-xs text-red-600">{error}</div>
         ) : !chartRows.length ? (
-          <div className="flex items-center justify-center h-[220px] text-xs" style={{ color: '#94A3B8' }}>No data</div>
+          <div className="flex items-center justify-center h-[242px] text-xs" style={{ color: '#94A3B8' }}>No data</div>
         ) : (
-          <ResponsiveContainer width="100%" height={220}>
+          <ResponsiveContainer width="100%" height={242}>
             <BarChart data={chartRows} margin={{ top: 10, right: 8, left: 0, bottom: 6 }}>
               <CartesianGrid {...SALES_CHART_GRID_PROPS} />
               <XAxis dataKey="label" tick={CHART_TICK_STYLE} axisLine={false} tickLine={false} dy={4} />

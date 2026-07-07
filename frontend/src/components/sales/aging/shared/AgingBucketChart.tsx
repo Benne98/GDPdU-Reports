@@ -113,14 +113,14 @@ export default function AgingBucketChart({
         <CartesianGrid stroke={COLORS.grid} strokeDasharray="4 6" vertical={false} />
         <XAxis
           dataKey="label"
-          tick={{ fontSize: 10, fill: COLORS.label, fontWeight: 500 }}
+          tick={{ fontSize: 11, fill: COLORS.label, fontWeight: 500 }}
           tickLine={false}
           axisLine={{ stroke: COLORS.grid }}
           interval={0}
           dy={6}
         />
         <YAxis
-          tick={{ fontSize: 10, fill: COLORS.axis }}
+          tick={{ fontSize: 11, fill: COLORS.axis }}
           tickLine={false}
           axisLine={false}
           tickFormatter={formatAxisMoney}

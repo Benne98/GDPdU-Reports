@@ -22,7 +22,7 @@ export default function AnomalyReport({ headline, bullets, score, band, label, s
               <p className="text-xs font-medium mb-0.5" style={{ color: '#64748B' }}>{label}</p>
             )}
             {sublabel && (
-              <p className="text-[11px] mb-0.5" style={{ color: '#94A3B8' }}>{sublabel}</p>
+              <p className="text-[12px] mb-0.5" style={{ color: '#94A3B8' }}>{sublabel}</p>
             )}
           </div>
           <SignalScoreBadge score={score} band={band} />

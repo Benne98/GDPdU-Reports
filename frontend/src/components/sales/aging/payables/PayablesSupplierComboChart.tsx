@@ -14,7 +14,7 @@ import { fmtAmount } from '../../../../lib/fmt'
 export default function PayablesSupplierComboChart({ data }: { data: PayablesSupplierComboRow[] }) {
   if (!data.length) {
     return (
-      <div className="h-[320px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+      <div className="h-[352px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
         No supplier data
       </div>
     )
@@ -26,12 +26,12 @@ export default function PayablesSupplierComboChart({ data }: { data: PayablesSup
   }))
 
   return (
-    <ResponsiveContainer width="100%" height={320}>
+    <ResponsiveContainer width="100%" height={352}>
       <ComposedChart data={short} margin={{ top: 12, right: 48, left: 4, bottom: 64 }}>
         <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" vertical={false} />
         <XAxis
           dataKey="name"
-          tick={{ fontSize: 9, fill: '#64748B' }}
+          tick={{ fontSize: 10, fill: '#64748B' }}
           angle={-32}
           textAnchor="end"
           height={72}
@@ -39,14 +39,14 @@ export default function PayablesSupplierComboChart({ data }: { data: PayablesSup
         />
         <YAxis
           yAxisId="left"
-          tick={{ fontSize: 10, fill: '#94A3B8' }}
+          tick={{ fontSize: 11, fill: '#94A3B8' }}
           tickFormatter={v => fmtAmount(Number(v))}
           width={56}
         />
         <YAxis
           yAxisId="right"
           orientation="right"
-          tick={{ fontSize: 10, fill: '#D97706' }}
+          tick={{ fontSize: 11, fill: '#D97706' }}
           tickFormatter={v => `${v}d`}
           width={40}
         />

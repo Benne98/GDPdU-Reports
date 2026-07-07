@@ -250,7 +250,7 @@ export default function ReportsTab() {
         <h2 className="text-sm font-semibold text-slate-800">Report period</h2>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <label className="space-y-1 block">
-            <span className="text-[11px] font-medium text-slate-500">Entity</span>
+            <span className="text-[12px] font-medium text-slate-500">Entity</span>
             <select className={`${selectClass} w-full`} value={entity} onChange={e => setEntity(e.target.value)}>
               <option value={ALL}>All entities</option>
               {entities.map(e => (
@@ -261,7 +261,7 @@ export default function ReportsTab() {
             </select>
           </label>
           <label className="space-y-1 block">
-            <span className="text-[11px] font-medium text-slate-500">Year</span>
+            <span className="text-[12px] font-medium text-slate-500">Year</span>
             <input
               type="number"
               className={`${selectClass} w-full`}
@@ -270,7 +270,7 @@ export default function ReportsTab() {
             />
           </label>
           <label className="space-y-1 block">
-            <span className="text-[11px] font-medium text-slate-500">Month</span>
+            <span className="text-[12px] font-medium text-slate-500">Month</span>
             <input
               type="number"
               min={1}
@@ -352,7 +352,7 @@ function ReportCard({
           </span>
         )}
       </div>
-      <p className="text-[11px] text-slate-400 flex items-center gap-1">
+      <p className="text-[12px] text-slate-400 flex items-center gap-1">
         <FileDown size={12} />
         XLSX includes PL_all, BS_all (with balance check), PL and BS table sheets with SUMIFS links.
       </p>

@@ -102,7 +102,7 @@ export default function ReceivablesAgingDonut({
                       {fmtAmount(displayTotal)}
                     </text>
                     {!compact && (
-                      <text x={cx} y={cy + 12} textAnchor="middle" fill="#94A3B8" fontSize={10}>
+                      <text x={cx} y={cy + 12} textAnchor="middle" fill="#94A3B8" fontSize={11}>
                         total open
                       </text>
                     )}

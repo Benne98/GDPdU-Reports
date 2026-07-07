@@ -37,7 +37,7 @@ export default function PayrollHeadcountBridgeChart({ entries, loading }: Props)
         ) : !data.length ? (
           <div className="flex items-center justify-center h-[280px] text-xs" style={{ color: BRAND.textMuted }}>No data</div>
         ) : (
-          <ResponsiveContainer width="100%" height={300}>
+          <ResponsiveContainer width="100%" height={330}>
             <ComposedChart data={data} margin={{ top: 24, right: 12, left: 4, bottom: 4 }} barCategoryGap="18%">
               <CartesianGrid {...SALES_CHART_GRID_PROPS} />
               <XAxis dataKey="name" tick={CHART_AXIS_TICK_STYLE} axisLine={false} tickLine={false} />
@@ -69,7 +69,7 @@ export default function PayrollHeadcountBridgeChart({ entries, loading }: Props)
                     if (e.is_total) return fmtChartKpi(v)
                     return (v >= 0 ? '+' : '') + fmtChartKpi(v)
                   }}
-                  style={{ fontSize: 11, fill: BRAND.textSecondary, fontWeight: 600 }}
+                  style={{ fontSize: 12, fill: BRAND.textSecondary, fontWeight: 600 }}
                 />
               </Bar>
             </ComposedChart>

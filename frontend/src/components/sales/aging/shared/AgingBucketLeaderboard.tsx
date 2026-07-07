@@ -38,7 +38,7 @@ export default function AgingBucketLeaderboard({
           >
             <div className="flex items-start gap-2.5">
               <span
-                className="shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-[11px] font-bold tabular-nums"
+                className="shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-[12px] font-bold tabular-nums"
                 style={{
                   background: isTop3 ? 'rgba(30, 58, 95, 0.1)' : BRAND.surface,
                   color: isTop3 ? BRAND.navy : BRAND.slate,

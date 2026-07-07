@@ -73,25 +73,25 @@ export default function NetDebtLoanTrendChart({ data, loading, loanLabel, compac
             <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" vertical={false} />
             <XAxis
               dataKey="label"
-              tick={{ fontSize: 9, fill: '#64748B' }}
+              tick={{ fontSize: 10, fill: '#64748B' }}
               interval="preserveStartEnd"
               minTickGap={24}
             />
             <YAxis
-              tick={{ fontSize: 9, fill: '#64748B' }}
+              tick={{ fontSize: 10, fill: '#64748B' }}
               width={44}
               tickFormatter={(v: number) => fmtChartKpi(v)}
             />
             <Tooltip
               formatter={(v: number) => [`${fmtChartKpi(v)} kEUR`, 'Payments']}
               labelFormatter={(l: string) => l}
-              contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }}
+              contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }}
             />
             <Bar dataKey="amount" fill={FA_NAVY} radius={[3, 3, 0, 0]} maxBarSize={28} />
           </BarChart>
         </ResponsiveContainer>
       </div>
-      <p className="text-[11px] text-slate-500 mt-2 leading-snug">{seasonalityHint}</p>
+      <p className="text-[12px] text-slate-500 mt-2 leading-snug">{seasonalityHint}</p>
     </div>
   )
 }

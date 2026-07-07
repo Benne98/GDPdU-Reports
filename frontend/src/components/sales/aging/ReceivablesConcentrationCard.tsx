@@ -19,12 +19,12 @@ export default function ReceivablesConcentrationCard({ data }: { data: Receivabl
 
   return (
     <div className="space-y-4">
-      <p className="text-[11px]" style={{ color: '#64748B' }}>
+      <p className="text-[12px]" style={{ color: '#64748B' }}>
         Non-overlapping share of open receivables ({fmtAmount(data.total)}) by customer rank
       </p>
       {segments.map(seg => (
         <div key={seg.band}>
-          <div className="flex justify-between text-[11px] mb-1 gap-2">
+          <div className="flex justify-between text-[12px] mb-1 gap-2">
             <span className="font-medium" style={{ color: '#334155' }}>
               {seg.label}
               {seg.customer_count > 0 && (

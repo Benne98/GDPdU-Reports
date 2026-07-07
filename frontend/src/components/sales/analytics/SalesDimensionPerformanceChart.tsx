@@ -157,8 +157,8 @@ export default function SalesDimensionPerformanceChart({ data }: Props) {
   const periodLabel = data.period_label
 
   return (
-    <div style={{ width: '100%', height: 300, minHeight: 300 }}>
-      <ResponsiveContainer width="100%" height={300}>
+    <div style={{ width: '100%', height: 330, minHeight: 330 }}>
+      <ResponsiveContainer width="100%" height={330}>
         <ComposedChart data={chartRows} margin={{ top: 44, right: 12, left: 4, bottom: 52 }} barGap={-18}>
           <CartesianGrid {...SALES_CHART_GRID_PROPS} />
           <XAxis
@@ -190,7 +190,7 @@ export default function SalesDimensionPerformanceChart({ data }: Props) {
             {...salesChartTooltipProps}
           />
           <Legend
-            wrapperStyle={{ fontSize: 11, paddingTop: 4 }}
+            wrapperStyle={{ fontSize: 12, paddingTop: 4 }}
             iconType="square"
             iconSize={9}
             formatter={(val: string) => val}

@@ -174,7 +174,7 @@ function PartnerCard({ position, override, onOverride, saving }: PartnerCardProp
                 key={m}
                 type="button"
                 onClick={() => setMode(m)}
-                className="px-2 py-1 text-[11px] font-medium transition-colors"
+                className="px-2 py-1 text-[12px] font-medium transition-colors"
                 style={{
                   background: mode === m ? '#1E3A5F' : '#FFFFFF',
                   color: mode === m ? '#FFFFFF' : '#64748B',

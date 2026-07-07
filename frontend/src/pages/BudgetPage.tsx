@@ -340,7 +340,7 @@ function HeuristicsPanel({
             />
             <div>
               <div className="text-xs font-semibold text-slate-700">{HEURISTIC_LABELS[h]}</div>
-              <div className="text-[11px] text-slate-400">{HEURISTIC_DESCS[h]}</div>
+              <div className="text-[12px] text-slate-400">{HEURISTIC_DESCS[h]}</div>
             </div>
           </label>
         ))}
@@ -361,7 +361,7 @@ function HeuristicsPanel({
             />
             <span className="text-xs text-slate-400">%</span>
           </div>
-          <span className="text-[11px] text-slate-400">Applied on top of prior year base values</span>
+          <span className="text-[12px] text-slate-400">Applied on top of prior year base values</span>
         </div>
       )}
 
@@ -389,7 +389,7 @@ function HeuristicsPanel({
           )}
           Apply suggestions
         </button>
-        <span className="text-[11px] text-slate-400">
+        <span className="text-[12px] text-slate-400">
           "Apply" seeds the budget from the chosen heuristic.
         </span>
       </div>
@@ -907,7 +907,7 @@ export default function BudgetPage() {
           {/* Unsaved indicator */}
           {hasUnsavedChanges && !saving && (
             <span
-              className="text-[11px] font-medium px-2 py-0.5 rounded-full"
+              className="text-[12px] font-medium px-2 py-0.5 rounded-full"
               style={{ background: 'rgba(245,158,11,0.12)', color: '#B45309' }}
             >
               Unsaved changes

@@ -67,7 +67,7 @@ export default function SalesAnalyticsNav({ className = '' }: Props) {
         <h2 className="text-sm font-semibold mt-0.5 tracking-tight" style={{ color: NAV_BRAND }}>
           Analytics
         </h2>
-        <p className="text-[11px] mt-1 leading-snug" style={{ color: '#64748B' }}>
+        <p className="text-[12px] mt-1 leading-snug" style={{ color: '#64748B' }}>
           Jump to any analysis block
         </p>
       </div>

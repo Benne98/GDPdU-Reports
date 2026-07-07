@@ -39,7 +39,7 @@ export default function ReceivablesConcentrationTrend({
 }) {
   if (!points.length) {
     return (
-      <div className="h-[220px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+      <div className="h-[242px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
         No concentration trend
       </div>
     )
@@ -54,21 +54,21 @@ export default function ReceivablesConcentrationTrend({
       <p className="text-[10px] mb-2" style={{ color: '#94A3B8' }}>
         Share by rank band — {bucketLabel} — last {spanLabel}
       </p>
-      <ResponsiveContainer width="100%" height={220}>
+      <ResponsiveContainer width="100%" height={242}>
         <LineChart data={data} margin={{ top: 8, right: 16, left: 4, bottom: 8 }}>
           <CartesianGrid stroke="#E8EDF3" strokeDasharray="4 6" vertical={false} />
-          <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#64748B' }} />
-          <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} unit="%" width={44} domain={[0, 100]}>
+          <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#64748B' }} />
+          <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} unit="%" width={44} domain={[0, 100]}>
             <Label
               value="Share %"
               angle={-90}
               position="insideLeft"
               offset={12}
-              style={{ fontSize: 10, fontWeight: 600, fill: '#64748B', textAnchor: 'middle' }}
+              style={{ fontSize: 11, fontWeight: 600, fill: '#64748B', textAnchor: 'middle' }}
             />
           </YAxis>
           <Tooltip formatter={(v: number) => `${v}%`} />
-          <Legend wrapperStyle={{ fontSize: 10 }} />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
           {AGING_CONCENTRATION_BANDS.map(({ band }) => {
             const label = points[0]?.segments?.find(s => s.band === band)?.label ?? band
             return (

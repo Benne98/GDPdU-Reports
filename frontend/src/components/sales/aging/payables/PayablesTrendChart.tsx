@@ -133,7 +133,7 @@ export default function PayablesTrendChart({
                 angle={-90}
                 position="insideLeft"
                 offset={8}
-                style={{ fontSize: 11, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
+                style={{ fontSize: 12, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
               />
             </YAxis>
           )}
@@ -141,7 +141,7 @@ export default function PayablesTrendChart({
             <YAxis
               yAxisId="ratio"
               orientation="right"
-              tick={{ fontSize: 10, fill: '#D97706' }}
+              tick={{ fontSize: 11, fill: '#D97706' }}
               tickLine={false}
               axisLine={false}
               width={rightWidth}
@@ -153,7 +153,7 @@ export default function PayablesTrendChart({
                 angle={90}
                 position="insideRight"
                 offset={8}
-                style={{ fontSize: 11, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
+                style={{ fontSize: 12, fontWeight: 600, fill: BRAND.textSecondary, textAnchor: 'middle' }}
               />
             </YAxis>
           )}
@@ -163,7 +163,7 @@ export default function PayablesTrendChart({
             cursor={SALES_CHART_CURSOR}
           />
           <Legend
-            wrapperStyle={{ fontSize: 11, paddingTop: 8 }}
+            wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
             iconType="plainline"
             iconSize={14}
           />

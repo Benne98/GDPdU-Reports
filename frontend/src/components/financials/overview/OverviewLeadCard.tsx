@@ -22,7 +22,7 @@ export default function OverviewLeadCard({ briefing }: Props) {
       <div className="px-6 pt-6 pb-5 flex flex-col lg:flex-row lg:items-start gap-6">
         <div className="min-w-0 flex-1">
           <div
-            className="text-[11px] font-semibold uppercase tracking-[0.14em] mb-2"
+            className="text-[12px] font-semibold uppercase tracking-[0.14em] mb-2"
             style={{ color: '#1E3A5F' }}
           >
             Lead story
@@ -39,7 +39,7 @@ export default function OverviewLeadCard({ briefing }: Props) {
           className="shrink-0 rounded-xl px-5 py-4 min-w-[200px]"
           style={{ background: 'linear-gradient(135deg, #F8FAFC 0%, #EFF6FF 100%)', border: '1px solid #E2E8F0' }}
         >
-          <div className="text-[11px] font-semibold uppercase tracking-wide mb-1" style={{ color: '#64748B' }}>
+          <div className="text-[12px] font-semibold uppercase tracking-wide mb-1" style={{ color: '#64748B' }}>
             {briefing.heroTitle}
           </div>
           <div className="text-3xl font-bold tabular-nums tracking-tight" style={{ color: '#0F172A' }}>

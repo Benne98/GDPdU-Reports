@@ -18,8 +18,8 @@ import { useVisibleModules, type Module } from '../lib/moduleRegistry'
 const W_EXPANDED = 248
 const W_COLLAPSED = 72 // icon centre at 36 px → aligns with the header logo (paddingLeft 20 + 16)
 
-/** Module pinned to the bottom of the rail. */
-const BOTTOM_KEY = 'project-setup'
+/** Modules pinned to the bottom of the rail, under the "Setup" heading (in order). */
+const BOTTOM_KEYS: string[] = ['project-setup', 'budget']
 
 // ---------------------------------------------------------------------------
 // SidebarItem
@@ -45,7 +45,7 @@ function SidebarItem({ module: m, collapsed, index }: { module: Module; collapse
           padding: collapsed ? '10px 0' : '9px 12px 9px 19px',
           margin: '1px 8px',
           justifyContent: collapsed ? ('center' as const) : undefined,
-          color: isActive ? '#1E3A5F' : hovered ? '#1E3A5F' : '#475569',
+          color: isActive ? '#1E3A5F' : hovered ? '#1E3A5F' : '#334155',
           background: isActive ? 'rgba(30,58,95,0.09)' : hovered ? 'rgba(30,58,95,0.05)' : 'transparent',
           transition: 'background 0.15s, color 0.15s',
           position: 'relative',
@@ -72,7 +72,7 @@ function SidebarItem({ module: m, collapsed, index }: { module: Module; collapse
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="px-4 mb-1.5 text-[10px] font-semibold uppercase tracking-widest" style={{ color: '#94A3B8' }}>
+    <p className="px-4 mb-1.5 text-[10px] font-semibold uppercase tracking-widest" style={{ color: '#64748B' }}>
       {children}
     </p>
   )
@@ -86,8 +86,10 @@ export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
   const { all, main, settings } = useVisibleModules()
 
-  const settingsTop = settings.filter((m) => m.key !== BOTTOM_KEY)
-  const bottomModule = all.find((m) => m.key === BOTTOM_KEY)
+  const settingsTop = settings.filter((m) => !BOTTOM_KEYS.includes(m.key))
+  const bottomModules = BOTTOM_KEYS
+    .map((k) => all.find((m) => m.key === k))
+    .filter((m): m is Module => Boolean(m))
 
   return (
     <div
@@ -122,10 +124,13 @@ export default function Sidebar() {
         )}
       </nav>
 
-      {/* Project Setup — pinned to the bottom (spacing from the flex nav above, no dividers) */}
-      {bottomModule && (
+      {/* Setup — Project Setup + Budget Planning, pinned to the bottom (no dividers) */}
+      {bottomModules.length > 0 && (
         <div className="pt-2 pb-1 shrink-0">
-          <SidebarItem module={bottomModule} collapsed={collapsed} index={0} />
+          {!collapsed && <GroupLabel>Setup</GroupLabel>}
+          {bottomModules.map((m, i) => (
+            <SidebarItem key={m.key} module={m} collapsed={collapsed} index={i} />
+          ))}
         </div>
       )}
 

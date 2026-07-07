@@ -49,7 +49,7 @@ function AccountMiniChart({
           </span>
         )}
       </div>
-      <div className="h-[100px] w-full">
+      <div className="h-[110px] w-full">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart data={account.series} margin={{ top: 2, right: 2, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="2 2" stroke="#E2E8F0" vertical={false} />
@@ -64,7 +64,7 @@ function AccountMiniChart({
             <YAxis tick={{ fontSize: 7, fill: '#64748B' }} width={32} domain={['auto', 'auto']} />
             <Tooltip
               formatter={(v: number) => [`€ ${v.toLocaleString('de-DE')}k`, 'Balance']}
-              contentStyle={{ fontSize: 10, borderRadius: 8 }}
+              contentStyle={{ fontSize: 11, borderRadius: 8 }}
             />
             <Bar dataKey="value_keur" radius={[2, 2, 0, 0]} maxBarSize={14}>
               {account.series.map(p => (

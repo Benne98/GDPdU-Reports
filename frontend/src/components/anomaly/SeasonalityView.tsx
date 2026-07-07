@@ -50,13 +50,13 @@ function SeasonalChartSet({ node, pointThreshold }: { node: AnomalyTreeNode; poi
     <div className="space-y-4">
       <div>
         <p className="text-xs font-semibold mb-2" style={{ color: '#475569' }}>Actual vs expected (with seasonal band)</p>
-        <ResponsiveContainer width="100%" height={280}>
+        <ResponsiveContainer width="100%" height={308}>
           <ComposedChart data={chartAData} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" />
-            <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94A3B8' }} {...tickProps} />
-            <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} unit=" k" width={48} />
-            <Tooltip formatter={(v: number, name: string) => [`${v.toFixed(1)} kEUR`, name]} contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }} />
-            <Legend wrapperStyle={{ fontSize: 10 }} />
+            <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94A3B8' }} {...tickProps} />
+            <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} unit=" k" width={48} />
+            <Tooltip formatter={(v: number, name: string) => [`${v.toFixed(1)} kEUR`, name]} contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
             <Line type="monotone" dataKey="actual" stroke="#1E3A5F" strokeWidth={2} dot={false} name="Actual" />
             <Line type="monotone" dataKey="expected" stroke="#3B82F6" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="Expected" />
             <Line type="monotone" dataKey="bandHigh" stroke="#93C5FD" strokeWidth={1} strokeDasharray="2 4" dot={false} name="Band +" legendType="none" />
@@ -64,18 +64,18 @@ function SeasonalChartSet({ node, pointThreshold }: { node: AnomalyTreeNode; poi
             <Scatter dataKey="flagged" fill="#DC2626" name="Off-season" />
           </ComposedChart>
         </ResponsiveContainer>
-        <p className="text-[11px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
+        <p className="text-[12px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
           Solid = actual value. Dashed blue = what the seasonal model expected. Light blue band = normal seasonal range. Red dots = months that deviated significantly.
         </p>
       </div>
       <div>
         <p className="text-xs font-semibold mb-2" style={{ color: '#475569' }}>Monthly seasonal pattern</p>
-        <ResponsiveContainer width="100%" height={200}>
+        <ResponsiveContainer width="100%" height={220}>
           <BarChart data={chartBData} margin={{ top: 4, right: 16, bottom: 4, left: 8 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" />
-            <XAxis dataKey="month" tick={{ fontSize: 10, fill: '#94A3B8' }} />
-            <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} unit=" k" width={40} />
-            <Tooltip formatter={(v: number) => [`${v.toFixed(1)} kEUR`]} contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }} />
+            <XAxis dataKey="month" tick={{ fontSize: 11, fill: '#94A3B8' }} />
+            <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} unit=" k" width={40} />
+            <Tooltip formatter={(v: number) => [`${v.toFixed(1)} kEUR`]} contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }} />
             <Bar dataKey="seasonal_index" name="Seasonal factor">
               {chartBData.map((entry, i) => (
                 <Cell key={`cell-${i}`} fill={entry.seasonal_index >= 0 ? '#3B82F6' : '#F59E0B'} />
@@ -83,7 +83,7 @@ function SeasonalChartSet({ node, pointThreshold }: { node: AnomalyTreeNode; poi
             </Bar>
           </BarChart>
         </ResponsiveContainer>
-        <p className="text-[11px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
+        <p className="text-[12px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
           Blue = above the year's average for that month. Amber = below average. Factors sum to zero across all 12 months.
         </p>
       </div>

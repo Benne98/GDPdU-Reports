@@ -263,11 +263,11 @@ function DeltaLine({
   unit:  Unit
 }) {
   if (delta === null) {
-    return <div className="mt-0.5 text-[11px] text-slate-300">Δ {label}: —</div>
+    return <div className="mt-0.5 text-[12px] text-slate-300">Δ {label}: —</div>
   }
   const positive = delta >= 0
   return (
-    <div className={`text-[11px] font-medium ${positive ? 'text-emerald-600' : 'text-red-500'}`}>
+    <div className={`text-[12px] font-medium ${positive ? 'text-emerald-600' : 'text-red-500'}`}>
       Δ {label}: {fmtDelta(delta, unit)}
     </div>
   )
@@ -301,7 +301,7 @@ function NodeCard({ node, data, isOpen, hasChildren, onToggle, onContextOpen, pm
           : 'border-slate-200',
       ].join(' ')}
     >
-      <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide leading-tight">
+      <div className="text-[12px] font-medium text-slate-500 uppercase tracking-wide leading-tight">
         {node.label}
       </div>
 
@@ -315,7 +315,7 @@ function NodeCard({ node, data, isOpen, hasChildren, onToggle, onContextOpen, pm
       </div>
 
       {hasChildren && (
-        <div className="mt-2 flex items-center gap-1 text-[11px] text-slate-400">
+        <div className="mt-2 flex items-center gap-1 text-[12px] text-slate-400">
           {isOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
           <span>{isOpen ? 'collapse' : 'expand'}</span>
         </div>
@@ -528,7 +528,7 @@ function EntityScopeControl({
       <button
         type="button"
         onClick={() => setScopeOpen(v => !v)}
-        className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-600 shadow-sm hover:bg-slate-50"
+        className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[12px] font-medium text-slate-600 shadow-sm hover:bg-slate-50"
         aria-expanded={scopeOpen}
       >
         <span className="text-slate-400">Entity</span>
@@ -946,12 +946,12 @@ export default function DuPontTree({ year, month, entities, title = 'DuPont Anal
                 ) : contextTrend.length === 0 ? (
                   <div className="text-xs text-slate-500">No trend data available for this metric.</div>
                 ) : (
-                  <div style={{ width: '100%', height: 220 }}>
+                  <div style={{ width: '100%', height: 242 }}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={contextTrend} margin={{ top: 10, right: 10, left: 6, bottom: 4 }}>
                         <CartesianGrid vertical={false} stroke="#F1F5F9" />
-                        <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94A3B8' }} axisLine={false} tickLine={false} />
-                        <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} axisLine={false} tickLine={false} width={48} />
+                        <XAxis dataKey="label" tick={{ fontSize: 12, fill: '#94A3B8' }} axisLine={false} tickLine={false} />
+                        <YAxis tick={{ fontSize: 12, fill: '#94A3B8' }} axisLine={false} tickLine={false} width={48} />
                         <Tooltip content={<ContextTooltip unit={contextNode.unit} />} cursor={{ stroke: '#E2E8F0' }} />
                         <Line type="monotone" dataKey="value" stroke="#1E3A5F" strokeWidth={2.2} dot={false} activeDot={{ r: 3 }} />
                       </LineChart>
@@ -959,7 +959,7 @@ export default function DuPontTree({ year, month, entities, title = 'DuPont Anal
                   </div>
                 )}
                 {contextTrendNote && (
-                  <p className="text-[11px] text-slate-500 mt-2">{contextTrendNote}</p>
+                  <p className="text-[12px] text-slate-500 mt-2">{contextTrendNote}</p>
                 )}
               </section>
 

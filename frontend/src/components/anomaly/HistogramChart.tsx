@@ -21,12 +21,12 @@ export default function HistogramChart({ bins, height = 160 }: Props) {
     <ResponsiveContainer width="100%" height={height}>
       <BarChart data={data} margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" vertical={false} />
-        <XAxis dataKey="label" tick={{ fontSize: 9, fill: '#94A3B8' }} interval="preserveStartEnd" />
-        <YAxis tick={{ fontSize: 9, fill: '#94A3B8' }} allowDecimals={false} width={24} />
+        <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94A3B8' }} interval="preserveStartEnd" />
+        <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} allowDecimals={false} width={24} />
         <Tooltip
           formatter={(v: number) => [v, 'Months']}
           labelFormatter={(l: string) => `Range: ${l} kEUR`}
-          contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }}
+          contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }}
         />
         <Bar dataKey="count" fill="#3B82F6" radius={[2, 2, 0, 0]} name="Months" />
       </BarChart>

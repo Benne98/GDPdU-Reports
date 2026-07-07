@@ -43,16 +43,16 @@ function OutlierChartSet({ node, pointThreshold }: { node: AnomalyTreeNode; poin
     <div className="space-y-4">
       <div>
         <p className="text-xs font-semibold mb-2" style={{ color: '#475569' }}>Monthly values with normal range and trend</p>
-        <ResponsiveContainer width="100%" height={240}>
+        <ResponsiveContainer width="100%" height={264}>
           <ComposedChart data={chartData} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" />
-            <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#94A3B8' }} {...tickProps} />
-            <YAxis tick={{ fontSize: 10, fill: '#94A3B8' }} unit=" k" width={48} />
+            <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#94A3B8' }} {...tickProps} />
+            <YAxis tick={{ fontSize: 11, fill: '#94A3B8' }} unit=" k" width={48} />
             <Tooltip
               formatter={(v: number, name: string) => [`${v.toFixed(1)} kEUR`, name]}
-              contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #E2E8F0' }}
+              contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #E2E8F0' }}
             />
-            <Legend wrapperStyle={{ fontSize: 10 }} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
             <ReferenceArea y1={mean_keur - 1.5 * std_keur} y2={mean_keur + 1.5 * std_keur} fill="#3B82F6" fillOpacity={0.08} strokeOpacity={0} />
             <ReferenceLine y={mean_keur} stroke="#3B82F6" strokeDasharray="4 3" strokeWidth={1} />
             <Line type="monotone" dataKey="value" stroke="#1E3A5F" strokeWidth={2} dot={false} name="Actual" />
@@ -60,15 +60,15 @@ function OutlierChartSet({ node, pointThreshold }: { node: AnomalyTreeNode; poin
             <Scatter dataKey="flagged" fill="#DC2626" name="Flagged" />
           </ComposedChart>
         </ResponsiveContainer>
-        <p className="text-[11px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
+        <p className="text-[12px] mt-2 leading-relaxed" style={{ color: '#94A3B8' }}>
           Solid line = monthly value. Blue band = normal range (mean ± 1.5 std). Dashed amber = linear trend. Red dots = months above the signal threshold.
         </p>
       </div>
       {histogram && histogram.length > 0 && (
         <div>
           <p className="text-xs font-semibold mb-2" style={{ color: '#475569' }}>Distribution of monthly values (kEUR)</p>
-          <HistogramChart bins={histogram} height={140} />
-          <p className="text-[11px] mt-1 leading-relaxed" style={{ color: '#94A3B8' }}>
+          <HistogramChart bins={histogram} height={156} />
+          <p className="text-[12px] mt-1 leading-relaxed" style={{ color: '#94A3B8' }}>
             How often each value range occurred across all months.
           </p>
         </div>

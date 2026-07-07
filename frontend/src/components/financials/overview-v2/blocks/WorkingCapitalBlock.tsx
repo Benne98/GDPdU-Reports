@@ -216,7 +216,7 @@ function FindingChip({ text, route }: { text: string; route: string }) {
     >
       <Info size={11} aria-hidden style={{ color: '#1E3A5F', flexShrink: 0 }} />
       <p
-        className="flex-1 text-[11px] leading-snug"
+        className="flex-1 text-[12px] leading-snug"
         style={{ color: '#374151' }}
       >
         {text}

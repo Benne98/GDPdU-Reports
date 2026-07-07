@@ -323,7 +323,7 @@ export default function ForensicView() {
   return (
     <div>
       {llmUsed && (
-        <div className="mb-4 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-medium"
+        <div className="mb-4 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[12px] font-medium"
           style={{ background: 'rgba(37,99,235,0.08)', color: '#2563EB', border: '1px solid rgba(37,99,235,0.2)' }}>
           <span aria-hidden>&#10024;</span>
           AI-filtered

@@ -24,7 +24,7 @@ export default function AgingPortfolioMetricCards({ metrics }: { metrics: AgingP
               {m.value}
             </p>
             {m.hint && (
-              <p className="text-[11px] tabular-nums mt-0.5 truncate" style={{ color: '#64748B' }}>
+              <p className="text-[12px] tabular-nums mt-0.5 truncate" style={{ color: '#64748B' }}>
                 {m.hint}
               </p>
             )}

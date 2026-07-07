@@ -68,14 +68,14 @@ function TrendTooltip({
 export default function ReceivablesAgingTrend({ points }: { points: ReceivablesTrendPoint[] }) {
   if (!points.length) {
     return (
-      <div className="h-[260px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
+      <div className="h-[286px] flex items-center justify-center text-sm" style={{ color: '#94A3B8' }}>
         No trend data
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={260}>
+    <ResponsiveContainer width="100%" height={286}>
       <ComposedChart data={points} margin={{ top: 12, right: 48, left: 4, bottom: 8 }}>
         <defs>
           <linearGradient id="recvTrendArea" x1="0" y1="0" x2="0" y2="1">
@@ -86,13 +86,13 @@ export default function ReceivablesAgingTrend({ points }: { points: ReceivablesT
         <CartesianGrid stroke={COLORS.grid} strokeDasharray="4 6" vertical={false} />
         <XAxis
           dataKey="label"
-          tick={{ fontSize: 10, fill: COLORS.label }}
+          tick={{ fontSize: 11, fill: COLORS.label }}
           tickLine={false}
           axisLine={{ stroke: COLORS.grid }}
         />
         <YAxis
           yAxisId="left"
-          tick={{ fontSize: 10, fill: COLORS.axis }}
+          tick={{ fontSize: 11, fill: COLORS.axis }}
           tickLine={false}
           axisLine={false}
           tickFormatter={formatAxisMoney}
@@ -101,7 +101,7 @@ export default function ReceivablesAgingTrend({ points }: { points: ReceivablesT
         <YAxis
           yAxisId="right"
           orientation="right"
-          tick={{ fontSize: 10, fill: '#D97706' }}
+          tick={{ fontSize: 11, fill: '#D97706' }}
           tickLine={false}
           axisLine={false}
           width={40}

@@ -18,7 +18,7 @@ interface Props {
 export default function AnomalyDetectionPage({ view }: Props) {
   return (
     <div className="min-h-screen" style={{ background: '#F4F6F9' }}>
-      <div className="mx-auto w-full max-w-[1680px] px-6 py-8">
+      <div className="mx-auto w-full max-w-[1920px] px-6 py-8">
 
         {/* Page header */}
         <motion.div

@@ -279,7 +279,7 @@ export default function WeeklyTable({ data, loading, showColumnEditor = false }:
         kpiHeaderInserted = true
         nodes.push(
           <tr key="weekly-kpi-divider" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td className="px-3 py-1.5 text-[11px] font-semibold italic" style={{ color: '#1E3A5F' }}>
+            <td className="px-3 py-1.5 text-[12px] font-semibold italic" style={{ color: '#1E3A5F' }}>
               KPIs — as % of total output
             </td>
             {visibleCols.map(c => (
