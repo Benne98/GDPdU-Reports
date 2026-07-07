@@ -1942,3 +1942,113 @@ byte-identical for `/balance-sheet`, `/cash-flow`, `/working-capital`; BS asset/
 > precisely; equity and other non-partner credit positions default to `asset` — a
 > pre-existing budget_service limitation that carries into the BS plan sign. Confirm the
 > BS comparison convention against seeded v2 data before enabling BS plan columns.
+
+---
+
+## Phase 4 — Versioned plans: forecast/coverage from the single ACTIVE version
+
+> Decision 4 (`docs/plans/v5-pipeline-rework.md`). Supersedes the side-by-side
+> `budget`+`forecast` scenario resolution (`load_position_plan_map_pref`
+> forecast→budget). Forecast is now a **derived column of the ONE active plan
+> version** — there is no separately-stored `scenario='forecast'` band in the read
+> path. Sign-off date 2026-07-07. Code: `backend/app/services/plan_version.py`
+> (resolution) + `fin_compat_pl.load_position_plan_map_pref` /
+> `_apply_annual_fy_forecast`. Test: `backend/tests/test_plan_version_forecast.py`.
+
+### The active-version model
+
+A **plan version** (`dim_plan_version`) is scoped to `(project_id, statement,
+fiscal_year)`. **Exactly ONE** version per scope has `is_active = TRUE` (enforced by
+a partial unique index — `scenario` is NOT in the key). Only a version with
+`include_in_reporting = TRUE` feeds the reporting forecast/coverage columns. The
+version owns the plan rows in `fact_position_plan` (linked by the nullable
+`plan_version_id`; legacy rows were backfilled to a default active+included `v1`).
+
+Resolution (`plan_version.resolve_plan_scope`) is tri-state + a legacy escape hatch:
+
+| Scope state | Meaning | Forecast/coverage source |
+|---|---|---|
+| `legacy` | `dim_plan_version` table absent (un-migrated DB) | UNCHANGED legacy path (budget scenario) — byte-identical |
+| `active_included` | active version exists, `include_in_reporting=TRUE` | the active version's plan (`scenario='budget'` band) |
+| `active_parked` | active version exists, `include_in_reporting=FALSE` | **None** (parked — never stale) |
+| `no_version` | table present, no active version for the scope | **None** (parked) |
+
+### FORMULA — forecast (per line, per column grain)
+
+Let `L` = last CLOSED fiscal period (the anchor month). For a reporting line and a
+column grain:
+
+```
+Plan(p)      = the ACTIVE version's plan amount for fiscal_period p  (presented sign)
+ytd_actual   = Σ_{p ≤ L} Actual(p)        (running-sum actual through the anchor)
+ytg_plan     = Σ_{p > L} Plan(p)           (active version's remaining-months plan)
+
+Forecast_FY  = ytd_actual + ytg_plan                          (annual column, "FY..F")
+             = ytd_actual                     when the active version is parked /
+                                              absent (no reporting signal)
+```
+
+Monthly grain: `Forecast(month=p) = Actual(p)` for `p ≤ L`, `= Plan(p)` for `p > L`
+(a closed month is always the actual; an open month is the active version's plan).
+Weekly grain routes through the same rule on the ISO-week actual/plan split (Phase 3).
+For a STOCK statement (BS/FA/OPOS) the "actual through anchor" is the balance at the
+anchor cutoff and the plan adds the active version's remaining-month movements (mirror
+of `fin_compat_bs._apply_snapshot_fy_forecast_amounts`, unchanged).
+
+This is exactly the pre-existing `_apply_annual_fy_forecast` stitching (`fy_f = ytd +
+ytg`), but `ytg` is now sourced from the **single active version** instead of a
+separate stored forecast band. The `has_ytg_plan` global gate is retained: with no
+active-version plan signal, `Forecast_FY == ytd_actual` (parked, byte-identical to the
+no-plan world — NOT a stale forecast-band value).
+
+### FORMULA — coverage_pct (unchanged arithmetic, re-sourced denominator)
+
+```
+coverage_pct = round(actual_cm / abs(plan_cm) * 100, 2)   if abs(plan_cm) > 1e-6
+             = None  (+ "no plan" flag)                    otherwise
+```
+
+`plan_cm` is now the ACTIVE version's current-month plan (was: forecast-preferred
+band). Denominator is `abs(plan_cm)` so the sign of `actual_cm` is preserved
+(a negative actual over a negative cost plan → negative coverage — documented, not a
+bug). `plan_vs_actual = actual_cm − plan_cm` (presented terms, one sign path).
+
+### WORKED EXAMPLE (anchor L = 6, Net sales, presented +)
+
+```
+Active version v1, include_in_reporting = TRUE.
+Actual  p1..p6 = 100 each  → ytd_actual = 600
+Plan    p7..p12 = 90 each  → ytg_plan  = 540      (active version 'budget' band)
+Forecast_FY = 600 + 540 = 1140
+Current-month (p6): actual_cm = 110, plan_cm = 100
+  coverage_pct = 110 / |100| * 100 = 110.0
+  plan_vs_actual = 110 − 100 = +10
+```
+
+### EDGE CASES (locked in test_plan_version_forecast.py)
+
+* **No active version** (`no_version`) → forecast = `ytd_actual`, `plan_cm = 0` →
+  coverage `None` + `"no plan"`. Never reads a stale/orphan plan row.
+* **Active but `include_in_reporting = FALSE`** (`active_parked`) → identical to
+  no-version: forecast = `ytd_actual`, coverage `None`. Un-checking the toggle parks
+  the columns immediately (no stale value from the previously-included version).
+* **Anchor = month 12** (year closed) → `ytg_plan = 0` → `Forecast_FY == ytd_actual`
+  == full-year actual (no open period to project).
+* **Partial open period** — the anchor `L` is the last CLOSED period; an in-progress
+  month is treated as OPEN (`p > L` uses plan) until it closes, so a half-booked month
+  never blends actual+plan for the same period.
+* **Table absent** (`legacy`, un-migrated DB) → the entire path is byte-identical to
+  the pre-Phase-4 budget resolution; a DB without `dim_plan_version` never 500s
+  (`plan_version.resolve_plan_scope` catches the missing table and returns `legacy`).
+* **`plan_cm = 0` / sub-epsilon** → coverage `None` (no divide-by-zero), forecast
+  still = `ytd_actual` (the FY column degrades gracefully to actuals).
+
+### Parity note (already-seeded v5 DB)
+
+Before Phase 4, `load_position_plan_map_pref` preferred the stored `scenario='forecast'`
+band, falling back to `budget`. After Phase 4 (migrated DB) it reads the ACTIVE version =
+the `budget` band. Where a DB carried a `forecast` band that DIFFERS from `budget`, the
+forecast/coverage columns change to reflect the active version — this is the intended
+un-parking, not a regression. The default backfilled `v1` is active+included, so a DB
+whose forecast≈budget is numerically unchanged. Un-migrated DBs (no table) are exactly
+byte-identical via the `legacy` escape hatch.

@@ -54,10 +54,10 @@ implementing. Status: OPOS F1–F4 ✅ approved; FA F1/F2 deliberately **deferre
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Bootstrap v5 stack | ✅ committed `4c7412c` |
-| 1 | Split PL/CF/BS structures (dec. 1) | ✅ **code-complete + gate-green** (2026-07-07); migration `0030` authored; CF→`dim_cf_structure`, BS/WC→`dim_bs_structure` readers repointed (`fin_compat_cf/bs`, `budget_service._load_positions`, `balance_sheet`, seed scripts); `dim_bs/cf_structure` added to `RESET_KEEP_TABLES`; new `test_structure_split.py`. **Live-DB steps still owed** (see below). Offline gate: 276 passed / 5 skipped |
+| 1 | Split PL/CF/BS structures (dec. 1) | ✅ **DONE + LIVE-VERIFIED** (2026-07-07, commit `0dafc4b`). `0030` applied to `finssentials_v5`: lossless partition 101 = 24 PL + 32 BS + 45 CF (0 overlap). Builders run on 1.3M GL lines; **0 BS/CF leakage into PL**; numbers match baseline (NET_SALES YTD 41.4M, NET_PROFIT 2.0M, Assets 100.97M). Offline gate 276 passed / 5 skipped |
 | 2 | CF structure + CF key-space bug | CF key-space fallback ✅ in `fin_compat_pl.py` L481 (`by_direct` index) |
-| 3 | ISO-weekly routing (dec. 3) | primitives exist; routing verify/wire pending |
-| 4 | `dim_plan_version` + active-version toggle (dec. 4) | pending |
+| 3 | ISO-weekly routing (dec. 3) | ✅ **VERIFIED already-built** (2026-07-07). Router `period_grain=^(month\|week\|year)$` + iso params; api.ts sends iso_year/iso_week; live v5 W27: PL FLOW weekly sums, BS STOCK balance-at-cutoff (ytd==cm), CF flows. No code change needed (built in reporting-v2 Phase 5) |
+| 4 | `dim_plan_version` + active-version toggle (dec. 4) | ✅ **DONE + LIVE-VERIFIED** (2026-07-07). `0031` applied to v5: 3 active+included v1 rows (PL/BS/CF 2025), 0 NULL version_ids, exactly-one-active enforced (partial unique index). Live: NET_SALES forecast fy_f=44.70M (=YTD+active-version plan); parking `include_in_reporting=false` → fy_f=YTD (41.43M); restore OK. Forecast now derived from the single active version (dropped scenario side-by-side). `/budget/versions` API added; version-selector UI is a frontend follow-on. Formula in financial-logic.md; 18 tests. Backend-only |
 | 5 | Auto-extension Project-Setup step (dec. 2) | pending |
 | 6 | OB mode carry_forward (dec. 5) | ✅ committed `d389c30` |
 | 7 | Remove entity dropdown; multi-select filter; conditional display (dec. 6/7) | pending |

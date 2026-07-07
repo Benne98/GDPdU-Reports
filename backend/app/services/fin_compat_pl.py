@@ -549,22 +549,42 @@ def load_position_plan_map_pref(
     *,
     prefixes: Optional[list[str]] = None,
 ) -> dict[str, dict[str, float]]:
-    """Forecast-preferred position-plan reader for the two-view Forecast/Coverage cols.
+    """Active-version position-plan reader for the two-view Forecast/Coverage cols.
 
-    Resolves the ``scenario='forecast'`` band in ``fact_position_plan`` first and only
-    falls back to ``scenario='budget'`` when forecast has NO signal.  Delegates entirely
-    to the primitive :func:`load_position_plan_map` — same sign conventions, same tenant
-    scoping (``ent_frag`` / ``prefixes`` forwarded verbatim), same ``has_signal`` gate.
+    PHASE 4 (decision 4): forecast/coverage now source from the SINGLE active plan
+    version, NOT a separate stored ``scenario='forecast'`` band.  Resolution is gated
+    by :func:`plan_version.resolve_plan_scope` on ``(statement, fiscal_year=year)``:
 
-    GOLDEN-SAFETY: on a DB WITHOUT forecast rows the forecast read returns ``{}`` (the
-    ``has_signal`` gate), so this wrapper is byte-identical to today's budget read.
+      * ``legacy`` (``dim_plan_version`` absent — un-migrated DB) → the pre-Phase-4
+        behaviour VERBATIM (forecast-band preferred, budget fallback), so a DB without
+        the new table is byte-identical and never 500s.
+      * ``active_included`` → the active version's plan (``scenario='budget'`` band).
+      * ``active_parked`` / ``no_version`` → ``{}`` (parked → None forecast/coverage,
+        never a stale value from a previously-included/forecast band).
+
+    Delegates to the primitive :func:`load_position_plan_map` — same sign conventions,
+    same tenant scoping (``ent_frag`` / ``prefixes`` forwarded verbatim), same
+    ``has_signal`` gate.
     """
-    fc = load_position_plan_map(
-        session, statement, year, month, ent_frag,
-        scenario="forecast", prefixes=prefixes,
-    )
-    if fc:
-        return fc
+    from app.services import plan_version
+
+    state, _ver = plan_version.resolve_plan_scope(session, statement, int(year))
+    if state == plan_version.LEGACY:
+        # Un-migrated DB → keep the exact pre-Phase-4 forecast→budget resolution.
+        fc = load_position_plan_map(
+            session, statement, year, month, ent_frag,
+            scenario="forecast", prefixes=prefixes,
+        )
+        if fc:
+            return fc
+        return load_position_plan_map(
+            session, statement, year, month, ent_frag,
+            scenario="budget", prefixes=prefixes,
+        )
+    if state != plan_version.ACTIVE_INCLUDED:
+        # active_parked or no_version → parked; forecast/coverage read as None.
+        return {}
+    # active_included → the single active version's plan (the 'budget' band).
     return load_position_plan_map(
         session, statement, year, month, ent_frag,
         scenario="budget", prefixes=prefixes,
@@ -997,7 +1017,19 @@ def build_pl_annual_compat(
     if not struct:
         raise ValueError("dim_pl_structure is empty — run setup or load PL Structure")
 
-    plan_map = _load_plan_map(session, year, month, ent_frag)
+    # PHASE 4: the annual FY forecast (fy_f = ytd ⊕ plan-ytg) sources from the SINGLE
+    # active plan version.  When the active version is parked (include_in_reporting=
+    # FALSE) or none is active, the forecast column collapses to actuals-YTD (parked,
+    # never a stale value) — we pass an empty plan_map.  Legacy DBs (no dim_plan_version)
+    # keep the exact pre-Phase-4 budget→forecast→plan resolution.
+    from app.services import plan_version
+
+    included = plan_version.reporting_included(session, "PL", int(year))
+    if included is False:
+        plan_map: dict[str, dict[str, float]] = {}   # parked → fy_f == ytd
+    else:
+        # included True (active version = the budget band) or None (legacy).
+        plan_map = _load_plan_map(session, year, month, ent_frag)
     return _build_annual_rows(struct, grains, year, month, plan_map=plan_map)
 
 
@@ -1320,15 +1352,22 @@ def build_statement_plan_response(
     # Pass ``prefixes`` ONLY for the restricted ≥2-prefix scope; admin / single-prefix
     # call byte-identically to before (no kwarg → default None → unchanged behaviour).
     if effstmt == "PL":
-        # Forecast-preferred PRE-CHECK: try the position-grain forecast band (falls back
-        # to budget internally).  Only when it has signal do we use it; otherwise the
-        # existing budget→gl_plan(forecast)→plan fallback stays UNCHANGED.  On a DB with
-        # no forecast rows this pref == today's budget read, so PL is byte-identical.
+        # PHASE 4: active-version PRE-CHECK.  ``load_position_plan_map_pref`` is now
+        # version-aware — it returns the active version's plan (active_included), ``{}``
+        # (parked / no_version), or the legacy forecast→budget read (un-migrated DB).
+        # The legacy ``_load_plan_map`` fallback (budget→gl_plan forecast→plan) is used
+        # ONLY when the DB is un-migrated (LEGACY): on a migrated DB a parked/absent
+        # version must PARK the columns (empty plan_map), not fall back to fact_gl_plan.
+        from app.services import plan_version
+
+        state, _ver = plan_version.resolve_plan_scope(session, "PL", int(year))
         pref = load_position_plan_map_pref(
             session, "PL", year, month, ent_frag, prefixes=restrict_prefixes
         )
         if pref:
             plan_map = pref
+        elif state != plan_version.LEGACY:
+            plan_map = {}   # migrated + parked/no_version → park (no gl_plan fallback)
         elif restrict_prefixes is not None:
             plan_map = _load_plan_map(session, year, month, ent_frag, prefixes=restrict_prefixes)
         else:

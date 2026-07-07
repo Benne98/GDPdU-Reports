@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import User, current_user, require_admin
 from app.db import get_session
-from app.services import budget_excel, budget_service
+from app.services import budget_excel, budget_service, plan_version
 from app.services.entity_visibility import visible_entity_codes
 from app.services.fin_compat_sql import resolve_entity_prefix
 
@@ -201,12 +201,58 @@ class CommitResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Plan-version models (Phase 4)
+# --------------------------------------------------------------------------- #
+class PlanVersionOut(BaseModel):
+    plan_version_id: int
+    project_id: Optional[int] = None
+    statement: str
+    fiscal_year: int
+    label: str
+    is_active: bool
+    include_in_reporting: bool
+
+
+class PlanVersionsResponse(BaseModel):
+    # ``supported=False`` when dim_plan_version is absent (un-migrated DB) — the FE
+    # then hides the version UI and the reporting stays on the legacy path.
+    supported: bool = True
+    versions: list[PlanVersionOut] = Field(default_factory=list)
+
+
+class CreateVersionRequest(BaseModel):
+    statement: str
+    fiscal_year: int = Field(..., ge=2000, le=2100)
+    label: str = Field(..., min_length=1, max_length=200)
+    activate: bool = True
+    include_in_reporting: bool = True
+
+
+class UpdateVersionRequest(BaseModel):
+    # Either flip the active flag, toggle include_in_reporting, or both.
+    activate: Optional[bool] = None
+    include_in_reporting: Optional[bool] = None
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def _validate_statement(statement: str) -> str:
     s = (statement or "").upper()
     if s not in _STATEMENTS:
         raise HTTPException(status_code=422, detail="statement must be 'PL' or 'BS'")
+    return s
+
+
+# Plan versions span PL / BS / CF (forecast/coverage un-parking applies to all three;
+# WC derives from BS so it has no own version scope).
+_VERSION_STATEMENTS = ("PL", "BS", "CF")
+
+
+def _validate_version_statement(statement: str) -> str:
+    s = (statement or "").upper()
+    if s not in _VERSION_STATEMENTS:
+        raise HTTPException(status_code=422, detail="statement must be 'PL', 'BS' or 'CF'")
     return s
 
 
@@ -508,6 +554,86 @@ def delete_budget(
         logger.error("delete_budget failed: %s", str(exc).split(chr(10))[0][:200])
         raise HTTPException(status_code=500, detail="Delete failed; transaction rolled back.") from exc
     return WriteResponse(deleted=res["deleted"])
+
+
+# --------------------------------------------------------------------------- #
+# Plan versions (Phase 4) — list / create / activate / toggle include-in-reporting
+# --------------------------------------------------------------------------- #
+@router.get("/versions", response_model=PlanVersionsResponse)
+def list_plan_versions(
+    session: Session = Depends(get_session),
+    user: User = Depends(current_user),
+    statement: Optional[str] = Query(None),
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
+) -> PlanVersionsResponse:
+    """List plan versions for the (optional) scope.
+
+    ``supported=False`` when ``dim_plan_version`` is absent (un-migrated DB) so the
+    FE can hide the version UI; reporting stays on the legacy path.
+    """
+    if not plan_version.table_exists(session):
+        return PlanVersionsResponse(supported=False, versions=[])
+    stmt = _validate_version_statement(statement) if statement else None
+    versions = plan_version.list_versions(session, statement=stmt, fiscal_year=fiscal_year)
+    return PlanVersionsResponse(
+        supported=True,
+        versions=[PlanVersionOut(**v.__dict__) for v in versions],
+    )
+
+
+@router.post("/versions", response_model=PlanVersionOut)
+def create_plan_version(
+    body: CreateVersionRequest,
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> PlanVersionOut:
+    """Create a plan version (optionally activate it for its scope)."""
+    if not plan_version.table_exists(session):
+        raise HTTPException(status_code=409, detail="Plan versions unavailable — apply migration 0031.")
+    stmt = _validate_version_statement(body.statement)
+    try:
+        new_id = plan_version.create_version(
+            session, statement=stmt, fiscal_year=body.fiscal_year, label=body.label,
+            activate=body.activate, include_in_reporting=body.include_in_reporting,
+            updated_by=admin.email,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("create_plan_version failed: %s", str(exc).split(chr(10))[0][:200])
+        raise HTTPException(status_code=500, detail="Create version failed; rolled back.") from exc
+    versions = plan_version.list_versions(session, statement=stmt, fiscal_year=body.fiscal_year)
+    created = next((v for v in versions if v.plan_version_id == new_id), None)
+    if created is None:  # pragma: no cover — defensive
+        raise HTTPException(status_code=500, detail="Version created but not readable.")
+    return PlanVersionOut(**created.__dict__)
+
+
+@router.patch("/versions/{plan_version_id}", response_model=WriteResponse)
+def update_plan_version(
+    plan_version_id: int,
+    body: UpdateVersionRequest,
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> WriteResponse:
+    """Activate a version and/or toggle its include-in-reporting flag.
+
+    Un-checking include-in-reporting parks the reporting forecast/coverage columns
+    immediately (they read as None) — never a stale value.
+    """
+    if not plan_version.table_exists(session):
+        raise HTTPException(status_code=409, detail="Plan versions unavailable — apply migration 0031.")
+    try:
+        if body.activate:
+            plan_version.set_active(session, plan_version_id, updated_by=admin.email)
+        if body.include_in_reporting is not None:
+            plan_version.set_include_in_reporting(
+                session, plan_version_id, body.include_in_reporting, updated_by=admin.email
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.error("update_plan_version failed: %s", str(exc).split(chr(10))[0][:200])
+        raise HTTPException(status_code=500, detail="Update version failed; rolled back.") from exc
+    return WriteResponse(ok=True)
 
 
 # --------------------------------------------------------------------------- #
