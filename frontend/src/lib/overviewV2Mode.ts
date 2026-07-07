@@ -4,4 +4,5 @@
 export const IS_OVERVIEW_V2 =
   import.meta.env.MODE === 'reporting-v2' ||
   import.meta.env.MODE === 'reporting-v2-sandbox' ||
-  import.meta.env.MODE === 'merged';
+  import.meta.env.MODE === 'merged' ||
+  import.meta.env.MODE === 'v5';
