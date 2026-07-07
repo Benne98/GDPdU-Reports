@@ -41,6 +41,7 @@ export default function BalanceSheetPage() {
       activeSubTab={subTab}
       onSubTabChange={setSubTab}
       entityFilterSubTabs={['receivables-aging', 'payables-aging', 'fixed-assets']}
+      annualOnlySubTabs={['fixed-assets']}
       renderSubTabContent={ctx => {
         if (subTab === 'receivables-aging' || subTab === 'payables-aging') {
           const anchor = periodAnchorYearMonth(ctx.period)

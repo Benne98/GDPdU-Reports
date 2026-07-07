@@ -115,6 +115,9 @@ type Props = {
    *  Payroll / Fixed-Assets / OPOS aging. The IS/BS/CF/WC statements themselves are
    *  always consolidated and never show an entity selector. */
   entityFilterSubTabs?: string[]
+  /** Sub-tab ids that support ANNUAL grain only (e.g. fixed-assets — year-end
+   *  snapshots): Monthly/Weekly pills are disabled and grain is forced to year. */
+  annualOnlySubTabs?: string[]
 }
 
 function finPeriodFromSelection(p: PeriodSelection, entity?: string): FinPeriodParams {
@@ -251,6 +254,7 @@ export default function StatementsPage({
   subTabContent,
   renderSubTabContent,
   entityFilterSubTabs,
+  annualOnlySubTabs,
 }: Props) {
   const [entities, setEntities] = useState<Entity[]>([])
   // Phase 7: the IS/BS/CF/WC statements are ALWAYS consolidated — no per-statement
@@ -316,6 +320,16 @@ export default function StatementsPage({
   const showEntityFilter = Boolean(
     altSubActive && activeSubTab && entityFilterSubTabs?.includes(activeSubTab),
   )
+  // Fixed-assets (and any annual-only sub-page): year-end snapshots only → force
+  // Annual grain and disable the Monthly/Weekly pills.
+  const annualOnly = Boolean(
+    activeSubTab && annualOnlySubTabs?.includes(activeSubTab),
+  )
+  useEffect(() => {
+    if (annualOnly && grain !== 'year') {
+      setGrain('year')
+    }
+  }, [annualOnly, grain])
 
   usePageChartKeyboardNav(pageContentRef, { enabled: periodReady && !loading && statementActive })
 
@@ -662,6 +676,7 @@ export default function StatementsPage({
               loading={loading}
               onRefresh={loadStatement}
               showYearGrain={true}
+              annualOnly={annualOnly}
             />
           </>
         )}

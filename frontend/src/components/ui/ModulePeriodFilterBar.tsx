@@ -34,6 +34,12 @@ type Props = {
   embedded?: boolean
   /** When true, show an additional "Annual" pill for year-grain selection (P&L only). */
   showYearGrain?: boolean
+  /**
+   * When true, only the Annual grain is offered — Monthly / Weekly are shown
+   * disabled (greyed). Fixed-asset snapshots are year-end only (no interim
+   * as-of), so a monthly/weekly rollforward would be meaningless.
+   */
+  annualOnly?: boolean
 }
 
 
@@ -59,6 +65,7 @@ export default function ModulePeriodFilterBar({
   weekCount = 12,
   embedded = false,
   showYearGrain = false,
+  annualOnly = false,
 }: Props) {
   const anchorYear = latest?.year ?? 2025
   const anchorMonth = latest?.month ?? 7
@@ -126,7 +133,7 @@ export default function ModulePeriodFilterBar({
 
               <div className="flex flex-wrap gap-1">
 
-                {showYearGrain && (
+                {(showYearGrain || annualOnly) && (
                   <button
                     type="button"
                     onClick={() => {
@@ -143,26 +150,32 @@ export default function ModulePeriodFilterBar({
 
                 <button
                   type="button"
+                  disabled={annualOnly}
+                  title={annualOnly ? 'Fixed-asset snapshots are year-end only' : undefined}
                   onClick={() => {
+                    if (annualOnly) return
                     onGrainChange('month')
                     const m = monthOptions[monthOptions.length - 1]
                     onPeriodChange(m)
                   }}
                   className={periodPillClass}
-                  style={pillStyle(grain === 'month')}
+                  style={{ ...pillStyle(grain === 'month'), ...(annualOnly ? { opacity: 0.4, cursor: 'not-allowed' } : {}) }}
                 >
                   Monthly
                 </button>
 
                 <button
                   type="button"
+                  disabled={annualOnly}
+                  title={annualOnly ? 'Fixed-asset snapshots are year-end only' : undefined}
                   onClick={() => {
+                    if (annualOnly) return
                     onGrainChange('week')
                     const w = weekOptions[weekOptions.length - 1]
                     onPeriodChange(w)
                   }}
                   className={periodPillClass}
-                  style={pillStyle(grain === 'week')}
+                  style={{ ...pillStyle(grain === 'week'), ...(annualOnly ? { opacity: 0.4, cursor: 'not-allowed' } : {}) }}
                 >
                   Weekly
                 </button>
