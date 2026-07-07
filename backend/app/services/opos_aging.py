@@ -38,6 +38,7 @@ residual buckets to overdue_over_180 per A5).
 from __future__ import annotations
 
 import calendar
+import logging
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -46,6 +47,8 @@ from typing import Any, Iterable, Iterator, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.services.entities import ENTITY_BUKRS, ENTITY_PREFIX
@@ -56,7 +59,24 @@ _BANDS = tuple(b for b, _ in AR_BANDS)
 
 # README payment terms — customer (AR) 30d, supplier (AP) 45d.  These are the
 # CORRECTED terms; the legacy gl_aging.py hardcoded the inverse (dso=45/dpo=30).
+# They are used for (a) due-date derivation (due = buchungsdatum + terms) and
+# (b) the DSO/DPO *fallback proxy* (F4) when the real period flow is unavailable.
 _TERMS = {"AR": 30, "AP": 45}
+
+# F4 REAL DSO/DPO — period-flow denominators.
+#   DSO = total_AR_open / gross_sales_period × days_in_period   (fact_sales)
+#   DPO = total_AP_open / purchases_period   × days_in_period   (GL-derived)
+# The DPO purchase base is NOT a dedicated purchase journal (none exists in v5):
+# it is the sum of the P&L "Cost of materials" postings (materials + purchased
+# services).  The account set is derived at RUNTIME from the dim_pl_structure
+# mapping row(s) below — never hardcoded account codes — so it tracks the loaded
+# PL structure (level_3 = "Cost of materials", covering both level_4 buckets).
+_PURCHASE_LINE_CODES: tuple[str, ...] = ("COST_OF_MATERIALS",)
+
+# Upper clamp on real DSO/DPO so a pathological open/flow ratio (tiny period flow
+# vs a large opening balance) can never render an absurd figure.  10 years is far
+# beyond any real trade cycle; hitting it flags a data problem, not a real value.
+_MAX_FLOW_DAYS = 3650.0
 
 # LuL trade-account scope (F5 / reconcile_opos.py account-map — NOT a naive konto
 # prefix).  23500/23502/35500 are LuL too; omitting 23500 is the Meridian-2024
@@ -491,6 +511,231 @@ def _agg_buckets(aging: dict[str, dict]) -> dict[str, float]:
     return out
 
 
+def _gross_open_eur(v: dict[str, Any]) -> float:
+    """Gross open aging basis in EUR — Σ positive-partner FIFO buckets.
+
+    This is the SAME total the aging view headlines (``total_open_gross`` =
+    before_due + overdue; credit-balance partners floored to 0 in
+    :func:`compute_opos_aging`), so it is the F4 DSO/DPO numerator that reconciles
+    with the displayed AR/AP.  NOT the net Method-A ``signed_total_eur`` (which
+    nets credit balances DOWN and cannot be tied back to the aging table).
+    """
+    return sum(_agg_buckets(v["aging"]).values())
+
+
+# --------------------------------------------------------------------------- #
+# F4 — REAL DSO / DPO (period-flow denominators) with proxy fallback
+# --------------------------------------------------------------------------- #
+def _days_in_fy_to_date(year: int, month: int) -> int:
+    """Calendar days from the fiscal-year start (Jan 1) to the Stichtag month-end.
+
+    Matches the aging Stichtag's period window (fy_label = year, posting_date <=
+    Stichtag): a December Stichtag → the whole fiscal year (365/366), a partial
+    YTD Stichtag (e.g. month=7) → Jan 1 .. Jul 31 (212).  ``+1`` makes the span
+    inclusive of both endpoints.
+    """
+    return (_month_end(year, month) - date(year, 1, 1)).days + 1
+
+
+def _safe_rollback(session: Session) -> None:
+    """Best-effort rollback so a failed flow query never leaves an aborted tx."""
+    try:
+        session.rollback()
+    except Exception:  # noqa: BLE001 — rollback is itself best-effort
+        pass
+
+
+def _effective_prefixes(
+    session: Session, entity: Optional[str], allowed: Optional[frozenset[str]],
+) -> Optional[list[str]]:
+    """Resolve the effective entity_prefix scope for a flow query.
+
+    Mirrors :func:`fetch_opos_rows` so DSO/DPO denominators are scoped to EXACTLY
+    the same entities as the numerator OPOS balance.  Returns:
+      * ``None``       — unrestricted (admin / no narrow) → all entities.
+      * ``[]``         — fail-closed deny (empty visibility) → caller issues NO SQL.
+      * ``[p, ...]``   — restrict to these 2-char prefixes.
+    """
+    eps = [str(e)[:2] for e in resolve_entity_prefixes(session, entity)]
+    if allowed is not None:
+        safe = sorted({str(p).replace("'", "")[:2] for p in allowed if p})
+        if eps:
+            narrow = set(eps)
+            safe = [p for p in safe if p in narrow]
+        return safe  # possibly [] → deny
+    return eps or None
+
+
+def _sales_period_eur(
+    session: Session, year: int, month: int, entity: Optional[str],
+    allowed: Optional[frozenset[str]],
+) -> Optional[float]:
+    """Gross sales (EUR) over the FY-to-date window for the DSO denominator.
+
+    Sums ``fact_sales.gross_sales`` (stored positive; ``entry_type = 'actual'``)
+    with ``posting_date`` in [Jan 1 .. Stichtag], entity-scoped by
+    ``LEFT(account_number_group, 2)`` (same convention as sales_analytics_compat).
+    Returns ``None`` on a deny scope OR any error (e.g. a missing ``fact_sales``
+    table) so the caller falls back to the payment-term proxy WITHOUT 500-ing —
+    the DSO enhancement is best-effort and must never break the aging page.
+    """
+    try:
+        prefixes = _effective_prefixes(session, entity, allowed)
+        if prefixes == []:
+            return None  # fail closed — no SQL
+        params: dict[str, Any] = {
+            "d0": date(year, 1, 1).isoformat(),
+            "d1": _month_end(year, month).isoformat(),
+        }
+        ent_frag = ""
+        if prefixes is not None:
+            ent_frag = "AND LEFT(f.account_number_group, 2) = ANY(:prefixes)"
+            params["prefixes"] = prefixes
+        sql = text(f"""
+            SELECT COALESCE(SUM(f.gross_sales), 0) AS gross_sales
+            FROM fact_sales f
+            WHERE f.entry_type = 'actual'
+              AND f.posting_date BETWEEN :d0 AND :d1
+              {ent_frag}
+        """)
+        val = session.execute(sql, params).scalar()
+        return float(val or 0.0)
+    except Exception:  # noqa: BLE001 — degrade to the term proxy, never 500
+        logger.warning("DSO gross_sales flow unavailable → proxy fallback", exc_info=True)
+        _safe_rollback(session)
+        return None
+
+
+def _com_level_filter(session: Session) -> Optional[tuple[str, dict[str, Any]]]:
+    """SQL fragment + params selecting the ``COST_OF_MATERIALS`` GL accounts.
+
+    Derives the level-2/3/4 filter at RUNTIME from the ``dim_pl_structure``
+    mapping row(s) whose ``line_code`` is a purchase code (``_PURCHASE_LINE_CODES``)
+    — so the purchase base tracks the loaded PL structure and never hardcodes
+    account numbers.  Returns ``None`` (→ proxy fallback) when the structure is
+    absent or defines no level filter for those codes.
+    """
+    try:
+        rows = session.execute(
+            text(
+                "SELECT level_2, level_3, level_4 FROM dim_pl_structure "
+                "WHERE line_code = ANY(:codes)"
+            ),
+            {"codes": list(_PURCHASE_LINE_CODES)},
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — no structure → proxy fallback, never 500
+        _safe_rollback(session)
+        return None
+
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    for i, r in enumerate(rows):
+        m = r._mapping
+        parts: list[str] = []
+        for lvl in ("level_2", "level_3", "level_4"):
+            v = m[lvl]
+            if v is not None and str(v).strip() != "":
+                key = f"com_{lvl}_{i}"
+                parts.append(f"TRIM(a.{lvl}) = :{key}")
+                params[key] = str(v).strip()
+        if parts:
+            clauses.append("(" + " AND ".join(parts) + ")")
+    if not clauses:
+        return None
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def _purchases_period_eur(
+    session: Session, year: int, month: int, entity: Optional[str],
+    allowed: Optional[frozenset[str]],
+) -> Optional[float]:
+    """GL-derived purchases (EUR) over the FY-to-date window for the DPO denominator.
+
+    Sums ``fact_gl_line.amount`` (raw expense debit → positive) over the P&L
+    "Cost of materials" accounts (materials + purchased services, resolved via
+    :func:`_com_level_filter`) for ``fiscal_year = year`` and ``fiscal_period``
+    1..month — the canonical PL YTD grain.  NOT a dedicated purchase journal.
+    Returns ``None`` on a deny scope, a missing structure, or any error so the
+    caller falls back to the payment-term proxy WITHOUT 500-ing (best-effort).
+    """
+    try:
+        prefixes = _effective_prefixes(session, entity, allowed)
+        if prefixes == []:
+            return None
+        com = _com_level_filter(session)
+        if com is None:
+            return None
+        com_frag, params = com
+        params["year"] = year
+        params["month"] = month
+        ent_frag = ""
+        if prefixes is not None:
+            ent_frag = "AND LEFT(l.account_number_group, 2) = ANY(:prefixes)"
+            params["prefixes"] = prefixes
+        sql = text(f"""
+            SELECT COALESCE(SUM(l.amount), 0) AS purchases
+            FROM fact_gl_line l
+            JOIN fact_gl_entry e
+              ON e.journal_entry_group_number = l.journal_entry_group_number
+             AND e.fiscal_year = l.fiscal_year
+            JOIN dim_gl_account a
+              ON a.account_number_group = l.account_number_group
+             AND a.fiscal_year = l.fiscal_year
+            WHERE a.level_0 = 'PL'
+              AND {com_frag}
+              AND e.fiscal_year = :year
+              AND e.fiscal_period BETWEEN 1 AND :month
+              {ent_frag}
+        """)
+        val = session.execute(sql, params).scalar()
+        return abs(float(val or 0.0))
+    except Exception:  # noqa: BLE001 — degrade to the term proxy, never 500
+        logger.warning("DPO purchases flow unavailable → proxy fallback", exc_info=True)
+        _safe_rollback(session)
+        return None
+
+
+def real_days_value(
+    open_eur: float, flow_eur: Optional[float], year: int, month: int,
+) -> Optional[float]:
+    """Real DSO/DPO in days, or ``None`` when it is not computable.
+
+    ``DSO/DPO = |open| / flow × days_in_period``.  Returns ``None`` (→ proxy) when
+    the period flow is missing or non-positive (divide-by-zero guard), and clamps
+    an implausibly large ratio to ``_MAX_FLOW_DAYS`` rather than emitting an absurd
+    figure.  ``open_eur`` is the gross open aging basis (already ≥ 0 for both AR and
+    AP); ``abs`` is a defensive guard only.
+    """
+    if flow_eur is None or flow_eur <= 1e-6:
+        return None
+    val = abs(open_eur) / flow_eur * _days_in_fy_to_date(year, month)
+    if val <= 0:
+        return None
+    return round(min(val, _MAX_FLOW_DAYS), 1)
+
+
+def _side_days(
+    session: Session, side: str, year: int, month: int, entity: Optional[str],
+    open_eur: float,
+) -> tuple[float, str]:
+    """Real DSO (AR) / DPO (AP) with a payment-term proxy fallback.
+
+    Returns ``(days, source)`` where ``source`` is ``'real'`` when computed from
+    the period flow and ``'proxy'`` when it falls back to ``term_proxy_days`` (no
+    flow data / missing table / 0 denominator) — the golden-safety flag so a DB
+    without the flow tables behaves EXACTLY as the pre-Phase-8 proxy did.
+    """
+    allowed = _ALLOWED_PREFIXES.get()
+    if side == "AR":
+        flow = _sales_period_eur(session, year, month, entity, allowed)
+    else:
+        flow = _purchases_period_eur(session, year, month, entity, allowed)
+    val = real_days_value(open_eur, flow, year, month)
+    if val is None:
+        return float(term_proxy_days(side)), "proxy"
+    return val, "real"
+
+
 # --------------------------------------------------------------------------- #
 # F5 KPI + aging series (drop-in for gl_aging.build_*_aging)
 # --------------------------------------------------------------------------- #
@@ -524,6 +769,11 @@ def build_receivables_aging_opos(
     # Credit-balance bridge: gross − net headline magnitude = Σ|net of credit-balance
     # partners|.  Reconciles the gross aging basis back to the net headline.
     credit_balances = round(total_open_gross - method_a_total, 2)
+    # F4: REAL DSO = gross_AR_open / gross_sales_period × days_in_period (fact_sales),
+    # with a term-proxy fallback (30d) flagged via dso_source when the flow is absent.
+    # Numerator is the GROSS aging basis (Σ positive-partner buckets == total_open_gross),
+    # so DSO reconciles with the displayed AR — NOT the net Method-A signed_total_eur.
+    dso_days, dso_source = _side_days(session, "AR", year, month, entity, sum(buckets.values()))
 
     return enrich_aging_response({
         "year": year, "month": month, "as_of": v["as_of"].isoformat(),
@@ -540,7 +790,8 @@ def build_receivables_aging_opos(
             # Anchored to the GROSS basis: overdue <= total_open_gross by
             # construction, so this is in [0,100] WITHOUT the clamp being load-bearing.
             "overdue_pct": clamp_pct(overdue, total_open_gross),
-            "dso_days": float(term_proxy_days("AR")),  # A2 proxy — corrected 30d
+            "dso_days": dso_days,        # F4 real (fact_sales) or proxy fallback
+            "dso_source": dso_source,    # 'real' | 'proxy' — golden-safety flag
             "open_documents": v["open_documents"],
         },
     })
@@ -565,6 +816,11 @@ def build_payables_aging_opos(
     # Credit-balance bridge: gross − net headline magnitude = Σ|net of debit-balance
     # (supplier-overpaid / prepayment) partners floored out of the gross basis|.
     credit_balances = round(total_open_gross - method_a_mag, 2)
+    # F4: REAL DPO = gross_AP_open / purchases_period × days_in_period (GL-derived
+    # Cost-of-materials postings), with a term-proxy fallback (45d) flagged via
+    # dpo_source.  Numerator is the GROSS aging basis (Σ positive-partner buckets ==
+    # total_open_gross), so DPO reconciles with the displayed AP.
+    dpo_days, dpo_source = _side_days(session, "AP", year, month, entity, sum(buckets.values()))
 
     return enrich_aging_response({
         "year": year, "month": month, "as_of": v["as_of"].isoformat(),
@@ -580,7 +836,8 @@ def build_payables_aging_opos(
             "overdue": overdue,
             # Anchored to the GROSS basis (clamp no longer load-bearing).
             "overdue_pct": clamp_pct(overdue, total_open_gross),
-            "dpo_days": float(term_proxy_days("AP")),  # A2 proxy — corrected 45d
+            "dpo_days": dpo_days,        # F4 real (GL purchases) or proxy fallback
+            "dpo_source": dpo_source,    # 'real' | 'proxy' — golden-safety flag
             "open_documents": v["open_documents"],
         },
     })
@@ -605,8 +862,13 @@ def build_metrics_aging_series_opos(
 # --------------------------------------------------------------------------- #
 # Partner register / scatter / combo
 # --------------------------------------------------------------------------- #
-def _register_rows(v: dict[str, Any], side: str, limit: int) -> list[dict[str, Any]]:
+def _register_rows(
+    v: dict[str, Any], side: str, limit: int, days_outstanding: Optional[float] = None,
+) -> list[dict[str, Any]]:
     terms = term_proxy_days(side)
+    # days_outstanding is the side-level REAL DSO/DPO (F4) when available, else the
+    # term proxy — kept SEPARATE from payment_terms_days (the due-date term stays 30/45).
+    dso_dpo = float(days_outstanding) if days_outstanding is not None else float(terms)
     # AR register consumers read r.gross_sales; AP register reads r.gross_spend.
     gross_key = "gross_sales" if side == "AR" else "gross_spend"
     out = []
@@ -628,8 +890,8 @@ def _register_rows(v: dict[str, Any], side: str, limit: int) -> list[dict[str, A
             "country_code": info.get("country_code"),
             "region_code": info.get("region_code"),
             "city": info.get("city"),
-            gross_key: None,  # A2: GoBD gross journal not wired in read path
-            "days_outstanding": float(terms),
+            gross_key: None,  # A2: per-partner GoBD gross journal not wired in read path
+            "days_outstanding": dso_dpo,  # F4 side-level real DSO/DPO (or proxy)
             "payment_terms_days": terms,
             "open_documents": a.get("open_documents", 0),
             "documents": [],
@@ -642,7 +904,8 @@ def build_receivables_customers_opos(
     session: Session, year: int, month: int, entity: Optional[str] = None, limit: int = 50,
 ) -> dict[str, Any]:
     v = _partner_view(session, "AR", year, month, entity)
-    register = _register_rows(v, "AR", limit)
+    dso_days, _ = _side_days(session, "AR", year, month, entity, _gross_open_eur(v))
+    register = _register_rows(v, "AR", limit, days_outstanding=dso_days)
     scatter = [
         {"customer_id": r["customer_id"], "name": r["name"],
          "customer_name": r["name"], "balanceKeur": r["balanceKeur"],
@@ -663,7 +926,8 @@ def build_payables_suppliers_opos(
     session: Session, year: int, month: int, entity: Optional[str] = None, limit: int = 50,
 ) -> dict[str, Any]:
     v = _partner_view(session, "AP", year, month, entity)
-    register = _register_rows(v, "AP", limit)
+    dpo_days, _ = _side_days(session, "AP", year, month, entity, _gross_open_eur(v))
+    register = _register_rows(v, "AP", limit, days_outstanding=dpo_days)
     scatter = [
         {"supplier_id": r["supplier_id"], "name": r["name"],
          "supplier_name": r["name"], "balanceKeur": r["balanceKeur"],

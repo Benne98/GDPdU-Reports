@@ -1414,21 +1414,83 @@ denominator and blew past 100%. **Fix, three layers:**
 net-open 50. OLD broken: 130 / 50 = **260 %**. NEW: FIFO allocates 50 against the
 overdue invoice → 50 overdue / 50 total = **100.0 %** (bounded).
 
-### F4 — DSO / DPO
+### F4 — DSO / DPO  (real period-flow — Phase 8, 2026-07-07)
 
 ```
-DSO = total_AR_open / gross_sales_period × days_in_period
-DPO = total_AP_open / purchases_period   × days_in_period
+DSO = gross_AR_open(Stichtag) / gross_sales_period × days_in_period      # source='real'
+DPO = gross_AP_open(Stichtag) / purchases_period   × days_in_period      # source='real'
 ```
 
-Gross sales / purchases come from the GoBD linkage (`Referenz` /
-`GoBD_Transaktionsnr` → GDPdU journal). **Assumption A2:** if that journal table is
-absent in `finssentials_v4`, fall back to a **payment-term proxy** = README terms:
-**AR 30d, AP 45d**. ⚠️ **Regression — current inversion:** `gl_aging.py`
-`build_receivables_aging` hardcodes `dso_days = 45.0` and `build_payables_aging`
-`dpo_days = 30.0` — **inverted** (README is customer 30d / supplier 45d). Phase 2
-must swap to AR 30 / AP 45. Locked by `test_current_gl_aging_proxy_is_inverted_BUG`
-(strict `xfail` today → flips green when fixed).
+**Primary (REAL) — v5 pipeline.** Numerators are the **gross open aging basis** per
+side — `total_open_gross` = Σ positive-partner FIFO buckets = `before_due + overdue`,
+**the exact total the aging view headlines** (credit-balance partners floored to 0 in
+F2). This is the conventional trade-DSO/DPO basis and, crucially, it **reconciles with
+the AR/AP the user sees** in the aging table. It is deliberately NOT the net Method-A
+`signed_total_eur` headline (F5), which nets credit balances DOWN (e.g. v5 AR
+gross €15,025k → net ~€2,025k) and cannot be tied back to the aging bars — using the
+net base understated DSO ~7× (4.4d vs 32.6d). Denominators are **period flows** over
+the fiscal-year-to-date window
+`[Jan 1 .. Stichtag]` (same period the aging Stichtag defines: `fy_label = year`,
+`posting_date <= Stichtag`):
+
+- **`gross_sales_period` (DSO):** `Σ fact_sales.gross_sales` where
+  `entry_type = 'actual'` and `posting_date ∈ [Jan 1 .. Stichtag]`, entity-scoped by
+  `LEFT(account_number_group, 2)`. `gross_sales` is stored **positive**.
+- **`purchases_period` (DPO):** **GL-derived — there is NO purchase journal in v5.**
+  `Σ fact_gl_line.amount` (raw expense debit → **positive**) over the P&L
+  **Cost-of-materials** accounts for `fiscal_year = year, fiscal_period ∈ [1..month]`
+  (the canonical PL YTD grain). The account set is **not hardcoded**: it is derived
+  at runtime from the `dim_pl_structure` mapping row `line_code = 'COST_OF_MATERIALS'`
+  (its filter is `level_3 = 'Cost of materials'`, `level_2/level_4` null → it covers
+  **both** level_4 buckets *Purchased goods and materials* **and** *Purchased
+  services*). Documented explicitly as **GL-derived materials cost**, not a dedicated
+  procurement journal.
+- **`days_in_period` = (Stichtag − Jan 1).days + 1** — a December Stichtag → the whole
+  fiscal year (365/366); a partial YTD Stichtag (e.g. `month=7`) → 212 (Jan 1..Jul 31).
+
+**Fallback (PROXY) — Assumption A2 (flagged).** When the period flow is unavailable
+(no `fact_sales`/`fact_gl_line` rows, a missing table, no `COST_OF_MATERIALS`
+structure, or a 0 / non-positive denominator) DSO/DPO fall back to the **payment-term
+proxy** = README terms **AR 30d / AP 45d**, and the KPI carries **`dso_source` /
+`dpo_source ∈ {'real','proxy'}`** so a DB without the flow tables behaves EXACTLY as
+the pre-Phase-8 proxy did (golden-safety). A missing `fact_sales` table never 500s —
+the query is caught (`SQLAlchemyError` → rollback → proxy). The proxy is also the
+**due-date term** everywhere (`due = buchungsdatum + terms`), which is unchanged by
+Phase 8. Historic inversion note: `gl_aging.py` once hardcoded `dso=45/dpo=30`
+(inverted); the OPOS path uses the corrected AR 30 / AP 45.
+
+**Worked example (DSO, real — synthetic).** Stichtag `S = 2025-12-31` (FY 2025, full
+year → `days_in_period = 365`). `gross_AR_open = 200,000` EUR (= before_due + overdue
+shown in the aging table); `gross_sales_period(FY2025) = 1,000,000` EUR.
+`DSO = 200000 / 1000000 × 365 = 73.0` days, `dso_source = 'real'`.
+
+**Worked example (DPO, real — synthetic).** Same `S`, `days = 365`. `gross_AP_open =
+90,000` EUR; `purchases_period` (Σ Cost-of-materials postings, FY2025) `= 600,000` EUR.
+`DPO = 90000 / 600000 × 365 = 54.75 → 54.8` days, `dpo_source = 'real'`.
+
+**Worked example (partial YTD — reconciles with live v5).** `S = 2025-07-31` →
+`days_in_period = 212`. The AR aging view shows `before_due 1,301.5k + overdue
+13,723.56k = gross_AR_open 15,025k` EUR; YTD `gross_sales_period = 97,591k` EUR.
+`DSO = 15,025,000 / 97,591,000 × 212 = 32.6` days — matches the displayed AR (using
+the net base instead would give a nonsensical 4.4d).
+
+**Edge cases.**
+- **0 / missing flow** → `None` denominator guard → proxy (30 AR / 45 AP),
+  `source='proxy'`. Never divides by zero.
+- **Missing `fact_sales` / `fact_gl_line` table** → `SQLAlchemyError` caught, session
+  rolled back, proxy returned (no 500).
+- **No `COST_OF_MATERIALS` structure row** → no derivable account set → DPO proxy.
+- **Fail-closed visibility** (empty entity scope) → no flow SQL issued → proxy.
+- **Pathological ratio** (tiny flow vs large opening balance) → clamped to
+  `_MAX_FLOW_DAYS = 3650` (10y) so no absurd figure renders (still `source='real'`).
+- **AP sign**: `signed_total_eur` is a credit (negative) for AP → magnitude used, DPO
+  stays positive.
+
+**Regression test:** `backend/tests/test_opos_dso_dpo.py` (DB-free): `real_days_value`
++ `_days_in_fy_to_date` numeric goldens (73.0 / 54.8 / 45.4, leap-year 366), the real
+path via monkeypatched `_partner_view` + flow helpers on both builders, the proxy
+fallback on `None`/0 flow with `dso_source/dpo_source` assertions, and the
+missing-table safety (flow helper swallows `SQLAlchemyError` → `None` → proxy).
 
 ### F5 — Total AR / AP KPI
 
