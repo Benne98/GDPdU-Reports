@@ -59,7 +59,7 @@ implementing. Status: OPOS F1–F4 ✅ approved; FA F1/F2 deliberately **deferre
 | 3 | ISO-weekly routing (dec. 3) | ✅ **VERIFIED already-built** (2026-07-07). Router `period_grain=^(month\|week\|year)$` + iso params; api.ts sends iso_year/iso_week; live v5 W27: PL FLOW weekly sums, BS STOCK balance-at-cutoff (ytd==cm), CF flows. No code change needed (built in reporting-v2 Phase 5) |
 | 4 | `dim_plan_version` + active-version toggle (dec. 4) | ✅ **DONE + LIVE-VERIFIED** (2026-07-07). `0031` applied to v5: 3 active+included v1 rows (PL/BS/CF 2025), 0 NULL version_ids, exactly-one-active enforced (partial unique index). Live: NET_SALES forecast fy_f=44.70M (=YTD+active-version plan); parking `include_in_reporting=false` → fy_f=YTD (41.43M); restore OK. Forecast now derived from the single active version (dropped scenario side-by-side). `/budget/versions` API added; version-selector UI is a frontend follow-on. Formula in financial-logic.md; 18 tests. Backend-only |
 | 5 | Auto-extension Project-Setup step (dec. 2) | pending |
-| 6 | OB mode carry_forward (dec. 5) | ✅ committed `d389c30` |
+| 6 | OB mode carry_forward (dec. 5) | ✅ committed `d389c30` + **VERIFIED** (2026-07-07): config.py + projects.py support per-project opening_balance_mode (in_data\|file\|carry_forward); wizard file_first_year→carry_forward; test-locked by test_projects.py (green) |
 | 7 | Remove entity dropdown; multi-select filter; conditional display (dec. 6/7) | pending |
 | 8 | Real DSO/DPO via GoBD journal; remove dead opos stub (dec. 8) | formulas ✅; wiring pending |
 | 9 | FA annual-only pills; keep pass-through (dec. 9) | pending |
