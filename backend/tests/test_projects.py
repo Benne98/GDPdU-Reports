@@ -366,7 +366,8 @@ class TestResetDataEndpoint:
         for t in ("lib_account_mapping", "lib_cf_mapping", "lib_na_mapping",
                   "admin_project_config", "admin_role_page_visibility",
                   "dim_user", "dim_role", "user_role", "auth_session",
-                  "dim_pl_structure", "dim_project"):
+                  "dim_pl_structure", "dim_bs_structure", "dim_cf_structure",
+                  "dim_project"):
             assert t in keep, t
 
     def test_capability_flag_true_on_nonlive_when_enabled(self, monkeypatch):

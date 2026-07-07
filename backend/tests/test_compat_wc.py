@@ -104,7 +104,7 @@ def _mock_session(grain_rows=None, ltm=None, ltm_by_entity=None, entity_rows=Non
                 _dict_row({"legal_entity_code": "AT", "entity_prefix": "AT",
                            "entity_name": "Austria GmbH"}),
             ]
-        elif "dim_pl_structure" in sql:
+        elif any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
             rows = []
         elif "a.level_0 = 'PL'" in sql:
             if "GROUP BY l.entity_prefix" in sql:

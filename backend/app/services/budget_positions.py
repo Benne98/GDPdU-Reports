@@ -152,6 +152,10 @@ def resolve_partner_driven(
             text(
                 "SELECT line_code, level_3, row_type, kpi_code "
                 "FROM dim_pl_structure "
+                "WHERE row_type = 'mapping' "
+                "UNION ALL "
+                "SELECT line_code, level_3, row_type, kpi_code "
+                "FROM dim_bs_structure "
                 "WHERE row_type = 'mapping'"
             )
         ).fetchall()

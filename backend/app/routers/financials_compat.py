@@ -1233,7 +1233,7 @@ def get_cf_weekly(
 ) -> dict:
     """Weekly-breakdown cash flow — M-2 / M-1 full months + M0 partial, by ISO week.
 
-    Same column layout as the P&L weekly breakdown; CF rows follow dim_pl_structure
+    Same column layout as the P&L weekly breakdown; CF rows follow dim_cf_structure
     order with section-aware subtotals.
     """
     try:

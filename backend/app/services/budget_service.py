@@ -765,9 +765,9 @@ def build_grid(
     light: bool = False,
 ) -> dict[str, Any]:
     """Read-only budget grid (TREE): the statement's reporting positions (L3 nodes
-    in ``dim_pl_structure`` sort order, mirroring the IS/BS), each seeded from
-    actuals and overlaid by any saved budget rows.  NEVER writes.  See router for
-    the response contract.
+    in the statement's own structure table sort order, mirroring the IS/BS), each
+    seeded from actuals and overlaid by any saved budget rows.  NEVER writes.  See
+    router for the response contract.
 
     Each position carries:
       * ``level_3`` — the structure reporting-position label (tree alignment).
@@ -950,16 +950,37 @@ def _build_l4_children(
 def _load_positions(session: Session, statement: str) -> list[tuple[str, str, str]]:
     """(line_code, label, level_3) mapping positions for the statement, in sort order.
 
-    ``level_3`` is the structure's reporting-position label (mirrors the IS/BS tree
-    nodes); it is surfaced on each tree node so the FE can align the budget grid with
-    the Income Statement / Balance Sheet hierarchy.
+    ``level_3`` is the structure's reporting-position label (mirrors the statement's
+    own tree nodes); it is surfaced on each tree node so the FE can align the budget
+    grid with the statement hierarchy.
+
+    Post-0030 each statement reads its OWN structure table (SAME 3-column SELECT
+    shape for every branch — ``line_code, label, level_3``):
+      * PL → ``dim_pl_structure`` (PL-only after the split; the ``NOT LIKE 'BS:%'``
+             filter is now a redundant belt-and-braces guard).
+      * BS → ``dim_bs_structure``.
+      * CF → ``dim_cf_structure`` (was previously served by the PL fall-through,
+             which post-split would silently seed PL line codes for a CF budget).
+      * WC → ``dim_bs_structure``: working capital is a BS-derived view (AR / AP /
+             inventory) and its plan band is read under ``statement='BS'`` (see
+             ``fin_compat_wc`` load_position_plan_map_pref(…, "BS") and
+             ``fin_compat_pl`` ``effstmt = "BS" if statement == "WC"``), so its
+             plannable positions are the BS mapping rows.
     """
-    if statement == "BS":
+    if statement in ("BS", "WC"):
         sql = text(
             "SELECT line_code, COALESCE(balance_title, line_code) AS label, "
             "       COALESCE(TRIM(level_3), '') AS level_3 "
-            "FROM dim_pl_structure "
-            "WHERE row_type = 'mapping' AND kpi_code LIKE 'BS:%' "
+            "FROM dim_bs_structure "
+            "WHERE row_type = 'mapping' "
+            "ORDER BY sort_order"
+        )
+    elif statement == "CF":
+        sql = text(
+            "SELECT line_code, COALESCE(balance_title, line_code) AS label, "
+            "       COALESCE(TRIM(level_3), '') AS level_3 "
+            "FROM dim_cf_structure "
+            "WHERE row_type = 'mapping' "
             "ORDER BY sort_order"
         )
     else:

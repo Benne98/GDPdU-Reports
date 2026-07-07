@@ -45,6 +45,17 @@ def _override_current_user():
     return _DUMMY_USER
 
 
+@pytest.fixture(autouse=True)
+def _clear_dependency_overrides():
+    """Prevent this module's ``_make_client`` overrides (get_session /
+    get_read_session / current_user) from leaking into later test files in the
+    same process — otherwise a plain ``TestClient`` elsewhere (e.g.
+    test_budget_api::test_get_requires_auth) inherits an authed dummy user and a
+    canned session, turning an expected 401 into a 500."""
+    yield
+    app.dependency_overrides.clear()
+
+
 # ---------------------------------------------------------------------------
 # Synthetic fixtures
 # ---------------------------------------------------------------------------
@@ -144,7 +155,7 @@ def _make_mock_session(
         result = MagicMock()
         rows: list[Any] = []
 
-        if "dim_pl_structure" in sql:
+        if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
             rows = [_dict_row(r) for r in (structure or _STRUCTURE_ROWS)]
         elif "fact_gl_entry" in sql and "posting_date" in sql:
             # latest_period query
@@ -728,7 +739,7 @@ class TestPlAnnualRunningSum:
         def _execute(stmt, params=None):
             sql = str(stmt)
             result = MagicMock()
-            if "dim_pl_structure" in sql:
+            if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
                 rows = [_dict_row(r) for r in _WE_STRUCTURE]
             else:
                 rows = [_dict_row(r) for r in _ANNUAL_GRAIN]
@@ -859,7 +870,9 @@ class TestPlAnnualConsolidation:
         _, out = self._build()
         assert out["statement"] == "pl"
         assert out["year"] == 2025 and out["month"] == 7
-        assert out["col_label"] == "FY24"  # last full FY = 2024
+        # Annual consolidation column is YTD-through-anchor-month (see
+        # build_pl_annual_consolidation docstring), not the last full FY.
+        assert out["col_label"] == "YTDJul25A"
         assert out["entities"] == [
             {"code": "AT", "label": "Austria GmbH"},
             {"code": "DE", "label": "Germany GmbH"},
@@ -883,7 +896,7 @@ class TestPlAnnualConsolidation:
         def _execute(stmt, params=None):
             sql = str(stmt)
             result = MagicMock()
-            if "dim_pl_structure" in sql:
+            if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
                 rows = [_dict_row(r) for r in _WE_STRUCTURE]
             elif "dim_legal_entity" in sql:
                 rows = _CONSL_ENTITY_ROWS
@@ -955,7 +968,7 @@ def _mock_struct_grain_session(structure, grains, entity_rows=None):
     def _execute(stmt, params=None):
         sql = str(stmt)
         result = MagicMock()
-        if "dim_pl_structure" in sql:
+        if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
             rows = [_dict_row(r) for r in structure]
         elif "dim_legal_entity" in sql:
             rows = entity_rows or []

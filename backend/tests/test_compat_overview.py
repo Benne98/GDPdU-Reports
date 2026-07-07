@@ -152,7 +152,7 @@ def _mock_session(
         result = MagicMock()
         rows: list[Any] = []
 
-        if "dim_pl_structure" in sql:
+        if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
             rows = [_dr(r) for r in structure]
         elif "dim_legal_entity" in sql:
             rows = list(ent_rows)

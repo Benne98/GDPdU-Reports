@@ -1,8 +1,9 @@
 """P5 / Phase C3 — Balance Sheet statement service.
 
 Aggregates ``fact_gl_line`` over ``dim_gl_account`` (level_0 = 'BS') per period
-column, builds the BS presentation via ``dim_pl_structure`` (BS rows) with the
-in-code fallback, and reconciles the accounting identity Assets = Liab + Equity.
+column, builds the BS presentation via ``dim_bs_structure`` (split out of
+dim_pl_structure by migration 0030) with the in-code fallback, and reconciles the
+accounting identity Assets = Liab + Equity.
 
 Like the P&L service (``app.services.statements``) the CALCULATION core
 (``aggregate_bs``) is PURE: it operates on already-fetched movement rows + a
@@ -13,7 +14,7 @@ golden-testable with a tiny synthetic fixture.  Thin DB helpers do the SQL.
 Unlike the P&L (whose structure comes from a "PL Structure" sheet), the BS report
 structure is DERIVED from the live GL balance-sheet hierarchy in dim_gl_account
 (level_0='BS'), ordered by (level_2_sort, level_3_sort), by
-``scripts/seed_bs_structure.py`` and persisted as BS rows in dim_pl_structure
+``scripts/seed_bs_structure.py`` and persisted as BS rows in dim_bs_structure
 (kpi_code 'BS:<section>').  The generated structure has THREE row types:
   • 'mapping'    — one per L3 category, wired by ``level_3 = <L3 value>`` so
                    ``_matches`` aggregates exactly that L3's GL accounts.
@@ -402,7 +403,7 @@ def default_bs_structure() -> list[BsStructureLine]:
 # DB read helpers (thin; exercised via dependency_overrides, not unit-tested raw)
 # --------------------------------------------------------------------------- #
 def fetch_bs_structure(session: Any) -> list[BsStructureLine]:
-    """Load BS rows from dim_pl_structure; fall back to default_bs_structure().
+    """Load BS rows from dim_bs_structure; fall back to default_bs_structure().
 
     BS rows are distinguished by ``kpi_code='BS'`` OR a ``section`` carried in
     ``kpi_code`` (convention: kpi_code holds the section for BS rows).  Until the
@@ -414,7 +415,7 @@ def fetch_bs_structure(session: Any) -> list[BsStructureLine]:
         text(
             "SELECT sort_order, line_code, COALESCE(balance_title,'') AS balance_title, "
             "row_type, level_2, level_3, level_4, kpi_code, is_bold "
-            "FROM dim_pl_structure WHERE kpi_code LIKE 'BS:%' ORDER BY sort_order"
+            "FROM dim_bs_structure ORDER BY sort_order"
         )
     ).fetchall()
     if not rows:
@@ -487,7 +488,7 @@ def _fetch_bs_budget_movements(
     struct_rows = session.execute(
         text(
             "SELECT line_code, level_2, level_3, level_4 "
-            "FROM dim_pl_structure WHERE kpi_code LIKE 'BS:%'"
+            "FROM dim_bs_structure"
         )
     ).fetchall()
     code_levels: dict[str, tuple[Any, Any, Any]] = {

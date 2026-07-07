@@ -77,7 +77,7 @@ _SEED_ACTOR = "seed_plan_forecast_budget.py"
 _FORECAST_DAYS = 360.0
 _FORECAST_GROWTH_G = 0.0
 # The reporting positions that play the driver / retained-earnings / cash roles in the
-# BS roll-forward (line_codes in dim_pl_structure — confirmed against finssentials_v2).
+# BS roll-forward (line_codes in dim_bs_structure — confirmed against finssentials_v2).
 _BS_ROLES = {"AR": "AR", "INV": "INVENTORY", "AP": "AP", "RE": "EQUITY", "CASH": "CASH"}
 # The equity line that absorbs the P7 balancing residual (the not-yet-GL-booked YTD
 # net profit in report_inject mode) so the starting BS balances and the CF cash tie
@@ -219,12 +219,14 @@ def _structure_maps(session: SASession, statement: str) -> tuple[dict[str, str],
                       ('BS:asset'->asset, 'BS:credit'->le); '' for non-BS.
     """
     if statement == "BS":
-        where = "kpi_code LIKE 'BS:%'"
+        table = "dim_bs_structure"
+        where = "TRUE"
     else:
+        table = "dim_pl_structure"
         where = "(kpi_code IS NULL OR kpi_code NOT LIKE 'BS:%') AND line_code NOT LIKE 'CF%'"
     rows = session.execute(text(
         f"SELECT line_code, COALESCE(TRIM(level_3),''), COALESCE(kpi_code,'') "
-        f"FROM dim_pl_structure WHERE row_type='mapping' AND {where}"
+        f"FROM {table} WHERE row_type='mapping' AND {where}"
     )).fetchall()
     l3_to_code: dict[str, str] = {}
     code_to_side: dict[str, str] = {}
@@ -304,8 +306,8 @@ def _bs_closing_natural(
 def _cf_leaf_map(session: SASession) -> dict[str, str]:
     """{normalised CF leaf label -> CF structure line_code} for the CF mapping rows."""
     rows = session.execute(text(
-        "SELECT line_code, COALESCE(balance_title,'') FROM dim_pl_structure "
-        "WHERE row_type = 'mapping' AND line_code LIKE 'CF%'"
+        "SELECT line_code, COALESCE(balance_title,'') FROM dim_cf_structure "
+        "WHERE row_type = 'mapping'"
     )).fetchall()
     return {_norm_cf_key(bt): str(lc) for lc, bt in rows if str(bt).strip()}
 

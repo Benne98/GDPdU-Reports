@@ -1,7 +1,13 @@
-"""Seed the Cash Flow statement structure into dim_pl_structure (CF rows).
+"""Seed the Cash Flow statement structure into dim_cf_structure (CF rows).
+
+NOTE (migration 0030): the CF rows now live in their OWN table ``dim_cf_structure``
+(physically split out of ``dim_pl_structure``).  The INSERTs below target
+``dim_cf_structure``; the historical "Option B" decision block is kept for context
+but is SUPERSEDED by the split — CF no longer shares the P&L table.
 
 ═══════════════════════════════════════════════════════════════════════════════
-ARCHITECTURAL DECISION: CF rows in dim_pl_structure (kpi_code LIKE 'CF:%')
+ARCHITECTURAL DECISION (SUPERSEDED by 0030): CF rows were tagged kpi_code 'CF:%'
+in dim_pl_structure; migration 0030 moved them to dim_cf_structure.
 ═══════════════════════════════════════════════════════════════════════════════
 Two storage options were evaluated:
 
@@ -149,7 +155,7 @@ def _make_kpi_code(
 
 
 def seed_cf_structure(xlsx_path: str | Path, session: SASession) -> int:
-    """Read CF Structure sheet, upsert into dim_pl_structure. Returns rows upserted."""
+    """Read CF Structure sheet, upsert into dim_cf_structure. Returns rows upserted."""
     try:
         df = pd.read_excel(str(xlsx_path), sheet_name="CF Structure", header=0)
     except Exception as exc:
@@ -196,7 +202,7 @@ def seed_cf_structure(xlsx_path: str | Path, session: SASession) -> int:
 
         session.execute(
             text("""
-                INSERT INTO dim_pl_structure
+                INSERT INTO dim_cf_structure
                   (sort_order, line_code, row_type, balance_title,
                    details, calc_type, kpi_code, is_bold)
                 VALUES (:so, :lc, :rt, :bt, :det, :ct, :kpi, :bold)
@@ -260,7 +266,7 @@ def _seed_cf_from_dim_gl_cf(session: SASession) -> int:
 
         session.execute(
             text("""
-                INSERT INTO dim_pl_structure
+                INSERT INTO dim_cf_structure
                   (sort_order, line_code, row_type, balance_title, calc_type, kpi_code)
                 VALUES (:so, :lc, 'mapping', :bt, 1, :kpi)
                 ON CONFLICT (line_code) DO UPDATE SET
@@ -282,7 +288,7 @@ def _seed_cf_from_dim_gl_cf(session: SASession) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Seed CF structure into dim_pl_structure")
+    parser = argparse.ArgumentParser(description="Seed CF structure into dim_cf_structure")
     parser.add_argument(
         "--xlsx",
         default=_DEFAULT_XLSX,
@@ -294,13 +300,13 @@ def main() -> int:
     with SASession(engine) as session:
         # Confirm there are no conflicting CF rows already (informational only)
         existing = session.execute(
-            text("SELECT COUNT(*) FROM dim_pl_structure WHERE kpi_code LIKE 'CF:%'")
+            text("SELECT COUNT(*) FROM dim_cf_structure")
         ).scalar() or 0
-        print(f"Existing CF rows in dim_pl_structure: {existing}")
+        print(f"Existing CF rows in dim_cf_structure: {existing}")
 
         n = seed_cf_structure(args.xlsx, session)
 
-    print(f"\nSummary: {n} CF rows upserted into dim_pl_structure (kpi_code LIKE 'CF:%').")
+    print(f"\nSummary: {n} CF rows upserted into dim_cf_structure.")
     return 0
 
 

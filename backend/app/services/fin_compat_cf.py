@@ -158,11 +158,11 @@ def _norm_cf_key(s: Any) -> str:
 
 
 def _load_cf_structure(session: Session) -> list[Any]:
-    """Load dim_pl_structure rows (ordered by sort_order). Same query as P&L/BS."""
+    """Load dim_cf_structure rows (ordered by sort_order). Same query as P&L/BS."""
     return session.execute(text(
         "SELECT pl_line_id, sort_order, line_code, row_type, balance_title, details, "
         "calc_type, level_2, level_3, level_4, gl_account_id, invert_delta, is_bold, kpi_code "
-        "FROM dim_pl_structure ORDER BY sort_order"
+        "FROM dim_cf_structure ORDER BY sort_order"
     )).fetchall()
 
 
@@ -178,7 +178,7 @@ def _cf_struct_rows(session: Session) -> list[dict[str, Any]]:
               if _is_cf_structure_row(r)]
     if not struct:
         raise ValueError(
-            "No cash-flow rows in dim_pl_structure — run scripts/seed_cf_structure.py"
+            "No cash-flow rows in dim_cf_structure — run scripts/seed_cf_structure.py"
         )
     return struct
 
@@ -912,7 +912,7 @@ def _resolve_cf_row(session: Session, line_code: str) -> Optional[dict]:
     base = line_code.split("::")[0].strip()
     row = session.execute(text(
         "SELECT line_code, row_type, balance_title, kpi_code "
-        "FROM dim_pl_structure WHERE line_code = :lc LIMIT 1"
+        "FROM dim_cf_structure WHERE line_code = :lc LIMIT 1"
     ), {"lc": base}).fetchone()
     return dict(row._mapping) if row else None
 

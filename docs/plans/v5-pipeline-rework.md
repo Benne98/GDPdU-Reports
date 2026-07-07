@@ -54,7 +54,7 @@ implementing. Status: OPOS F1–F4 ✅ approved; FA F1/F2 deliberately **deferre
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Bootstrap v5 stack | ✅ committed `4c7412c` |
-| 1 | Split PL/CF/BS structures (dec. 1) | ⚠️ migration `0030_split_statement_structures.py` **drafted, UNTRACKED**; reader wiring (fin_compat_cf/bs, structure loader) NOT started |
+| 1 | Split PL/CF/BS structures (dec. 1) | ✅ **code-complete + gate-green** (2026-07-07); migration `0030` authored; CF→`dim_cf_structure`, BS/WC→`dim_bs_structure` readers repointed (`fin_compat_cf/bs`, `budget_service._load_positions`, `balance_sheet`, seed scripts); `dim_bs/cf_structure` added to `RESET_KEEP_TABLES`; new `test_structure_split.py`. **Live-DB steps still owed** (see below). Offline gate: 276 passed / 5 skipped |
 | 2 | CF structure + CF key-space bug | CF key-space fallback ✅ in `fin_compat_pl.py` L481 (`by_direct` index) |
 | 3 | ISO-weekly routing (dec. 3) | primitives exist; routing verify/wire pending |
 | 4 | `dim_plan_version` + active-version toggle (dec. 4) | pending |
@@ -69,15 +69,34 @@ drill-down — `_annual_l4_children` wired into `build_pl_annual_consolidation`;
 `maxDepthOverride` (depth 0–2 auto-expand). Reconciles Σ children == parent per entity (residual
 "(no L4)" bucket); 5 regression tests in `test_compat_layer.py`.
 
-## Next up: **Phase 1 — complete the statement-structure split**
-1. Review/finalise `0030_split_statement_structures.py` (creates `dim_bs_structure` / `dim_cf_structure`
-   from the `dim_pl_structure` column set, copies rows; downgrade drops them). Apply to `finssentials_v5`.
-2. Point the CF reader (`fin_compat_cf.py`) and BS reader (`fin_compat_bs.py`) / the shared structure
-   loader (`_statement_structure_rows`, `_load_structure`) at the new per-statement tables so **CF rows
-   can never leak into the Income Statement** and vice-versa.
-3. Parity-first: golden-file snapshot the 5180 IS/BS/CF endpoints, prove v5 matches numerically after
-   the split (tolerance for intentional fixes).
-4. Tests + quality gate; restart 8015 after backend edits; do NOT push.
+## Phase 1 — LIVE-DB steps still owed (need `DB_PASSWORD` + running servers)
+Code is done + offline-gate-green; these require the live v5 DB, which the offline test process
+cannot reach:
+1. **Apply migration 0030** to `finssentials_v5`: `.\scripts\run-v5-api.ps1` style env, then
+   `cd backend && alembic upgrade head` (chains `0029 → 0030`). Confirm `dim_bs_structure` /
+   `dim_cf_structure` exist and are row-populated (0030 copies from `dim_pl_structure`).
+2. **Seed** the split structures if needed: `python -m backend.scripts.seed_bs_structure` /
+   `seed_cf_structure` (now target the split tables).
+3. **Restart API 8015** (OneDrive `--reload` unreliable → stale code).
+4. **Parity check** IS/BS/CF on 5181 vs the 5180 baseline — numbers must match (tolerance band). The
+   split relocates *where* structure rows are read; it must not change any statement number.
+
+## Next up (candidates — pick after Phase 1 live-parity)
+- **Phase 4** `dim_plan_version` + single active-version toggle (needs a migration; un-parks forecast/coverage).
+- **Phase 7** remove entity dropdown from IS/BS/CF/WC; multi-select entity filter + conditional display
+  (frontend + read-only backend; NO migration → verifiable offline; but beware the uncommitted
+  ~110-file typography pass touching the same frontend tree).
+- **Phase 5** auto-extension interactive Project-Setup step (dec. 2).
+- **Phase 3** ISO-weekly routing verify (dec. 3).
+
+## Known pre-existing test-suite fragility (NOT introduced by this rework)
+The full backend suite has order-dependent test-isolation leaks (`app.dependency_overrides` /
+shared SQLite schema state) + live-DB-required tests that hang offline (`no password supplied`).
+Symptoms seen: `test_budget_api::test_get_requires_auth` 500 (fixed here via a `_clear_dependency_overrides`
+autouse teardown in `test_compat_layer.py`), plus `test_anomaly_entity_auth`, `test_granularity_view`
+reconciliation, `test_ingest_issue_rows` failing only under full-suite ordering. Verify phases with the
+**mock-based touched-file gate**, not the full offline suite. Candidate cleanup: harden auth-test
+isolation (test-engineer).
 
 ## Guardrails
 - Hard rule #1: no financial logic without formula + worked example + edge cases + test.

@@ -174,11 +174,11 @@ _BS_ALIAS_CODES = {"AR", "INVENTORY", "AP", "CASH", "EQUITY"}
 # ---------------------------------------------------------------------------
 
 def _load_structure(session: Session) -> list[Any]:
-    """Load dim_pl_structure rows (ordered by sort_order). Mirrors fin_compat_pl."""
+    """Load dim_bs_structure rows (ordered by sort_order). Mirrors fin_compat_pl."""
     return session.execute(text(
         "SELECT pl_line_id, sort_order, line_code, row_type, balance_title, details, "
         "calc_type, level_2, level_3, level_4, gl_account_id, invert_delta, is_bold, kpi_code "
-        "FROM dim_pl_structure ORDER BY sort_order"
+        "FROM dim_bs_structure ORDER BY sort_order"
     )).fetchall()
 
 
@@ -1486,7 +1486,7 @@ def _resolve_bs_mapping_row(session: Session, line_code: str) -> Optional[dict]:
     l4_override = line_code.split("::", 1)[1].strip() if "::" in line_code else None
     row = session.execute(text(
         "SELECT line_code, row_type, balance_title, level_2, level_3, level_4, gl_account_id, kpi_code "
-        "FROM dim_pl_structure WHERE line_code = :lc LIMIT 1"
+        "FROM dim_bs_structure WHERE line_code = :lc LIMIT 1"
     ), {"lc": base}).fetchone()
     if not row:
         return None

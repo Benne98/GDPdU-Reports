@@ -179,7 +179,7 @@ def _mock_session(structure=None, grain_rows=None, net_profit=None,
         sql = str(stmt)
         result = MagicMock()
         rows: list[Any] = []
-        if "dim_pl_structure" in sql:
+        if any(t in sql for t in ("dim_pl_structure", "dim_bs_structure", "dim_cf_structure")):
             rows = [_dict_row(r) for r in structure]
         elif "dim_legal_entity" in sql:
             rows = entity_rows or [

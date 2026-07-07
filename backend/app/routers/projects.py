@@ -211,6 +211,8 @@ RESET_KEEP_TABLES: tuple[str, ...] = (
     "auth_session",
     # structural / reference dims + presentation templates
     "dim_pl_structure",
+    "dim_bs_structure",
+    "dim_cf_structure",
     "dim_pl_recon_mapping",
     "dim_bs_recon_mapping",
     "dim_country",

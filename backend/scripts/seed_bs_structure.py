@@ -1,4 +1,9 @@
-"""Seed the Balance-Sheet report structure into dim_pl_structure (BS rows).
+"""Seed the Balance-Sheet report structure into dim_bs_structure (BS rows).
+
+NOTE (migration 0030): BS rows now live in their OWN table ``dim_bs_structure``
+(physically split out of ``dim_pl_structure``).  The INSERT below targets
+``dim_bs_structure``; references to dim_pl_structure in the notes describe the
+pre-split layout.
 
 There is NO "BS Structure" sheet in the Decidra workbook, so the BS report
 structure is DERIVED from the live GL balance-sheet hierarchy in dim_gl_account
@@ -21,9 +26,9 @@ EQUITY & LIABILITIES are credit-side (section 'credit', presented −amount → 
 put the whole "Equity & liabilities" L1 into ONE section ('credit') so the
 accounting identity is simply  imbalance = Total assets − Total equity&liabilities.
 
-============================================================ PERSISTENCE (dim_pl_structure, BS rows)
-BS rows share the dim_pl_structure table with the P&L rows; they are distinguished
-by ``kpi_code LIKE 'BS:%'`` (fetch_bs_structure reads only those).  Convention:
+============================================================ PERSISTENCE (dim_bs_structure, BS rows)
+BS rows live in the dedicated dim_bs_structure table (split out of dim_pl_structure
+by migration 0030); fetch_bs_structure reads that table.  Convention (unchanged):
   kpi_code      = 'BS:asset' | 'BS:credit'   (carries the section AND tags the row BS)
   row_type      = 'mapping' | 'subtotal' | 'grandtotal'
   level_3       = the GL L3 value  (mapping rows only; NULL on subtotals/grandtotals)
@@ -223,7 +228,7 @@ def seed_bs_structure(session) -> int:
         kpi_code = f"BS:{r.section}"
         session.execute(
             text("""
-                INSERT INTO dim_pl_structure
+                INSERT INTO dim_bs_structure
                   (sort_order, line_code, row_type, balance_title, calc_type,
                    kpi_code, level_2, level_3, is_bold)
                 VALUES (:so, :lc, :rt, :bt, 1, :kpi, :l2, :l3, :bold)
@@ -253,4 +258,4 @@ if __name__ == "__main__":
 
     with SASession(engine) as session:
         n = seed_bs_structure(session)
-    print(f"seed_bs_structure: {n} BS rows upserted into dim_pl_structure")
+    print(f"seed_bs_structure: {n} BS rows upserted into dim_bs_structure")

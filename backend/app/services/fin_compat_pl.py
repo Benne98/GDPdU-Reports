@@ -127,11 +127,11 @@ def _row_dict(row: Any) -> dict[str, Any]:
 def _is_pl_structure_row(r: dict[str, Any]) -> bool:
     """True for P&L rows only (balance-sheet rows excluded).
 
-    The GDPdU ``dim_pl_structure`` stores both P&L (sort_order < 1000) and the
-    balance sheet (sort_order >= 1010, line_code prefixed 'BS_') in one table.
-    We keep a row only when BOTH markers agree it is below the BS block:
-    ``sort_order < 1000`` AND ``line_code`` does not start with 'BS_'.  Using
-    both criteria is robust if either marker drifts in a future structure load.
+    Post-0030 ``dim_pl_structure`` is PL-only (BS/CF rows were split into
+    dim_bs_structure / dim_cf_structure), so this predicate is now a no-op guard —
+    kept as belt-and-braces.  It keeps a row only when BOTH markers agree it is
+    below the (former) BS block: ``sort_order < 1000`` AND ``line_code`` does not
+    start with 'BS_', which is robust if a stray BS/CF row ever reappears here.
     """
     code = str(r.get("line_code") or "")
     try:
