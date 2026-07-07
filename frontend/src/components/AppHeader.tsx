@@ -23,6 +23,7 @@ import {
   Check,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
+import { useReportingAvailability, type ReportingAvailability } from '../hooks/useReportingAvailability'
 
 // ---------------------------------------------------------------------------
 // Nav definitions
@@ -54,6 +55,24 @@ const REPORTING_NAV: { to: string; label: string; Icon: typeof LayoutDashboard; 
 /** '/anomaly-detection' is intentionally excluded from primary nav (dropped from the rail +
  *  home redirect); ANOMALY_NAV still renders when already on an /anomaly-detection* route. */
 const REPORTING_PATHS: ReadonlySet<string> = new Set(REPORTING_NAV.map(n => n.to))
+
+/** Sub-pages that render only when their underlying data is loaded (Phase 7). A sub-page
+ *  absent from this map is always shown (GL, Profitability, statements, Cash & debt). */
+const CONDITIONAL_SUBPAGES: Record<string, keyof Omit<ReportingAvailability, 'loaded'>> = {
+  payroll: 'payroll',
+  'fixed-assets': 'fixed_assets',
+  'receivables-aging': 'opos',
+  'payables-aging': 'opos',
+}
+
+/** Drop conditional sub-pages whose data is not available. */
+function filterSub(sub: SubPage[] | undefined, avail: ReportingAvailability): SubPage[] | undefined {
+  if (!sub) return sub
+  return sub.filter(sp => {
+    const key = CONDITIONAL_SUBPAGES[sp.id]
+    return key ? avail[key] : true
+  })
+}
 
 const ANOMALY_NAV = [
   { to: '/anomaly-detection',             label: 'Overview',    Icon: LayoutDashboard },
@@ -155,6 +174,7 @@ export default function AppHeader() {
   const { user, logout } = useAuth()
   const location = useLocation()
   const navigate = useNavigate()
+  const availability = useReportingAvailability()
 
   const isReportingRoute = REPORTING_PATHS.has(location.pathname)
   const isAnomalyRoute = location.pathname.startsWith('/anomaly-detection')
@@ -203,7 +223,7 @@ export default function AppHeader() {
           {isReportingRoute && (
             <nav className="flex flex-wrap items-center justify-end gap-0.5">
               {REPORTING_NAV.map(({ to, label, Icon, sub }) => (
-                <NavPill key={to} to={to} label={label} Icon={Icon} sub={sub} isActive={location.pathname === to} />
+                <NavPill key={to} to={to} label={label} Icon={Icon} sub={filterSub(sub, availability)} isActive={location.pathname === to} />
               ))}
             </nav>
           )}

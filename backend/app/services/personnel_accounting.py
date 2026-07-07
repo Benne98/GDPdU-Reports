@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.services.fin_compat_pl import build_pl_annual_compat
-from app.services.fin_compat_sql import resolve_entity_prefix
+from app.services.fin_compat_sql import resolve_entity_prefixes
 from app.services.personnel_calc import (
     METRIC_CATALOG,
     aggregate_metric,
@@ -65,16 +65,19 @@ def _fetch_rows(
     entity: Optional[str],
     project_id: str = "default",
 ) -> list[dict[str, Any]]:
-    ep = resolve_entity_prefix(session, entity)
+    eps = resolve_entity_prefixes(session, entity)
     sql = """
         SELECT *
         FROM fact_personnel_employee
         WHERE project_id = :pid AND as_of_date = :as_of
     """
     params: dict[str, Any] = {"pid": project_id, "as_of": as_of}
-    if ep:
+    if len(eps) == 1:
         sql += " AND entity_prefix = :ep"
-        params["ep"] = ep
+        params["ep"] = eps[0]
+    elif len(eps) > 1:
+        sql += " AND entity_prefix = ANY(:eps)"
+        params["eps"] = eps
     result = session.execute(text(sql), params)
     return [dict(r._mapping) for r in result.fetchall()]
 

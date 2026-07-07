@@ -65,14 +65,16 @@ function AnalyticsSection({ id, children }: { id: string; children: ReactNode })
 
 interface Props {
   period: PeriodSelection
-  entity?: string
+  /** Selected legal_entity_codes; empty/undefined = all entities (consolidated). */
+  entities?: string[]
 }
 
-export default function GlProfitabilityTab({ period, entity }: Props) {
+export default function GlProfitabilityTab({ period, entities }: Props) {
+  const entityKey = (entities ?? []).join(',')
   const filters = useMemo<SalesFilters>(() => {
-    if (!entity || entity === 'all') return {}
-    return { entity: [entity] }
-  }, [entity])
+    if (!entities || entities.length === 0) return {}
+    return { entity: entities }
+  }, [entityKey])
   const anchor = periodAnchorYearMonth(period)
   const y = anchor.year
   const month = anchor.month

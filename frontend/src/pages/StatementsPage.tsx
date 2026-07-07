@@ -18,6 +18,7 @@ import {
   type WeeklyBreakdownResponse,
 } from '../lib/api'
 import ModulePeriodFilterBar from '../components/ui/ModulePeriodFilterBar'
+import EntityMultiSelect from '../components/ui/EntityMultiSelect'
 import {
   defaultAnnualPeriodFromLatest,
   periodAnchorYearMonth,
@@ -92,9 +93,9 @@ export type StatementSubTab = {
 
 export type StatementSubTabRenderContext = {
   period: PeriodSelection
-  entity: string
+  /** Selected legal_entity_codes for entity-scoped sub-pages; empty = all (consolidated). */
+  entities: string[]
   periodReady: boolean
-  entityId?: string
 }
 
 type Props = {
@@ -110,6 +111,10 @@ type Props = {
   subTabContent?: ReactNode
   /** Factory for sub-tab content that needs period / entity from this page. */
   renderSubTabContent?: (ctx: StatementSubTabRenderContext) => ReactNode
+  /** Sub-tab ids that get the multi-select entity filter (Phase 7): Profitability /
+   *  Payroll / Fixed-Assets / OPOS aging. The IS/BS/CF/WC statements themselves are
+   *  always consolidated and never show an entity selector. */
+  entityFilterSubTabs?: string[]
 }
 
 function finPeriodFromSelection(p: PeriodSelection, entity?: string): FinPeriodParams {
@@ -245,9 +250,13 @@ export default function StatementsPage({
   activeSubTab,
   subTabContent,
   renderSubTabContent,
+  entityFilterSubTabs,
 }: Props) {
   const [entities, setEntities] = useState<Entity[]>([])
-  const [entity, setEntity] = useState('all')
+  // Phase 7: the IS/BS/CF/WC statements are ALWAYS consolidated — no per-statement
+  // entity selector. Only the entity-scoped sub-pages carry a multi-select.
+  const entity = 'all'
+  const [selectedEntities, setSelectedEntities] = useState<string[]>([])
   const [grain, setGrain] = useState<PeriodGrain>('year')
   const [period, setPeriod] = useState<PeriodSelection>({ grain: 'year', year: 2025, month: 7 })
   const [latest, setLatest] = useState<LatestPeriodInfo | null>(null)
@@ -299,10 +308,14 @@ export default function StatementsPage({
   const pageTitle = activeSub?.label ?? title
   const pageDescription = activeSub?.description ?? description
   const altContent = altSubActive
-    ? (renderSubTabContent?.({ period, entity, periodReady, entityId: ent })
+    ? (renderSubTabContent?.({ period, periodReady, entities: selectedEntities })
       ?? subTabContent)
     : undefined
   const statementActive = !altSubActive
+  // The multi-select entity filter appears only on the entity-scoped sub-pages.
+  const showEntityFilter = Boolean(
+    altSubActive && activeSubTab && entityFilterSubTabs?.includes(activeSubTab),
+  )
 
   usePageChartKeyboardNav(pageContentRef, { enabled: periodReady && !loading && statementActive })
 
@@ -620,27 +633,37 @@ export default function StatementsPage({
           </button>
         </motion.div>
 
-        {/* Period filter window — opens beneath the title row */}
+        {/* Period filter window — opens beneath the title row. The IS/BS/CF/WC
+            statements are always consolidated (no entity selector); only the
+            entity-scoped sub-pages get a multi-select entity filter. */}
         {filtersOpen && (
-          <ModulePeriodFilterBar
-            entities={entities}
-            entity={entity}
-            onEntityChange={e => {
-              setEntity(e)
-              setDrill(null)
-            }}
-            grain={grain}
-            onGrainChange={setGrain}
-            period={period}
-            onPeriodChange={p => {
-              setPeriod(p)
-              setDrill(null)
-            }}
-            latest={latest}
-            loading={loading}
-            onRefresh={loadStatement}
-            showYearGrain={true}
-          />
+          <>
+            {showEntityFilter && (
+              <div
+                className="rounded-xl mb-3 px-5 py-4"
+                style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}
+              >
+                <EntityMultiSelect
+                  entities={entities}
+                  selected={selectedEntities}
+                  onChange={setSelectedEntities}
+                />
+              </div>
+            )}
+            <ModulePeriodFilterBar
+              grain={grain}
+              onGrainChange={setGrain}
+              period={period}
+              onPeriodChange={p => {
+                setPeriod(p)
+                setDrill(null)
+              }}
+              latest={latest}
+              loading={loading}
+              onRefresh={loadStatement}
+              showYearGrain={true}
+            />
+          </>
         )}
 
         {error && statementActive && (

@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.entities import ENTITY_BUKRS, ENTITY_PREFIX
-from app.services.fin_compat_sql import resolve_entity_prefix
+from app.services.fin_compat_sql import resolve_entity_prefixes
 from app.services.gl_aging import AR_BANDS  # reuse the canonical bucket set (F4 rule)
 
 _BANDS = tuple(b for b, _ in AR_BANDS)
@@ -284,23 +284,30 @@ def fetch_opos_rows(
     kontos = list(AR_LUL_KONTOS if side == "AR" else AP_LUL_KONTOS)
     as_of = _month_end(year, month)
 
-    ep = resolve_entity_prefix(session, entity)
+    # ``entity`` may be a single legal_entity_code OR a comma-separated list
+    # (multi-entity / consolidated-subset filter). ``resolve_entity_prefixes``
+    # returns [] for ''/'all'/None (no narrow), one prefix for a single code, or
+    # many prefixes for a comma-list.
+    eps = [str(e)[:2] for e in resolve_entity_prefixes(session, entity)]
     ent_frag = ""
     params: dict[str, Any] = {"fy": str(year), "kontos": kontos}
     if allowed is not None:
         # Visibility-scoped read: restrict to the allowed entity_prefix set,
-        # intersected with any single-entity narrow already resolved from ``entity``.
+        # intersected with any entity narrow already resolved from ``entity``.
         safe = sorted({str(p).replace("'", "")[:2] for p in allowed if p})
-        if ep is not None:
-            ep2 = str(ep)[:2]
-            safe = [ep2] if ep2 in safe else []
+        if eps:
+            narrow = set(eps)
+            safe = [p for p in safe if p in narrow]
         if not safe:
             return [], {}  # fail closed (defensive; the endpoint pre-resolves this)
         ent_frag = "AND o.entity_prefix = ANY(:allowed)"
         params["allowed"] = safe
-    elif ep:
+    elif len(eps) == 1:
         ent_frag = "AND o.entity_prefix = :ep"
-        params["ep"] = str(ep)[:2]
+        params["ep"] = eps[0]
+    elif len(eps) > 1:
+        ent_frag = "AND o.entity_prefix = ANY(:eps)"
+        params["eps"] = eps
 
     asof_frag = ""
     if month != 12:

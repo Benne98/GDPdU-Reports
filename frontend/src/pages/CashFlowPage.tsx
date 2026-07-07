@@ -27,7 +27,8 @@ export default function CashFlowPage() {
       onSubTabChange={setSubTab}
       renderSubTabContent={ctx => {
         if (subTab === 'cash-debt') {
-          return <CashDebtErrorBoundary period={ctx.period} entity={ctx.entity} />
+          // Cash & debt is a consolidated view (no per-entity selector on CF, Phase 7).
+          return <CashDebtErrorBoundary period={ctx.period} />
         }
         return null
       }}

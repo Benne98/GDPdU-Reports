@@ -163,6 +163,62 @@ def _latest_period(session: Session, entity: Optional[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/meta/reporting-availability
+# ---------------------------------------------------------------------------
+@router.get("/api/v1/meta/reporting-availability")
+def get_reporting_availability(
+    _user: Annotated[User, Depends(current_user)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Which optional reporting modules actually have data (FE hides empty tabs).
+
+    GL + Profitability are always shown, so they are intentionally NOT reported
+    here.  Each probe is a cheap existence check wrapped in try/except → False on
+    ANY error: a missing table / query failure must read as "not available" (the
+    FE hides the tab) rather than 500 the whole endpoint.
+    """
+    return {
+        "payroll": _has_payroll(session),
+        "fixed_assets": _has_fixed_assets(session),
+        "opos": _has_opos(session),
+    }
+
+
+def _has_payroll(session: Session) -> bool:
+    """True iff any personnel snapshot exists (reuses list_snapshots)."""
+    try:
+        from app.services.personnel_accounting import list_snapshots
+        return bool(list_snapshots(session))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _has_fixed_assets(session: Session) -> bool:
+    """True iff any fixed-asset snapshot exists (reuses list_snapshots)."""
+    try:
+        from app.services.fixed_asset_rollforward import list_snapshots
+        return bool(list_snapshots(session))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _has_opos(session: Session) -> bool:
+    """True iff any OPOS open-item row exists (cheap EXISTS probe — the aging
+    service reads fact_opos_debitor / fact_opos_kreditor).  Does NOT run the full
+    (expensive) aging computation."""
+    for table in ("fact_opos_debitor", "fact_opos_kreditor"):
+        try:
+            row = session.execute(text(
+                f"SELECT EXISTS(SELECT 1 FROM {table} WHERE project_id = 'default')"
+            )).fetchone()
+            if row and row[0]:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
 # GET /health/ready  (no auth — like existing /api/v1/health)
 # ---------------------------------------------------------------------------
 @router.get("/health/ready")

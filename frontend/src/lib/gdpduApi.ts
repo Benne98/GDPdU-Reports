@@ -1586,6 +1586,79 @@ export async function budgetCommit(payload: {
 }
 
 // ---------------------------------------------------------------------------
+// Plan versions (Phase 4) — versioned plans + active-version / include-in-reporting
+// ---------------------------------------------------------------------------
+
+/** One plan version row (mirrors backend PlanVersionOut). */
+export interface PlanVersion {
+  plan_version_id: number;
+  project_id: number | null;
+  statement: string;
+  fiscal_year: number;
+  label: string;
+  is_active: boolean;
+  include_in_reporting: boolean;
+}
+
+/**
+ * GET /api/v1/budget/versions — list plan versions for an (optional) scope.
+ *
+ * ``supported === false`` on an un-migrated DB (dim_plan_version absent) — the
+ * caller should then hide the version UI and leave reporting on the legacy path.
+ */
+export interface PlanVersionsResponse {
+  supported: boolean;
+  versions: PlanVersion[];
+}
+
+export async function listPlanVersions(params?: {
+  statement?: string;
+  fiscal_year?: number;
+  signal?: AbortSignal;
+}): Promise<PlanVersionsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.statement) qs.set("statement", params.statement);
+  if (params?.fiscal_year != null) qs.set("fiscal_year", String(params.fiscal_year));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await apiFetch(`/api/v1/budget/versions${suffix}`, {
+    signal: params?.signal,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<PlanVersionsResponse>;
+}
+
+/** POST /api/v1/budget/versions — create (optionally activate) a plan version (admin). */
+export async function createPlanVersion(payload: {
+  statement: string;
+  fiscal_year: number;
+  label: string;
+  activate?: boolean;
+  include_in_reporting?: boolean;
+}): Promise<PlanVersion> {
+  const res = await apiFetch("/api/v1/budget/versions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<PlanVersion>;
+}
+
+/**
+ * PATCH /api/v1/budget/versions/{id} — activate and/or toggle include-in-reporting (admin).
+ */
+export async function updatePlanVersion(
+  plan_version_id: number,
+  payload: { activate?: boolean; include_in_reporting?: boolean },
+): Promise<BudgetWriteResponse> {
+  const res = await apiFetch(`/api/v1/budget/versions/${plan_version_id}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<BudgetWriteResponse>;
+}
+
+// ---------------------------------------------------------------------------
 // Project data reset (admin-only, non-live stacks only)
 // ---------------------------------------------------------------------------
 

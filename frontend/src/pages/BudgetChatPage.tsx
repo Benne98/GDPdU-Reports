@@ -22,6 +22,7 @@ import ChatSummaryBar from '../components/budget/chat/ChatSummaryBar';
 import SaveProgress from '../components/budget/chat/SaveProgress';
 import StructuredBudgetView from '../components/budget/StructuredBudgetView';
 import BudgetMonthlyAdjustModal from '../components/budget/BudgetMonthlyAdjustModal';
+import PlanVersionPanel from '../components/budget/PlanVersionPanel';
 import type { PositionOverride } from '../components/budget/BudgetGrid';
 import { IS_REPORTING_V2_SANDBOX } from '../lib/reportingV2SandboxMode';
 import { groupPartnersByRank } from '../lib/budgetPartnerGroups';
@@ -1400,6 +1401,14 @@ export default function BudgetChatPage() {
                     Could not load statement structure: {granularityViewError}
                   </div>
                 )}
+
+                {/* Plan versions (Phase 4) — active version + include-in-reporting toggle for
+                    the current statement/year. Hidden when the DB is un-migrated (supported=false). */}
+                <PlanVersionPanel
+                  statement={activeStatement}
+                  fiscalYear={activeYear}
+                  disabled={isSaving}
+                />
 
                 {/* Structured IS/BS Final View */}
                 <StructuredBudgetView

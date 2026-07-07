@@ -4020,6 +4020,11 @@ export const api = {
   entities: (): Promise<Entity[]> =>
     get('/api/v1/entities'),
 
+  /** Which optional reporting sub-pages have data loaded (conditional display, Phase 7).
+   *  GL + Profitability are always shown, so they are not reported here. */
+  reportingAvailability: (): Promise<{ payroll: boolean; fixed_assets: boolean; opos: boolean }> =>
+    get('/api/v1/meta/reporting-availability'),
+
   kpiTotals: (entity?: string, dateFrom?: string, dateTo?: string): Promise<{ metric: string; grain: string; data: KpiTotals }> =>
     get('/api/v1/metrics', { metric: 'kpi_totals', entity, date_from: dateFrom, date_to: dateTo }),
 

@@ -7,7 +7,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services.fin_compat_sql import resolve_entity_prefix
+from app.services.fin_compat_sql import resolve_entity_prefixes
 from app.services.fixed_asset_calc import aggregate_rows
 from app.services.fixed_asset_dimensions import (
     DIMENSION_IDS,
@@ -57,16 +57,19 @@ def _fetch_rows(
     entity: Optional[str],
     project_id: str = "default",
 ) -> list[dict[str, Any]]:
-    ep = resolve_entity_prefix(session, entity)
+    eps = resolve_entity_prefixes(session, entity)
     sql = """
         SELECT *
         FROM fact_fixed_asset
         WHERE project_id = :pid AND as_of_date = :as_of
     """
     params: dict[str, Any] = {"pid": project_id, "as_of": as_of}
-    if ep:
+    if len(eps) == 1:
         sql += " AND entity_prefix = :ep"
-        params["ep"] = ep
+        params["ep"] = eps[0]
+    elif len(eps) > 1:
+        sql += " AND entity_prefix = ANY(:eps)"
+        params["eps"] = eps
     return [dict(r._mapping) for r in session.execute(text(sql), params).fetchall()]
 
 

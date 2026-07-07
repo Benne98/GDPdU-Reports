@@ -38,12 +38,14 @@ import { anchorDateFromPeriod, defaultCompareDates } from './fixedAssetsPeriodUt
 
 type Props = {
   period: PeriodSelection
-  entity?: string
+  /** Selected legal_entity_codes; empty/undefined = all entities (consolidated). */
+  entities?: string[]
 }
 
-export default function GlFixedAssetsTab({ period, entity }: Props) {
+export default function GlFixedAssetsTab({ period, entities }: Props) {
   const periodKey = periodCacheKey(period)
-  const entityKey = entity && entity !== 'all' ? entity : undefined
+  // Multi-select: comma-join the selected codes for the (multi-entity) backend; empty = all.
+  const entityKey = entities && entities.length ? entities.join(',') : undefined
 
   const [snapshots, setSnapshots] = useState<FixedAssetSnapshotInfo[]>([])
   const [snapshotsLoading, setSnapshotsLoading] = useState(true)
