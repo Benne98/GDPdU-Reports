@@ -368,6 +368,79 @@ def _mode_carry_forward(session: Session, scope) -> dict:
     if year_set is not None:
         carries = [c for c in carries if c["fiscal_year"] in year_set]
 
+    # Pre-flight: guarantee a dim_gl_account row for every synthetic (account,
+    # fiscal_year) target BEFORE inserting the synthetic OB lines.  A BS account
+    # carried forward into a year where it has NO real movement has no
+    # dim_gl_account row for that year, so fact_gl_line's
+    # (account_number_group, fiscal_year) -> dim_gl_account FK would fail on insert
+    # (the round-trip / separate-OB-file provisioning path).  We compute the MISSING
+    # keys first and only invoke the fill when at least one is missing — this keeps
+    # the common case (every target already classified) free of the account-library
+    # lookup.  The fill additively clones the missing classification from another
+    # year — the SAME helper + golden guarantees as the OB-file path (ingest.py):
+    # NEVER mutates an existing row, never a duplicate, and never sources an
+    # opening-balance AMOUNT (that stays the carry-forward sum computed above).
+    if carries:
+        want = {(str(c["account_number_group"]), int(c["fiscal_year"])) for c in carries}
+        angs = sorted({a for a, _ in want})
+        placeholders = ", ".join(f":a{i}" for i in range(len(angs)))
+        existing = {
+            (str(r[0]), int(r[1]))
+            for r in session.execute(
+                text(
+                    "SELECT account_number_group, fiscal_year FROM dim_gl_account "
+                    f"WHERE account_number_group IN ({placeholders})"
+                ),
+                {f"a{i}": a for i, a in enumerate(angs)},
+            ).fetchall()
+        }
+        missing = sorted(want - existing)
+        # A carry-forward account is ALWAYS present in dim_gl_account for at least
+        # one year (``_compute_carry_forward`` sources its BS accounts from that
+        # table), and its classification is year-invariant.  So clone the account's
+        # OWN existing classification row into the missing target year — no account-
+        # library dependency, additive (ON CONFLICT DO NOTHING), never mutates an
+        # existing row, never touches an opening-balance amount.
+        #
+        # DB-generated columns (e.g. ``entity_prefix`` is GENERATED ALWAYS in the
+        # Postgres schema, derived from account_number_group) must be excluded from
+        # the INSERT — Postgres rejects an explicit value.  We drop them by name.
+        generated_cols: set[str] = set()
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            generated_cols = {
+                str(r[0])
+                for r in session.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'dim_gl_account' "
+                        "AND is_generated = 'ALWAYS'"
+                    )
+                ).fetchall()
+            }
+        for ang, fy in missing:
+            src = session.execute(
+                text(
+                    "SELECT * FROM dim_gl_account WHERE account_number_group = :a "
+                    "ORDER BY fiscal_year DESC LIMIT 1"
+                ),
+                {"a": ang},
+            ).mappings().first()
+            if src is None:
+                continue
+            row = {k: v for k, v in dict(src).items() if k not in generated_cols}
+            row["fiscal_year"] = fy
+            if "source_system" in row:
+                row["source_system"] = "carry_forward_account_fill"
+            cols = ", ".join(row.keys())
+            binds = ", ".join(f":{k}" for k in row.keys())
+            session.execute(
+                text(
+                    f"INSERT INTO dim_gl_account ({cols}) VALUES ({binds}) "
+                    "ON CONFLICT (account_number_group, fiscal_year) DO NOTHING"
+                ),
+                row,
+            )
+
     entry_sql = text(
         """
         INSERT INTO fact_gl_entry

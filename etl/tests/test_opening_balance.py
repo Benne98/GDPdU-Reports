@@ -476,3 +476,50 @@ def test_invalid_mode_raises():
     s = _make_session()
     with pytest.raises(ValueError):
         OB.synthesize_opening_balances(s, _scope(), "bogus")
+
+
+# --------------------------------------------------------------------------- #
+# Regression: carry-forward into a year the account lacks a dim_gl_account row
+# --------------------------------------------------------------------------- #
+class TestCarryForwardFillsMissingDimRow:
+    """A BS account carried forward into a later year where it has NO real movement
+    has no dim_gl_account row for that year.  Without synthesizing that row first,
+    the ``fact_gl_line (account_number_group, fiscal_year) -> dim_gl_account`` FK
+    fails on insert in Postgres — the failure the separate-OB-file / round-trip
+    provisioning path hit for entity 02 (account 02015951 in 2025)."""
+
+    def setup_method(self):
+        _bid_counter[0] = 1
+
+    def test_missing_later_year_dim_row_is_cloned_from_own_account(self):
+        s = _make_session()
+        # Account A active 2022+2023 -> entity '01' has years {2022, 2023}.
+        _add_movement(s, "019100", 2022, 100.0)
+        _add_movement(s, "019100", 2023, 20.0)
+        # Account B (BS) has a 2022 movement ONLY -> no dim row for 2023, yet it
+        # carries a 500 balance forward into 2023.
+        _add_movement(s, "019200", 2022, 500.0)
+        assert (
+            s.execute(
+                text(
+                    "SELECT count(*) FROM dim_gl_account "
+                    "WHERE account_number_group='019200' AND fiscal_year=2023"
+                )
+            ).scalar()
+            == 0
+        )
+
+        OB.synthesize_opening_balances(s, _scope(), "carry_forward")
+
+        # the classification row was cloned into 2023 (level_0 / entity carried).
+        row = s.execute(
+            text(
+                "SELECT level_0, entity_prefix FROM dim_gl_account "
+                "WHERE account_number_group='019200' AND fiscal_year=2023"
+            )
+        ).first()
+        assert row is not None, "missing dim_gl_account row was not synthesized"
+        assert row[0] == "BS" and row[1] == "01"
+        # and the carry-forward OB line (500) exists for (019200, 2023).
+        synth = {(r["ang"], r["fy"]): r["amount"] for r in _synthetic_rows(s)}
+        assert synth.get(("019200", 2023)) == 500.0
