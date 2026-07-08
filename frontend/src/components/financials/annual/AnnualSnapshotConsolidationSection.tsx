@@ -270,7 +270,7 @@ export default function AnnualSnapshotConsolidationSection({
       </div>
 
       {viewMode === 'table' ? (
-        <div className="px-4 pb-4 pt-2 overflow-x-auto">
+        <div className="px-6 pb-4 pt-2 overflow-x-auto">
           {(statement === 'bs' || statement === 'wc') && consol.period_grain === 'year' ? (
             <AnnualSnapshotConsolidationTableView
               data={consol}

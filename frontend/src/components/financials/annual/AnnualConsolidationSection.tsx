@@ -261,7 +261,7 @@ export default function AnnualConsolidationSection({
       </div>
 
       {viewMode === 'table' ? (
-        <div className="px-4 pb-4 pt-2 overflow-x-auto">
+        <div className="px-6 pb-4 pt-2 overflow-x-auto">
           <PlConsolidationTableView
             data={consol}
             year={year}

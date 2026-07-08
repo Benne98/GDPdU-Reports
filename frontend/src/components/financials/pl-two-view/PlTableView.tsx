@@ -43,7 +43,7 @@ export default function PlTableView({ data, monthly, year, month, planMap, colum
   }
 
   return (
-    <div className="overflow-x-auto p-4">
+    <div className="overflow-x-auto px-6 py-4">
       <table className="w-full border-collapse text-xs">
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
