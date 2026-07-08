@@ -345,7 +345,7 @@ export type RequiredGlColumnKey = typeof REQUIRED_GL_COLUMN_KEYS[number]
 /** User-facing labels for required GL column fields — reused in UI messages. */
 export const GL_COLUMN_FRIENDLY_LABELS: Record<RequiredGlColumnKey, string> = {
   posting_date: 'Posting date',
-  journal_entry_number: 'Transaction/journal number',
+  journal_entry_number: 'Booking ID',
   account_number: 'Account number',
 }
 

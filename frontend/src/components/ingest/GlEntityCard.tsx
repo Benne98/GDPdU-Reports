@@ -156,35 +156,42 @@ export const GL_ENTITY_SUB_STEPS = [
 /**
  * Default GoBD column mapping when source headers match a standard DATEV/Decidra export.
  */
+// The GL column picker offers ONLY the fields relevant to a GL booking line
+// (order = dropdown order). Amount/sign columns are configured separately in the
+// sign options (profile.sign), NOT here. source_no is the partner number and — via
+// the companion "Source type" column (or split mode) — represents the creditor /
+// debtor / fixed-asset number.
 const GOBD_GL_DEFAULTS: Record<string, string> = {
-  journal_entry_number: 'Transaction number',
+  journal_entry_number: 'Booking ID',
+  line_note: 'Booking text',
   account_number: 'Account number',
   posting_date: 'Posting date',
-  document_date: 'Document date',
-  document_type: 'Document type',
-  reference_document_number: 'Document number',
   amount: 'Amount',
-  vat_amount: 'VAT amount',
-  line_note: 'Booking text',
-  posting_type: 'Posting type',
   source_type: 'Source type',
-  source_no: 'Source No.',
+  source_no: 'Source number',
 }
 
-/**
- * Ordered list of standard GoBD label options for the dropdown.
- * Derived from GOBD_GL_DEFAULTS values, with 'Account name' appended.
- */
-const GOBD_LABEL_OPTIONS: readonly string[] = [
-  ...Object.values(GOBD_GL_DEFAULTS),
-  'Account name',
-]
+// Legacy / alternate source-header spellings that still auto-map to each field, so
+// files whose headers use an older label (e.g. DATEV 'Transaction number') keep
+// auto-detecting even though the picker now shows the canonical label.
+const GOBD_GL_SOURCE_ALIASES: Record<string, readonly string[]> = {
+  journal_entry_number: ['Transaction number', 'Journal number', 'Belegnummer', 'Buchungs-ID'],
+  source_no: ['Source No.', 'Creditor number', 'Debitor number', 'Debtor number', 'Fixed asset number'],
+}
+
+/** Ordered list of the standard GoBD label options for the per-column dropdown. */
+const GOBD_LABEL_OPTIONS: readonly string[] = Object.values(GOBD_GL_DEFAULTS)
 
 export function suggestGlMapping(columns: string[]): Record<string, string> {
   const colSet = new Set(columns)
   const out: Record<string, string> = {}
   for (const [target, source] of Object.entries(GOBD_GL_DEFAULTS)) {
-    if (colSet.has(source)) out[target] = source
+    if (colSet.has(source)) {
+      out[target] = source
+      continue
+    }
+    const alias = GOBD_GL_SOURCE_ALIASES[target]?.find(a => colSet.has(a))
+    if (alias) out[target] = alias
   }
   return out
 }
