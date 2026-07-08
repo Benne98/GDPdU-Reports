@@ -124,7 +124,12 @@ export default function GlFormatAssignmentStep({
       {/* Entity rows */}
       <div className="divide-y divide-slate-100">
         {entities.map((entity, i) => {
-          const entityName = entity.entityCode.trim() || `Entity ${i + 1}`
+          const entityCode = entity.entityCode.trim()
+          const entityLabel = entity.entityLabel?.trim()
+          const entityName =
+            entityLabel && entityLabel !== entityCode
+              ? `${entityLabel} (${entityCode})`
+              : entityCode || `Entity ${i + 1}`
           const colCount = entity.combinedColumns?.length ?? 0
           const currentKey = assignment[i]
 

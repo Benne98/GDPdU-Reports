@@ -103,7 +103,9 @@ export default function GlGroupConfigPanel({
     .map(i => {
       const e = entities[i]
       if (!e) return `Entity ${i + 1}`
-      return e.entityCode.trim() || `Entity ${i + 1}`
+      const code = e.entityCode.trim()
+      const label = e.entityLabel?.trim()
+      return label && label !== code ? `${label} (${code})` : code || `Entity ${i + 1}`
     })
     .join(', ')
 

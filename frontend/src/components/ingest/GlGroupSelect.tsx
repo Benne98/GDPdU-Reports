@@ -86,7 +86,10 @@ export default function GlGroupSelect({
           const reason = ineligibilityReason(entity, group)
           const eligible = reason === null
           const isSelected = selected.has(index)
-          const entityName = entity.entityCode.trim() || `Entity ${index + 1}`
+          const eCode = entity.entityCode.trim()
+          const eLabel = entity.entityLabel?.trim()
+          const entityName =
+            eLabel && eLabel !== eCode ? `${eLabel} (${eCode})` : eCode || `Entity ${index + 1}`
           const colCount = entity.combinedColumns?.length ?? null
 
           return (
