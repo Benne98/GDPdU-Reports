@@ -5277,11 +5277,16 @@ export default function ProjectSetupWizard() {
       for (let i = 0; i < stagedGlEntities.length; i++) {
         const entity = stagedGlEntities[i]
         const entityCode = entity.entityCode.trim() || `entity_${i}`
+        // Show the entity NAME the user entered (with the code in parens) rather than
+        // just the bare code/prefix; fall back to the code when no name was given.
+        const entityName = entity.entityLabel?.trim()
+        const entityDisplay =
+          entityName && entityName !== entityCode ? `${entityName} (${entityCode})` : entityCode
         const commit_mode: 'replace' | 'append' = committedScopes.has(entityCode) ? 'append' : 'replace'
         committedScopes.add(entityCode)
 
         const stepId = `gl_${i}`
-        const stepLabel = `GL — ${entityCode} (entity ${i + 1} of ${stagedGlEntities.length})`
+        const stepLabel = `GL — ${entityDisplay} · entity ${i + 1} of ${stagedGlEntities.length}`
 
         setCommitSteps(prev => {
           if (i === 0) {
@@ -5326,7 +5331,7 @@ export default function ProjectSetupWizard() {
             }
             return `${r.entries} entries, ${r.lines} lines (mode: ${commit_mode}, AR: ${r.ar}, AP: ${r.ap}, skipped: ${r.skipped})`
           },
-          (raw) => friendlyFinishError(raw, { stepLabel: 'GL bookings', entityCode }),
+          (raw) => friendlyFinishError(raw, { stepLabel: 'GL bookings', entityCode: entityDisplay }),
         )
         glSubTimers.forEach(clearTimeout)
         if (glResult === null) return

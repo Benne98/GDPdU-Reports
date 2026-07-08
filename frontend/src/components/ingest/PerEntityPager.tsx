@@ -58,7 +58,12 @@ export default function PerEntityPager({ entities, stagedCount, renderEntity }: 
           </button>
 
           <span className="text-sm font-semibold text-slate-700">
-            Entity {idx + 1} of {entities.length}
+            {entity.name && entity.name !== entity.prefix
+              ? `${entity.name} (${entity.prefix || entity.code})`
+              : (entity.prefix || entity.code || `Entity ${idx + 1}`)}
+            <span className="ml-1.5 font-normal text-slate-400">
+              · {idx + 1} of {entities.length}
+            </span>
           </span>
 
           <button
