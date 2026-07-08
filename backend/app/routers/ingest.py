@@ -2396,12 +2396,20 @@ def commit(
             elif "journal_entry_group_number" in canonical.columns:
                 entity_prefix_val = str(canonical["journal_entry_group_number"].iloc[0])[:2]
             if entity_prefix_val:
+                # register-if-absent ONLY: this is a placeholder upsert for a data
+                # prefix with no confirmed wizard assignment (entity_name == prefix).
+                # It must NOT clobber a real entity_name already set by Project-Setup
+                # (upsert_project_entities) or a column-mode GL commit — otherwise a
+                # fixed-mode GL /commit overwrites e.g. "Venturo" with "05". The name
+                # stays whatever the setup persisted; the prefix is a harmless default
+                # only when nothing real exists yet.
                 load_legal_entity(
                     session,
                     entity_prefix=entity_prefix_val,
                     entity_name=entity_prefix_val,
                     is_consolidation=False,
                     source_system=source_system if source_system != "unknown" else None,
+                    preserve_existing=True,
                 )
     except Exception as exc:
         logger.warning("commit: dim_legal_entity upsert failed (%s); continuing", exc)

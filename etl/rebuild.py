@@ -301,6 +301,14 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         from scripts.realign_pl_structure import realign_pl_structure  # type: ignore
 
         out["pl_structure_realigned"] = realign_pl_structure(session, scope)
+
+        # "KPIs as % of total output" rows (row_type='kpi'): NOT in the Decidra
+        # Excel, so re-assert them here idempotently — a from-scratch rebuild /
+        # fresh DB must always carry the full ordered KPI block (Gross margin …
+        # Net profit margin). Additive: only the seven KPI line_codes are touched.
+        from scripts.seed_pl_structure import seed_pl_kpi_rows  # type: ignore
+
+        out["pl_kpi_rows"] = seed_pl_kpi_rows(session)
     except (ImportError, FileNotFoundError) as exc:
         # GRACEFUL — and ONLY here: the recon-mapping source / scripts module is
         # absent (legacy or pure-ETL test schema).  Matches historical behaviour;

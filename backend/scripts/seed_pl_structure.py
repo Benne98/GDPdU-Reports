@@ -49,6 +49,72 @@ _KPI_BY_TITLE: dict[str, tuple[str, str]] = {
 # Everything else with Calc type=2 -> subtotal
 
 
+# --------------------------------------------------------------------------- #
+# "KPIs as % of total output" rows (row_type='kpi')
+# --------------------------------------------------------------------------- #
+# These percentage-of-total-output KPI rows are NOT in the Decidra
+# Account_Mapping.xlsx "PL Structure" sheet (that sheet only carries the P&L line
+# hierarchy + the GROSS_PROFIT / EBITDA calc lines). They render as a separate
+# "KPIs as % of total output" block below the P&L. Each row's value is
+# line(kpi_code) / |TOTAL_OUTPUT| x 100 (see fin_compat_pl); kpi_code references
+# the numerator's structure line_code, resolved by _resolve_kpi_line_code.
+#
+# They live in code (not the Excel) so a from-scratch rebuild / fresh DB always
+# re-asserts the full, ordered set — seed_pl_kpi_rows is wired into the rebuild's
+# structure refresh. Order mirrors the P&L reading order the user confirmed:
+# Gross margin, Personnel, Other op income, Other op expenses, EBITDA, EBIT, Net
+# profit. Idempotent: ON CONFLICT(line_code) re-pins every mutable column.
+#
+# (offset-from-P&L-end, line_code, balance_title, kpi_code)
+_PL_KPI_ROWS: list[tuple[int, str, str, str]] = [
+    (1, "GROSS_MARGIN_PCT",             "Gross margin %",             "GROSS_PROFIT"),
+    (2, "PERSONNEL_EXPENSES_PCT",       "Personnel expenses %",       "PERSONNEL_EXPENSES"),
+    (3, "OTHER_OPERATING_INCOME_PCT",   "Other operating income %",   "OTHER_OPERATING_INCOME"),
+    (4, "OTHER_OPERATING_EXPENSES_PCT", "Other operating expenses %", "OTHER_OPERATING_EXPENSES"),
+    (5, "EBITDA_MARGIN_PCT",            "EBITDA margin %",            "EBITDA"),
+    (6, "EBIT_MARGIN_PCT",              "EBIT margin %",              "EBIT"),
+    (7, "NET_PROFIT_MARGIN_PCT",        "Net profit margin %",        "NET_PROFIT"),
+]
+
+
+def seed_pl_kpi_rows(session) -> int:
+    """Idempotently upsert the 'KPIs as % of total output' rows into dim_pl_structure.
+
+    Places them immediately AFTER the last non-KPI P&L line (sort_order base =
+    MAX(sort_order) over non-'kpi' rows) so the block always trails the statement,
+    regardless of how many mapping rows the CoA produced. Deterministic + additive:
+    only the seven KPI ``line_code``s are touched (ON CONFLICT re-pins them); the
+    P&L mapping/calc/subtotal rows are never modified. Returns rows upserted.
+    """
+    from sqlalchemy import text
+
+    base = session.execute(
+        text("SELECT COALESCE(MAX(sort_order), 0) FROM dim_pl_structure "
+             "WHERE row_type <> 'kpi'")
+    ).scalar() or 0
+    n = 0
+    for offset, line_code, balance_title, kpi_code in _PL_KPI_ROWS:
+        session.execute(
+            text("""
+                INSERT INTO dim_pl_structure
+                  (sort_order, line_code, row_type, balance_title, calc_type,
+                   kpi_code, is_bold, invert_delta, source)
+                VALUES (:so, :lc, 'kpi', :bt, 1, :kpi, FALSE, FALSE, 'seed')
+                ON CONFLICT (line_code) DO UPDATE SET
+                  sort_order    = EXCLUDED.sort_order,
+                  row_type      = EXCLUDED.row_type,
+                  balance_title = EXCLUDED.balance_title,
+                  calc_type     = EXCLUDED.calc_type,
+                  kpi_code      = EXCLUDED.kpi_code,
+                  source        = EXCLUDED.source
+            """),
+            {"so": int(base) + offset, "lc": line_code, "bt": balance_title,
+             "kpi": kpi_code},
+        )
+        n += 1
+    return n
+
+
 def _make_line_code(dynamic_name: str, balance_title: str, sort: int) -> str:
     """Build a stable line_code from the Dynamic name or Balance title."""
     src = (dynamic_name or balance_title or "").strip()
