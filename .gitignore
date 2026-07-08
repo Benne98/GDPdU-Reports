@@ -40,6 +40,9 @@ rasa/models/
 backend/golden/*/
 !backend/golden/README.md
 
+# Round-trip / demo data exports (never committed — regenerated from the DB)
+/exports/
+
 # Agent / editor / scratch artifacts (never committed)
 .claude/
 .cursor/

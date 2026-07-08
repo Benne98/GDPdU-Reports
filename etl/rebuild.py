@@ -276,6 +276,21 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         sys.path.insert(0, str(_backend))
 
     out: dict = {}
+
+    # (B) Statement backfill — repair accounts left with level_0 IS NULL by a CoA
+    # export/re-ingest round-trip (double-duplicate hierarchy → NULL statement) so
+    # their still-posted GL activity is not silently dropped by the reader filters
+    # (WHERE level_0='PL'/'BS').  Runs FIRST — BEFORE seed_bs_structure /
+    # realign_pl_structure, which READ level_0 — so a repaired account is re-seeded
+    # and re-pinned this same rebuild.  Deterministic / idempotent / additive
+    # (only UPDATEs currently-NULL level_0); a strict NO-OP on a clean CoA (v5 parity).
+    from etl.statement_backfill import (
+        backfill_null_statement,
+        warn_unresolved_null_statement,
+    )
+
+    out["statement_backfill"] = backfill_null_statement(session, scope)
+
     try:
         # BS re-seed (delete-then-insert; commits internally, harmless in our txn).
         from scripts.seed_bs_structure import seed_bs_structure  # type: ignore
@@ -296,6 +311,11 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         out.setdefault("bs_structure_rows", 0)
         out.setdefault("pl_structure_realigned", 0)
         out["error"] = str(exc)
+
+    # (C) Guardrail — AFTER the (B) backfill: WARN (do NOT relax any reader filter)
+    # about any account_number_group that STILL has GL activity but level_0 IS NULL,
+    # i.e. whose mapped bookings the readers will silently drop.  Visibility only.
+    out["statement_unresolved"] = warn_unresolved_null_statement(session, scope)
 
     return out
 
