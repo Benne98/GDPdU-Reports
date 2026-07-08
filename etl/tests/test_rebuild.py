@@ -239,6 +239,75 @@ class TestPartnerBackfill:
 
 
 # --------------------------------------------------------------------------- #
+# Structure/recon stage: BS re-seed + P&L realign wiring (Prong A)
+# --------------------------------------------------------------------------- #
+class TestStructureReconStage:
+    def _patch_scripts(self, monkeypatch, *, bs=lambda session: 12,
+                       realign=lambda session, scope: 3):
+        """Patch the callables _stage_structure_recon_refresh imports at call time."""
+        import scripts.seed_bs_structure as sbs
+        import scripts.realign_pl_structure as rps
+
+        monkeypatch.setattr(sbs, "seed_bs_structure", bs)
+        monkeypatch.setattr(rps, "realign_pl_structure", realign)
+
+    def test_stage_returns_bs_rows_and_pl_realigned(self, monkeypatch):
+        self._patch_scripts(monkeypatch)
+        out = R._stage_structure_recon_refresh(_fresh_session(), R.RebuildScope())
+        assert out["bs_structure_rows"] == 12
+        assert "pl_structure_realigned" in out
+        assert out["pl_structure_realigned"] == 3
+
+    def test_pl_realign_receives_scope(self, monkeypatch):
+        seen = {}
+
+        def _realign(session, scope):
+            seen["scope"] = scope
+            return 0
+
+        self._patch_scripts(monkeypatch, realign=_realign)
+        sc = R.RebuildScope(prefixes=["01"], years=[2025])
+        R._stage_structure_recon_refresh(_fresh_session(), sc)
+        assert seen["scope"] is sc
+
+    def test_db_error_propagates_no_silent_zero(self, monkeypatch):
+        """A real DB error out of seed_bs_structure must PROPAGATE (not degrade to 0)."""
+        def _boom(session):
+            raise RuntimeError("relation dim_bs_structure broken")
+
+        self._patch_scripts(monkeypatch, bs=_boom)
+        with pytest.raises(RuntimeError):
+            R._stage_structure_recon_refresh(_fresh_session(), R.RebuildScope())
+
+    def test_db_error_propagates_through_full_rebuild(self, monkeypatch):
+        def _boom(session):
+            raise RuntimeError("db down")
+
+        self._patch_scripts(monkeypatch, bs=_boom)
+        # Neutralise the earlier stages so the failure is isolated to structure.
+        for name in ("_stage_classification_refresh", "_stage_account_library_fill",
+                     "_stage_partner_backfill", "_stage_derived_facts",
+                     "_stage_opening_balances", "_stage_net_profit"):
+            monkeypatch.setattr(R, name, lambda *a, **k: {})
+        session = _fresh_session()
+        with pytest.raises(RuntimeError):
+            R.rebuild_project(session, scope=None, mode="full")
+        session.rollback.assert_called_once()
+        session.commit.assert_not_called()
+
+    def test_import_absence_is_graceful(self, monkeypatch):
+        """ImportError/FileNotFoundError (recon source / scripts absent) stays graceful."""
+        def _missing(session):
+            raise FileNotFoundError("recon mapping Excel not found")
+
+        self._patch_scripts(monkeypatch, bs=_missing)
+        out = R._stage_structure_recon_refresh(_fresh_session(), R.RebuildScope())
+        assert out["bs_structure_rows"] == 0
+        assert out["pl_structure_realigned"] == 0
+        assert "error" in out
+
+
+# --------------------------------------------------------------------------- #
 # DB-backed idempotency (opt-in: set GDPDU_TEST_DB=1 + DB_PASSWORD [+ DB_NAME])
 # --------------------------------------------------------------------------- #
 _DB_TEST_ENABLED = os.getenv("GDPDU_TEST_DB", "").strip() not in ("", "0", "false", "no")

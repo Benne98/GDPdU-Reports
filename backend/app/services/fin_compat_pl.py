@@ -248,50 +248,280 @@ def _match_grain(g: dict, row: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Account-level rows under a level-4 grouping
+# Grain-relative hierarchy (Prong A read-side)
+# ---------------------------------------------------------------------------
+# After a CoA round-trip the GL grain levels can shift UP by one, so a mapping
+# row's category value may be pinned at a SHALLOWER grain level (level_2 instead
+# of level_3).  The concurrent derivation engine re-pins each PL structure row's
+# filter to the SHALLOWEST grain level its category value occupies (matched level
+# M ∈ {2,3,4}).  The reader must therefore treat M as the position level and read
+# children from the NEXT POPULATED grain level below M — NOT a hard-coded level_3.
+#
+# SEAM CONTRACT (shared verbatim with the derivation engineer):
+#   * matched_level(row) = the SHALLOWEST grain level the row's value occupies.
+#   * children are the NEXT populated grain level below M (child_lvl = M+1).
+#   * account leaves hang under each child (or, when the matched level itself has
+#     no populated deeper level, the reader shows nothing new — see note below).
+#
+# On the legacy v5 convention M == 3 → children at level_4 (IDENTICAL to the old
+# hard-coded behaviour, so v5 output is byte-for-byte unchanged).  On the shifted
+# e2e convention M == 2 → children at level_3 (level_4 NULL) so the L3 breakdown
+# reappears where the old `l3 and not l4` gate had silently stopped firing.
+
+
+def matched_level(row: Any) -> Optional[int]:
+    """The SHALLOWEST grain level a (re-pinned) mapping row's value occupies.
+
+    * ``gl_account_id`` set → ``None`` (account-pinned leaf; no level expansion).
+    * else the DEEPEST populated among level_2/3/4 → ``2|3|4``.  A re-pinned row
+      has exactly one populated level filter, so "deepest populated" == the pin;
+      for the legacy v5 convention (level_2 parent + level_3 value both set) the
+      deepest populated is level_3 → ``M == 3`` (children = level_4, as before).
+    * all empty → ``None``.
+    """
+    r = row if isinstance(row, dict) else _row_dict(row)
+    if (r.get("gl_account_id") or "").strip():
+        return None
+    for lvl in (4, 3, 2):
+        if (r.get(f"level_{lvl}") or "").strip():
+            return lvl
+    return None
+
+
+def _row_filters(row: Any) -> dict[str, str]:
+    """The non-empty level filters currently pinned on the structure row."""
+    r = row if isinstance(row, dict) else _row_dict(row)
+    out: dict[str, str] = {}
+    for lvl in ("level_2", "level_3", "level_4"):
+        v = (r.get(lvl) or "").strip()
+        if v:
+            out[lvl] = v
+    return out
+
+
+def _match_filters(g: dict, filters: dict[str, str]) -> bool:
+    """True iff grain ``g`` matches EVERY (level, value) in ``filters``."""
+    for lvl, val in filters.items():
+        if (g.get(lvl) or "").strip() != val:
+            return False
+    return True
+
+
+def _pl_child_grouping(grains: list[dict], row: Any) -> Optional[dict]:
+    """Grain-relative child bucketing for a mapping row (Prong A read-side).
+
+    Returns ``None`` when the row does not expand (account-pinned, matched level
+    is 4, or no level filter at all).  Otherwise returns::
+
+        {"matched_level": M, "child_level": "level_{M+1}",
+         "filters": {..pinned levels..}, "matched": [grains matching filters],
+         "buckets": {child_value: [grains]}}      # child_value non-empty only
+
+    An empty ``buckets`` means the matched level is itself the leaf (no populated
+    deeper level).
+    """
+    m = matched_level(row)
+    if m is None or m >= 4:
+        return None
+    child_level = f"level_{m + 1}"
+    filters = _row_filters(row)
+    matched = [g for g in grains if _match_filters(g, filters)]
+    buckets: dict[str, list[dict]] = {}
+    for g in matched:
+        cv = (g.get(child_level) or "").strip()
+        if cv:
+            buckets.setdefault(cv, []).append(g)
+    return {
+        "matched_level": m,
+        "child_level": child_level,
+        "filters": filters,
+        "matched": matched,
+        "buckets": buckets,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Account-level leaves under a level filter (generalized, grain-relative)
 # ---------------------------------------------------------------------------
 
-def _accounts_under_l4(grains: list[dict], l2: str, l3: str, l4: str, invert: bool,
-                       week_ctx: bool = False) -> list[dict]:
-    out = []
+def _accounts_under(
+    grains: list[dict],
+    filters: dict[str, str],
+    invert: bool,
+    *,
+    keys: list[str],
+    amounts_fn,
+    sort_key,
+    deltas_fn=None,
+    id_prefix: str = "acc",
+) -> list[dict]:
+    """Account rows whose grain matches EVERY (level, value) in ``filters``.
+
+    Generalizes the old ``_accounts_under_l4`` (which hard-coded level_2/3/4) so
+    the same leaf builder serves any matched level.  All-zero accounts are
+    excluded (``Σ|value| < 1e-9``); accounts are deduped by
+    ``account_number_group``; the drill is built from ``filters`` + the account id.
+    """
     seen_ang: dict[str, dict[str, float]] = {}
     seen_meta: dict[str, tuple[str, str]] = {}  # ang → (gl_account_id, account_name)
     for g in grains:
-        if (g.get("level_3") or "").strip() != l3:
-            continue
-        if (g.get("level_4") or "").strip() != l4:
-            continue
-        if l2 and (g.get("level_2") or "").strip() != l2:
+        if not _match_filters(g, filters):
             continue
         ang = g.get("account_number_group") or g.get("gl_account_id") or ""
         if not ang:
             continue
-        am = _row_amounts(g, week_ctx=week_ctx)
+        am = amounts_fn(g)
         if sum(abs(v) for v in am.values()) < 1e-9:
             continue
         if ang not in seen_ang:
-            seen_ang[ang] = {k: 0.0 for k in am}
+            seen_ang[ang] = {k: 0.0 for k in keys}
             gid = (g.get("gl_account_id") or ang).strip()
             aname = (g.get("account_name") or "").strip()
             seen_meta[ang] = (gid, aname)
-        for k in am:
-            seen_ang[ang][k] = seen_ang[ang].get(k, 0.0) + am[k]
+        for k in keys:
+            seen_ang[ang][k] = seen_ang[ang].get(k, 0.0) + am.get(k, 0.0)
+    out: list[dict] = []
     for ang, am in seen_ang.items():
         gid, aname = seen_meta[ang]
         acc_label = f"{gid} | {aname}" if aname else gid
-        out.append({
-            "id": f"acc-{ang}",
+        node: dict[str, Any] = {
+            "id": f"{id_prefix}-{ang}",
             "line_code": gid,
             "label": acc_label,
             "row_kind": "account",
             "amounts": _round_am(am),
-            "deltas": _deltas(am, invert),
             "invert_delta": invert,
-            "drill": {"statement_type": "PL", "level_2": l2 or None,
-                      "level_3": l3, "level_4": l4, "gl_account_id": gid},
-        })
-    out.sort(key=lambda x: _sort_key_cm(x.get("amounts") or {}), reverse=True)
+            "drill": {"statement_type": "PL",
+                      "level_2": filters.get("level_2"),
+                      "level_3": filters.get("level_3"),
+                      "level_4": filters.get("level_4"),
+                      "gl_account_id": gid},
+        }
+        if deltas_fn is not None:
+            node["deltas"] = deltas_fn(am, invert)
+        out.append(node)
+    out.sort(key=lambda x: sort_key(x.get("amounts") or {}), reverse=True)
     return out
+
+
+def _pl_hierarchy_children(
+    grains: list[dict],
+    row: Any,
+    *,
+    keys: list[str],
+    invert: bool,
+    rc: str,
+    balance_title: str,
+    id_base: str,
+    amounts_fn,
+    sort_key,
+    deltas_fn=None,
+    account_id_prefix: str = "acc",
+    make_accounts: bool = True,
+    leaf_accounts: bool = False,
+) -> tuple[list[dict], list[dict], Optional[dict]]:
+    """Grain-relative child expansion for one mapping row (Prong A read-side).
+
+    Returns ``(children, hoisted_accounts, hoist_drill)``:
+
+    * matched level ``M`` = :func:`matched_level`; ``None``/4 → ``([], [], None)``
+      (account-pinned / level_4-pinned rows do not expand — as today).
+    * child_lvl = ``level_{M+1}``; matching grains are bucketed by that level
+      (empty child values skipped).  Each child node carries its account leaves
+      via :func:`_accounts_under` (``make_accounts``) plus a drill dict, and the
+      children are ordered by ``sort_key`` DESC (matching the statement builder —
+      NOT alphabetical).
+    * NO buckets (the matched level is itself the leaf): with ``leaf_accounts``
+      the row's accounts are attached directly; otherwise it does not expand
+      (preserves the legacy v5 has_children exactly — a mapping row whose grains
+      lack the deeper level shows nothing new).
+    * Single-child hoist: when there is exactly one child whose label equals the
+      parent's ``balance_title`` the child is dissolved into the parent — the
+      parent adopts the child's drill and its account leaves (load-bearing for v5
+      parity, where several L3/L4 values share a name).
+    """
+    grouping = _pl_child_grouping(grains, row)
+    if grouping is None:
+        return [], [], None
+    filters = grouping["filters"]
+    child_level = grouping["child_level"]
+    buckets = grouping["buckets"]
+
+    if not buckets:
+        if leaf_accounts and make_accounts:
+            accts = _accounts_under(
+                grains, filters, invert, keys=keys, amounts_fn=amounts_fn,
+                sort_key=sort_key, deltas_fn=deltas_fn, id_prefix=account_id_prefix,
+            )
+            return [], accts, None
+        return [], [], None
+
+    scored: list[tuple[float, dict]] = []
+    for cv, cg in buckets.items():
+        am = {k: 0.0 for k in keys}
+        for g in cg:
+            gv = amounts_fn(g)
+            for k in keys:
+                am[k] += gv.get(k, 0.0)
+        child_filters = {**filters, child_level: cv}
+        node: dict[str, Any] = {
+            "id": f"{id_base}-l4-{abs(hash(cv)) % 100000}",
+            "line_code": f"{rc}::{cv}",
+            "label": cv,
+            "row_kind": "detail",
+            "amounts": _round_am(am),
+            "invert_delta": invert,
+            "drill": {"statement_type": "PL",
+                      "level_2": child_filters.get("level_2"),
+                      "level_3": child_filters.get("level_3"),
+                      "level_4": child_filters.get("level_4"),
+                      "gl_account_id": None},
+        }
+        if deltas_fn is not None:
+            node["deltas"] = deltas_fn(am, invert)
+        if make_accounts:
+            node["accounts"] = _accounts_under(
+                grains, child_filters, invert, keys=keys, amounts_fn=amounts_fn,
+                sort_key=sort_key, deltas_fn=deltas_fn, id_prefix=account_id_prefix,
+            )
+        scored.append((sort_key(am), node))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    nodes = [n for _, n in scored]
+
+    # Single-child == parent-title hoist (load-bearing v5 parity dedup).
+    if len(nodes) == 1 and nodes[0].get("label") == balance_title:
+        return [], nodes[0].get("accounts", []), nodes[0]["drill"]
+    return nodes, [], None
+
+
+# ---------------------------------------------------------------------------
+# All-zero mapping-row exclusion (Prong B)
+# ---------------------------------------------------------------------------
+
+def _is_all_zero_amounts(am: Any, keys: list[str]) -> bool:
+    if not isinstance(am, dict):
+        return False
+    return all(abs(float(am.get(k) or 0.0)) < 1e-9 for k in keys)
+
+
+def _exclude_zero_rows(rows: list[dict], keys: list[str]) -> list[dict]:
+    """Prong B: drop all-zero MAPPING ('line') rows and empty section headers.
+
+    ONLY ``row_kind == 'line'`` (mapping) rows that are zero across EVERY period
+    column ``keys`` are dropped — a row that is non-zero in ANY period stays.
+    Structurally-required subtotal/calc/grandtotal/kpi/total rows are NEVER
+    dropped even when zero (they carry the running sums).  A ``kpi_header`` with
+    no surviving ``kpi`` row under it is also dropped (empty section header).
+    """
+    kept: list[dict] = []
+    for r in rows:
+        if r.get("row_kind") == "line" and _is_all_zero_amounts(r.get("amounts"), keys):
+            continue
+        kept.append(r)
+    if not any(r.get("row_kind") == "kpi" for r in kept):
+        kept = [r for r in kept if r.get("row_kind") != "kpi_header"]
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -797,45 +1027,22 @@ def _build_rows(
             "level_4": l4 or None, "gl_account_id": gid,
         }
 
-        # L4 children for L3-only mapping rows
+        # Grain-relative child expansion (Prong A) — children at the next
+        # populated grain level below the row's matched level, each with account
+        # leaves; single-child==title hoist preserved.  (On v5 M==3 → level_4,
+        # byte-identical to the old hard-coded gate.)
         children: list[dict] = []
         hoisted_accounts: list[dict] = []
 
-        if rt == "mapping" and l3 and not l4 and not gid:
-            seen_l4: dict[str, dict[str, float]] = {}
-            for g in grains:
-                if (g.get("level_3") or "").strip() != l3:
-                    continue
-                if l2 and (g.get("level_2") or "").strip() != l2:
-                    continue
-                l4v = (g.get("level_4") or "").strip()
-                if not l4v:
-                    continue
-                if l4v not in seen_l4:
-                    seen_l4[l4v] = {k: 0.0 for k in keys}
-                am4 = _row_amounts(g, week_ctx=is_week)
-                for k in keys:
-                    seen_l4[l4v][k] = seen_l4[l4v].get(k, 0.0) + am4.get(k, 0.0)
-            for l4v, am4 in sorted(seen_l4.items(), key=lambda kv: _sort_key_cm(kv[1]), reverse=True):
-                d4 = _deltas(am4, inv)
-                children.append({
-                    "id": f"pl-{rc}-l4-{abs(hash(l4v)) % 100000}",
-                    "line_code": f"{rc}::{l4v}",
-                    "label": l4v,
-                    "row_kind": "detail",
-                    "amounts": _round_am(am4),
-                    "deltas": d4,
-                    "invert_delta": inv,
-                    "drill": {"statement_type": "PL", "level_2": l2 or None,
-                              "level_3": l3, "level_4": l4v, "gl_account_id": None},
-                    "accounts": _accounts_under_l4(grains, l2, l3, l4v, inv, week_ctx=is_week),
-                })
-            # Dedup: single L4 with same label as parent → hoist
-            if len(children) == 1 and children[0].get("label", "") == r["balance_title"]:
-                child = children[0]
-                drill = child["drill"]
-                hoisted_accounts = child.get("accounts", [])
-                children = []
+        if rt == "mapping":
+            children, hoisted_accounts, hoist_drill = _pl_hierarchy_children(
+                grains, r, keys=keys, invert=inv, rc=rc,
+                balance_title=r["balance_title"], id_base=f"pl-{rc}",
+                amounts_fn=lambda g: _row_amounts(g, week_ctx=is_week),
+                sort_key=_sort_key_cm, deltas_fn=_deltas, account_id_prefix="acc",
+            )
+            if hoist_drill is not None:
+                drill = hoist_drill
 
         am_full = _attach_plan(_round_am(am), plan_map, rc, week_ctx)
         row_kind = _row_kind_for(rt)
@@ -854,6 +1061,9 @@ def _build_rows(
             "children": children,
             "accounts": hoisted_accounts,
         })
+
+    # Prong B: drop all-zero mapping rows + empty section headers.
+    rows_out = _exclude_zero_rows(rows_out, keys)
 
     out: dict[str, Any] = {
         "statement": "pl",
@@ -909,55 +1119,6 @@ def _er_flow_deltas(am: dict[str, float], invert: bool) -> dict[str, float]:
 def _er_sort_key(am: dict[str, float]) -> float:
     """Magnitude proxy for child ordering — the most recent full year (fy3)."""
     return abs(float(am.get("fy3") or 0))
-
-
-def _er_accounts_under_l4(
-    grains: list[dict], l2: str, l3: str, l4: str, invert: bool,
-) -> list[dict]:
-    """Account-level rows under one level-4 grouping (annual flow columns).
-
-    Mirrors :func:`_accounts_under_l4` but accumulates the 7 flow keys and uses
-    :func:`_er_flow_deltas`.
-    """
-    out = []
-    seen_ang: dict[str, dict[str, float]] = {}
-    seen_meta: dict[str, tuple[str, str]] = {}  # ang → (gl_account_id, account_name)
-    for g in grains:
-        if (g.get("level_3") or "").strip() != l3:
-            continue
-        if (g.get("level_4") or "").strip() != l4:
-            continue
-        if l2 and (g.get("level_2") or "").strip() != l2:
-            continue
-        ang = g.get("account_number_group") or g.get("gl_account_id") or ""
-        if not ang:
-            continue
-        am = _er_row_amounts(g)
-        if sum(abs(v) for v in am.values()) < 1e-9:
-            continue
-        if ang not in seen_ang:
-            seen_ang[ang] = {k: 0.0 for k in _ER_FLOW_KEYS}
-            gid = (g.get("gl_account_id") or ang).strip()
-            aname = (g.get("account_name") or "").strip()
-            seen_meta[ang] = (gid, aname)
-        for k in _ER_FLOW_KEYS:
-            seen_ang[ang][k] = seen_ang[ang].get(k, 0.0) + am[k]
-    for ang, am in seen_ang.items():
-        gid, aname = seen_meta[ang]
-        acc_label = f"{gid} | {aname}" if aname else gid
-        out.append({
-            "id": f"er-acc-{ang}",
-            "line_code": gid,
-            "label": acc_label,
-            "row_kind": "account",
-            "amounts": _round_am(am),
-            "deltas": _round_am(_er_flow_deltas(am, invert)),
-            "invert_delta": invert,
-            "drill": {"statement_type": "PL", "level_2": l2 or None,
-                      "level_3": l3, "level_4": l4, "gl_account_id": gid},
-        })
-    out.sort(key=lambda x: _er_sort_key(x.get("amounts") or {}), reverse=True)
-    return out
 
 
 def build_pl_annual_compat(
@@ -1158,45 +1319,23 @@ def _build_annual_rows(
             "level_4": l4 or None, "gl_account_id": gid,
         }
 
-        # L4 children for L3-only mapping rows (+ accounts-under-L4 + hoisting).
+        # Grain-relative child expansion (Prong A) — children at the next
+        # populated grain level below the row's matched level, each with account
+        # leaves (7 flow keys); single-child==title hoist preserved.  On v5 M==3
+        # → level_4, byte-identical to the old hard-coded gate.
         children: list[dict] = []
         hoisted_accounts: list[dict] = []
 
-        if rt == "mapping" and l3 and not l4 and not gid:
-            seen_l4: dict[str, dict[str, float]] = {}
-            for g in grains:
-                if (g.get("level_3") or "").strip() != l3:
-                    continue
-                if l2 and (g.get("level_2") or "").strip() != l2:
-                    continue
-                l4v = (g.get("level_4") or "").strip()
-                if not l4v:
-                    continue
-                if l4v not in seen_l4:
-                    seen_l4[l4v] = {k: 0.0 for k in keys}
-                am4 = _er_row_amounts(g)
-                for k in keys:
-                    seen_l4[l4v][k] = seen_l4[l4v].get(k, 0.0) + am4.get(k, 0.0)
-            for l4v, am4 in sorted(seen_l4.items(),
-                                   key=lambda kv: _er_sort_key(kv[1]), reverse=True):
-                children.append({
-                    "id": f"er-pl-{rc}-l4-{abs(hash(l4v)) % 100000}",
-                    "line_code": f"{rc}::{l4v}",
-                    "label": l4v,
-                    "row_kind": "detail",
-                    "amounts": _round_am(am4),
-                    "deltas": _round_am(_er_flow_deltas(am4, inv)),
-                    "invert_delta": inv,
-                    "drill": {"statement_type": "PL", "level_2": l2 or None,
-                              "level_3": l3, "level_4": l4v, "gl_account_id": None},
-                    "accounts": _er_accounts_under_l4(grains, l2, l3, l4v, inv),
-                })
-            # Dedup: single L4 with same label as parent → hoist its accounts.
-            if len(children) == 1 and children[0].get("label", "") == r["balance_title"]:
-                child = children[0]
-                drill = child["drill"]
-                hoisted_accounts = child.get("accounts", [])
-                children = []
+        if rt == "mapping":
+            children, hoisted_accounts, hoist_drill = _pl_hierarchy_children(
+                grains, r, keys=keys, invert=inv, rc=rc,
+                balance_title=r["balance_title"], id_base=f"er-pl-{rc}",
+                amounts_fn=_er_row_amounts, sort_key=_er_sort_key,
+                deltas_fn=lambda am, i: _round_am(_er_flow_deltas(am, i)),
+                account_id_prefix="er-acc",
+            )
+            if hoist_drill is not None:
+                drill = hoist_drill
 
         rows_out.append({
             "id": f"er-pl-{rc}", "parent_id": None, "line_code": rc,
@@ -1212,6 +1351,11 @@ def _build_annual_rows(
             "accounts": hoisted_accounts,
         })
 
+    # NOTE: _exclude_zero_rows is deliberately NOT applied here (annual ErFlow).
+    # The annual FY/YTD/LTM slices must show the FULL structure so the columns
+    # reconcile across years and against the consolidation views — a line that is
+    # zero in one FY slice may be non-zero in another, and dropping it per-slice
+    # would break row alignment. Do not "fix" by filtering zero rows.
     return {
         "statement": "pl",
         "year": year,
@@ -1551,23 +1695,17 @@ def build_pl_consolidation(
 
         am = line_entity.get(rc, {ec: 0.0 for ec in entity_codes})
 
-        # L4 children
+        # Grain-relative detail children (Prong A): bucket at the next populated
+        # grain level below the row's matched level; per-entity sums; flat detail
+        # rows (no account leaves — the consolidation view stays a flat table).
         children: list[dict] = []
         if rt == "mapping":
-            l3_val = (r.get("level_3") or "").strip()
-            l4_val = (r.get("level_4") or "").strip()
-            gid_val = (r.get("gl_account_id") or "").strip()
-            if l3_val and not l4_val and not gid_val:
-                matched = [g for g in grains if _match_grain(g, r)]
-                l4_dict: dict[str, list[dict]] = {}
-                for g in matched:
-                    l4v = (g.get("level_4") or "").strip()
-                    if l4v:
-                        l4_dict.setdefault(l4v, []).append(g)
-                for l4v, l4g in sorted(l4_dict.items()):
-                    l4_am = _consl_amounts(l4g)
+            grouping = _pl_child_grouping(grains, r)
+            if grouping is not None and grouping["buckets"]:
+                for cv, cg in sorted(grouping["buckets"].items()):
                     children.append(_consl_row(
-                        f"pl-{rc}-l4-{abs(hash(l4v)) % 100000}", l4v, "detail", False, l4_am,
+                        f"pl-{rc}-l4-{abs(hash(cv)) % 100000}", cv, "detail", False,
+                        _consl_amounts(cg),
                     ))
                 if len(children) == 1 and children[0]["label"] == r["balance_title"]:
                     children = []
@@ -1580,6 +1718,11 @@ def build_pl_consolidation(
         ))
 
     col_label = labels.get("cm", period_label(yr, mo))
+    # NOTE: _exclude_zero_rows is deliberately NOT applied here (consolidation).
+    # Every entity column must expose the same rows so entity_amounts/aggregated/
+    # consolidation totals reconcile across entities — a line zero for one entity
+    # can be non-zero for another, so per-row zero-pruning would misalign columns.
+    # Do not "fix" by filtering zero rows.
     out: dict[str, Any] = {
         "statement": "pl",
         "period_grain": period_grain,
@@ -1711,27 +1854,24 @@ def _build_annual_consolidation_rows(
         Σ children == parent — but only when a real L4 breakdown exists (otherwise
         there is nothing to break down and we stay flat, like the monthly builder).
         """
-        matched = [g for g in grains if _match_grain(g, r_line)]
-        l4_dict: dict[str, list[dict]] = {}
-        no_l4: list[dict] = []
-        for g in matched:
-            l4v = (g.get("level_4") or "").strip()
-            if l4v:
-                l4_dict.setdefault(l4v, []).append(g)
-            else:
-                no_l4.append(g)
+        grouping = _pl_child_grouping(grains, r_line)
+        if grouping is None:
+            return []
+        child_level = grouping["child_level"]
+        matched = grouping["matched"]
+        no_child = [g for g in matched if not (g.get(child_level) or "").strip()]
         kids: list[dict] = []
-        for l4v, l4g in sorted(l4_dict.items()):
+        for cv, cg in sorted(grouping["buckets"].items()):
             kids.append(_annual_child_row(
-                f"pl-{base_rc}-l4-{abs(hash(l4v)) % 100000}", l4v, _consl_ytd(l4g),
+                f"pl-{base_rc}-l4-{abs(hash(cv)) % 100000}", cv, _consl_ytd(cg),
             ))
         # Collapse a single self-referential child (matches monthly behaviour).
         if len(kids) == 1 and kids[0]["label"] == r_line["balance_title"]:
             kids = []
-        # Residual bucket: only when a real L4 breakdown exists, so children
+        # Residual bucket: only when a real child breakdown exists, so children
         # reconcile to the parent per entity without emitting a lone "(no L4)".
-        if kids and no_l4:
-            res_am = _consl_ytd(no_l4)
+        if kids and no_child:
+            res_am = _consl_ytd(no_child)
             if any(abs(v) > 1e-9 for v in res_am.values()):
                 kids.append(_annual_child_row(f"pl-{base_rc}-l4-none", "(no L4)", res_am))
         return kids
@@ -1803,18 +1943,11 @@ def _build_annual_consolidation_rows(
             continue  # skip presentation-only 'title' rows (flat table)
         am = line_entity.get(rc, {ec: 0.0 for ec in entity_codes})
         agg = sum(am.get(ec, 0.0) for ec in entity_codes)
-        # L4 detail children for L3-only mapping rows — same gate as the monthly
-        # builder (see ``build_pl_monthly``): an L3 mapping row that carries no
-        # level_4 / gl_account_id of its own.  The children reconcile to the
-        # parent per entity column (residual "(no L4)" bucket, see helper docstring).
-        l3 = (r.get("level_3") or "").strip()
-        l4 = (r.get("level_4") or "").strip()
-        gid = (r.get("gl_account_id") or "").strip() or None
-        kids = (
-            _annual_l4_children(r, rc)
-            if (rt == "mapping" and l3 and not l4 and not gid)
-            else []
-        )
+        # Grain-relative detail children (Prong A): the helper expands a mapping
+        # row into the next populated grain level below its matched level (None
+        # for account-pinned / level_4-pinned / leaf rows).  The children
+        # reconcile to the parent per entity column (residual "(no L4)" bucket).
+        kids = _annual_l4_children(r, rc) if rt == "mapping" else []
         rows_out.append({
             "id": f"pl-{rc}",
             "label": r["balance_title"],
@@ -1828,6 +1961,10 @@ def _build_annual_consolidation_rows(
             "children": kids,
         })
 
+    # NOTE: _exclude_zero_rows is deliberately NOT applied here (annual entity
+    # consolidation). Per-entity columns and the aggregated/consolidation totals
+    # must reconcile across entities, so the full structure is kept — a line zero
+    # for one entity may be non-zero for another. Do not "fix" by filtering zeros.
     return {
         "statement": "pl",
         "year": year,
@@ -1945,13 +2082,15 @@ def build_pl_monthly(
 
     total_output = line_monthly.get("TOTAL_OUTPUT", zero)
 
-    def _monthly_row(rid, label, row_kind, is_bold, am, has_children=False, children=None):
+    def _monthly_row(rid, label, row_kind, is_bold, am, has_children=False,
+                     children=None, accounts=None):
         return {
             "id": rid, "label": label, "row_kind": row_kind,
             "is_bold": is_bold,
             "amounts": {k: round(am.get(k, 0.0), 2) for k in all_keys},
             "has_children": has_children,
             "children": children or [],
+            "accounts": accounts or [],
         }
 
     rows_out: list[dict[str, Any]] = []
@@ -1984,34 +2123,34 @@ def build_pl_monthly(
 
         am = line_monthly.get(rc, dict(zero))
 
-        # L4 children
+        # Grain-relative children (Prong A), unified onto the shared hierarchy
+        # helper so monthly matches the statement builder: children at the next
+        # populated grain level below the row's matched level, magnitude-desc
+        # order, 'detail' row_kind, each carrying its account leaves.
         children: list[dict] = []
+        hoisted_accounts: list[dict] = []
         if rt == "mapping":
-            l3_val = (r.get("level_3") or "").strip()
-            l4_val = (r.get("level_4") or "").strip()
-            gid_val = (r.get("gl_account_id") or "").strip()
-            if l3_val and not l4_val and not gid_val:
-                matched = [g for g in grains if _match_grain(g, r)]
-                l4_dict: dict[str, dict[str, float]] = {}
-                for g in matched:
-                    l4v = (g.get("level_4") or "").strip()
-                    if l4v:
-                        if l4v not in l4_dict:
-                            l4_dict[l4v] = {k: 0.0 for k in all_keys}
-                        for k in all_keys:
-                            l4_dict[l4v][k] = l4_dict[l4v].get(k, 0.0) + float(g.get(k) or 0)
-                for l4v, l4_am in sorted(l4_dict.items()):
-                    children.append(_monthly_row(
-                        f"pl-{rc}-l4-{abs(hash(l4v)) % 100000}", l4v, "line", False, l4_am,
-                    ))
-                if len(children) == 1 and children[0]["label"] == r["balance_title"]:
-                    children = []
+            children, hoisted_accounts, _hoist_drill = _pl_hierarchy_children(
+                grains, r, keys=all_keys, invert=False, rc=rc,
+                balance_title=r["balance_title"], id_base=f"pl-{rc}",
+                amounts_fn=lambda g: {k: float(g.get(k) or 0.0) for k in all_keys},
+                sort_key=lambda a: max((abs(v) for v in a.values()), default=0.0),
+                deltas_fn=None, account_id_prefix="acc",
+            )
+            for ch in children:
+                ch.setdefault("is_bold", False)
+                ch["has_children"] = bool(ch.get("accounts"))
+                ch.setdefault("children", [])
 
         row_kind = _row_kind_for(rt)
         rows_out.append(_monthly_row(
             f"pl-{rc}", r["balance_title"], row_kind, bool(r.get("is_bold", False)), am,
-            has_children=len(children) > 0, children=children,
+            has_children=len(children) > 0 or len(hoisted_accounts) > 0,
+            children=children, accounts=hoisted_accounts,
         ))
+
+    # Prong B: drop all-zero mapping rows + empty section headers.
+    rows_out = _exclude_zero_rows(rows_out, all_keys)
 
     out: dict[str, Any] = {
         "statement": "pl",
@@ -2116,11 +2255,13 @@ def build_pl_weekly_breakdown(
 
     total_output = line_weekly.get("TOTAL_OUTPUT", zero)
 
-    def _wk_row(rid, label, row_kind, is_bold, am, has_children=False, children=None):
+    def _wk_row(rid, label, row_kind, is_bold, am, has_children=False,
+                children=None, accounts=None):
         return {
             "id": rid, "label": label, "row_kind": row_kind, "is_bold": is_bold,
             "amounts": {k: round(am.get(k, 0.0), 2) for k in all_keys},
             "has_children": has_children, "children": children or [],
+            "accounts": accounts or [],
         }
 
     rows_out: list[dict[str, Any]] = []
@@ -2153,33 +2294,30 @@ def build_pl_weekly_breakdown(
 
         am = line_weekly.get(rc, dict(zero))
 
-        # L4 children (mirrors build_pl_monthly).
+        # Grain-relative children (Prong A), unified onto the shared hierarchy
+        # helper (mirrors build_pl_monthly): children at the next populated grain
+        # level below the row's matched level, magnitude-desc, 'detail' row_kind,
+        # each with account leaves.
         children: list[dict] = []
+        hoisted_accounts: list[dict] = []
         if rt == "mapping":
-            l3_val = (r.get("level_3") or "").strip()
-            l4_val = (r.get("level_4") or "").strip()
-            gid_val = (r.get("gl_account_id") or "").strip()
-            if l3_val and not l4_val and not gid_val:
-                matched = [g for g in grains if _match_grain(g, r)]
-                l4_dict: dict[str, dict[str, float]] = {}
-                for g in matched:
-                    l4v = (g.get("level_4") or "").strip()
-                    if l4v:
-                        if l4v not in l4_dict:
-                            l4_dict[l4v] = {k: 0.0 for k in all_keys}
-                        for k in all_keys:
-                            l4_dict[l4v][k] = l4_dict[l4v].get(k, 0.0) + float(g.get(k) or 0)
-                for l4v, l4_am in sorted(l4_dict.items()):
-                    children.append(_wk_row(
-                        f"pl-{rc}-l4-{abs(hash(l4v)) % 100000}", l4v, "line", False, l4_am,
-                    ))
-                if len(children) == 1 and children[0]["label"] == r["balance_title"]:
-                    children = []
+            children, hoisted_accounts, _hoist_drill = _pl_hierarchy_children(
+                grains, r, keys=all_keys, invert=False, rc=rc,
+                balance_title=r["balance_title"], id_base=f"pl-{rc}",
+                amounts_fn=lambda g: {k: float(g.get(k) or 0.0) for k in all_keys},
+                sort_key=lambda a: max((abs(v) for v in a.values()), default=0.0),
+                deltas_fn=None, account_id_prefix="acc",
+            )
+            for ch in children:
+                ch.setdefault("is_bold", False)
+                ch["has_children"] = bool(ch.get("accounts"))
+                ch.setdefault("children", [])
 
         rows_out.append(_wk_row(
             f"pl-{rc}", r["balance_title"], _row_kind_for(rt),
             bool(r.get("is_bold", False)), am,
-            has_children=len(children) > 0, children=children,
+            has_children=len(children) > 0 or len(hoisted_accounts) > 0,
+            children=children, accounts=hoisted_accounts,
         ))
 
     groups_resp = [
@@ -2193,6 +2331,9 @@ def build_pl_weekly_breakdown(
         }
         for g in layout
     ]
+
+    # Prong B: drop all-zero mapping rows + empty section headers.
+    rows_out = _exclude_zero_rows(rows_out, all_keys)
 
     return {
         "statement": "pl",

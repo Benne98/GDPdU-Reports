@@ -250,30 +250,52 @@ def _bs_net_profit_source() -> str:
 
 
 def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dict:
-    """Idempotent re-seed of the BS report structure from the live GL hierarchy.
+    """Idempotent re-derive of the BS + P&L report structure from the live GL hierarchy.
 
-    ``seed_bs_structure`` upserts BS rows into dim_pl_structure from dim_gl_account
-    (ON CONFLICT (line_code) DO UPDATE) — re-running it on already-seeded data is a
-    no-op.  Recon-mapping re-seed reads Excel files that are seeded out-of-band; we
-    skip it gracefully when those files are absent so the rebuild stays self-contained
-    and behaviour-preserving.
+    Two independent re-derivations run here on every ``mode=='full'`` rebuild:
+
+      * ``seed_bs_structure`` — delete-then-insert re-seed of the BS rows in
+        ``dim_bs_structure`` from ``dim_gl_account`` (the BS structure has always been
+        GL-derived, so it already tracks a CoA round-trip).
+      * ``realign_pl_structure`` — re-pin each seeded P&L mapping row's grain filter to
+        the SHALLOWEST grain level its category currently occupies (Prong A).  The P&L
+        structure is seeded from a curated Excel and was NEVER re-derived, so after a
+        CoA export/re-ingest round-trip its stale ``level_3`` filters matched nothing
+        and the position rendered 0.  NO-OP when the CoA is unchanged (v5 parity).
+
+    ERROR POLICY (behaviour change vs the old blanket try/except).  Only the recon
+    MAPPING Excel being absent stays graceful (that file is seeded out-of-band).  A
+    real DB error out of ``seed_bs_structure`` / ``realign_pl_structure`` PROPAGATES on
+    ``mode=='full'`` — a broken report structure must NOT silently degrade to rows=0.
     """
-    out: dict = {}
-    # seed_bs_structure lives under backend/scripts (callable, idempotent upsert).
-    try:
-        import sys
-        from pathlib import Path
+    import sys
+    from pathlib import Path
 
-        _backend = Path(__file__).resolve().parent.parent / "backend"
-        if str(_backend) not in sys.path:
-            sys.path.insert(0, str(_backend))
+    _backend = Path(__file__).resolve().parent.parent / "backend"
+    if str(_backend) not in sys.path:
+        sys.path.insert(0, str(_backend))
+
+    out: dict = {}
+    try:
+        # BS re-seed (delete-then-insert; commits internally, harmless in our txn).
         from scripts.seed_bs_structure import seed_bs_structure  # type: ignore
 
-        # seed_bs_structure commits internally; harmless inside our transaction.
         out["bs_structure_rows"] = seed_bs_structure(session)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("rebuild: seed_bs_structure skipped (%s)", exc)
-        out["bs_structure_rows"] = 0
+
+        # P&L grain-filter realign (Prong A): re-pin to the shallowest live grain.
+        from scripts.realign_pl_structure import realign_pl_structure  # type: ignore
+
+        out["pl_structure_realigned"] = realign_pl_structure(session, scope)
+    except (ImportError, FileNotFoundError) as exc:
+        # GRACEFUL — and ONLY here: the recon-mapping source / scripts module is
+        # absent (legacy or pure-ETL test schema).  Matches historical behaviour;
+        # the structure is simply not refreshed on such a DB.  A real DB error is
+        # NOT caught here → it propagates (see docstring: a broken structure must not
+        # silently degrade to rows=0 on a full rebuild).
+        logger.warning("rebuild: structure refresh source absent (%s)", exc)
+        out.setdefault("bs_structure_rows", 0)
+        out.setdefault("pl_structure_realigned", 0)
+        out["error"] = str(exc)
 
     return out
 

@@ -112,6 +112,21 @@ export const DEFAULT_WEEK_BS_TABLE_COLUMN_IDS = [
   'ytg',
 ]
 
+/**
+ * Column kinds that require an active plan version (has_plan_data = true).
+ * When has_plan_data is false these are hidden from defaults and saved layouts.
+ */
+export const PLAN_ONLY_COL_KINDS = new Set<PlColumnKind>([
+  'plan_cm',
+  'plan_vs_actual',
+  'ytd_plan',
+  'ytd_vs_plan',
+  'ytg',
+  'coverage',
+  'coverage_mtd',
+  'mtg',
+])
+
 export function priorMonthKey(key: string): string {
   const [ys, ms] = key.split('-')
   let y = parseInt(ys, 10)
@@ -138,6 +153,7 @@ export function buildDefaultColumns(
   lbl: FinancialStatementColLabels,
   periodGrain: 'month' | 'week' = 'month',
   statement?: string,
+  hasPlanData = true,
 ): PlTableColumnDef[] {
   const catalog = buildColumnCatalog(lbl, [], periodGrain)
   const stmt = (statement || 'pl').toLowerCase()
@@ -147,7 +163,13 @@ export function buildDefaultColumns(
         ? DEFAULT_WEEK_BS_TABLE_COLUMN_IDS
         : DEFAULT_WEEK_PL_TABLE_COLUMN_IDS
       : DEFAULT_TABLE_COLUMN_IDS
-  return ids.map(id => catalog.get(id)).filter(Boolean) as PlTableColumnDef[]
+  const active = hasPlanData
+    ? ids
+    : ids.filter(id => {
+        const col = catalog.get(id)
+        return !col || !PLAN_ONLY_COL_KINDS.has(col.kind)
+      })
+  return active.map(id => catalog.get(id)).filter(Boolean) as PlTableColumnDef[]
 }
 
 /** All addable column templates keyed by id (standard + optional period-driven). */

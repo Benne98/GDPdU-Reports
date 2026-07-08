@@ -540,11 +540,16 @@ class TestPlRunningSumSubtotals:
         return {r["line_code"]: r for r in out["rows"]}
 
     def test_total_output_is_running_sum(self):
-        """TOTAL_OUTPUT = NET_SALES + FG&WIP + OWN_WORK = 6,550,772 + 10,014,538 + 0."""
+        """TOTAL_OUTPUT = NET_SALES + FG&WIP + OWN_WORK = 6,550,772 + 10,014,538 + 0.
+
+        Prong B: OWN_WORK_CAPITALISED is all-zero across every period column, so it
+        is EXCLUDED from the output — but its 0 still flows through the running sum,
+        so TOTAL_OUTPUT is unchanged.
+        """
         rows = self._build()
         assert rows["NET_SALES"]["amounts"]["cm"] == 6_550_772.0
         assert rows["FINISHED_GOODS_WIP"]["amounts"]["cm"] == 10_014_538.0
-        assert rows["OWN_WORK_CAPITALISED"]["amounts"]["cm"] == 0.0
+        assert "OWN_WORK_CAPITALISED" not in rows  # all-zero mapping row dropped
         assert rows["TOTAL_OUTPUT"]["amounts"]["cm"] == 16_565_310.0
 
     def test_gross_profit_running_sum(self):
@@ -1377,3 +1382,248 @@ class TestAnnualConsolidationL4Children:
         for ec in ("AT", "DE"):
             child_sum = round(sum(c["entity_amounts"][ec] for c in parent["children"]), 2)
             assert child_sum == parent["entity_amounts"][ec]
+
+
+# ---------------------------------------------------------------------------
+# (o) Grain-relative hierarchy (Prong A) + zero-row exclusion (Prong B)
+# ---------------------------------------------------------------------------
+# After a CoA round-trip the GL grain levels can shift UP by one, so a mapping
+# row's category value gets re-pinned at a SHALLOWER grain level.  The reader
+# must read children from the NEXT populated grain level below the matched level
+# (M), not a hard-coded level_3.  These tests exercise BOTH conventions:
+#   * v5-faithful (M == 3, children at level_4) — must stay byte-identical.
+#   * shifted / e2e (M == 2, children at level_3, level_4 NULL) — the L3
+#     breakdown must reappear where the old `l3 and not l4` gate stopped firing.
+
+
+def _grain_l4(level_2, level_3, level_4, cm, ang, account_name):
+    """A statement-grain (py_cm/pm/cm/ytd/ytd_py) at an explicit level_4 leaf."""
+    return {
+        "level_2": level_2, "level_3": level_3, "level_4": level_4,
+        "gl_account_id": ang, "account_number_group": ang,
+        "account_name": account_name,
+        "py_cm": 0.0, "pm": 0.0, "cm": cm, "ytd": cm, "ytd_py": 0.0,
+    }
+
+
+# --- v5-faithful convention: Cost of materials pinned at level_3, two level_4
+#     children (mirrors the live v5 golden anchor: children ['Purchased
+#     services', 'Purchased goods and materials'], total -10,182,291). ----------
+_V5_STRUCTURE = [
+    _struct(1, 1, "NET_SALES", "mapping", level_2="Income", level_3="Net sales", is_bold=True),
+    _struct(2, 2, "FINISHED_GOODS_WIP", "mapping", level_2="Income", level_3="Finished goods WIP"),
+    _struct(4, 4, "TOTAL_OUTPUT", "subtotal", is_bold=True),
+    _struct(5, 5, "COST_OF_MATERIALS", "mapping", level_2="Expense", level_3="Cost of materials"),
+    _struct(6, 6, "GROSS_PROFIT", "calc", is_bold=True),
+]
+
+_V5_GRAIN = [
+    _grain("Income", "Net sales", 6_550_772.0, "AT4000"),
+    _grain("Income", "Finished goods WIP", 10_014_538.0, "AT4100"),
+    _grain_l4("Expense", "Cost of materials", "Purchased services",
+              -7_000_000.0, "AT5000", "Purchased services"),
+    _grain_l4("Expense", "Cost of materials", "Purchased goods and materials",
+              -3_182_291.0, "AT5100", "Purchased goods and materials"),
+]
+
+
+class TestGrainRelativeV5Parity:
+    """PARITY GUARD: the v5 convention (M == 3 → level_4 children) is byte-for-byte
+    unchanged by the grain-relative refactor — the golden anchor totals, the
+    Cost-of-materials children, their order, and the account leaves all hold."""
+
+    def _rows(self):
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        session = _make_mock_session(structure=_V5_STRUCTURE, grain_rows=_V5_GRAIN)
+        out = build_pl_statement_compat(session, period_grain="month", year=2025, month=7)
+        return {r["line_code"]: r for r in out["rows"]}
+
+    def test_key_line_totals_unchanged(self):
+        rows = self._rows()
+        assert rows["NET_SALES"]["amounts"]["cm"] == 6_550_772.0
+        assert rows["COST_OF_MATERIALS"]["amounts"]["cm"] == -10_182_291.0
+        assert rows["TOTAL_OUTPUT"]["amounts"]["cm"] == 16_565_310.0
+        assert rows["GROSS_PROFIT"]["amounts"]["cm"] == 6_383_019.0
+
+    def test_cost_of_materials_has_children_level4(self):
+        rows = self._rows()
+        com = rows["COST_OF_MATERIALS"]
+        assert com["has_children"] is True
+        # Children are the level_4 values, ordered by |cm| DESC (NOT alphabetical).
+        assert [c["label"] for c in com["children"]] == [
+            "Purchased services", "Purchased goods and materials",
+        ]
+
+    def test_children_carry_account_leaves(self):
+        rows = self._rows()
+        com = rows["COST_OF_MATERIALS"]
+        by_label = {c["label"]: c for c in com["children"]}
+        svc = by_label["Purchased services"]
+        assert svc["row_kind"] == "detail"
+        assert svc["amounts"]["cm"] == -7_000_000.0
+        # level_4 child → drill pins level_2/3/4; account leaf is non-empty.
+        assert svc["drill"]["level_4"] == "Purchased services"
+        assert [a["line_code"] for a in svc["accounts"]] == ["AT5000"]
+        goods = by_label["Purchased goods and materials"]
+        assert [a["line_code"] for a in goods["accounts"]] == ["AT5100"]
+
+    def test_subtotals_have_no_children(self):
+        rows = self._rows()
+        for code in ("TOTAL_OUTPUT", "GROSS_PROFIT"):
+            assert rows[code]["has_children"] is False
+
+
+# --- shifted / e2e convention: the SAME category 'Cost of materials' now lives at
+#     grain level_2, its breakdown at level_3, level_4 NULL. The structure row is
+#     re-pinned at level_2 (matched level M == 2 → children at level_3). ---------
+_SHIFTED_STRUCTURE = [
+    _struct(1, 1, "NET_SALES", "mapping", level_2="Net sales", is_bold=True),
+    _struct(4, 4, "TOTAL_OUTPUT", "subtotal", is_bold=True),
+    _struct(5, 5, "COST_OF_MATERIALS", "mapping", level_2="Cost of materials"),
+    _struct(6, 6, "GROSS_PROFIT", "calc", is_bold=True),
+]
+
+
+def _grain_shift(level_2, level_3, cm, ang, account_name):
+    """A statement-grain where the value sits at level_2, breakdown at level_3,
+    level_4 NULL (mirrors the CoA round-trip 'up by one' shift)."""
+    return {
+        "level_2": level_2, "level_3": level_3, "level_4": None,
+        "gl_account_id": ang, "account_number_group": ang,
+        "account_name": account_name,
+        "py_cm": 0.0, "pm": 0.0, "cm": cm, "ytd": cm, "ytd_py": 0.0,
+    }
+
+
+_SHIFTED_GRAIN = [
+    _grain_shift("Net sales", "Domestic", 6_550_772.0, "AT4000", "Domestic revenue"),
+    _grain_shift("Cost of materials", "Purchased services",
+                 -7_000_000.0, "AT5000", "Purchased services"),
+    _grain_shift("Cost of materials", "Purchased goods and materials",
+                 -3_182_291.0, "AT5100", "Purchased goods and materials"),
+]
+
+
+class TestGrainRelativeShiftedConvention:
+    """The e2e convention (M == 2 → level_3 children, level_4 NULL): the reader must
+    resolve Cost of materials non-zero WITH its breakdown, where the old level_3-
+    hard-coded gate silently vanished."""
+
+    def _rows(self):
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        session = _make_mock_session(structure=_SHIFTED_STRUCTURE, grain_rows=_SHIFTED_GRAIN)
+        out = build_pl_statement_compat(session, period_grain="month", year=2025, month=7)
+        return {r["line_code"]: r for r in out["rows"]}
+
+    def test_cost_of_materials_resolves_nonzero_with_correct_total(self):
+        rows = self._rows()
+        assert rows["COST_OF_MATERIALS"]["amounts"]["cm"] == -10_182_291.0
+        # Running-sum subtotals still reconcile.
+        assert rows["TOTAL_OUTPUT"]["amounts"]["cm"] == 6_550_772.0
+        assert rows["GROSS_PROFIT"]["amounts"]["cm"] == -3_631_519.0
+
+    def test_children_at_level3(self):
+        rows = self._rows()
+        com = rows["COST_OF_MATERIALS"]
+        assert com["has_children"] is True
+        # M == 2 → children are the level_3 values (ordered by |cm| DESC).
+        assert [c["label"] for c in com["children"]] == [
+            "Purchased services", "Purchased goods and materials",
+        ]
+
+    def test_level3_child_has_nonempty_account_leaf(self):
+        rows = self._rows()
+        com = rows["COST_OF_MATERIALS"]
+        svc = next(c for c in com["children"] if c["label"] == "Purchased services")
+        # level_3 child → drill pins level_2 + level_3; account leaf non-empty.
+        assert svc["drill"]["level_2"] == "Cost of materials"
+        assert svc["drill"]["level_3"] == "Purchased services"
+        assert svc["drill"]["level_4"] is None
+        assert [a["line_code"] for a in svc["accounts"]] == ["AT5000"]
+
+
+class TestZeroRowExclusion:
+    """Prong B: an all-zero MAPPING row is dropped; a structurally-required
+    subtotal/running-sum row is retained even when it is zero."""
+
+    _STRUCT = [
+        _struct(1, 1, "ZERO_LINE", "mapping", level_2="Income", level_3="Nothing here"),
+        _struct(2, 2, "ZERO_SUBTOTAL", "subtotal", is_bold=True),
+    ]
+    # A grain that matches NOTHING in the structure → every line is zero.
+    _GRAIN = [_grain("Income", "Something else", 123.0, "AT9999")]
+
+    def _rows(self):
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        session = _make_mock_session(structure=self._STRUCT, grain_rows=self._GRAIN)
+        out = build_pl_statement_compat(session, period_grain="month", year=2025, month=7)
+        return out["rows"], {r["line_code"]: r for r in out["rows"]}
+
+    def test_all_zero_mapping_row_dropped(self):
+        _rows, by_code = self._rows()
+        assert "ZERO_LINE" not in by_code  # all-zero mapping row excluded
+
+    def test_zero_subtotal_retained(self):
+        _rows, by_code = self._rows()
+        assert "ZERO_SUBTOTAL" in by_code  # running-sum row kept even at 0
+        assert by_code["ZERO_SUBTOTAL"]["row_kind"] == "subtotal"
+        assert by_code["ZERO_SUBTOTAL"]["amounts"]["cm"] == 0.0
+
+    def test_nonzero_mapping_row_stays(self):
+        # Same structure but the grain now matches ZERO_LINE's level filter.
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        grain = [_grain("Income", "Nothing here", 500.0, "AT4000")]
+        session = _make_mock_session(structure=self._STRUCT, grain_rows=grain)
+        out = build_pl_statement_compat(session, period_grain="month", year=2025, month=7)
+        by_code = {r["line_code"]: r for r in out["rows"]}
+        assert "ZERO_LINE" in by_code
+        assert by_code["ZERO_LINE"]["amounts"]["cm"] == 500.0
+
+
+class TestMonthlyStatementReconciliation:
+    """Prong B: the monthly hierarchy now routes through the SAME shared helper as
+    the statement builder, so Cost-of-materials children reconcile — same order,
+    same labels, same account leaves."""
+
+    _MONTH_GRAIN = [
+        _grain_keys("Income", "Net sales", "AT4000", {"2025-07": 6_550_772.0}),
+        _grain_keys("Income", "Finished goods WIP", "AT4100", {"2025-07": 10_014_538.0}),
+        {**_grain_keys("Expense", "Cost of materials", "AT5000", {"2025-07": -7_000_000.0}),
+         "level_4": "Purchased services", "account_name": "Purchased services"},
+        {**_grain_keys("Expense", "Cost of materials", "AT5100", {"2025-07": -3_182_291.0}),
+         "level_4": "Purchased goods and materials",
+         "account_name": "Purchased goods and materials"},
+    ]
+
+    def _statement_com(self):
+        from app.services.fin_compat_pl import build_pl_statement_compat
+        session = _make_mock_session(structure=_V5_STRUCTURE, grain_rows=_V5_GRAIN)
+        out = build_pl_statement_compat(session, period_grain="month", year=2025, month=7)
+        return next(r for r in out["rows"] if r["line_code"] == "COST_OF_MATERIALS")
+
+    def _monthly_com(self):
+        from app.services.fin_compat_pl import build_pl_monthly
+        session = _make_mock_session(structure=_V5_STRUCTURE, grain_rows=self._MONTH_GRAIN)
+        out = build_pl_monthly(session, period_grain="month", year=2025, month=7, span="12m")
+        return next(r for r in out["rows"] if r["id"] == "pl-COST_OF_MATERIALS")
+
+    def test_child_labels_and_order_match(self):
+        st = self._statement_com()
+        mo = self._monthly_com()
+        assert mo["has_children"] is True
+        assert [c["label"] for c in mo["children"]] == [c["label"] for c in st["children"]]
+        assert [c["label"] for c in mo["children"]] == [
+            "Purchased services", "Purchased goods and materials",
+        ]
+
+    def test_child_row_kind_is_detail(self):
+        mo = self._monthly_com()
+        assert all(c["row_kind"] == "detail" for c in mo["children"])
+
+    def test_account_leaves_match_statement(self):
+        st = self._statement_com()
+        mo = self._monthly_com()
+        st_accts = {c["label"]: [a["line_code"] for a in c["accounts"]] for c in st["children"]}
+        mo_accts = {c["label"]: [a["line_code"] for a in c["accounts"]] for c in mo["children"]}
+        assert mo_accts == st_accts
+        assert mo_accts["Purchased services"] == ["AT5000"]

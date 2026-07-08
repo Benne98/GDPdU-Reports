@@ -9,6 +9,7 @@ import {
   loadLegacyColumnIds,
   loadSavedColumns,
   reconcileColumns,
+  PLAN_ONLY_COL_KINDS,
   type PlTableColumnDef,
 } from './plColumnRegistry'
 import type { PlPlanMap } from './usePlStatementData'
@@ -66,6 +67,7 @@ export default function PlTableView({ data, monthly, year, month, planMap, colum
 export function usePlTableColumns(
   data: FinancialStatementResponse | null,
   monthly: MonthlyResponse | null,
+  hasPlanData = true,
 ): PlTableColumnDef[] {
   return useMemo(() => {
     if (!data) return []
@@ -73,12 +75,15 @@ export function usePlTableColumns(
     const periods: MonthlyPeriod[] =
       periodGrain === 'week' ? [] : (monthly?.periods ?? [])
     const catalog = buildColumnCatalog(data.col_labels, periods, periodGrain)
-    const defaults = buildDefaultColumns(data.col_labels, periodGrain, data.statement)
+    const defaults = buildDefaultColumns(data.col_labels, periodGrain, data.statement, hasPlanData)
+
+    const gateOut = (cols: PlTableColumnDef[]) =>
+      hasPlanData ? cols : cols.filter(c => !PLAN_ONLY_COL_KINDS.has(c.kind))
 
     const stmt = data.statement || 'pl'
     const saved = loadSavedColumns(stmt)
     if (saved?.length) {
-      return reconcileColumns(saved, catalog, periods)
+      return gateOut(reconcileColumns(saved, catalog, periods))
     }
 
     const legacyIds = loadLegacyColumnIds(stmt)
@@ -86,9 +91,9 @@ export function usePlTableColumns(
       const fromLegacy = legacyIds
         .map(id => catalog.get(id))
         .filter((c): c is PlTableColumnDef => Boolean(c))
-      if (fromLegacy.length) return fromLegacy
+      if (fromLegacy.length) return gateOut(fromLegacy)
     }
 
     return defaults
-  }, [data, monthly])
+  }, [data, monthly, hasPlanData])
 }

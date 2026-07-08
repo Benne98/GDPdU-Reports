@@ -12,7 +12,7 @@ import { buildPlanMapFromStatement } from './plPlanMap'
 import PlReportView from './PlReportView'
 import PlTableView, { usePlTableColumns } from './PlTableView'
 import PlViewToggleButton, { type PlViewMode } from './PlViewToggleButton'
-import { buildColumnCatalog, buildDefaultColumns, reconcileColumns } from './plColumnRegistry'
+import { buildColumnCatalog, buildDefaultColumns, reconcileColumns, PLAN_ONLY_COL_KINDS } from './plColumnRegistry'
 import { buildClientNarrativeResponse, mapApiBulletsToUi } from './plNarrativeEngine'
 import { exportPlTableView } from './plExport'
 import { exportPlReportViewPdf, exportPlTableViewPdf, type PlExportContext } from './plExportPdf'
@@ -64,7 +64,8 @@ export default function PlStatementSection({
   )
   const [detailBullet, setDetailBullet] = useState<PlNarrativeBullet | null>(null)
   const [narrative, setNarrative] = useState<PlNarrativeResponse | null>(null)
-  const defaultColumns = usePlTableColumns(data, monthly)
+  const hasPlanData = data?.plan?.has_plan_data ?? false
+  const defaultColumns = usePlTableColumns(data, monthly, hasPlanData)
   const [columns, setColumns] = useState<PlTableColumnDef[]>([])
   // Tracks the period grain the current `columns` were built for. When the grain
   // flips (month <-> week) we must reset to that grain's defaults instead of
@@ -88,9 +89,10 @@ export default function PlStatementSection({
       if (!prev.length || grainChanged) return defaultColumns
       const periods = periodGrain === 'week' ? [] : (monthly?.periods ?? [])
       const catalog = buildColumnCatalog(data.col_labels, periods, periodGrain)
-      return reconcileColumns(prev, catalog, periods)
+      const reconciled = reconcileColumns(prev, catalog, periods)
+      return hasPlanData ? reconciled : reconciled.filter(c => !PLAN_ONLY_COL_KINDS.has(c.kind))
     })
-  }, [defaultColumns, data, monthly])
+  }, [defaultColumns, data, monthly, hasPlanData])
 
   useEffect(() => {
     applyViewModeFromSearchParams(setViewMode)
@@ -107,17 +109,18 @@ export default function PlStatementSection({
             data.col_labels,
             data.period_grain === 'week' ? 'week' : 'month',
             data.statement,
+            hasPlanData,
           )
         : [],
-    [data],
+    [data, hasPlanData],
   )
 
-  const miniColumns = useMemo(
-    () => allDataColumns.filter(c =>
-      ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'].includes(c.kind),
-    ),
-    [allDataColumns],
-  )
+  const miniColumns = useMemo(() => {
+    const kinds = hasPlanData
+      ? ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual']
+      : ['pm', 'cm', 'mom']
+    return allDataColumns.filter(c => kinds.includes(c.kind as string))
+  }, [allDataColumns, hasPlanData])
 
   useEffect(() => {
     if (!notesCtx || !data) {
@@ -279,6 +282,7 @@ export default function PlStatementSection({
                 columns={columns}
                 onChange={setColumns}
                 statement="pl"
+                hasPlanData={hasPlanData}
               />
             )}
             {notesCtx && (

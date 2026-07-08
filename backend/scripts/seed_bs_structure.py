@@ -156,19 +156,28 @@ def fetch_bs_hierarchy(session) -> list[tuple[str, str, str, float, float]]:
 
 def build_bs_rows(
     hierarchy: list[tuple[str, str, str, float, float]],
+    occupied: Optional[set[int]] = None,
 ) -> list[_Row]:
     """Pure: turn the ordered BS L1/L2/L3 hierarchy into structure rows.
 
     Emits, per L2 group: its L3 mapping rows then a "Total <L2>" subtotal; and, when
     the L1 side changes (or at the end), a "Total assets" / "Total equity &
     liabilities" grandtotal closing that side.  Order is preserved from the input.
+
+    ``occupied`` is the set of ``sort_order`` values already taken by SURVIVING
+    ``source='auto_extend'`` rows (which the re-seed does NOT delete).  ``nxt`` skips
+    them so a freshly re-seeded row can never collide with an auto_extend row on the
+    UNIQUE(sort_order) constraint after a CoA round-trip.
     """
+    occupied = occupied or set()
     rows: list[_Row] = []
     sort = _BS_SORT_BASE
 
     def nxt() -> int:
         nonlocal sort
         sort += 10
+        while sort in occupied:
+            sort += 10
         return sort
 
     cur_l1: Optional[str] = None
@@ -213,15 +222,54 @@ def build_bs_rows(
     return rows
 
 
-def seed_bs_structure(session) -> int:
-    """Generate BS rows from dim_gl_account and upsert them into dim_pl_structure.
+def _has_source_column(session) -> bool:
+    """True when dim_bs_structure carries the Phase-5 ``source`` provenance column."""
+    from sqlalchemy import text
 
-    Returns the number of rows upserted.  Idempotent: ON CONFLICT (line_code) updates.
+    return session.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='dim_bs_structure' AND column_name='source'"
+        )
+    ).fetchone() is not None
+
+
+def seed_bs_structure(session) -> int:
+    """Generate BS rows from dim_gl_account and (re-)seed them into dim_bs_structure.
+
+    Returns the number of rows written.  Idempotent AFTER a CoA round-trip:
+
+    ``dim_bs_structure`` carries TWO unique constraints — ``line_code`` AND
+    ``sort_order``.  A plain ``ON CONFLICT (line_code) DO UPDATE`` re-seed can still
+    raise ``UniqueViolation`` when a *different* line_code recomputes to a sort_order
+    already occupied by another surviving row (the conflict target line_code can't
+    catch it).  So we DELETE the previously-seeded rows first, keep any user-owned
+    ``source='auto_extend'`` rows, and skip their sort_orders when numbering the fresh
+    rows (see ``build_bs_rows(occupied=...)``).  The ON CONFLICT clause is retained as
+    belt-and-suspenders for a line_code that also matches a surviving auto_extend row.
     """
     from sqlalchemy import text
 
+    has_source = _has_source_column(session)
+
+    # Delete the previously-seeded rows.  Preserve user-placed auto_extend rows only
+    # when the provenance column exists (it only carries 'auto_extend' when present).
+    if has_source:
+        session.execute(
+            text("DELETE FROM dim_bs_structure WHERE COALESCE(source, '') <> 'auto_extend'")
+        )
+        occupied = {
+            int(r[0])
+            for r in session.execute(
+                text("SELECT sort_order FROM dim_bs_structure")
+            ).fetchall()
+        }
+    else:
+        session.execute(text("DELETE FROM dim_bs_structure"))
+        occupied = set()
+
     hierarchy = fetch_bs_hierarchy(session)
-    rows = build_bs_rows(hierarchy)
+    rows = build_bs_rows(hierarchy, occupied)
 
     upserted = 0
     for r in rows:

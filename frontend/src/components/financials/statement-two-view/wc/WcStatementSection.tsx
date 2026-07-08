@@ -13,6 +13,7 @@ import {
   buildColumnCatalog,
   buildDefaultColumns,
   reconcileColumns,
+  PLAN_ONLY_COL_KINDS,
   type PlTableColumnDef,
 } from '../../pl-two-view/plColumnRegistry'
 import { buildPlanMapFromStatement } from '../../pl-two-view/plPlanMap'
@@ -72,7 +73,8 @@ export default function WcStatementSection({
   const [viewMode, setViewMode] = useState<StatementViewMode>(() => loadStatementViewMode('wc'))
   const [detailBullet, setDetailBullet] = useState<WcNarrativeBullet | null>(null)
   const [narrative, setNarrative] = useState<PlNarrativeResponse | null>(null)
-  const defaultColumns = usePlTableColumns(data, monthly)
+  const hasPlanData = data?.plan?.has_plan_data ?? false
+  const defaultColumns = usePlTableColumns(data, monthly, hasPlanData)
   const [columns, setColumns] = useState<PlTableColumnDef[]>([])
   const planMap = useMemo(() => buildPlanMapFromStatement(data), [data])
   const notesCtx = useOptionalActionNotesContext()
@@ -86,9 +88,10 @@ export default function WcStatementSection({
       const periodGrain = data.period_grain === 'week' ? 'week' : 'month'
       const periods = periodGrain === 'week' ? [] : (monthly?.periods ?? [])
       const catalog = buildColumnCatalog(data.col_labels, periods, periodGrain)
-      return reconcileColumns(prev, catalog, periods)
+      const reconciled = reconcileColumns(prev, catalog, periods)
+      return hasPlanData ? reconciled : reconciled.filter(c => !PLAN_ONLY_COL_KINDS.has(c.kind))
     })
-  }, [defaultColumns, data, monthly])
+  }, [defaultColumns, data, monthly, hasPlanData])
 
   const allDataColumns = useMemo(
     () =>
@@ -97,19 +100,19 @@ export default function WcStatementSection({
             data.col_labels,
             data.period_grain === 'week' ? 'week' : 'month',
             data.statement,
+            hasPlanData,
           )
         : [],
-    [data],
+    [data, hasPlanData],
   )
 
   const miniColumns = useMemo(() => {
     const grain = data?.period_grain === 'week' ? 'week' : 'month'
-    const kinds =
-      grain === 'week'
-        ? ['pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual']
-        : ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual']
+    const kinds = grain === 'week'
+      ? (hasPlanData ? ['pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual'] : ['pm', 'cm', 'mom', 'mtd'])
+      : (hasPlanData ? ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'] : ['pm', 'cm', 'mom'])
     return allDataColumns.filter(c => kinds.includes(c.kind))
-  }, [allDataColumns, data?.period_grain])
+  }, [allDataColumns, data?.period_grain, hasPlanData])
 
   const displayColumns = columns.length > 0 ? columns : defaultColumns
 
@@ -309,6 +312,7 @@ export default function WcStatementSection({
                 columns={displayColumns}
                 onChange={setColumns}
                 statement="wc"
+                hasPlanData={hasPlanData}
               />
             )}
             {notesCtx && (

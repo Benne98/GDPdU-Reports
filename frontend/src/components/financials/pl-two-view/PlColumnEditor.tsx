@@ -21,6 +21,8 @@ type Props = {
   onChange: (cols: PlTableColumnDef[]) => void
   /** pl | bs | wc — separate localStorage keys per statement */
   statement?: string
+  /** When false, plan/budget/coverage columns are hidden from the add-column catalog and the reset action. */
+  hasPlanData?: boolean
 }
 
 const PLAN_COLUMN_KINDS = new Set([
@@ -43,12 +45,15 @@ const STANDARD_GROUPS: Array<{ title: string; kinds: typeof STANDARD_KINDS }> = 
   },
 ]
 
-function standardGroupsForStatement(statement: string) {
-  if (statement === 'pl') return STANDARD_GROUPS
-  return STANDARD_GROUPS.map(g => ({
-    ...g,
-    kinds: g.kinds.filter(k => !PLAN_COLUMN_KINDS.has(k)),
-  })).filter(g => g.kinds.length > 0)
+function standardGroupsForStatement(statement: string, hasPlanData = true) {
+  const base =
+    statement === 'pl' && hasPlanData
+      ? STANDARD_GROUPS
+      : STANDARD_GROUPS.map(g => ({
+          ...g,
+          kinds: g.kinds.filter(k => !PLAN_COLUMN_KINDS.has(k)),
+        })).filter(g => g.kinds.length > 0)
+  return base
 }
 
 function Section({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
@@ -74,6 +79,7 @@ export default function PlColumnEditor({
   columns,
   onChange,
   statement = 'pl',
+  hasPlanData = true,
 }: Props) {
   const [open, setOpen] = useState(false)
   const [dragIdx, setDragIdx] = useState<number | null>(null)
@@ -195,7 +201,7 @@ export default function PlColumnEditor({
                 )}
               </section>
 
-              {standardGroupsForStatement(statement).map(group => (
+              {standardGroupsForStatement(statement, hasPlanData).map(group => (
                 <Section key={group.title} title={group.title} defaultOpen={group.title.includes('Current')}>
                   <div className="flex flex-wrap gap-1.5">
                     {group.kinds.map(kind => {
@@ -306,7 +312,7 @@ export default function PlColumnEditor({
 
               <button
                 type="button"
-                onClick={() => persist(buildDefaultColumns(colLabels))}
+                onClick={() => persist(buildDefaultColumns(colLabels, undefined, statement, hasPlanData))}
                 className="text-xs font-medium w-full py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
               >
                 Reset to default layout
