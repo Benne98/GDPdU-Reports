@@ -1184,6 +1184,12 @@ def build_wc_snapshot_annual(
     ytg_np = _snapshot_net_profit_ytg_plan(session, year, month, ent_frag)
     _apply_snapshot_fy_forecast_amounts(rows, ytg_np, bump_codes=())
 
+    # DISPLAY GATE (Phase 4 extension): the Forecast (fy_f) column renders ONLY when
+    # a real active + include_in_reporting plan version supplies plan values.  WC
+    # uses the "BS" plan version (same reader the WC two-view uses); the reader
+    # returns {} for parked/no-version/no-rows.  The flag drives DISPLAY only.
+    wc_plan_map = load_position_plan_map_pref(session, "BS", year, month, ent_frag)
+
     # LTM denominators ending at each snapshot column's representative date.
     col_dates = {
         "dec_py2": last_day(year - 3, 12),
@@ -1200,6 +1206,7 @@ def build_wc_snapshot_annual(
     return {
         "statement": "wc", "year": year, "month": month,
         "col_labels": col_labels_bs_snapshot(year, month), "rows": rows,
+        "has_plan_data": bool(wc_plan_map),
     }
 
 

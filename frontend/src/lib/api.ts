@@ -1556,6 +1556,9 @@ export interface ErFlowResponse {
   month:      number
   col_labels: ErFlowColLabels
   rows:       ErStatementRow[]
+  /** True only when a real active + include_in_reporting plan version supplied plan
+   *  values. When false/absent the Forecast (fy_f) + Coverage columns are hidden. */
+  has_plan_data?: boolean
 }
 
 export interface ErSnapshotResponse {
@@ -1564,6 +1567,9 @@ export interface ErSnapshotResponse {
   month:      number
   col_labels: ErSnapshotColLabels
   rows:       ErStatementRow[]
+  /** True only when a real active + include_in_reporting plan version supplied plan
+   *  values. When false/absent the Forecast (fy_f) column is hidden. */
+  has_plan_data?: boolean
 }
 
 // ─── Sales ────────────────────────────────────────────────────────────────────

@@ -218,9 +218,15 @@ export default function StatementConsolidationSection({
     return buildAnnualCfNarrativeResponse(entityStmt.rows as import('../../../../lib/api').ErStatementRow[], year, month, fy3, fy2, selected?.code)
   }, [isAnnualGrain, entityStmt, statement, year, month, selected?.code])
 
+  const annualCfHasPlanData = (entityStmt as unknown as ErFlowResponse | null)?.has_plan_data ?? false
   const annualCfReportColumns = useMemo(
-    () => buildAnnualFlowReportColumns(entityStmt?.col_labels as unknown as ErFlowColLabels | undefined, year, month),
-    [entityStmt?.col_labels, year, month],
+    () => buildAnnualFlowReportColumns(
+      entityStmt?.col_labels as unknown as ErFlowColLabels | undefined,
+      year,
+      month,
+      annualCfHasPlanData,
+    ),
+    [entityStmt?.col_labels, year, month, annualCfHasPlanData],
   )
 
   useChartLoadReporter(`fin-consl-${statement}`, loading || entityLoading, error)

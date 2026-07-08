@@ -128,8 +128,8 @@ export default function AnnualConsolidationSection({
   }, [viewMode, selected?.code, year, month])
 
   const annualCfReportColumns = useMemo(
-    () => buildAnnualFlowReportColumns(entityStmt?.col_labels, year, month),
-    [entityStmt?.col_labels, year, month],
+    () => buildAnnualFlowReportColumns(entityStmt?.col_labels, year, month, entityStmt?.has_plan_data ?? false),
+    [entityStmt?.col_labels, year, month, entityStmt?.has_plan_data],
   )
 
   const fy3BaseLabel = entityStmt?.col_labels?.fy3 ?? labelActual(`FY${String(year - 1).slice(-2)}`)

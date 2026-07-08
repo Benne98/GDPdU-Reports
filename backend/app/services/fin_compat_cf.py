@@ -892,11 +892,19 @@ def build_cf_annual_compat(
         id_prefix="er-cf",
     )
 
+    # DISPLAY GATE (Phase 4 extension): resolve the version-gated CF plan purely to
+    # decide whether the Forecast (fy_f) + Coverage columns render.  It returns {}
+    # for parked/no-version/no-rows and non-empty only for an active +
+    # include_in_reporting version with plan rows (same reader the monthly CF path
+    # uses).  fy_f numerics are unchanged — the flag drives DISPLAY only.
+    cf_plan_map = load_position_plan_map_pref(session, "CF", year, month, ent_frag)
+
     return {
         "statement": "cf",
         "year": year, "month": month,
         "col_labels": col_labels_annual(year, month),
         "rows": rows_out,
+        "has_plan_data": bool(cf_plan_map),
     }
 
 

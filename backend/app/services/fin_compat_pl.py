@@ -1030,7 +1030,15 @@ def build_pl_annual_compat(
     else:
         # included True (active version = the budget band) or None (legacy).
         plan_map = _load_plan_map(session, year, month, ent_frag)
-    return _build_annual_rows(struct, grains, year, month, plan_map=plan_map)
+    out = _build_annual_rows(struct, grains, year, month, plan_map=plan_map)
+    # DISPLAY GATE (Phase 4 extension): the Forecast (fy_f) + Coverage columns must
+    # render ONLY when real plan values fed the forecast.  ``plan_map`` is already
+    # version-gated above (parked/no-version → {} ; no plan rows → {} via the
+    # has_signal gate in _load_plan_map), so ``bool(plan_map)`` == "an active +
+    # include_in_reporting version supplied plan values".  fy_f still computes
+    # numerically (== ytd when {}), but the flag drives DISPLAY only.
+    out["has_plan_data"] = bool(plan_map)
+    return out
 
 
 def _apply_annual_fy_forecast(

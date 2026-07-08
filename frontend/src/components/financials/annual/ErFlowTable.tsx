@@ -140,17 +140,26 @@ export default function ErFlowTable({
 }: ErFlowTableProps) {
   const statementKey = data?.statement === 'cf' ? 'cf' : 'pl'
   const stmtCfg = getStatementConfig(statementKey)
+  // DISPLAY GATE: Forecast (fy_f/forecast/fy25_proxy) + Coverage columns render ONLY
+  // when the backend reports real plan values (active + include_in_reporting version).
+  // Absent flag → false → both columns hidden (rule: hidden unless there ARE plan values).
+  const hasPlanData = data?.has_plan_data ?? false
+  const PLAN_ONLY_COL_IDS = ['forecast', 'fy_f', 'fy25_proxy', 'coverage_pct']
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
   const [viewMode, setViewMode] = useState<ErViewMode>(() => loadStatementViewMode(statementKey) as ErViewMode)
   const [tableColIds, setTableColIds] = useState<string[]>([])
   const [columnEditorOpen, setColumnEditorOpen] = useState(false)
   const notesCtx = useOptionalActionNotesContext()
   const defaultTableColIds = useMemo(
-    () =>
-      statementKey === 'cf'
-        ? ['fy2', 'fy3', 'cagr', 'ytd', 'forecast', 'coverage_pct']
-        : ['fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm'],
-    [statementKey],
+    () => {
+      const ids =
+        statementKey === 'cf'
+          ? ['fy2', 'fy3', 'cagr', 'ytd', 'forecast', 'coverage_pct']
+          : ['fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm']
+      return hasPlanData ? ids : ids.filter(id => !PLAN_ONLY_COL_IDS.includes(id))
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [statementKey, hasPlanData],
   )
 
   useEffect(() => {
@@ -229,15 +238,17 @@ export default function ErFlowTable({
       statementKey === 'cf'
         ? ['fy2', 'fy3', 'cagr', 'ytd', 'forecast', 'coverage_pct']
         : ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm', 'plan_cm', 'coverage_pct']
-    return ids.map(id => catalog[id]).filter(Boolean)
-  }, [catalog, statementKey])
+    const gated = hasPlanData ? ids : ids.filter(id => !PLAN_ONLY_COL_IDS.includes(id))
+    return gated.map(id => catalog[id]).filter(Boolean)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalog, statementKey, hasPlanData])
   const tableColumns = useMemo(() => {
     const allowed = new Set(availableTableColumns.map(c => c.id))
     return tableColIds.filter(id => allowed.has(id)).map(id => catalog[id]).filter(Boolean)
   }, [tableColIds, catalog, availableTableColumns])
   const reportColumns = useMemo(
-    () => buildAnnualFlowReportColumns(lbl, year, month),
-    [lbl, year, month],
+    () => buildAnnualFlowReportColumns(lbl, year, month, hasPlanData),
+    [lbl, year, month, hasPlanData],
   )
   const effectiveViewMode: ErViewMode = viewMode
   const activeColumns = effectiveViewMode === 'report' ? reportColumns : tableColumns

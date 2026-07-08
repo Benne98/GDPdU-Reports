@@ -1107,6 +1107,13 @@ def build_bs_snapshot_annual(
     ytg_np = _snapshot_net_profit_ytg_plan(session, year, month, ent_frag)
     _apply_snapshot_fy_forecast_amounts(rows_out, ytg_np)
 
+    # DISPLAY GATE (Phase 4 extension): the Forecast (fy_f) column renders ONLY when
+    # a real active + include_in_reporting plan version supplies plan values.  The
+    # version-gated reader returns {} for parked/no-version/no-rows (same reader the
+    # BS two-view uses).  fy_f numerics (bumped by ytg_np) are unchanged — the flag
+    # drives DISPLAY only.
+    bs_plan_map = load_position_plan_map_pref(session, "BS", year, month, ent_frag)
+
     kpi = equity_ratio_row_from_grains(
         grains, keys, row_id="er-bs-kpi-equity-ratio", line_code="EQUITY_RATIO",
     )
@@ -1119,6 +1126,7 @@ def build_bs_snapshot_annual(
         "year": year, "month": month,
         "col_labels": col_labels_bs_snapshot(year, month),
         "rows": rows_out,
+        "has_plan_data": bool(bs_plan_map),
     }
 
 
