@@ -44,8 +44,18 @@ Concretely, for column C whose latest bucket is (fy*, p*):
 Ordering of buckets is lexicographic on (fiscal_year, fiscal_period): a movement
 is "<= cutoff" iff (fy, p) <= (fy*, p*).  This is why opening balances and every
 prior period flow into the current stock — exactly how a real ledger balance
-accumulates.  (The synthetic fixture seeds an OPENING balance in period 1 so the
-cumulative behaviour is observable and testable.)
+accumulates.  (The synthetic pure-core fixture seeds an OPENING balance in period 1
+so the cumulative behaviour is observable and testable.)
+
+REAL opening balances live at ``fiscal_period=0`` (Jan-1, ``entry_type=
+'opening_balance'``) and are stored as the FULL cumulative closing balance PER
+YEAR (not a per-year delta).  ``fetch_bs_movements`` reads them and
+``_encode_bs_ob_rows`` anchors/delta-encodes them before the pure core so the
+cumulative Σ reconstructs the stock without multi-counting the opening (matching
+the GDPdU compat reader ``fin_compat_bs_sql._bal_amount_expr``).  An OB-only
+account (no movement — e.g. equity/retained-earnings/fixed-asset lines) would
+otherwise VANISH; the fix restores it.  See that encoder's docstring for the
+formula, worked example and edge cases (test_statements_bs.py::TestBsOpeningBalanceEncoding).
 
 For an EMPTY column (e.g. YTD with last_closed_period=0, which has no buckets) the
 cutoff is undefined → the stock is 0.0 for every line (documented edge case).
@@ -574,6 +584,85 @@ def _fetch_bs_budget_movements(
     return out
 
 
+def _encode_bs_ob_rows(
+    rows: list[tuple[Any, int, int, str, Any, Any, Any, float]],
+) -> list[BsMovement]:
+    """Encode raw actuals GL rows (opening balances + movements) into BsMovements
+    whose CUMULATIVE Σ ≤ cutoff reconstructs the closing balance WITHOUT double
+    counting the opening stock.  PURE — no DB, deterministic.
+
+    WHY THIS EXISTS.  Real GoBD opening balances (``entry_type='opening_balance'``,
+    ``fiscal_period=0``, Jan-1) are stored as the **full cumulative closing balance
+    per year** — NOT a per-year delta.  The pure core :func:`aggregate_bs` is a Σ
+    over every ``(fy,period) ≤ cutoff`` bucket, so feeding every year's OB in raw
+    would multi-count the opening stock (30515/03: OB 2022=1,059,935.42 →
+    2023=1,059,935.42 → 2024=3,619,935.42 → 2025=6,179,935.42, each a full closing).
+    Naively widening the old ``fiscal_period BETWEEN 1 AND 12`` filter to include
+    period 0 would therefore be WRONG.  This encoder reproduces the authoritative
+    GDPdU compat reader (``fin_compat_bs_sql._bal_amount_expr``) hybrid policy so
+    the P5 balance equals the client-facing GDPdU balance:
+
+      • Movements (period 1..12, non-opening) → emitted RAW at their own bucket.
+      • Opening-balance rows (period 0), PER ACCOUNT:
+          – account that HAS ≥1 movement in the window → keep ONLY its **earliest
+            fiscal-year OB** as a single period-0 anchor.  That anchor already
+            embeds every pre-window closing (OBs are cumulative), and the raw
+            in-window movements carry the rest — so later OBs are redundant and
+            are dropped (adding them would double count).
+          – **OB-only** account (no movement in the window, e.g. 38818 Profit
+            distribution) → **delta-encode** the OB series
+            ``OB[fy] − OB[fy_prev]`` at each year's period-0 bucket, so the
+            cumulative Σ ≤ cutoff telescopes to the latest OB ≤ cutoff (its stock).
+
+    Sign convention is UNTOUCHED: amounts stay in the stored GL sign (+debit /
+    −credit); the BS credit flip lives solely in :func:`_present_bs`.
+
+    Input rows: ``(account_number_group, fiscal_year, fiscal_period, entry_type,
+    level_2, level_3, level_4, amount)`` — one per (account, fy, period) bucket.
+    Backward-compatible: with NO opening-balance rows present (pure-movement data
+    and the synthetic golden fixture) every account takes the movement path and the
+    output equals the raw movements — byte-identical to the pre-fix reader.
+    """
+    from collections import defaultdict
+
+    by_acct: dict[Any, list[tuple[int, int, str, Any, Any, Any, float]]] = defaultdict(list)
+    for (acct, fy, p, etype, l2, l3, l4, amt) in rows:
+        by_acct[acct].append((int(fy), int(p), etype or "", l2, l3, l4, float(amt)))
+
+    out: list[BsMovement] = []
+    for _acct, recs in by_acct.items():
+        movements = [r for r in recs if r[2] != "opening_balance"]
+        obs = [r for r in recs if r[2] == "opening_balance"]
+
+        # Non-opening movements: emit raw (stored sign, own bucket).
+        for (fy, p, _e, l2, l3, l4, amt) in movements:
+            out.append(BsMovement(fy, p, l2, l3, l4, amt))
+
+        if not obs:
+            continue
+
+        # Collapse to one OB per fiscal_year (defensive: OB is single-row per year,
+        # but sum guards against any duplicate; keep that year's level path).
+        ob_by_fy: dict[int, tuple[Any, Any, Any, float]] = {}
+        for (fy, _p, _e, l2, l3, l4, amt) in obs:
+            prev = ob_by_fy.get(fy)
+            base = prev[3] if prev else 0.0
+            ob_by_fy[fy] = (l2, l3, l4, base + amt)
+        ordered = sorted(ob_by_fy.items())  # by fiscal_year ascending
+
+        if movements:
+            # Movement account → single earliest-year OB anchor (embeds pre-window).
+            fy, (l2, l3, l4, amt) = ordered[0]
+            out.append(BsMovement(fy, 0, l2, l3, l4, amt))
+        else:
+            # OB-only account → delta-encode so cumulative Σ = latest OB ≤ cutoff.
+            prev_stock = 0.0
+            for fy, (l2, l3, l4, stock) in ordered:
+                out.append(BsMovement(fy, 0, l2, l3, l4, stock - prev_stock))
+                prev_stock = stock
+    return out
+
+
 def fetch_bs_movements(
     session: Any,
     fiscal_years: tuple[int, ...],
@@ -586,6 +675,13 @@ def fetch_bs_movements(
     Returns RAW movements (stored sign).  The cumulative stock and the BS sign are
     applied in the pure core, not here.  ``scenario`` reads fact_gl_plan (movements,
     per docs §14.2 BS-plan is stored as movement so cumulative sum gives the stock).
+
+    Opening balances (actuals path): real GoBD ``opening_balance`` rows live at
+    ``fiscal_period=0`` (Jan-1) and hold the FULL cumulative closing balance per
+    year, so they are read here and encoded by :func:`_encode_bs_ob_rows` (which
+    anchors/delta-encodes them to prevent double counting) instead of being dropped
+    by a ``BETWEEN 1 AND 12`` filter.  The plan path (fact_gl_plan) stays movement-
+    only per docs §14.2, so it keeps the 1..12 window.
     """
     from sqlalchemy import text
 
@@ -612,6 +708,8 @@ def fetch_bs_movements(
             return budget_mvs
 
     if scenario:
+        # Plan path: fact_gl_plan is movement-encoded (no period-0 OB), so the
+        # cumulative Σ already gives the stock — keep the 1..12 window untouched.
         params["scenario"] = scenario
         sql = text(f"""
             SELECT pl.fiscal_year, pl.fiscal_period,
@@ -628,37 +726,49 @@ def fetch_bs_movements(
               {entity_clause}
             GROUP BY pl.fiscal_year, pl.fiscal_period, a.level_2, a.level_3, a.level_4
         """)
-    else:
-        sql = text(f"""
-            SELECT e.fiscal_year, e.fiscal_period,
-                   a.level_2, a.level_3, a.level_4,
-                   SUM(l.amount) AS amount
-            FROM fact_gl_line l
-            JOIN fact_gl_entry e
-              ON e.journal_entry_group_number = l.journal_entry_group_number
-             AND e.fiscal_year = l.fiscal_year
-            JOIN dim_gl_account a
-              ON a.account_number_group = l.account_number_group
-             AND a.fiscal_year = l.fiscal_year
-            WHERE a.level_0 = 'BS'
-              AND e.fiscal_year = ANY(:years)
-              AND e.fiscal_period BETWEEN 1 AND 12
-              {entity_clause}
-            GROUP BY e.fiscal_year, e.fiscal_period, a.level_2, a.level_3, a.level_4
-        """)
+        rows = session.execute(sql, params).fetchall()
+        return [
+            BsMovement(
+                fiscal_year=int(r[0]),
+                fiscal_period=int(r[1]),
+                level_2=r[2],
+                level_3=r[3],
+                level_4=r[4],
+                amount=float(r[5]),
+            )
+            for r in rows
+        ]
 
+    # Actuals path: read movements (period 1..12) AND real Jan-1 opening balances
+    # (entry_type='opening_balance', fiscal_period=0), grouped PER ACCOUNT so the
+    # opening-balance encoder can anchor/delta-encode them without double counting
+    # the cumulative opening stock (see _encode_bs_ob_rows).
+    sql = text(f"""
+        SELECT l.account_number_group, e.fiscal_year, e.fiscal_period,
+               COALESCE(e.entry_type, '') AS entry_type,
+               a.level_2, a.level_3, a.level_4,
+               SUM(l.amount) AS amount
+        FROM fact_gl_line l
+        JOIN fact_gl_entry e
+          ON e.journal_entry_group_number = l.journal_entry_group_number
+         AND e.fiscal_year = l.fiscal_year
+        JOIN dim_gl_account a
+          ON a.account_number_group = l.account_number_group
+         AND a.fiscal_year = l.fiscal_year
+        WHERE a.level_0 = 'BS'
+          AND e.fiscal_year = ANY(:years)
+          AND (
+                e.fiscal_period BETWEEN 1 AND 12
+                OR (e.fiscal_period = 0 AND COALESCE(e.entry_type, '') = 'opening_balance')
+              )
+          {entity_clause}
+        GROUP BY l.account_number_group, e.fiscal_year, e.fiscal_period,
+                 COALESCE(e.entry_type, ''), a.level_2, a.level_3, a.level_4
+    """)
     rows = session.execute(sql, params).fetchall()
-    return [
-        BsMovement(
-            fiscal_year=int(r[0]),
-            fiscal_period=int(r[1]),
-            level_2=r[2],
-            level_3=r[3],
-            level_4=r[4],
-            amount=float(r[5]),
-        )
-        for r in rows
-    ]
+    return _encode_bs_ob_rows(
+        [(r[0], int(r[1]), int(r[2]), r[3], r[4], r[5], r[6], float(r[7])) for r in rows]
+    )
 
 
 def _all_years_for_cumulative(plan: Any) -> tuple[int, ...]:

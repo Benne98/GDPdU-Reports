@@ -39,7 +39,12 @@ class _FakeResult:
 # net income (P&L GROSS_PROFIT over FY = 2500) is carried into Retained earnings
 # (−2500), and the offsetting cash inflow lifts cumulative cash to 3300.  The set is
 # balanced (Σ stored amount == 0) and the accounting identity holds.
-# Shape: (fiscal_year, fiscal_period, level_2, level_3, level_4, amount)
+# Shape mirrors fetch_bs_movements' actuals SQL SELECT (post OB-fix):
+#   (account_number_group, fiscal_year, fiscal_period, entry_type, level_2, level_3,
+#    level_4, amount)
+# All rows are non-opening ('actual') movements (opening stock is seeded in P1 as a
+# movement, as the pure-core golden does), so _encode_bs_ob_rows passes them through
+# unchanged — the numbers below are identical to the pre-fix fixture.
 #   Cash:      opening 2900 (P1) + 100×4 (P2..5)  → cum 3300
 #   AR:        300 (P1) + 200 (P3)                 → cum 500
 #   Inventory: 200 (P1)                            → cum 200
@@ -49,18 +54,18 @@ class _FakeResult:
 # Σ stored = 3300 + 500 + 200 − 500 − 1000 − 2500 = 0  → balanced.
 def _bs_rows():
     rows = [
-        (2025, 1, "Current assets", "Cash", "Bank", 2900.0),
-        (2025, 2, "Current assets", "Cash", "Bank", 100.0),
-        (2025, 3, "Current assets", "Cash", "Bank", 100.0),
-        (2025, 4, "Current assets", "Cash", "Bank", 100.0),
-        (2025, 5, "Current assets", "Cash", "Bank", 100.0),
-        (2025, 1, "Current assets", "Receivables", "Trade", 300.0),
-        (2025, 3, "Current assets", "Receivables", "Trade", 200.0),
-        (2025, 1, "Current assets", "Inventory", "Raw", 200.0),
-        (2025, 1, "Current liabilities", "Payables", "Trade", -400.0),
-        (2025, 4, "Current liabilities", "Payables", "Trade", -100.0),
-        (2025, 1, "Equity", "Equity", "Share capital", -1000.0),
-        (2025, 1, "Equity", "Retained earnings", "P/L", -2500.0),
+        ("01CASH", 2025, 1, "actual", "Current assets", "Cash", "Bank", 2900.0),
+        ("01CASH", 2025, 2, "actual", "Current assets", "Cash", "Bank", 100.0),
+        ("01CASH", 2025, 3, "actual", "Current assets", "Cash", "Bank", 100.0),
+        ("01CASH", 2025, 4, "actual", "Current assets", "Cash", "Bank", 100.0),
+        ("01CASH", 2025, 5, "actual", "Current assets", "Cash", "Bank", 100.0),
+        ("01AR", 2025, 1, "actual", "Current assets", "Receivables", "Trade", 300.0),
+        ("01AR", 2025, 3, "actual", "Current assets", "Receivables", "Trade", 200.0),
+        ("01INV", 2025, 1, "actual", "Current assets", "Inventory", "Raw", 200.0),
+        ("01AP", 2025, 1, "actual", "Current liabilities", "Payables", "Trade", -400.0),
+        ("01AP", 2025, 4, "actual", "Current liabilities", "Payables", "Trade", -100.0),
+        ("01EQ", 2025, 1, "actual", "Equity", "Equity", "Share capital", -1000.0),
+        ("01RE", 2025, 1, "actual", "Equity", "Retained earnings", "P/L", -2500.0),
     ]
     return rows
 
