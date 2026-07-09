@@ -3965,7 +3965,6 @@ function StepReview({
   onRunSetup: (runRebuild: boolean) => void
 }) {
   const startMonth = fyStartFromEndMonth(state.fyEndMonth)
-  const [runRebuild, setRunRebuild] = useState(false)
 
   const glSummary = (() => {
     if (state.gl.years.length === 0) return 'No fiscal years selected'
@@ -4113,24 +4112,15 @@ function StepReview({
           </table>
         </div>
 
-        {/* Rebuild checkbox */}
-        <label className="flex items-center gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white px-4 py-3 hover:bg-slate-50 transition">
-          <input
-            type="checkbox"
-            checked={runRebuild}
-            onChange={e => setRunRebuild(e.target.checked)}
-            className="accent-blue-600 h-4 w-4"
-          />
-          <div>
-            <p className="text-sm font-semibold text-slate-800">Run full rebuild now</p>
-            <p className="text-xs text-slate-500 mt-0.5">
-              After committing all data, trigger a full rebuild of all derived tables
-              (P&amp;L, BS, WC, CF, dimension tables). Takes 1–3 minutes depending on data volume.
-              If rebuild_on_commit is disabled on the server the rebuild step will be skipped
-              gracefully (no error).
-            </p>
-          </div>
-        </label>
+        {/* Full rebuild always runs on Project Setup — no opt-out. */}
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-sm font-semibold text-slate-800">Full rebuild runs automatically</p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            After all data is committed, a full rebuild of every derived table
+            (P&amp;L, BS, WC, CF, dimension tables) runs automatically so the reports always
+            reflect the complete dataset. Takes 1–3 minutes depending on data volume.
+          </p>
+        </div>
 
         <InfoBox>
           <strong>Collect-then-commit model:</strong> nothing has been written to the database yet.
@@ -4140,7 +4130,7 @@ function StepReview({
 
         <button
           type="button"
-          onClick={() => onRunSetup(runRebuild)}
+          onClick={() => onRunSetup(true)}
           className="rounded-md px-6 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 disabled:cursor-not-allowed"
           style={{ backgroundColor: '#1E3A5F' }}
         >
