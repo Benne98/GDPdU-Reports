@@ -649,3 +649,53 @@ class TestCarryForwardFillsMissingDimRow:
         # and the carry-forward OB line (500) exists for (019200, 2023).
         synth = {(r["ang"], r["fy"]): r["amount"] for r in _synthetic_rows(s)}
         assert synth.get(("019200", 2023)) == 500.0
+
+
+# --------------------------------------------------------------------------- #
+# NO DOUBLE-COUNT: carry-forward excludes the retained-earnings-roll marker
+# --------------------------------------------------------------------------- #
+class TestCarryForwardExcludesRetainedEarnings:
+    """The optional retained-earnings roll writes REAL equity opening-balance rows
+    on a BS account (source_system='synthetic_retained_earnings').  The carry-forward
+    cumulative sum MUST exclude them (like its own marker) so they never cascade
+    into the next year's OB and get double-counted."""
+
+    def setup_method(self):
+        _bid_counter[0] = 1
+
+    def _add_re_row(self, s, ang, fy, amount):
+        bid = _bid_counter[0]; _bid_counter[0] += 1
+        jegn = f"{ang[:2]}6{str(fy)[-2:]}999999"
+        s.execute(
+            text(
+                "INSERT INTO fact_gl_entry "
+                "(journal_entry_group_number, fiscal_year, fiscal_period, entry_type, "
+                " posting_date, currency_code, source_system) "
+                "VALUES (:j, :y, 0, 'opening_balance', :pd, 'EUR', :src)"
+            ),
+            {"j": jegn, "y": fy, "pd": f"{fy}-01-01", "src": "synthetic_retained_earnings"},
+        )
+        s.execute(
+            text(
+                "INSERT INTO fact_gl_line "
+                "(journal_entry_group_number, fiscal_year, line_number, booking_line_id, "
+                " account_number_group, amount, source_system) "
+                "VALUES (:j, :y, 1, :b, :a, :amt, :src)"
+            ),
+            {"j": jegn, "y": fy, "b": bid, "a": ang, "amt": amount,
+             "src": "synthetic_retained_earnings"},
+        )
+
+    def test_re_roll_rows_not_summed_into_next_year_ob(self):
+        s = _make_session()
+        # BS account with a single real 2022 movement of +600.
+        _add_movement(s, "019100", 2022, 600.0)
+        _add_movement(s, "019100", 2023, 20.0)  # keep 2023 active for the entity
+        # A retained-earnings-roll row of +9999 also lands on it in 2022.
+        self._add_re_row(s, "019100", 2022, 9999.0)
+
+        OB.synthesize_opening_balances(s, _scope(), "carry_forward")
+
+        synth = {(r["ang"], r["fy"]): r["amount"] for r in _synthetic_rows(s)}
+        # 2023 carry-forward OB = Σ real 2022 movements = 600 (NOT 600 + 9999).
+        assert synth.get(("019100", 2023)) == 600.0

@@ -55,6 +55,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "partner_master_source": "files",  # 'files' | 'gdpdu'
     "sales_label": "Sales",
     "cost_label": "Cost of materials",
+    # OPTIONAL retained-earnings roll (year-end close).  OFF by default → the
+    # rebuild stage is a strict no-op (golden parity).  When enabled:
+    #   accounts: {entity_prefix: account_number_group}  per-entity Gewinnvortrag
+    #             target; absent entities AUTO-RESOLVE to the level_3='Retained
+    #             earnings' 'Gewinn-/Verlustvortrag' account (MIN if >1).
+    #   opening:  {entity_prefix: number}  optional pre-first-year retained
+    #             earnings in canonical STORED sign (credit = NEGATIVE); absent →
+    #             not booked.  To fully balance an entity, opening = −(FY-first
+    #             imbalance residual).
+    "retained_earnings_roll": {
+        "enabled": False,
+        "accounts": {},
+        "opening": {},
+    },
 }
 
 #: Config keys persisted (anything else in a PUT body is ignored).
@@ -288,6 +302,93 @@ def resolve_rebuild_flags(
         "net_profit_source": np,
         "account_mapping_mode": am,
     }
+
+
+def resolve_retained_earnings_config(
+    session: Session, project_id: str = DEFAULT_PROJECT_ID
+) -> dict[str, Any]:
+    """Resolve the OPTIONAL retained-earnings roll config for *project_id*.
+
+    Returns a sanitised ``{"enabled": bool, "accounts": {ep: ang},
+    "opening": {ep: float}}``.  Malformed values fall back to safe defaults (roll
+    stays OFF / entry dropped) with a warning — never raises, so a bad config can
+    never break a rebuild.  When the project config is absent the global
+    ``settings.retained_earnings_roll_enabled`` (default False) drives ``enabled``.
+    """
+    settings_enabled = _settings_re_enabled()
+    record = read_project_config(session, project_id)
+    cfg = record.get("config") or {}
+    raw = cfg.get("retained_earnings_roll")
+
+    enabled = settings_enabled
+    accounts: dict[str, str] = {}
+    opening: dict[str, float] = {}
+
+    if isinstance(raw, dict):
+        enabled = bool(raw.get("enabled", settings_enabled))
+        raw_accts = raw.get("accounts")
+        if isinstance(raw_accts, dict):
+            for ep, ang in raw_accts.items():
+                ep2 = str(ep).strip()[:2]
+                ang2 = str(ang).strip() if ang is not None else ""
+                if ep2 and ang2:
+                    accounts[ep2] = ang2
+                else:
+                    logger.warning(
+                        "project %s: dropping malformed retained_earnings account %r=%r",
+                        project_id, ep, ang,
+                    )
+        elif raw_accts is not None:
+            logger.warning(
+                "project %s: retained_earnings.accounts is not a mapping; ignored",
+                project_id,
+            )
+        raw_open = raw.get("opening")
+        if isinstance(raw_open, dict):
+            for ep, val in raw_open.items():
+                ep2 = str(ep).strip()[:2]
+                try:
+                    num = float(val)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "project %s: dropping non-numeric retained_earnings opening %r=%r",
+                        project_id, ep, val,
+                    )
+                    continue
+                if ep2:
+                    opening[ep2] = num
+        elif raw_open is not None:
+            logger.warning(
+                "project %s: retained_earnings.opening is not a mapping; ignored",
+                project_id,
+            )
+    elif raw is not None:
+        logger.warning(
+            "project %s: retained_earnings_roll is not a mapping; roll disabled",
+            project_id,
+        )
+
+    return {"enabled": enabled, "accounts": accounts, "opening": opening}
+
+
+def _settings_re_enabled() -> bool:
+    """Global retained-earnings-roll default from backend settings or env."""
+    try:
+        import sys
+        from pathlib import Path
+
+        _backend = Path(__file__).resolve().parent.parent / "backend"
+        if str(_backend) not in sys.path:
+            sys.path.insert(0, str(_backend))
+        from app.config import settings  # type: ignore
+
+        return bool(settings.retained_earnings_roll_enabled)
+    except Exception:  # noqa: BLE001
+        import os
+
+        return os.getenv("RETAINED_EARNINGS_ROLL", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
 
 
 def _settings_defaults() -> tuple[str, str]:

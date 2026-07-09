@@ -75,6 +75,19 @@ class EntityConfig(BaseModel):
     name: str = Field("", max_length=200)
 
 
+class RetainedEarningsRollConfig(BaseModel):
+    """OPTIONAL retained-earnings roll (year-end close) config.
+
+    ``accounts`` maps entity_prefix → the target Gewinnvortrag account_number_group
+    (absent entities auto-resolve).  ``opening`` maps entity_prefix → the optional
+    pre-first-year retained earnings in canonical STORED sign (credit = negative).
+    """
+
+    enabled: bool = False
+    accounts: dict[str, str] = Field(default_factory=dict)
+    opening: dict[str, float] = Field(default_factory=dict)
+
+
 class ProjectConfig(BaseModel):
     """Wizard answers persisted per project (mirrors etl.project_config.DEFAULT_CONFIG)."""
 
@@ -87,6 +100,9 @@ class ProjectConfig(BaseModel):
     sales_label: str = Field(default="Sales", max_length=200)
     cost_label: str = Field(default="Cost of materials", max_length=200)
     account_mapping_mode: str = Field(default="library")
+    retained_earnings_roll: RetainedEarningsRollConfig = Field(
+        default_factory=RetainedEarningsRollConfig
+    )
 
 
 class ProjectResponse(BaseModel):
@@ -111,6 +127,7 @@ class ProjectPutRequest(BaseModel):
     sales_label: Optional[str] = None
     cost_label: Optional[str] = None
     account_mapping_mode: Optional[str] = None
+    retained_earnings_roll: Optional[RetainedEarningsRollConfig] = None
 
 
 class RebuildRequest(BaseModel):
@@ -342,6 +359,10 @@ def _validated_config_from_put(body: ProjectPutRequest) -> dict[str, Any]:
                 detail=f"account_mapping_mode must be one of {sorted(VALID_ACCOUNT_MAPPING_MODES)}",
             )
         cfg["account_mapping_mode"] = body.account_mapping_mode
+    if body.retained_earnings_roll is not None:
+        # Pydantic already coerced enabled:bool / accounts:{str:str} / opening:
+        # {str:float}; the ETL resolver re-sanitises defensively at rebuild time.
+        cfg["retained_earnings_roll"] = body.retained_earnings_roll.model_dump()
     return cfg
 
 

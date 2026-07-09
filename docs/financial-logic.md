@@ -433,6 +433,119 @@ the **golden equivalence gate** (BOTH directions): `report_inject` → `compare 
 v2_reportinject` exit 0 (no regression); `gl_rows` → `compare live v2_glrows` exit 0
 (BS identical though the ledger now balances).
 
+## Retained-earnings roll (year-end close) — OPTIONAL rebuild stage (v5 Phase 8)
+
+`etl/retained_earnings.py::synthesize_retained_earnings(session, scope, *, accounts,
+opening)` owns rebuild **stage 5b**, gated by the per-project
+`retained_earnings_roll.enabled` config (global fallback
+`settings.retained_earnings_roll_enabled`, **default OFF**). Wired in
+`etl/rebuild.py::_stage_retained_earnings`.
+
+### Problem it fixes
+
+On a `carry_forward` + `pl_sum` dataset the visible `balance_check` imbalance
+(`fin_compat_bs.bs_imbalance_from_grains`, snapshot/consolidation, per entity/year)
+GROWS every year by **exactly the prior year's net profit**: the completed year's
+P&L result lands in assets but is never rolled into a retained-earnings equity
+account, so Assets ≠ Equity & liabilities and the gap compounds
+(`imbalance(N) = imbalance(N-1) + NP_presented(N-1)`).
+
+### Sign convention (unchanged, matches `fin_compat_bs_sql.py`)
+
+`fact_gl_line.amount`: **+ = debit** (assets), **− = credit** (equity & liab.).
+The roll rows are **single-sided** opening balances (`fiscal_period=0`,
+`entry_type='opening_balance'`), so they are exempt from B1/B2/B3 via
+`etl/checks.py::_opening_exempt_mask` — exactly like carry-forward OBs.
+
+### Formula
+
+Per-entity net profit **stored** (credit) value for a fiscal year `y` (from the
+P&L, identical to `etl/net_profit.py`):
+
+```
+NP_stored[e, y]      = Σ amount over level_0='PL' rows of (e, y)   = −NP_presented[e, y]
+RE_roll_stored[e, N] = opening_stored[e] + Σ_{first ≤ y < N} NP_stored[e, y]
+```
+
+booked as an opening balance (Jan-1 of `N`) on the entity's retained-earnings
+account `A_e`. First year → `RE_roll = opening_stored[e]` (empty sum; only booked
+when an `opening` is configured). `opening_stored[e]` is the pre-first-year
+retained earnings in **stored** sign (credit = **negative**); to fully balance an
+entity it equals `−(FY-first imbalance residual)`.
+
+**Sign proof (the crux).** The FY-scoped snapshot column for year `N` reads the
+raw grain balances; `imbalance(N) = Σ_raw_BS(N) − NP_presented(N)`. Adding
+`RE_roll_stored(N)` (a credit, negative for accumulated profit) to `Σ_raw_BS(N)`
+gives `imbalance'(N) = imbalance(N) + RE_roll_stored(N) = [R + Σ_{y<N}
+NP_presented(y)] + Σ_{y<N} NP_stored(y) = R` (since `NP_stored = −NP_presented`) —
+the year-over-year growth cancels and the imbalance is **constant = R**, the
+FY-first residual. With `opening_stored[e] = −R` it becomes **0**.
+
+### Why an opening balance (not a movement)
+
+The snapshot / consolidation views are **fiscal-year-scoped**
+(`_bal_amount_expr_fy`): a column for year `N` = that year's Jan-1 opening balance
++ that year's movements. Booking each year's **full cumulative** roll as a Jan-1
+opening balance adds exactly `RE_roll_stored[e, N]` to the FY-`N` column and
+nothing carries into `N+1` on its own, so the rolls **never stack**. A movement
+row would instead accumulate in the lifetime grain and double up.
+
+### No double-count (carry-forward interaction — CRITICAL)
+
+The roll rows are real GL rows on a BS equity account, so the carry-forward
+cumulative sum would otherwise sum them into the next year's OB and cascade.
+`etl/opening_balance.py::_compute_carry_forward` now excludes **both** synthetic
+markers (`synthetic_carry_forward_ob` **and** `synthetic_retained_earnings`);
+disabled → no such rows exist → strict no-op → golden parity. The roll rows carry
+`entry_type='opening_balance'` (NOT `'net_profit'`), so they are **included** in
+the BS cumulative-balance grain (counted once as opening equity — which is what
+drives the fix); no interaction with `etl/net_profit.py` (that sums `level_0='PL'`
+rows; the roll is on a distinct `level_3='Retained earnings'` account with a
+distinct source marker / jegn discriminator `6` / booking_line_id band `600e9`).
+
+### Worked example (entity 01, live e2e, no opening)
+
+`NP_stored` 2022 `−1,563,074.44`, 2023 `−1,879,465.91`, 2024 `−1,827,932.34`.
+No 2022 roll (first year, no opening). 2023 roll `= −1,563,074.44`; 2024 roll
+`= −3,442,540.35`; 2025 roll `= −5,270,472.69`. Imbalance goes from the growing
+`602,469 → 2,165,543 → 4,045,009 → 5,872,941` to a **constant 602,468.75** every
+year (verified to the cent, all 5 entities). With `opening["01"]=−602,468.75` →
+**0** for every year of entity 01.
+
+### Edge cases (tested)
+
+First year with/without opening (no row unless opening given); a loss year
+(positive `NP_stored`) moves the cumulative roll up; opening value present vs
+absent; **disabled → strict no-op / golden parity** (and disabling AFTER an enable
+deletes the roll rows via `cleanup_retained_earnings`, restoring the exact
+baseline — verified to the cent); an entity whose RE account cannot be resolved →
+**skip + warn**, never crash; account auto-resolve (`MIN` of the
+`Gewinn-/Verlustvortrag` accounts) and config override; year-scope restriction;
+idempotent re-run (delete-by-marker then re-insert = identical rows, no FK error).
+
+### Config shape (per-project `admin_project_config` JSON)
+
+```json
+"retained_earnings_roll": {
+  "enabled": false,
+  "accounts": { "01": "01030515" },
+  "opening":  { "01": -602468.75 }
+}
+```
+
+`accounts` (optional) = per-entity target Gewinnvortrag account; absent entities
+auto-resolve. `opening` (optional) = pre-first-year retained earnings in stored
+sign (credit = negative); absent → not booked.
+
+### Regression test
+
+`etl/tests/test_retained_earnings.py` (SQLite, synthetic): cumulative prior-NP
+opening per year + sign; opening seeds first year + shifts all; loss year;
+idempotent re-run; auto-resolve `MIN` + config override; unresolvable → skip+warn;
+year scope. Plus `etl/tests/test_opening_balance.py::
+TestCarryForwardExcludesRetainedEarnings` (carry-forward does not double-count the
+roll rows) and `backend/tests/test_projects.py` (config default OFF / round-trip).
+
 ## BS current-year-result = Σ P&L (not a plug) + visible balance check (v5)
 
 The balance-sheet equity **current-year-result** ("Net profit" row) MUST be the

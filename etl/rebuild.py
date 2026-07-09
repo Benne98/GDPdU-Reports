@@ -223,6 +223,59 @@ def _stage_net_profit(
     return {"source": "report_inject", "net_profit_rows": 0, "noop": True}
 
 
+def _stage_retained_earnings(
+    session: Session,
+    scope: RebuildScope,
+    re_config: Optional[dict] = None,
+) -> dict:
+    """Stage 5b (OPTIONAL): roll each completed FY's result into retained earnings.
+
+    Gated by the per-project ``retained_earnings_roll`` config (or the global
+    ``settings.retained_earnings_roll_enabled`` default = OFF).  Disabled → strict
+    no-op (no rows written), so golden parity is preserved.  Enabled → books, per
+    (entity, year > first), the cumulative prior-year P&L result as an opening
+    balance on the entity's retained-earnings equity account (plus an optional
+    pre-first-year opening).  Runs AFTER net_profit; its rows are excluded from the
+    carry-forward cumulative sum so they never cascade (see etl.opening_balance).
+    """
+    cfg = re_config if re_config is not None else {"enabled": _retained_earnings_enabled()}
+    if not cfg.get("enabled"):
+        # Delete-by-marker cleanup (no-op on a DB that never carried the roll), so
+        # disabling fully reverts to the baseline and golden parity always holds.
+        from etl.retained_earnings import cleanup_retained_earnings
+
+        return cleanup_retained_earnings(session, scope)
+    from etl.retained_earnings import synthesize_retained_earnings
+
+    out = synthesize_retained_earnings(
+        session, scope,
+        accounts=cfg.get("accounts") or None,
+        opening=cfg.get("opening") or None,
+    )
+    out["enabled"] = True
+    return out
+
+
+def _retained_earnings_enabled() -> bool:
+    """Read RETAINED_EARNINGS_ROLL from settings, defaulting to OFF (golden parity)."""
+    try:
+        import sys
+        from pathlib import Path
+
+        _backend = Path(__file__).resolve().parent.parent / "backend"
+        if str(_backend) not in sys.path:
+            sys.path.insert(0, str(_backend))
+        from app.config import settings  # type: ignore
+
+        return bool(settings.retained_earnings_roll_enabled)
+    except Exception:  # noqa: BLE001
+        import os
+
+        return os.getenv("RETAINED_EARNINGS_ROLL", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+
 _VALID_NP_SOURCES = frozenset({"report_inject", "gl_rows"})
 
 
@@ -378,16 +431,26 @@ def rebuild_project(
     ob_override: Optional[str] = None
     np_override: Optional[str] = None
     am_override: Optional[str] = None
+    re_config: Optional[dict] = None
     if project_id is not None:
         try:
-            from etl.project_config import resolve_rebuild_flags
+            from etl.project_config import (
+                resolve_rebuild_flags,
+                resolve_retained_earnings_config,
+            )
 
             flags = resolve_rebuild_flags(session, project_id)
             ob_override = flags["opening_balance_mode"]
             np_override = flags["net_profit_source"]
             am_override = flags.get("account_mapping_mode")
+            re_config = resolve_retained_earnings_config(session, project_id)
             summary["project_id"] = project_id
             summary["resolved_flags"] = flags
+            summary["retained_earnings_config"] = {
+                "enabled": re_config.get("enabled"),
+                "accounts": re_config.get("accounts"),
+                "opening": re_config.get("opening"),
+            }
         except Exception as exc:  # noqa: BLE001 — config lookup must not break rebuild
             logger.warning("rebuild: project config lookup failed (%s); using settings defaults", exc)
 
@@ -415,6 +478,11 @@ def rebuild_project(
             summary["net_profit"] = _stage_net_profit(session, sc, np_override)
         else:
             summary["net_profit"] = _stage_net_profit(session, sc)
+
+        # Stage 5b (OPTIONAL): retained-earnings roll.  Disabled → no-op (golden
+        # parity).  When project_id resolved a config it drives enable + accounts +
+        # opening; otherwise the global settings default (OFF) applies.
+        summary["retained_earnings"] = _stage_retained_earnings(session, sc, re_config)
 
         if mode == "full":
             summary["structure_recon"] = _stage_structure_recon_refresh(session, sc)

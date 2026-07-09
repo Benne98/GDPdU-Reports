@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     )
     # Opening-balance acquisition: "in_data" | "file" | "carry_forward"
     opening_balance_mode: str = Field(default="in_data", validation_alias="OPENING_BALANCE_MODE")
+    # Retained-earnings roll (year-end close) — global DEFAULT for the OPTIONAL
+    # rebuild stage that rolls each completed FY's P&L result into the entity's
+    # retained-earnings (Gewinnvortrag) equity account as an opening balance.  OFF
+    # by default so a dataset that already carries the close booking is byte-
+    # identical (golden parity); a per-project config (retained_earnings_roll) may
+    # enable it and supply per-entity target accounts + a pre-first-year opening.
+    retained_earnings_roll_enabled: bool = Field(
+        default=False, validation_alias="RETAINED_EARNINGS_ROLL"
+    )
     # Run the full deterministic rebuild on every ingest commit (reporting-v2).
     rebuild_on_commit: bool = Field(default=False, validation_alias="REBUILD_ON_COMMIT")
     # Allow the admin "reset all ingested data" capability (POST /projects/{id}/reset-data).

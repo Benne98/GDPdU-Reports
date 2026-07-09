@@ -85,6 +85,13 @@ logger = logging.getLogger(__name__)
 #: rows from the cumulative carry-forward sum.
 SYNTHETIC_OB_SOURCE = "synthetic_carry_forward_ob"
 
+#: The optional retained-earnings-roll marker (etl.retained_earnings).  Those rows
+#: are equity opening balances on a BS account, so they too must be excluded from
+#: the cumulative carry-forward sum or they would cascade into the next year's OB.
+#: Imported by value (a plain string constant; no import cycle — etl.retained_earnings
+#: does not import etl.opening_balance).
+from etl.retained_earnings import SYNTHETIC_RE_SOURCE  # noqa: E402
+
 #: entry_type / fiscal_period tag for opening balances (matches gobd_gl_prepare +
 #: checks._OPENING_ENTRY_TYPES).
 OPENING_ENTRY_TYPE = "opening_balance"
@@ -261,7 +268,15 @@ def _compute_carry_forward(
     # active after its first year).  We build the year set per entity (not per
     # account) so an account whose balance exists but has no later movement still
     # carries forward into subsequent years.
-    params: dict = {"src": SYNTHETIC_OB_SOURCE}
+    #
+    # NO DOUBLE-COUNT: the cumulative carry-forward sum excludes BOTH synthetic
+    # opening-balance markers — our own (``synthetic_carry_forward_ob``) AND the
+    # optional retained-earnings roll (``synthetic_retained_earnings``, an equity
+    # opening balance on a BS account).  Without the second exclusion the RE-roll
+    # rows would be summed into the next year's carry-forward OB and cascade.  When
+    # the RE roll is disabled (default) no such rows exist, so the extra exclusion
+    # is a strict no-op and golden parity holds.
+    params: dict = {"src": SYNTHETIC_OB_SOURCE, "src_re": SYNTHETIC_RE_SOURCE}
     pfx_clause = ""
     if prefix_set:
         pph = ", ".join(f":pfx{i}" for i in range(len(prefix_set)))
@@ -307,7 +322,7 @@ def _compute_carry_forward(
               JOIN fact_gl_line l
                 ON l.account_number_group = t.account_number_group
                AND l.fiscal_year < t.fiscal_year
-               AND l.source_system <> :src
+               AND COALESCE(l.source_system, '') NOT IN (:src, :src_re)
              GROUP BY t.entity_prefix, t.account_number_group, t.fiscal_year
             """
         ),
