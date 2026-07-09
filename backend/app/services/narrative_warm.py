@@ -7,7 +7,7 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from app.db import SessionLocal
+from app.db import apply_read_guard, read_session_scope
 from app.services.fin_compat_narrative_snapshot_cache import entity_scope_key, tables_exist
 from app.services.fin_compat_overview_narrative_snapshots import _build_and_store
 
@@ -33,10 +33,18 @@ def warm_narratives_for_period(
     entities: Optional[list[Optional[str]]] = None,
     grains: tuple[str, ...] = _GRAINS,
 ) -> dict[str, int]:
-    """Build and persist snapshots for all statements × entities × grains."""
-    session = SessionLocal()
+    """Build and persist snapshots for all statements × entities × grains.
+
+    Runs OUTSIDE any HTTP request (a background daemon thread) on its OWN session,
+    so it must arm the heavy-report read guard itself — otherwise the balance-sheet
+    ``bal_mov`` scans it fires for every entity run UNBOUNDED with parallel workers
+    (statement_timeout=0), pile up for hours and starve the concurrent GL-commit
+    rebuild.  ``read_session_scope`` arms the first transaction; because
+    ``_build_and_store`` COMMITS each snapshot (resetting ``SET LOCAL``), we RE-ARM
+    with :func:`apply_read_guard` at the top of every iteration.
+    """
     stats = {"ok": 0, "skip": 0, "error": 0}
-    try:
+    with read_session_scope() as session:
         if not tables_exist(session):
             logger.warning("warm_narratives: compat_narrative_snapshot table missing")
             return stats
@@ -45,6 +53,10 @@ def warm_narratives_for_period(
             for grain in grains:
                 for stmt in _STATEMENTS:
                     try:
+                        # Clean txn + re-arm the bounded statement_timeout / serial
+                        # plan (the prior iteration's save_snapshot commit reset it).
+                        session.rollback()
+                        apply_read_guard(session)
                         nar = _build_and_store(
                             session,
                             statement=stmt,
@@ -78,8 +90,6 @@ def warm_narratives_for_period(
             stats["error"],
         )
         return stats
-    finally:
-        session.close()
 
 
 def schedule_narrative_warm(year: int, month: int) -> None:
