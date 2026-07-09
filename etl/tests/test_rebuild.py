@@ -207,6 +207,24 @@ class TestDerivedFactSql:
         assert "l.amount::NUMERIC" in com_sql and "(-l.amount)" not in com_sql, \
             "cost_of_materials must use +amount"
 
+    def test_ar_ap_derivers_exclude_synthetic_ob(self):
+        """AR/AP derivers must exclude synthetic carry-forward OB gl lines so those
+        single-sided BS roll-forwards never become subledger facts referencing the
+        synthetic booking_line_id — which would block the carry-forward stage's
+        idempotent DELETE (ForeignKeyViolation).  Sales/COM are PL-only (no OB) so
+        they are unaffected."""
+        from etl.opening_balance import SYNTHETIC_OB_SOURCE
+
+        for fn in (DFS.derive_fact_ar, DFS.derive_fact_ap):
+            s = _fresh_session()
+            fn(s)
+            sql = " ".join(_executed_sql(s))
+            assert SYNTHETIC_OB_SOURCE in sql, f"{fn.__name__}: missing synthetic-OB exclusion"
+            # NULL-safe form so real rows with a NULL source_system are kept.
+            assert "source_system IS NULL OR l.source_system <>" in sql, (
+                f"{fn.__name__}: exclusion must be NULL-safe"
+            )
+
     def test_rebuild_derive_stage_uses_shared_sql(self):
         """rebuild_project's derived-facts stage must call the SAME functions as the
         derive_facts.py CLI (proves the fold is behaviour-preserving)."""

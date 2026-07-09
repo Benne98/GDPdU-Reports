@@ -28,7 +28,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -467,6 +468,131 @@ class TestEntityScopedRebuild:
         rows = {(r["ang"], r["fy"]): r["amount"] for r in _synthetic_rows(s)}
         assert set(rows) == {("011200", 2023)}
         assert ("021200", 2023) not in rows
+
+
+# --------------------------------------------------------------------------- #
+# Regression: subledger FK must not block the carry-forward delete/recompute
+# --------------------------------------------------------------------------- #
+class TestSubledgerFkDoesNotBlockCarryForward:
+    """A trade-receivable/payable BS account is carried forward, so it gets a
+    SYNTHETIC opening-balance ``fact_gl_line``.  The AR/AP subledger deriver MUST
+    exclude those synthetic OB lines — otherwise ``fact_ar``/``fact_ap`` reference
+    the synthetic ``booking_line_id`` and the carry-forward stage's idempotent
+    ``DELETE FROM fact_gl_line WHERE source_system=SYNTHETIC_OB_SOURCE`` raises a
+    ForeignKeyViolation, so a full rebuild can never recompute carry-forward.
+
+    These tests use a FK-ENFORCED in-memory SQLite (``PRAGMA foreign_keys=ON``) and
+    bind to the PRODUCTION exclusion predicate
+    (``etl.derive_facts_sql._EXCLUDE_SYNTHETIC_OB``) so they fail if that guard is
+    ever removed from the AR/AP derivers.
+    """
+
+    def setup_method(self):
+        _bid_counter[0] = 1
+
+    @staticmethod
+    def _fk_session() -> Session:
+        engine = create_engine("sqlite://")
+
+        @event.listens_for(engine, "connect")
+        def _fk_on(dbapi_con, _rec):  # noqa: ANN001
+            dbapi_con.execute("PRAGMA foreign_keys=ON")
+
+        with engine.begin() as conn:
+            for ddl in _SCHEMA:
+                conn.execute(text(ddl))
+            # fact_ar with a FK on booking_line_id -> fact_gl_line (mirrors prod).
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE fact_ar (
+                        booking_line_id      INTEGER NOT NULL,
+                        account_number_group TEXT NOT NULL,
+                        fiscal_year          INTEGER NOT NULL,
+                        source_system        TEXT,
+                        FOREIGN KEY (booking_line_id)
+                            REFERENCES fact_gl_line (booking_line_id)
+                    )
+                    """
+                )
+            )
+        return Session(engine)
+
+    @staticmethod
+    def _derive_fact_ar(session: Session, *, exclude_synthetic: bool) -> None:
+        """Portable stand-in for derive_facts_sql.derive_fact_ar.
+
+        The production SQL uses Postgres-only casts (``::NUMERIC``/``::DATE``) so it
+        cannot run on SQLite; this mirror keeps only the WHERE shape.  With
+        *exclude_synthetic* it appends the SAME production predicate the fix adds, so
+        the test tracks the real guard rather than a hand-copied string.
+        """
+        from etl.derive_facts_sql import _EXCLUDE_SYNTHETIC_OB
+
+        session.execute(text("DELETE FROM fact_ar"))
+        where = "l.account_number_group = '011200'"  # the receivable BS account
+        if exclude_synthetic:
+            where += f" AND {_EXCLUDE_SYNTHETIC_OB}"
+        session.execute(
+            text(
+                f"""
+                INSERT INTO fact_ar (booking_line_id, account_number_group,
+                                     fiscal_year, source_system)
+                SELECT l.booking_line_id, l.account_number_group, l.fiscal_year,
+                       l.source_system
+                  FROM fact_gl_line l
+                 WHERE {where}
+                """
+            )
+        )
+
+    def _seed_receivable(self, s: Session) -> None:
+        # Receivable BS account 011200 (carried forward) + a 2023 movement so the
+        # entity has a later year to carry into -> synthetic OB for 011200/2023.
+        _add_movement(s, "011200", 2022, 600.0)
+        _add_movement(s, "011900", 2023, 10.0)
+        OB.synthesize_opening_balances(s, _scope(), "carry_forward")
+        assert any(
+            r["ang"] == "011200" and r["fy"] == 2023 for r in _synthetic_rows(s)
+        ), "expected a synthetic OB row for the receivable account"
+
+    def test_deriver_excludes_synthetic_ob_so_delete_succeeds(self):
+        s = self._fk_session()
+        self._seed_receivable(s)
+        # Fixed deriver: synthetic OB line never enters fact_ar.
+        self._derive_fact_ar(s, exclude_synthetic=True)
+        synth_in_ar = s.execute(
+            text(
+                "SELECT COUNT(*) FROM fact_ar WHERE source_system = :s"
+            ),
+            {"s": OB.SYNTHETIC_OB_SOURCE},
+        ).scalar()
+        assert synth_in_ar == 0, "synthetic OB must not enter fact_ar"
+        # A REAL receivable movement is still derived (guard is not over-broad).
+        assert (
+            s.execute(text("SELECT COUNT(*) FROM fact_ar")).scalar() == 1
+        )
+        # Idempotent recompute: the DELETE of synthetic OB gl lines is unblocked.
+        out = OB.synthesize_opening_balances(s, _scope(), "carry_forward")
+        assert out["mode"] == "carry_forward"
+        s.commit()  # FK is checked at statement time; commit confirms consistency
+
+    def test_including_synthetic_ob_reproduces_the_fk_block(self):
+        """Negative control: the OLD behaviour (deriver includes synthetic OB) makes
+        the carry-forward delete raise a FK error — proving the exclusion is load-
+        bearing, not incidental."""
+        s = self._fk_session()
+        self._seed_receivable(s)
+        self._derive_fact_ar(s, exclude_synthetic=False)
+        assert (
+            s.execute(
+                text("SELECT COUNT(*) FROM fact_ar WHERE source_system = :s"),
+                {"s": OB.SYNTHETIC_OB_SOURCE},
+            ).scalar()
+            >= 1
+        )
+        with pytest.raises(IntegrityError):
+            OB.synthesize_opening_balances(s, _scope(), "carry_forward")
 
 
 # --------------------------------------------------------------------------- #

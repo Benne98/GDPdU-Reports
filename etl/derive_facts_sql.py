@@ -22,6 +22,24 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from etl.opening_balance import SYNTHETIC_OB_SOURCE
+
+# Synthetic carry-forward opening-balance GL lines are single-sided roll-forwards
+# of a BS account's prior-year closing balance (fiscal_period=0, no customer /
+# supplier, synthetic booking_line_id).  They must NEVER become subledger facts:
+#   * an OB roll-forward is opening stock, not a receivable/payable *transaction*
+#     (link_method would be 'none' — no partner, no due date, no document);
+#   * if they entered fact_ar / fact_ap, those rows would reference the synthetic
+#     GL line by booking_line_id and BLOCK the carry-forward stage's idempotent
+#     ``DELETE FROM fact_gl_line WHERE source_system=SYNTHETIC_OB_SOURCE``
+#     (ForeignKeyViolation), so a full rebuild could never recompute carry-forward.
+# NULL-safe (``IS NULL OR <>``) so real rows with a NULL source_system are kept,
+# and golden-parity-safe: in_data/file modes have ZERO synthetic-OB rows, so the
+# predicate excludes nothing and fact_ar/fact_ap stay byte-identical.
+_EXCLUDE_SYNTHETIC_OB = (
+    f"(l.source_system IS NULL OR l.source_system <> '{SYNTHETIC_OB_SOURCE}')"
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Account-classification label sets (verbatim from derive_facts.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +165,7 @@ def derive_fact_ar(session: Session) -> int:
               ON a.account_number_group = l.account_number_group
              AND a.fiscal_year          = l.fiscal_year
             WHERE a.level_3 IN ({ar_l3})
+              AND {_EXCLUDE_SYNTHETIC_OB}
             ON CONFLICT (booking_line_id) DO NOTHING
         """)
     )
@@ -189,6 +208,7 @@ def derive_fact_ap(session: Session) -> int:
               ON a.account_number_group = l.account_number_group
              AND a.fiscal_year          = l.fiscal_year
             WHERE a.level_3 IN ({ap_l3})
+              AND {_EXCLUDE_SYNTHETIC_OB}
             ON CONFLICT (booking_line_id) DO NOTHING
         """)
     )
