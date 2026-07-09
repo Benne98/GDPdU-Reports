@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import coa_template
@@ -86,6 +87,27 @@ class RetainedEarningsRollConfig(BaseModel):
     enabled: bool = False
     accounts: dict[str, str] = Field(default_factory=dict)
     opening: dict[str, float] = Field(default_factory=dict)
+
+
+class ReAccountCandidate(BaseModel):
+    """A selectable retained-earnings target account for an entity."""
+
+    account_number_group: str
+    account_name: str
+
+
+class ReAccountEntity(BaseModel):
+    """Per-entity retained-earnings account picker data for the Project-Setup step."""
+
+    entity_prefix: str
+    entity_name: str
+    #: Auto-resolved default (the 'Gewinn-/Verlustvortrag' account) — None if none found.
+    resolved_account: Optional[str] = None
+    candidates: list[ReAccountCandidate] = Field(default_factory=list)
+
+
+class RetainedEarningsAccountsResponse(BaseModel):
+    entities: list[ReAccountEntity] = Field(default_factory=list)
 
 
 class ProjectConfig(BaseModel):
@@ -438,6 +460,68 @@ def download_coa_template(
         media_type=_XLSX_MEDIA,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/v1/projects/{project_id}/retained-earnings-accounts
+# --------------------------------------------------------------------------- #
+@router.get(
+    "/{project_id}/retained-earnings-accounts",
+    response_model=RetainedEarningsAccountsResponse,
+)
+def get_retained_earnings_accounts(
+    project_id: str,
+    _user: _UserDep,
+    session: _SessionDep,
+) -> RetainedEarningsAccountsResponse:
+    """Per-entity retained-earnings target accounts for the optional roll step.
+
+    Returns, for each entity, the auto-resolved 'Gewinn-/Verlustvortrag' account
+    (the default the roll would use) plus the selectable candidate accounts
+    (level_3='Retained earnings') so the user can override it in Project Setup.
+    Read-only; never mutates. project_id is accepted for symmetry (the accounts are
+    a property of the loaded chart, not the project config).
+    """
+    try:
+        from etl.retained_earnings import _auto_resolve_accounts
+
+        resolved = _auto_resolve_accounts(session, None)  # {entity_prefix: ang}
+        cand_rows = session.execute(
+            text(
+                "SELECT DISTINCT entity_prefix, account_number_group, account_name "
+                "FROM dim_gl_account "
+                "WHERE level_0='BS' AND level_3='Retained earnings' "
+                "ORDER BY entity_prefix, account_number_group"
+            )
+        ).fetchall()
+        name_rows = session.execute(
+            text("SELECT entity_prefix, entity_name FROM dim_legal_entity")
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("get_retained_earnings_accounts error")
+        raise HTTPException(
+            status_code=500, detail="Failed to read retained-earnings accounts"
+        ) from exc
+
+    names = {str(r[0]): str(r[1]) if r[1] is not None else str(r[0]) for r in name_rows}
+    by_ent: dict[str, list[ReAccountCandidate]] = {}
+    for ep, ang, nm in cand_rows:
+        by_ent.setdefault(str(ep), []).append(
+            ReAccountCandidate(
+                account_number_group=str(ang),
+                account_name=str(nm) if nm is not None else "",
+            )
+        )
+    entities = [
+        ReAccountEntity(
+            entity_prefix=ep,
+            entity_name=names.get(ep, ep),
+            resolved_account=resolved.get(ep),
+            candidates=by_ent[ep],
+        )
+        for ep in sorted(by_ent)
+    ]
+    return RetainedEarningsAccountsResponse(entities=entities)
 
 
 # --------------------------------------------------------------------------- #
