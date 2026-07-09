@@ -924,6 +924,21 @@ export interface FinancialStatementColLabels {
   mtg?: string
 }
 
+/** Accounting-identity check returned by all BS statement endpoints.
+ *  Column keys match the period-column keys used in the same response
+ *  (e.g. 'cm', 'ytd', 'ytd_py', 'pm', 'py_cm' for standard monthly BS;
+ *  'fy', 'fy_py', 'cm', 'cm_py', 'dec_py2' for annual snapshot).
+ *  Values are in full EUR (same unit as row amounts — divide by 1000 for kEUR).
+ *  `is_balanced` is true iff every column's |imbalance| <= 0.01 EUR.
+ *  Older API responses / plug mode may omit this field entirely — treat absence as balanced.
+ */
+export interface BalanceCheckResult {
+  imbalance:     Record<string, number>
+  total_assets:  Record<string, number>
+  total_eq_liab: Record<string, number>
+  is_balanced:   boolean
+}
+
 export interface FinancialStatementResponse {
   statement:     'pl' | 'bs' | 'cf' | 'wc'
   period_grain?: 'month' | 'week' | 'year'
@@ -935,6 +950,8 @@ export interface FinancialStatementResponse {
   rows:          FinancialStatementRow[]
   /** P&L only — plan/budget lines bundled with statement for reliable display */
   plan?:         PlPlanResponse
+  /** BS only — accounting-identity check; absent / is_balanced=true → hide banner */
+  balance_check?: BalanceCheckResult
 }
 
 export type FinPeriodParams =
@@ -1570,6 +1587,8 @@ export interface ErSnapshotResponse {
   /** True only when a real active + include_in_reporting plan version supplied plan
    *  values. When false/absent the Forecast (fy_f) column is hidden. */
   has_plan_data?: boolean
+  /** BS only — accounting-identity check per snapshot column; absent → treat as balanced */
+  balance_check?: BalanceCheckResult
 }
 
 // ─── Sales ────────────────────────────────────────────────────────────────────
@@ -3812,6 +3831,10 @@ export interface ConsolidationResponse {
   col_labels?: ErSnapshotColLabels
   entities:   Array<{ code: string; label: string }>
   rows:       ConsolidationRow[]
+  /** BS only — per-entity accounting-identity checks.
+   *  Shape: { by_entity: { [entityCode]: BalanceCheckResult } }
+   *  UI rendering of per-entity imbalances is scoped to a future consolidation-specific banner. */
+  balance_check?: { by_entity: Record<string, BalanceCheckResult> }
 }
 
 export interface MonthlyRow {
