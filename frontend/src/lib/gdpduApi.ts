@@ -1164,6 +1164,75 @@ export async function applyLibraryMapping(
 }
 
 // ---------------------------------------------------------------------------
+// GL mapping — candidate positions + manual account assignment
+// ---------------------------------------------------------------------------
+
+/** One position line returned by POST /api/v1/ingest/mapping/candidate-positions. */
+export interface CandidatePosition {
+  statement: "PL" | "BS" | "CF";
+  line_code: string;
+  balance_title: string;
+  level_2: string | null;
+  level_3: string | null;
+  level_4: string | null;
+}
+
+/** One row in the assignments array sent to POST /api/v1/ingest/mapping/assign. */
+export interface AccountMappingAssignment {
+  account_number_group: string;
+  gl_account_id: string;
+  fiscal_year: number;
+  account_name?: string | null;
+  level_0: string;
+  level_1?: string | null;
+  level_2?: string | null;
+  level_3?: string | null;
+  level_4?: string | null;
+  l4_sub?: string | null;
+}
+
+/** Response from POST /api/v1/ingest/mapping/assign. */
+export interface AssignAccountMappingsResponse {
+  inserted: number;
+  overrides_written: number;
+}
+
+/**
+ * Fetch the list of candidate positions (all P&L / BS / CF lines) from the
+ * project's statement structure.  Used to populate the "Map to position" selects
+ * in the unmapped-accounts recovery UI.
+ */
+export async function fetchCandidatePositions(
+  projectId?: string
+): Promise<CandidatePosition[]> {
+  const res = await apiFetch("/api/v1/ingest/mapping/candidate-positions", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId ?? "default" }),
+  });
+  if (!res.ok) await throwApiError(res);
+  const data = (await res.json()) as { positions: CandidatePosition[] };
+  return data.positions;
+}
+
+/**
+ * Submit manual account-to-position assignments.
+ * Requires admin role (normal user auth token is attached automatically;
+ * the endpoint itself enforces the admin check).
+ */
+export async function assignAccountMappings(
+  assignments: AccountMappingAssignment[],
+  projectId?: string
+): Promise<AssignAccountMappingsResponse> {
+  const res = await apiFetch("/api/v1/ingest/mapping/assign", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId ?? "default", assignments }),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<AssignAccountMappingsResponse>;
+}
+
+// ---------------------------------------------------------------------------
 // GL combine — merge per-year files into one tagged file (Project Setup Wizard)
 // ---------------------------------------------------------------------------
 

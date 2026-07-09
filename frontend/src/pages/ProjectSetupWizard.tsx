@@ -79,6 +79,8 @@ import {
   runFteDevelopment,
   glUnmappedDetail,
   applyLibraryMapping,
+  fetchCandidatePositions,
+  assignAccountMappings,
   type ResetProjectDataResponse,
   type Profile,
   type AccountMappingProfile,
@@ -91,6 +93,8 @@ import {
   type GlUnmappedDetail,
   type GlUnmappedAccount,
   type ApplyLibraryResponse,
+  type CandidatePosition,
+  type AccountMappingAssignment,
 } from '../lib/gdpduApi'
 import FteColumnMapper, { type FteMappingPayload } from '../components/fdd-bot/FteColumnMapper'
 import FteDimensionPicker, { type FteDimension } from '../components/fdd-bot/FteDimensionPicker'
@@ -4179,6 +4183,209 @@ function UnmappedAccountsTable({ rows }: { rows: GlUnmappedAccount[] }) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Statement labels for the position-select optgroups
+// ---------------------------------------------------------------------------
+const STATEMENT_LABELS: Record<string, string> = {
+  PL: 'P&L — Profit & Loss',
+  BS: 'BS — Balance Sheet',
+  CF: 'CF — Cash Flow',
+}
+
+/** Build a human-readable breadcrumb label for a candidate position. */
+function positionLabel(pos: CandidatePosition): string {
+  const crumbs = [pos.level_2, pos.level_3, pos.level_4]
+    .filter((v): v is string => v !== null && v.trim() !== '')
+  crumbs.push(pos.balance_title)
+  return crumbs.join(' › ')
+}
+
+/**
+ * Interactive mapper: same rows as UnmappedAccountsTable but with an extra
+ * "Map to position" select per row.  Fetches candidate positions once on mount
+ * and groups them by statement (PL / BS / CF) using <optgroup>.
+ * Rows left at "— select position —" are skipped (not submitted).
+ * On successful assign, calls onSuccess() so the caller can re-run the commit.
+ */
+function UnmappedAccountsMapper({
+  rows,
+  onSuccess,
+}: {
+  rows: GlUnmappedAccount[]
+  onSuccess: () => void
+}) {
+  const [positions, setPositions] = useState<CandidatePosition[]>([])
+  const [posLoading, setPosLoading] = useState(true)
+  const [posError, setPosError] = useState<string | null>(null)
+
+  // selections: unique row key → index into positions[]
+  const [selections, setSelections] = useState<Record<string, number>>({})
+  const [assignBusy, setAssignBusy] = useState(false)
+  const [assignError, setAssignError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setPosLoading(true)
+    setPosError(null)
+    fetchCandidatePositions(PROJECT_ID)
+      .then(p => {
+        if (!cancelled) {
+          setPositions(p)
+          setPosLoading(false)
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setPosError(err instanceof Error ? err.message : String(err))
+          setPosLoading(false)
+        }
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  // Group positions by statement for optgroup rendering
+  const byStatement: Record<string, { idx: number; pos: CandidatePosition }[]> = {}
+  positions.forEach((p, idx) => {
+    if (!byStatement[p.statement]) byStatement[p.statement] = []
+    byStatement[p.statement].push({ idx, pos: p })
+  })
+
+  /** Unique key for a row — used both as the select's id and to store the selection. */
+  const rowKey = (u: GlUnmappedAccount) =>
+    `${u.account_number_group}__${u.account}__${u.fiscal_year}`
+
+  function handleSelect(u: GlUnmappedAccount, value: string) {
+    const k = rowKey(u)
+    if (value === '') {
+      setSelections(prev => {
+        const next = { ...prev }
+        delete next[k]
+        return next
+      })
+    } else {
+      setSelections(prev => ({ ...prev, [k]: Number(value) }))
+    }
+  }
+
+  async function handleAssign() {
+    setAssignBusy(true)
+    setAssignError(null)
+    try {
+      const assignments: AccountMappingAssignment[] = []
+      for (const u of rows) {
+        const k = rowKey(u)
+        if (!(k in selections)) continue
+        const pos = positions[selections[k]]
+        if (!pos) continue
+        assignments.push({
+          account_number_group: u.account_number_group,
+          gl_account_id: u.account,
+          fiscal_year: u.fiscal_year,
+          account_name: u.line_note ?? null,
+          level_0: pos.statement,
+          level_2: pos.level_2,
+          level_3: pos.level_3,
+          level_4: pos.level_4,
+        })
+      }
+      if (assignments.length === 0) {
+        setAssignError('Select a position for at least one account before applying.')
+        setAssignBusy(false)
+        return
+      }
+      await assignAccountMappings(assignments, PROJECT_ID)
+      onSuccess()
+    } catch (err) {
+      setAssignError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAssignBusy(false)
+    }
+  }
+
+  const selectedCount = Object.keys(selections).length
+
+  return (
+    <div className="space-y-2">
+      {posLoading && (
+        <p className="text-xs text-slate-500 flex items-center gap-1.5">
+          <SpinnerIcon />
+          Loading available positions…
+        </p>
+      )}
+      {posError && (
+        <p className="text-xs text-red-700">
+          Could not load positions: {posError}
+        </p>
+      )}
+
+      <div className="rounded border border-red-200 overflow-x-auto">
+        <table className="w-full text-xs text-left">
+          <thead className="bg-red-100 text-red-700">
+            <tr>
+              <th className="px-3 py-2 font-semibold">Account</th>
+              <th className="px-3 py-2 font-semibold">Year</th>
+              <th className="px-3 py-2 font-semibold">Entity</th>
+              <th className="px-3 py-2 font-semibold">Label</th>
+              <th className="px-3 py-2 font-semibold">Map to position</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-red-100 bg-white">
+            {rows.map((u, i) => {
+              const k = rowKey(u)
+              const selIdx = k in selections ? String(selections[k]) : ''
+              return (
+                <tr key={i} className="odd:bg-white even:bg-red-50/30">
+                  <td className="px-3 py-1.5 font-mono">{u.account}</td>
+                  <td className="px-3 py-1.5">{u.fiscal_year}</td>
+                  <td className="px-3 py-1.5">{u.entity_prefix}</td>
+                  <td className="px-3 py-1.5 text-slate-600">{u.line_note ?? ''}</td>
+                  <td className="px-3 py-1.5">
+                    <select
+                      disabled={posLoading || !!posError}
+                      value={selIdx}
+                      onChange={e => handleSelect(u, e.target.value)}
+                      className="w-full min-w-[220px] rounded border border-slate-300 px-2 py-1 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                    >
+                      <option value="">— select position —</option>
+                      {(['PL', 'BS', 'CF'] as const).map(stmt => {
+                        const group = byStatement[stmt]
+                        if (!group || group.length === 0) return null
+                        return (
+                          <optgroup key={stmt} label={STATEMENT_LABELS[stmt]}>
+                            {group.map(({ idx, pos }) => (
+                              <option key={idx} value={idx}>
+                                {positionLabel(pos)}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )
+                      })}
+                    </select>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {assignError && (
+        <p className="text-xs text-red-700">{assignError}</p>
+      )}
+
+      <button
+        type="button"
+        disabled={assignBusy || posLoading || !!posError}
+        onClick={handleAssign}
+        className="inline-flex items-center gap-2 rounded-md border border-red-300 bg-white px-4 py-1.5 text-sm font-semibold text-red-700 hover:bg-red-50 transition disabled:opacity-60 disabled:cursor-not-allowed"
+      >
+        {assignBusy && <SpinnerIcon />}
+        Apply mappings{selectedCount > 0 ? ` (${selectedCount})` : ''}
+      </button>
+    </div>
+  )
+}
+
 function FinishPanel({
   steps,
   done,
@@ -4354,7 +4561,11 @@ function FinishPanel({
                   Unmapped accounts ({unmappedDetail.total_unmapped} total)
                 </p>
 
-                <UnmappedAccountsTable rows={unmappedDetail.unmapped} />
+                {/* Interactive mapper — per-row position select + Apply mappings button */}
+                <UnmappedAccountsMapper
+                  rows={unmappedDetail.unmapped}
+                  onSuccess={onRetry}
+                />
 
                 {unmappedDetail.truncated && (
                   <p className="text-xs text-red-600">
@@ -4362,7 +4573,7 @@ function FinishPanel({
                   </p>
                 )}
 
-                {/* Library apply button — only when at least one CoA group uses a library */}
+                {/* Library apply button — alternative recovery when a library is configured */}
                 {hasLibrary && applyUnresolved === null && (
                   <button
                     type="button"
