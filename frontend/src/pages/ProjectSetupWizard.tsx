@@ -32,7 +32,7 @@
 
 import { type Dispatch, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import PartnerMasterEditor from '../components/masters/PartnerMasterEditor'
-import { api, type ProjectConfigResponse, type AccountMappingMode } from '../lib/api'
+import { api, type ProjectConfigResponse, type AccountMappingMode, type RetainedEarningsEntity } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Stepper, StepCard, NavButtons } from '../components/ingest/IngestStepCard'
 import EntitySourceSelector, { type EntitySource } from '../components/ingest/EntitySourceSelector'
@@ -355,6 +355,24 @@ export interface WizardFteState {
 export type { WizardAnlagenUpload, WizardAnlagenState } from '../components/ingest/AnlagenStep'
 export type { WizardOposUpload, WizardOposSideState, WizardOposState } from '../components/ingest/OposStep'
 
+/** Retained-earnings year-end roll state — persisted and forwarded to putProject. */
+export interface WizardReRollState {
+  /** Whether the year-end RE roll is active. Default false. */
+  enabled: boolean
+  /**
+   * entity_prefix → chosen account_number_group.
+   * Only entries where the user overrode the backend's auto-resolved account are included.
+   * Omitting an entity lets the backend auto-resolve at rebuild.
+   */
+  accounts: Record<string, string>
+  /**
+   * entity_prefix → opening retained earnings as a display string (natural sign:
+   * accumulated profit = positive, accumulated loss = negative).
+   * Negated to stored credit-negative sign at submit time.
+   */
+  opening: Record<string, string>
+}
+
 export interface WizardState {
   projectName: string
   fyEndMonth: number          // 1–12; UI value (converted to fy_start_month at Finish)
@@ -370,6 +388,8 @@ export interface WizardState {
   anlagen: WizardAnlagenState
   /** DRAFT provisioning state for OPOS (open-items lists). */
   opos: WizardOposState
+  /** Year-end retained-earnings roll configuration. Default: disabled. */
+  reRoll: WizardReRollState
 }
 
 function defaultState(): WizardState {
@@ -411,6 +431,7 @@ function defaultState(): WizardState {
       debitor:  { viewMode: 'combined', uploads: [], columnMap: {} },
       kreditor: { viewMode: 'combined', uploads: [], columnMap: {} },
     },
+    reRoll: { enabled: false, accounts: {}, opening: {} },
   }
 }
 
@@ -466,6 +487,7 @@ type WizardAction =
   | { type: 'PATCH_ANLAGEN'; patch: Partial<WizardAnlagenState> }
   | { type: 'PATCH_OPOS'; patch: Partial<WizardOposState> }
   | { type: 'TOGGLE_DATASET'; dataset: 'fte' | 'anlagen' | 'opos'; value: boolean }
+  | { type: 'PATCH_RE_ROLL'; patch: Partial<WizardReRollState> }
   | { type: 'PREFILL'; partial: Partial<WizardState> }
 
 export function wizardReducer(state: WizardState, action: WizardAction): WizardState {
@@ -652,6 +674,7 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
         opos: nextOpos,
       }
     }
+    case 'PATCH_RE_ROLL':    return { ...state, reRoll: { ...state.reRoll, ...action.patch } }
     case 'PREFILL':          return { ...state, ...action.partial }
     default:                 return state
   }
@@ -1859,6 +1882,233 @@ function StepChartOfAccounts({
 }
 
 // ---------------------------------------------------------------------------
+// Step 4 — Opening balances helpers: Retained-earnings roll sub-section
+// ---------------------------------------------------------------------------
+
+/**
+ * RetainedEarningsSection — optional collapsible sub-section shown on the
+ * Opening Balances step when OB mode is "file_first_year" (carry_forward).
+ *
+ * Sign convention
+ *   Display (natural):  accumulated profit → positive number entered by user
+ *   Stored (backend):   credit-negative   → profit sent as NEGATIVE
+ *   Conversion at submit: stored = -natural
+ *   Conversion at prefill: natural = -stored
+ *
+ * Account override logic:
+ *   Only entities where the user actively chose a NON-default account are
+ *   included in reRoll.accounts.  Entities whose selection matches the
+ *   backend's resolved_account are not tracked (backend auto-resolves them).
+ */
+function RetainedEarningsSection({
+  reRoll,
+  dispatch,
+}: {
+  reRoll: WizardReRollState
+  dispatch: Dispatch<WizardAction>
+}) {
+  const [reAccounts, setReAccounts] = useState<RetainedEarningsEntity[]>([])
+  const [fetchLoading, setFetchLoading] = useState(false)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+
+  // Fetch account candidates once when the section is enabled.
+  useEffect(() => {
+    if (!reRoll.enabled) return
+    let cancelled = false
+    setFetchLoading(true)
+    setFetchError(null)
+    api.fetchRetainedEarningsAccounts(PROJECT_ID)
+      .then(data => {
+        if (cancelled) return
+        setReAccounts(data.entities ?? [])
+      })
+      .catch(err => {
+        if (cancelled) return
+        console.error('[RetainedEarningsSection] fetch failed', err)
+        setFetchError(
+          'Could not load retained-earnings account list — accounts will be auto-resolved at rebuild.',
+        )
+      })
+      .finally(() => {
+        if (!cancelled) setFetchLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [reRoll.enabled])
+
+  function handleToggle() {
+    dispatch({ type: 'PATCH_RE_ROLL', patch: { enabled: !reRoll.enabled } })
+  }
+
+  /** Track an account override only when it differs from the backend's resolved default. */
+  function handleAccountChange(
+    entityPrefix: string,
+    value: string,
+    resolvedAccount: string | null,
+  ) {
+    const next = { ...reRoll.accounts }
+    if (value && (resolvedAccount === null || value !== resolvedAccount)) {
+      next[entityPrefix] = value
+    } else {
+      delete next[entityPrefix]
+    }
+    dispatch({ type: 'PATCH_RE_ROLL', patch: { accounts: next } })
+  }
+
+  /** Store opening value as a display string; remove entry when blank. */
+  function handleOpeningChange(entityPrefix: string, value: string) {
+    const next = { ...reRoll.opening }
+    if (value.trim() === '') {
+      delete next[entityPrefix]
+    } else {
+      next[entityPrefix] = value
+    }
+    dispatch({ type: 'PATCH_RE_ROLL', patch: { opening: next } })
+  }
+
+  return (
+    <div className="space-y-3">
+      {/* Toggle row */}
+      <div className="rounded-lg border border-slate-200 bg-white px-4 py-4">
+        <div className="flex items-start gap-3">
+          <div className="mt-0.5 shrink-0">
+            <input
+              id="re-roll-toggle"
+              type="checkbox"
+              checked={reRoll.enabled}
+              onChange={handleToggle}
+              className="h-4 w-4 rounded border-slate-300 accent-blue-600 cursor-pointer"
+            />
+          </div>
+          <div>
+            <label htmlFor="re-roll-toggle" className="text-sm font-semibold text-slate-800 cursor-pointer select-none">
+              Roll prior-year result into retained earnings (year-end close)
+            </label>
+            <p className="mt-0.5 text-xs text-slate-500">
+              With first-year opening balances, each completed year's P&amp;L result is normally
+              closed into retained earnings (Gewinnvortrag). Some datasets already contain that
+              booking; some don't. When enabled, the pipeline rolls each prior year's result into
+              the entity's retained-earnings account so the balance sheet's equity accumulates
+              correctly. An optional per-entity opening value seeds retained earnings brought
+              forward from before the first year.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Body — visible only when enabled */}
+      {reRoll.enabled && (
+        <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-4 py-4 space-y-4">
+          {fetchLoading && (
+            <p className="text-sm text-slate-500">Loading retained-earnings account candidates…</p>
+          )}
+
+          {fetchError && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              {fetchError}
+            </div>
+          )}
+
+          {!fetchLoading && !fetchError && reAccounts.length === 0 && (
+            <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600">
+              No retained-earnings account candidates found yet — accounts will be auto-resolved at
+              rebuild. Opening values can be added once accounts are ingested.
+            </div>
+          )}
+
+          {!fetchLoading && reAccounts.length > 0 && (
+            <div className="space-y-3">
+              <p className="text-xs font-medium text-slate-700">
+                Per-entity retained-earnings account and opening balance
+              </p>
+
+              {reAccounts.map(entity => {
+                const ep = entity.entity_prefix
+                // Display the user's override if present, else fall back to resolved default.
+                const currentAccount = reRoll.accounts[ep] ?? entity.resolved_account ?? ''
+                const openingVal = reRoll.opening[ep] ?? ''
+
+                // Build an option list: resolved_account first (labeled auto-resolved),
+                // then all candidates that differ from the resolved account.
+                const resolvedLabel = entity.candidates.find(
+                  c => c.account_number_group === entity.resolved_account,
+                )?.account_name
+
+                return (
+                  <div
+                    key={ep}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-3 space-y-3"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-slate-700">
+                        {entity.entity_name || ep}
+                      </span>
+                      <span className="font-mono text-xs text-slate-400 bg-slate-100 rounded px-1.5 py-0.5">
+                        {ep}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {/* Account selector */}
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-slate-700">
+                          Retained-earnings account
+                        </label>
+                        <select
+                          value={currentAccount}
+                          onChange={e => handleAccountChange(ep, e.target.value, entity.resolved_account)}
+                          className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                          {!entity.resolved_account && !currentAccount && (
+                            <option value="">-- Select account --</option>
+                          )}
+                          {entity.resolved_account && (
+                            <option value={entity.resolved_account}>
+                              {resolvedLabel
+                                ? `${resolvedLabel} (${entity.resolved_account})`
+                                : entity.resolved_account}{' '}
+                              — auto-resolved
+                            </option>
+                          )}
+                          {entity.candidates
+                            .filter(c => c.account_number_group !== entity.resolved_account)
+                            .map(c => (
+                              <option key={c.account_number_group} value={c.account_number_group}>
+                                {c.account_name} ({c.account_number_group})
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+
+                      {/* Opening retained earnings input */}
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-slate-700">
+                          Opening retained earnings brought forward
+                        </label>
+                        <input
+                          type="number"
+                          step="any"
+                          value={openingVal}
+                          onChange={e => handleOpeningChange(ep, e.target.value)}
+                          placeholder="0.00"
+                          className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <p className="text-xs text-slate-400">
+                          Accumulated profit = positive, accumulated loss = negative (optional)
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Step 4 — Opening balances (Phase 4 — COMPLETE)
 // ---------------------------------------------------------------------------
 
@@ -1866,10 +2116,12 @@ function StepOpeningBalances({
   ob,
   dispatch,
   entities,
+  reRoll,
 }: {
   ob: WizardObState
   dispatch: Dispatch<WizardAction>
   entities: WizardState['entities']
+  reRoll: WizardReRollState
 }) {
   const validEntities = entities.filter(e => e.code.trim())
   const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
@@ -2498,6 +2750,18 @@ function StepOpeningBalances({
                 )
               }}
             />
+          </div>
+        )}
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Retained-earnings year-end roll — only meaningful for carry_forward */}
+        {/* ------------------------------------------------------------------ */}
+        {mode === 'file_first_year' && (
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-slate-700">
+              Retained-earnings roll (optional)
+            </p>
+            <RetainedEarningsSection reRoll={reRoll} dispatch={dispatch} />
           </div>
         )}
 
@@ -4964,6 +5228,21 @@ export default function ProjectSetupWizard() {
         // explicitly signals this stack allows resets.
         setDataResetAllowed(data.data_reset_allowed === true)
 
+        // Prefill retained-earnings roll from stored config.
+        // Stored sign: credit-negative (profit → negative number).
+        // Display sign: natural (profit → positive number).
+        // Conversion: displayedValue = -storedValue.
+        const storedReRoll = cfg.retained_earnings_roll
+        const prefilledReRoll: WizardReRollState = storedReRoll
+          ? {
+              enabled: storedReRoll.enabled,
+              accounts: { ...(storedReRoll.accounts ?? {}) },
+              opening: Object.fromEntries(
+                Object.entries(storedReRoll.opening ?? {}).map(([ep, v]) => [ep, String(-v)]),
+              ),
+            }
+          : { enabled: false, accounts: {}, opening: {} }
+
         dispatch({
           type: 'PREFILL',
           partial: {
@@ -4973,6 +5252,7 @@ export default function ProjectSetupWizard() {
               Array.isArray(cfg.entities) && cfg.entities.length > 0
                 ? cfg.entities
                 : [{ code: '', prefix: '', name: '' }],
+            reRoll: prefilledReRoll,
           },
         })
       })
@@ -5183,7 +5463,7 @@ export default function ProjectSetupWizard() {
       s.id === 'rebuild' ? { ...s, status: runRebuild ? 'pending' : 'skipped', detail: runRebuild ? undefined : 'Rebuild checkbox not selected' } : s
     ))
 
-    const { gl, coa, ob, partner, fte, projectName, fyEndMonth, entities: wizardEntities } = state
+    const { gl, coa, ob, partner, fte, reRoll, projectName, fyEndMonth, entities: wizardEntities } = state
     const fyStart = fyStartFromEndMonth(fyEndMonth)
 
     // ---- Helper: run one async step, mark done/failed, return false on failure ----
@@ -5355,6 +5635,21 @@ export default function ProjectSetupWizard() {
         sales_label: 'Sales',
         cost_label: 'Cost of materials',
         account_mapping_mode: coa.accountMappingMode,
+        // Retained-earnings year-end roll.
+        // Display sign (natural): profit = positive, loss = negative.
+        // Stored sign (credit-negative): profit = NEGATIVE, loss = POSITIVE.
+        // Conversion: stored = -natural (negate the user's entered value).
+        retained_earnings_roll: {
+          enabled: reRoll.enabled,
+          accounts: reRoll.enabled ? { ...reRoll.accounts } : {},
+          opening: reRoll.enabled
+            ? Object.fromEntries(
+                Object.entries(reRoll.opening)
+                  .filter(([, v]) => v.trim() !== '' && !isNaN(Number(v.trim())))
+                  .map(([ep, v]) => [ep, -Number(v.trim())]),  // natural → stored (negate)
+              )
+            : {},
+        },
       }),
       () => `Project "${projectName}" saved (fy_start_month=${fyStart}, account_mapping_mode=${coa.accountMappingMode})`,
     )
@@ -5962,7 +6257,7 @@ export default function ProjectSetupWizard() {
               entities={state.entities}
             />
           )}
-          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} />}
+          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} reRoll={state.reRoll} />}
           {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} entities={state.entities} />}
           {step === 6 && (
             <StepAdditionalInformation
