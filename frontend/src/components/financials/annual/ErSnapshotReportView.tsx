@@ -15,7 +15,6 @@ import PlDetailOverlay from '../pl-two-view/PlDetailOverlay'
 import { ChartLoadReporter } from '../../../hooks/useChartLoadReporter'
 import type { FinStatementKind } from '../statement-two-view/statementTypes'
 import ErSnapshotMiniTable from './ErSnapshotMiniTable'
-import BsImbalanceBanner from '../statement-two-view/bs/BsImbalanceBanner'
 import { useAnnualStatementNarrative } from './useAnnualStatementNarrative'
 import { buildAnnualSnapshotReportTableHeading, KEY_DRIVERS_HEADING } from './annualReportSectionHeadings'
 import type { PlNarrativeResponse } from '../../../lib/api'
@@ -94,12 +93,6 @@ export default function ErSnapshotReportView({
       <div className={FIN_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
         <div className="min-w-0" ref={tableWrapRef}>
           <StatementSectionHeading>{tableHeading}</StatementSectionHeading>
-          {statement === 'bs' && (
-            <BsImbalanceBanner
-              balanceCheck={data.balance_check}
-              colLabels={data.col_labels as unknown as Record<string, string | undefined>}
-            />
-          )}
           <ErSnapshotMiniTable
             data={data}
             year={year}

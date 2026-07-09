@@ -9,7 +9,6 @@ import { countVisibleStatementRows, fitBulletsToTable } from '../narrativeFit'
 import { buildReportCommentMarkerMap } from '../reportCommentMarkers'
 import StatementNarrativeList from '../StatementNarrativeList'
 import StatementSectionHeading from '../StatementSectionHeading'
-import BsImbalanceBanner from './BsImbalanceBanner'
 import BsMiniTable from './BsMiniTable'
 import {
   buildClientBsNarrative,
@@ -136,10 +135,6 @@ export default function BsReportView({
       <div className={FIN_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
         <div className="min-w-0" ref={tableWrapRef}>
           <StatementSectionHeading>{tableHeading}</StatementSectionHeading>
-          <BsImbalanceBanner
-            balanceCheck={data.balance_check}
-            colLabels={data.col_labels as unknown as Record<string, string | undefined>}
-          />
           <BsMiniTable
             data={data}
             year={year}
