@@ -433,6 +433,68 @@ the **golden equivalence gate** (BOTH directions): `report_inject` → `compare 
 v2_reportinject` exit 0 (no regression); `gl_rows` → `compare live v2_glrows` exit 0
 (BS identical though the ledger now balances).
 
+## BS current-year-result = Σ P&L (not a plug) + visible balance check (v5)
+
+The balance-sheet equity **current-year-result** ("Net profit" row) MUST be the
+income-statement result **Σ P&L** — never a balancing plug `Assets − (Equity+Liab)`
+that forces the sheet to tie out and hides data errors. The residual is SURFACED
+via `balance_check` so a non-balancing dataset is visible, never absorbed silently.
+
+### Where each derivation lives (compat reader `fin_compat_bs.py`)
+
+- **Main statement (`build_bs_statement_compat`), monthly (`build_bs_monthly`),
+  non-entity-scoped snapshot**: net profit = `bs_net_profit_sql_*` = `Σ(PL × −1)`
+  (level_0='PL'). Always Σ P&L; **never a plug**. Unaffected by the flag below.
+- **Entity-scoped ER snapshot (`build_bs_snapshot_annual`) + consolidation
+  (`build_bs_consolidation`)**: legacy derived the current-year result as the
+  **balancing plug** `_equity_bridge_from_grains` / `_equity_bridge_by_entity_from_grains`
+  (= Σ raw BS balances). Now gated by `settings.bs_current_year_result_mode`
+  (`BS_CURRENT_YEAR_RESULT_MODE`): `balancing_plug` (DEFAULT → byte-identical legacy,
+  golden-safe) | `pl_sum` (Σ P&L; residual made visible). **v5/e2e should set
+  `pl_sum`.** Consolidation `pl_sum` uses `bs_consl_net_profit_sql_month/_annual`;
+  the week grain has no per-entity P&L SQL so it stays on the plug (documented
+  follow-up).
+
+### Formula (per column `k`; raw grains, + = debit/asset, − = credit/E&L)
+
+```
+assets_raw    = Σ grain[k]  over level_1 ~ 'asset'
+all_bs_raw    = Σ grain[k]  over ALL BS grains
+NP (pl_sum)         = Σ(PL amount × −1)          # income statement bottom line
+NP (balancing_plug) = all_bs_raw                 # = Total assets − Total E&L (a plug)
+total_eq_liab = −(all_bs_raw − assets_raw) + NP
+imbalance     = total_assets − total_eq_liab = all_bs_raw − NP
+```
+
+`imbalance == 0` (±0.01) iff the DISPLAYED sheet balances. `pl_sum` → real residual
+(`Σ BS − Σ P&L`), visible; `balancing_plug` → identically 0 (error hidden). Surfaced
+as `out["balance_check"] = {imbalance, total_assets, total_eq_liab, is_balanced}`
+(consolidation: `{by_entity: {code: {...}}}`). Never forced to zero.
+
+### Worked example (live finssentials_v5, entity 01, FY2024, cm)
+
+`NP = Σ(PL × −1) = 2,339,753.40` (a profit, independent of assets — NOT a plug).
+`Total assets = 31,595,930.87`; `Total E&L (incl NP) = 30,993,462.12` →
+`imbalance = 602,468.75` (previously HIDDEN, now shown; `is_balanced=False`). A plug
+would inject `all_bs_raw = 2,942,222.14` → `imbalance = 0` (error absorbed). The two
+derivations differ by exactly the imbalance. Entity-scoped snapshot: `plug` →
+imbalance {cm: 0.0}; `pl_sum` → {cm: 602,468.75} — the SAME residual, now visible.
+
+### Edge cases (tested, DB-free)
+
+Balanced (Σ P&L == BS residual) → imbalance 0 / `is_balanced` True; unbalanced →
+non-zero & visible; **plug vs Σ P&L distinguished only on an UNBALANCED fixture**
+(they coincide when the sheet balances); loss (negative NP); missing column key → 0;
+empty ledger → 0 / balanced; multi-column (any column off → `is_balanced` False);
+default mode = `balancing_plug` (golden parity).
+
+### Regression test
+
+`backend/tests/test_compat_bs.py::TestBsCurrentYearResultAndImbalance` (pure): `pl_sum`
+returns Σ P&L not the plug; imbalance visible on unbalanced data; 0 on balanced;
+plug-mode always balances (hides error); loss; missing-key/empty; multi-column;
+default = legacy plug.
+
 ## Mapping library + per-project CoA override + client-CoA (reporting-v2 Phase 4)
 
 Phase 4 is **classification/presentation only** — it sets `dim_gl_account.level_*`

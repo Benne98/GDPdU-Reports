@@ -66,6 +66,22 @@ class Settings(BaseSettings):
     #   "report_inject" = virtual report-layer injection (legacy, fin_compat_bs.py)
     #   "gl_rows"       = real synthetic net-profit GL bookings (reporting-v2)
     bs_net_profit_source: str = Field(default="report_inject", validation_alias="BS_NET_PROFIT_SOURCE")
+    # How the balance-sheet current-year-result (the equity "Net profit" row) is
+    # derived in the compat reader (fin_compat_bs.py) for the ENTITY-SCOPED ER
+    # snapshot and the CONSOLIDATION views:
+    #   "balancing_plug" (legacy DEFAULT) = Σ raw BS balances = Total assets −
+    #        Total equity & liabilities.  Forces Assets = E&L per entity column, so
+    #        the displayed imbalance is ALWAYS 0 — a data error is silently absorbed.
+    #   "pl_sum" = the income-statement result Σ(PL amount × −1) (level_0='PL').
+    #        Identical source as the main month/week statement; the residual
+    #        (Total assets − Total E&L incl. this result) is then SURFACED via
+    #        ``balance_check`` so a non-balancing dataset is visible, never hidden.
+    # Default keeps legacy/golden behaviour; the v5/e2e project should set "pl_sum".
+    # The main statement + monthly BS views ALWAYS use Σ P&L (never a plug) and are
+    # unaffected by this flag.
+    bs_current_year_result_mode: str = Field(
+        default="balancing_plug", validation_alias="BS_CURRENT_YEAR_RESULT_MODE"
+    )
     # Opening-balance acquisition: "in_data" | "file" | "carry_forward"
     opening_balance_mode: str = Field(default="in_data", validation_alias="OPENING_BALANCE_MODE")
     # Run the full deterministic rebuild on every ingest commit (reporting-v2).

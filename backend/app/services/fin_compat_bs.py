@@ -107,6 +107,8 @@ from app.services.fin_compat_pl import (
     load_position_plan_map_pref,
 )
 
+from app.config import settings
+
 _BS_HIER_KEYS = ["level_1", "level_2", "level_3", "level_4"]
 _BS_SORT_MAP = {
     "level_1": "level_1_sort",
@@ -366,6 +368,93 @@ def _inject_net_profit(
     return False
 
 
+def _grain_is_asset(g: dict[str, Any]) -> bool:
+    """True when a BS grain row belongs to the ASSET side (level_1 ~ 'asset').
+
+    Mirrors ``equity_ratio_row_from_grains``' ``_find_l1('asset')`` classification:
+    the asset side keeps its raw (debit-positive) sign; everything else is the
+    credit side (equity & liabilities), presented by negating the raw balance.
+    """
+    return "asset" in (g.get("level_1") or "").strip().lower()
+
+
+def bs_current_year_result(
+    grains: list[dict[str, Any]],
+    pl_net_profit: dict[str, float],
+    keys: list[str],
+    *,
+    mode: Optional[str] = None,
+) -> dict[str, float]:
+    """The equity "Net profit" (current-year result) to inject into the BS.
+
+    Two documented derivations (see ``settings.bs_current_year_result_mode``):
+
+    * ``pl_sum``          → the income-statement bottom line ``Σ(PL amount × −1)``
+      (``pl_net_profit``, from ``bs_*_net_profit_sql``), verbatim.  Independent of
+      the asset side, so the residual (Total assets − Total E&L incl. this result)
+      is REAL and surfaced via :func:`bs_imbalance_from_grains`.
+    * ``balancing_plug``  → legacy bridge ``Σ raw BS balances`` (== Total assets −
+      Total equity & liabilities pre-injection).  Forces Assets = E&L per column,
+      so the displayed imbalance is identically 0 — a data error is HIDDEN.
+
+    ``mode=None`` reads ``settings.bs_current_year_result_mode`` (default
+    ``balancing_plug`` → golden/parity-preserving).  Pure; no I/O.
+    """
+    resolved = mode or settings.bs_current_year_result_mode
+    if resolved == "pl_sum":
+        return {k: float(pl_net_profit.get(k, 0.0) or 0.0) for k in keys}
+    # legacy balancing plug: Σ raw BS balances (identical to _equity_bridge_from_grains)
+    return {k: sum(float(g.get(k) or 0.0) for g in grains) for k in keys}
+
+
+def bs_imbalance_from_grains(
+    grains: list[dict[str, Any]],
+    net_profit: dict[str, float],
+    keys: list[str],
+) -> dict[str, dict[str, float]]:
+    """Displayed accounting-identity residual per column — the visible balance check.
+
+    Uses the SAME raw grain balances the statement rows are built from and the SAME
+    ``net_profit`` dict that is injected into equity, so the result equals exactly
+    what the report shows::
+
+        total_assets[k]  = Σ grain[k]  over ASSET-side grains          (presented +)
+        all_bs_raw[k]    = Σ grain[k]  over ALL BS grains              (raw stored sign)
+        total_eq_liab[k] = −(all_bs_raw[k] − total_assets[k]) + net_profit[k]
+        imbalance[k]     = total_assets[k] − total_eq_liab[k]
+                         = all_bs_raw[k] − net_profit[k]
+
+    ``imbalance`` is 0 (to a 0.01 cent tolerance) iff the displayed balance sheet
+    ties out.  In ``pl_sum`` mode it is the real residual (Σ BS − Σ P&L); in
+    ``balancing_plug`` mode it is identically 0 (the plug hides the error).  NEVER
+    forced to zero.  Returns per-column ``imbalance`` / ``total_assets`` /
+    ``total_eq_liab`` plus a scalar ``is_balanced`` convenience flag.
+    """
+    assets_raw = {k: 0.0 for k in keys}
+    all_raw = {k: 0.0 for k in keys}
+    for g in grains:
+        is_asset = _grain_is_asset(g)
+        for k in keys:
+            v = float(g.get(k) or 0.0)
+            all_raw[k] += v
+            if is_asset:
+                assets_raw[k] += v
+    total_assets = {k: round(assets_raw[k], 2) for k in keys}
+    total_eq_liab = {
+        k: round(-(all_raw[k] - assets_raw[k]) + float(net_profit.get(k, 0.0) or 0.0), 2)
+        for k in keys
+    }
+    imbalance = {
+        k: round(all_raw[k] - float(net_profit.get(k, 0.0) or 0.0), 2) for k in keys
+    }
+    return {
+        "imbalance": imbalance,
+        "total_assets": total_assets,
+        "total_eq_liab": total_eq_liab,
+        "is_balanced": all(abs(v) <= 0.01 for v in imbalance.values()),
+    }
+
+
 def _find_assets_equity_codes(
     struct_bs: list[dict[str, Any]],
 ) -> tuple[Optional[str], Optional[str]]:
@@ -589,6 +678,12 @@ def build_bs_statement_compat(
         "month": mo,
         "col_labels": labels,
         "rows": rows_out,
+        # Visible accounting-identity check: Total assets − Total E&L (incl. the
+        # injected Σ P&L net profit) per column.  0 iff the data balances; a
+        # non-zero value is a real data error surfaced to the frontend, never a
+        # hidden plug.  net_profit here is Σ P&L (bs_net_profit_sql_*), so the main
+        # statement is always the pl_sum derivation.
+        "balance_check": bs_imbalance_from_grains(grains, net_profit, keys),
     }
     if iso_year is not None:
         out["iso_year"] = iso_year
@@ -674,6 +769,8 @@ def build_bs_monthly(
         "year": year, "month": month,
         "periods": [{"year": y, "month": m, "label": period_label(y, m)} for y, m in periods],
         "rows": rows_out,
+        # Visible balance check per month column (net_profit is Σ P&L → pl_sum).
+        "balance_check": bs_imbalance_from_grains(grains, net_profit, all_keys),
     }
     if totals:
         out["totals"] = [
@@ -1078,10 +1175,16 @@ def build_bs_snapshot_annual(
     np_sql, np_params = bs_snapshot_net_profit_sql(year, month, ent_frag)
     np_row = session.execute(text(np_sql), np_params).fetchone()
     np_map = dict(np_row._mapping) if (np_row is not None and hasattr(np_row, "_mapping")) else {}
+    pl_np = {k: float(np_map.get(k) or 0.0) for k in keys}
     if is_entity_scoped:
-        net_profit = _equity_bridge_from_grains(grains, keys)
+        # Entity-scoped ER snapshot: legacy derives the current-year result as the
+        # balancing plug (Σ raw BS balances, forcing Assets = E&L); ``pl_sum`` uses
+        # the income-statement result Σ P&L and lets ``balance_check`` surface the
+        # residual.  Gated by settings.bs_current_year_result_mode (default plug →
+        # byte-identical to before).
+        net_profit = bs_current_year_result(grains, pl_np, keys)
     else:
-        net_profit = {k: float(np_map.get(k) or 0.0) for k in keys}
+        net_profit = pl_np
 
     def _snap_am(g: dict) -> dict[str, float]:
         return {k: float(g.get(k) or 0.0) for k in keys}
@@ -1127,6 +1230,9 @@ def build_bs_snapshot_annual(
         "col_labels": col_labels_bs_snapshot(year, month),
         "rows": rows_out,
         "has_plan_data": bool(bs_plan_map),
+        # Visible balance check per snapshot column.  In balancing_plug mode this is
+        # 0 by construction; in pl_sum mode it exposes the real Σ BS − Σ P&L residual.
+        "balance_check": bs_imbalance_from_grains(grains, net_profit, keys),
     }
 
 
@@ -1313,6 +1419,49 @@ def _equity_bridge_from_grains(grains: list[dict], keys: list[str]) -> dict[str,
     return {k: sum(float(g.get(k) or 0.0) for g in grains) for k in keys}
 
 
+def _consl_current_year_result(
+    session: Session,
+    grains: list[dict],
+    entity_codes: list[str],
+    ep_to_code: dict[str, str],
+    keys: list[str],
+    *,
+    period_grain: str,
+    year: int,
+    month: int,
+) -> dict[str, dict[str, float]]:
+    """Per-entity current-year result for the BS consolidation view.
+
+    ``balancing_plug`` (legacy default) → :func:`_equity_bridge_by_entity_from_grains`
+    (Σ raw BS balances per entity; forces each column to balance, hides errors).
+
+    ``pl_sum`` → the per-entity income-statement result ``Σ(PL amount × −1)`` from
+    ``bs_consl_net_profit_sql_month`` / ``_annual`` (month / year grain).  The week
+    grain has no per-entity P&L SQL, so it FALLS BACK to the plug in both modes
+    (documented follow-up).  Gated by ``settings.bs_current_year_result_mode``.
+    """
+    plug = _equity_bridge_by_entity_from_grains(grains, entity_codes, ep_to_code, keys)
+    if settings.bs_current_year_result_mode != "pl_sum":
+        return plug
+    if period_grain == "year":
+        np_sql, np_params = bs_consl_net_profit_sql_annual(year, month)
+    elif period_grain == "month":
+        np_sql, np_params = bs_consl_net_profit_sql_month(year, month)
+    else:  # week — no per-entity P&L SQL; keep the plug (documented)
+        return plug
+    pl_by_code: dict[str, dict[str, float]] = {
+        ec: {k: 0.0 for k in keys} for ec in entity_codes
+    }
+    for r in session.execute(text(np_sql), np_params).fetchall():
+        m = dict(r._mapping)
+        ec = ep_to_code.get((m.get("entity_prefix") or "").strip())
+        if ec is None:
+            continue
+        for k in keys:
+            pl_by_code[ec][k] = float(m.get(k) or 0.0)
+    return pl_by_code
+
+
 def _equity_ratio_by_entity_from_grains(
     grains: list[dict],
     entity_codes: list[str],
@@ -1448,8 +1597,15 @@ def build_bs_consolidation(
     apply_bs_consl_display_signs(rows_out)
     _sort_bs_display_order(rows_out)
 
-    net_profit = _equity_bridge_by_entity_from_grains(
-        grains, entity_codes, ep_to_code, keys,
+    # Current-year result per entity: legacy = balancing plug (Σ raw BS per entity,
+    # forces each column to balance); ``pl_sum`` = per-entity income-statement result
+    # Σ P&L (bs_consl_net_profit_sql_*) with the residual surfaced via balance_check.
+    # Gated by settings.bs_current_year_result_mode (default plug → identical output).
+    # NOTE: the week grain has no per-entity P&L SQL, so it stays on the plug in both
+    # modes (documented follow-up); month/year support pl_sum.
+    net_profit = _consl_current_year_result(
+        session, grains, entity_codes, ep_to_code, keys,
+        period_grain=period_grain, year=yr, month=mo,
     )
     _inject_net_profit_consl(rows_out, net_profit, entity_codes, keys)
     _append_consl_equity_ratio_kpi(
@@ -1465,6 +1621,20 @@ def build_bs_consolidation(
         "col_label": col_label,
         "entities": entity_dicts,
         "rows": rows_out,
+        # Visible balance check per entity: Total assets − Total E&L (incl. the
+        # injected current-year result) per column.  0 in balancing_plug mode;
+        # the real residual per entity in pl_sum mode.
+        "balance_check": {
+            "by_entity": {
+                ec: bs_imbalance_from_grains(
+                    [g for g in grains
+                     if ep_to_code.get((g.get("entity_prefix") or "").strip()) == ec],
+                    net_profit.get(ec, {}),
+                    keys,
+                )
+                for ec in entity_codes
+            }
+        },
     }
     if period_grain == "year":
         out["col_labels"] = labels

@@ -761,3 +761,106 @@ class TestBsL4TrendSql:
         last = out["series"][-1]
         assert last["current"] == 1234.0
         assert last["previous"] == 1000.0
+
+
+# ---------------------------------------------------------------------------
+# Current-year result = Σ P&L (NOT a balancing plug) + visible balance check
+#
+# FORMULA (per column k, raw grain balances; + = debit/asset, − = credit/E&L):
+#   assets_raw  = Σ grain[k]  over level_1 ~ 'asset'
+#   all_bs_raw  = Σ grain[k]  over ALL BS grains
+#   NP (pl_sum)         = pl_net_profit[k]              (Σ(PL amount × −1))
+#   NP (balancing_plug) = all_bs_raw[k]                 (== Total assets − Total E&L)
+#   total_eq_liab = −(all_bs_raw − assets_raw) + NP
+#   imbalance     = assets_raw − total_eq_liab = all_bs_raw − NP
+#
+# WORKED EXAMPLE (single 'cm' column):
+#   Assets +600 +400 → assets_raw=1000 ; E&L −400 −500 → credit_raw=−900
+#   → all_bs_raw = +100.
+#   Σ P&L (income statement) = +70  (deliberately ≠ the +100 BS residual).
+#   pl_sum  → NP=70,  imbalance = 100 − 70 = 30  (data error VISIBLE)
+#   plug    → NP=100, imbalance = 100 − 100 = 0  (error HIDDEN)
+# The two derivations differ by exactly the imbalance (30) — the test that
+# distinguishes "Σ P&L" from "plug" requires an UNBALANCED fixture.
+# ---------------------------------------------------------------------------
+class TestBsCurrentYearResultAndImbalance:
+
+    # Unbalanced fixture: Σ P&L (70) ≠ Σ raw BS residual (100).
+    _GRAINS_UNBAL = [
+        {"level_1": "Assets", "cm": 600.0},
+        {"level_1": "Assets", "cm": 400.0},
+        {"level_1": "Equity & liabilities", "cm": -400.0},
+        {"level_1": "Equity & liabilities", "cm": -500.0},
+    ]
+
+    def test_pl_sum_returns_income_statement_result_not_plug(self):
+        from app.services.fin_compat_bs import bs_current_year_result
+        pl_np = {"cm": 70.0}
+        pl_sum = bs_current_year_result(self._GRAINS_UNBAL, pl_np, ["cm"], mode="pl_sum")
+        plug = bs_current_year_result(self._GRAINS_UNBAL, pl_np, ["cm"], mode="balancing_plug")
+        # pl_sum == Σ P&L (70), the income statement bottom line — NOT the plug.
+        assert pl_sum["cm"] == 70.0
+        # balancing_plug == Σ raw BS balances (100) == Total assets − Total E&L.
+        assert plug["cm"] == 100.0
+        # They MUST differ on unbalanced data (else a plug is indistinguishable).
+        assert pl_sum["cm"] != plug["cm"]
+
+    def test_imbalance_visible_when_pl_sum(self):
+        from app.services.fin_compat_bs import bs_imbalance_from_grains
+        bc = bs_imbalance_from_grains(self._GRAINS_UNBAL, {"cm": 70.0}, ["cm"])
+        assert bc["total_assets"]["cm"] == 1000.0
+        assert bc["total_eq_liab"]["cm"] == 970.0        # -(-900) + 70
+        assert bc["imbalance"]["cm"] == 30.0             # 100 − 70, NOT forced to 0
+        assert bc["is_balanced"] is False
+
+    def test_imbalance_zero_on_balanced_data(self):
+        from app.services.fin_compat_bs import bs_imbalance_from_grains
+        # Σ P&L (100) exactly equals the BS residual → balances.
+        bc = bs_imbalance_from_grains(self._GRAINS_UNBAL, {"cm": 100.0}, ["cm"])
+        assert bc["total_assets"]["cm"] == 1000.0
+        assert bc["total_eq_liab"]["cm"] == 1000.0
+        assert bc["imbalance"]["cm"] == 0.0
+        assert bc["is_balanced"] is True
+
+    def test_plug_mode_always_balances_hiding_error(self):
+        from app.services.fin_compat_bs import bs_current_year_result, bs_imbalance_from_grains
+        np_plug = bs_current_year_result(self._GRAINS_UNBAL, {"cm": 70.0}, ["cm"], mode="balancing_plug")
+        bc = bs_imbalance_from_grains(self._GRAINS_UNBAL, np_plug, ["cm"])
+        # The plug forces imbalance to 0 even though Σ P&L (70) ≠ residual (100):
+        # this is exactly the behaviour the pl_sum mode + balance_check replaces.
+        assert bc["imbalance"]["cm"] == 0.0
+        assert bc["is_balanced"] is True
+
+    def test_edge_loss_negative_net_profit(self):
+        from app.services.fin_compat_bs import bs_imbalance_from_grains
+        bc = bs_imbalance_from_grains(self._GRAINS_UNBAL, {"cm": -50.0}, ["cm"])
+        assert bc["imbalance"]["cm"] == 150.0            # 100 − (−50)
+        assert bc["total_eq_liab"]["cm"] == 850.0        # 900 + (−50)
+
+    def test_edge_missing_key_and_empty_grains(self):
+        from app.services.fin_compat_bs import bs_current_year_result, bs_imbalance_from_grains
+        # missing 'cm' in the P&L dict → treated as 0.0, no KeyError
+        assert bs_current_year_result(self._GRAINS_UNBAL, {}, ["cm"], mode="pl_sum")["cm"] == 0.0
+        # empty ledger → everything 0, trivially balanced
+        bc = bs_imbalance_from_grains([], {}, ["cm"])
+        assert bc["total_assets"]["cm"] == 0.0
+        assert bc["imbalance"]["cm"] == 0.0
+        assert bc["is_balanced"] is True
+
+    def test_multi_column_keys(self):
+        from app.services.fin_compat_bs import bs_imbalance_from_grains
+        grains = [
+            {"level_1": "Assets", "cm": 1000.0, "fy": 900.0},
+            {"level_1": "Equity & liabilities", "cm": -800.0, "fy": -820.0},
+        ]
+        bc = bs_imbalance_from_grains(grains, {"cm": 150.0, "fy": 80.0}, ["cm", "fy"])
+        # all_bs_raw cm=200, fy=80 ; imbalance = all_bs_raw − NP
+        assert bc["imbalance"]["cm"] == 50.0             # 200 − 150
+        assert bc["imbalance"]["fy"] == 0.0              # 80 − 80
+        assert bc["is_balanced"] is False                # any column off → False
+
+    def test_default_mode_is_legacy_plug(self):
+        from app.services.fin_compat_bs import bs_current_year_result
+        # No mode passed → reads settings (default 'balancing_plug' → golden parity).
+        got = bs_current_year_result(self._GRAINS_UNBAL, {"cm": 70.0}, ["cm"])
+        assert got["cm"] == 100.0                        # the plug, not Σ P&L (70)
