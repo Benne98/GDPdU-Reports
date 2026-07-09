@@ -6343,9 +6343,6 @@ export const api = {
     // The rebuild endpoint requires an explicit confirm=true (422 otherwise).
     post(`/api/v1/projects/${id}/rebuild`, { confirm: true }),
 
-  fetchRetainedEarningsAccounts: (id = 'default'): Promise<RetainedEarningsAccountsResponse> =>
-    get(`/api/v1/projects/${id}/retained-earnings-accounts`),
-
   financialsAnomalyOverview: (): Promise<AnomalyOverviewResponse> =>
     get('/api/v1/financials/anomalies/overview', {}, { timeoutMs: 180_000 }),
 
@@ -7080,15 +7077,6 @@ export interface ProjectConfig {
    *  'library' (default) — fill gaps from the Finssentials library (most-frequent).
    *  'exclusive'         — leave unmatched accounts unmapped (no library fill). */
   account_mapping_mode?: AccountMappingMode
-  /** Year-end close: roll prior-year P&L result into retained earnings.
-   *  Only meaningful when opening_balance_mode = 'carry_forward'. */
-  retained_earnings_roll?: {
-    enabled: boolean
-    /** entity_prefix → chosen account_number_group (only user overrides; omit = auto-resolve). */
-    accounts: Record<string, string>
-    /** entity_prefix → opening retained earnings in stored sign (credit = NEGATIVE). */
-    opening: Record<string, number>
-  }
 }
 
 /** Backend GET /api/v1/projects/{id} returns the config NESTED under `config`,
@@ -7108,24 +7096,6 @@ export interface ProjectConfigResponse {
 export interface RebuildResponse {
   status:  string
   message: string
-}
-
-// ─── Retained-earnings roll types ─────────────────────────────────────────────
-
-export interface RetainedEarningsCandidate {
-  account_number_group: string
-  account_name: string
-}
-
-export interface RetainedEarningsEntity {
-  entity_prefix: string
-  entity_name: string
-  resolved_account: string | null
-  candidates: RetainedEarningsCandidate[]
-}
-
-export interface RetainedEarningsAccountsResponse {
-  entities: RetainedEarningsEntity[]
 }
 
 // ─── Admin types ──────────────────────────────────────────────────────────────
