@@ -4011,6 +4011,23 @@ function StepReview({
         if (!state.ob.mode) return 'Not yet configured'
         if (state.ob.mode === 'in_data') return 'Already included in GL data'
         const scope = state.ob.mode === 'file_first_year' ? 'first-year file' : 'all-years file'
+        // Mirror the commit dispatcher + Partner summary: for >1 entity the OB step
+        // defaults to per-entity, and that default may never have been persisted, so
+        // apply the `?? default` fallback and inspect the perEntity slots — otherwise
+        // per-entity uploads (state.ob.perEntity[code]) show as "no file staged yet".
+        const validEntities = state.entities.filter(e => e.code.trim())
+        const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
+        const entitySource = state.ob.entitySource ?? defaultEntitySource
+        if (entitySource === 'per_entity') {
+          const withFile = validEntities.filter(e => state.ob.perEntity?.[e.code]?.obFileId)
+          if (withFile.length === 0) return `Separate ${scope} (per-entity) — no files staged yet`
+          const mapped = withFile.filter(
+            e => state.ob.perEntity?.[e.code]?.obProfile?.account_col &&
+                 state.ob.perEntity?.[e.code]?.obProfile?.amount_col
+          ).length
+          const suffix = mapped < withFile.length ? ` (${withFile.length - mapped} mapping incomplete)` : ''
+          return `Separate ${scope} — ${withFile.length} ${withFile.length === 1 ? 'entity' : 'entities'} staged (per-entity)${suffix}`
+        }
         if (!state.ob.obFileId) return `Separate ${scope} — no file staged yet`
         const profile = state.ob.obProfile
         const cols = profile?.account_col && profile?.amount_col
@@ -5348,6 +5365,14 @@ export default function ProjectSetupWizard() {
     }
 
     // ---- Step 4: Opening balances commit ----
+    // For >1 entity the OB step DEFAULTS to per-entity, but the wizard only writes
+    // ob.entitySource when the user actively toggles the radio. Accepting the default
+    // leaves it undefined, so we must apply the same `?? default` fallback the Partner
+    // commit uses (see _defaultEntitySource below) — otherwise a per-entity OB upload
+    // falls into the combined branch, finds no ob.obFileId, and is silently SKIPPED.
+    const _obValidEntities = wizardEntities.filter(e => e.code.trim())
+    const _obDefaultSource: EntitySource = _obValidEntities.length > 1 ? 'per_entity' : 'combined'
+    const _obEntitySource = ob.entitySource ?? _obDefaultSource
     if (ob.mode === 'in_data') {
       patchStep('ob', {
         status: 'skipped',
@@ -5359,7 +5384,7 @@ export default function ProjectSetupWizard() {
         status: 'skipped',
         detail: 'No GL fiscal years configured — OB first-year commit requires at least one GL year; skipped',
       })
-    } else if (ob.entitySource === 'per_entity') {
+    } else if (_obEntitySource === 'per_entity') {
       // Per-entity mode: commit one file per entity
       const perObItems = wizardEntities
         .filter(e => e.code.trim())
