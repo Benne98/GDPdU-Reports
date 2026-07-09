@@ -4376,16 +4376,8 @@ function StepReview({
           </table>
         </div>
 
-        {/* Full rebuild always runs on Project Setup — no opt-out. */}
-        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
-          <p className="text-sm font-semibold text-slate-800">Full rebuild runs automatically</p>
-          <p className="text-xs text-slate-500 mt-0.5">
-            After all data is committed, a full rebuild of every derived table
-            (P&amp;L, BS, WC, CF, dimension tables) runs automatically so the reports always
-            reflect the complete dataset. Takes 1–3 minutes depending on data volume.
-          </p>
-        </div>
-
+        {/* A full rebuild always runs as the final commit step (see the sequence
+            below) — no separate opt-in/info box needed. */}
         <InfoBox>
           <strong>Collect-then-commit model:</strong> nothing has been written to the database yet.
           Clicking Run Setup will execute the sequence below in order. Each step is idempotent
