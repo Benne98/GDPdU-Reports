@@ -90,6 +90,11 @@ from etl.bs_pl_master import (
 )
 from etl.mapping_account import AccountMappingProfile, REQUIRED_FIELDS as _AM_REQUIRED, account_profile_from_dict, apply_account_mapping
 from app.services import structure_autoextend as _autoextend
+from etl.project_coa_override import (
+    DEFAULT_PROJECT_ID as _COA_DEFAULT_PROJECT_ID,
+    _override_table_exists,
+    capture_overrides_from_accounts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3133,6 +3138,186 @@ def mapping_apply_library(
         resolved_keys=len(rows),
         unresolved=unresolved,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Manual account mapping — assign a "gl_accounts_unmapped" account to a target
+# statement position and make it RELOAD-SAFE.
+# --------------------------------------------------------------------------- #
+# Sibling of apply-library: instead of resolving a class from the mapping
+# library, the user hand-picks a target statement position (a row_type='mapping'
+# row of dim_pl_structure / dim_bs_structure / dim_cf_structure). The chosen
+# level path is written into dim_gl_account (so the blocked commit can proceed)
+# AND upserted into dim_project_coa_override (so it replays on a full reload;
+# apply-library/mapping_editor do NOT persist there). See docs/architecture.md.
+
+
+class CandidatePositionsRequest(BaseModel):
+    project_id: str = _COA_DEFAULT_PROJECT_ID
+
+
+class CandidatePosition(BaseModel):
+    statement: Literal["PL", "BS", "CF"]
+    line_code: str
+    balance_title: str
+    level_2: str | None = None
+    level_3: str | None = None
+    level_4: str | None = None
+
+
+class CandidatePositionsResponse(BaseModel):
+    positions: list[CandidatePosition] = Field(default_factory=list)
+
+
+@router.post("/mapping/candidate-positions", response_model=CandidatePositionsResponse)
+def mapping_candidate_positions(
+    body: CandidatePositionsRequest,
+    session: Session = Depends(get_session),
+    _user: User = Depends(current_user),
+) -> CandidatePositionsResponse:
+    """Read-only: the assignable statement positions a user can map an unmapped GL
+    account onto.
+
+    For each statement (PL/BS/CF) returns the ``row_type='mapping'`` rows of its
+    presentation structure (dim_pl/bs/cf_structure). ``balance_title`` is the
+    human dropdown label; ``line_code`` + the level_2/3/4 path are what an
+    ``/assign`` call writes into dim_gl_account for the account. Degrades to an
+    empty list on a legacy DB whose split structure tables are absent
+    (load_structure_rows returns [] rather than raising).
+    """
+    positions: list[CandidatePosition] = []
+    for stmt in ("PL", "BS", "CF"):
+        for r in _autoextend.load_structure_rows(session, stmt):
+            if str(r.get("row_type") or "mapping") != "mapping":
+                continue
+            line_code = str(r.get("line_code") or "").strip()
+            title = str(r.get("balance_title") or "").strip()
+            if not line_code:
+                continue
+            positions.append(
+                CandidatePosition(
+                    statement=stmt,
+                    line_code=line_code,
+                    balance_title=title or line_code,
+                    level_2=r.get("level_2"),
+                    level_3=r.get("level_3"),
+                    level_4=r.get("level_4"),
+                )
+            )
+    return CandidatePositionsResponse(positions=positions)
+
+
+class AssignMappingItem(BaseModel):
+    account_number_group: str
+    gl_account_id: str
+    fiscal_year: int
+    account_name: str | None = None
+    level_0: str
+    level_1: str | None = None
+    level_2: str | None = None
+    level_3: str | None = None
+    level_4: str | None = None
+    l4_sub: str | None = None
+
+
+class AssignMappingRequest(BaseModel):
+    project_id: str = _COA_DEFAULT_PROJECT_ID
+    assignments: list[AssignMappingItem] = Field(..., min_length=1)
+
+
+class AssignMappingResponse(BaseModel):
+    inserted: int
+    overrides_written: int
+
+
+@router.post("/mapping/assign", response_model=AssignMappingResponse)
+def mapping_assign(
+    body: AssignMappingRequest,
+    session: Session = Depends(get_session),
+    _admin: User = Depends(require_admin),
+) -> AssignMappingResponse:
+    """Manually map GL accounts (from the ``gl_accounts_unmapped`` pre-flight) onto a
+    chosen target statement position, RELOAD-SAFE.
+
+    Writes each assignment into dim_gl_account via the shared mapping writer
+    (idempotent ON CONFLICT, exactly like apply-library) AND upserts the same
+    level path into dim_project_coa_override so the manual mapping is replayed
+    onto dim_gl_account at the start of every full reload (otherwise a reload
+    would re-derive dim_gl_account from the upload and drop the edit).
+
+    Admin-gated and entity-visibility fail-closed. One commit at the end; on any
+    error the whole transaction is rolled back.
+    """
+    # Fail-closed entity-visibility guard BEFORE any write (mirrors apply-library).
+    prefixes = sorted({a.account_number_group[:2] for a in body.assignments})
+    _assert_prefixes_visible(session, _admin, prefixes)
+
+    rows: list[dict] = []
+    override_accounts: list[dict] = []
+    for a in body.assignments:
+        rows.append(
+            {
+                "account_number_group": a.account_number_group,
+                "fiscal_year": int(a.fiscal_year),
+                "gl_account_id": a.gl_account_id,
+                "account_name": a.account_name,
+                "level_0": a.level_0,
+                "level_1": a.level_1,
+                "level_2": a.level_2,
+                "level_3": a.level_3,
+                "level_4": a.level_4,
+                "l4_sub": a.l4_sub,
+                "level_2_sort": None,
+                "level_3_sort": None,
+                "is_ic": False,
+                "source_system": "manual",
+            }
+        )
+        override_accounts.append(
+            {
+                "account_number_group": a.account_number_group,
+                "fiscal_year": int(a.fiscal_year),
+                "level_0": a.level_0,
+                "level_1": a.level_1,
+                "level_2": a.level_2,
+                "level_3": a.level_3,
+                "level_4": a.level_4,
+                "l4_sub": a.l4_sub,
+            }
+        )
+
+    try:
+        counts = load_account_mapping(session, pd.DataFrame(rows), auto_commit=False)
+        # RELOAD-SAFE persistence. Guarded so a legacy DB without the override
+        # table degrades to a no-op (like replay_project_overrides) instead of a
+        # 500 — production has the table (migration 0009) so overrides ARE written.
+        if _override_table_exists(session):
+            overrides_written = capture_overrides_from_accounts(
+                session, override_accounts, project_id=body.project_id
+            )
+        else:
+            overrides_written = 0
+            logger.warning("mapping_assign: override table absent; mappings NOT reload-safe")
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error(
+            "mapping_assign failed: %s (pgcode=%s)",
+            type(exc).__name__,
+            getattr(getattr(exc, "orig", None), "pgcode", None),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Assigning the mapping failed; transaction rolled back. Check server logs.",
+        ) from exc
+
+    inserted = counts["accounts"]
+    logger.info(
+        "mapping_assign: %d account(s) written, %d override(s) upserted",
+        inserted,
+        overrides_written,
+    )
+    return AssignMappingResponse(inserted=inserted, overrides_written=overrides_written)
 
 
 # --------------------------------------------------------------------------- #
