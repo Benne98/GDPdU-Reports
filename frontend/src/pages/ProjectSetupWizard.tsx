@@ -370,6 +370,10 @@ export interface WizardState {
   anlagen: WizardAnlagenState
   /** DRAFT provisioning state for OPOS (open-items lists). */
   opos: WizardOposState
+  /** Year-end close: carry the prior-year net profit forward into retained earnings.
+   *  A simple on/off toggle (default off); the target account auto-resolves and the
+   *  opening balances come from the OB data. */
+  netProfitRoll: boolean
 }
 
 function defaultState(): WizardState {
@@ -411,6 +415,7 @@ function defaultState(): WizardState {
       debitor:  { viewMode: 'combined', uploads: [], columnMap: {} },
       kreditor: { viewMode: 'combined', uploads: [], columnMap: {} },
     },
+    netProfitRoll: false,
   }
 }
 
@@ -466,6 +471,7 @@ type WizardAction =
   | { type: 'PATCH_ANLAGEN'; patch: Partial<WizardAnlagenState> }
   | { type: 'PATCH_OPOS'; patch: Partial<WizardOposState> }
   | { type: 'TOGGLE_DATASET'; dataset: 'fte' | 'anlagen' | 'opos'; value: boolean }
+  | { type: 'SET_NET_PROFIT_ROLL'; value: boolean }
   | { type: 'PREFILL'; partial: Partial<WizardState> }
 
 export function wizardReducer(state: WizardState, action: WizardAction): WizardState {
@@ -652,6 +658,7 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
         opos: nextOpos,
       }
     }
+    case 'SET_NET_PROFIT_ROLL': return { ...state, netProfitRoll: action.value }
     case 'PREFILL':          return { ...state, ...action.partial }
     default:                 return state
   }
@@ -1866,10 +1873,12 @@ function StepOpeningBalances({
   ob,
   dispatch,
   entities,
+  netProfitRoll,
 }: {
   ob: WizardObState
   dispatch: Dispatch<WizardAction>
   entities: WizardState['entities']
+  netProfitRoll: boolean
 }) {
   const validEntities = entities.filter(e => e.code.trim())
   const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
@@ -2511,6 +2520,31 @@ function StepOpeningBalances({
             using the entry type mapping from your column profile (e.g. rows where Source Type
             or Posting Type indicates an opening balance entry).
           </InfoBox>
+        )}
+
+        {/* Net-profit carry-forward toggle — only meaningful when opening balances
+            are first-year-only (carry_forward), which is where the prior-year result
+            would otherwise not roll into retained earnings. */}
+        {mode === 'file_first_year' && (
+          <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white px-4 py-3 hover:bg-slate-50 transition">
+            <input
+              type="checkbox"
+              checked={netProfitRoll}
+              onChange={e => dispatch({ type: 'SET_NET_PROFIT_ROLL', value: e.target.checked })}
+              className="mt-0.5 accent-blue-600 h-4 w-4"
+            />
+            <div>
+              <p className="text-sm font-semibold text-slate-800">
+                Carry net profit forward into retained earnings (year-end close)
+              </p>
+              <p className="text-xs text-slate-500 mt-0.5">
+                With first-year-only opening balances, each year&apos;s result is not automatically
+                rolled into the retained-earnings account. Enable this to book the prior-year P&amp;L
+                result into retained earnings every year, so the balance sheet does not drift year
+                over year. The target account is resolved automatically.
+              </p>
+            </div>
+          </label>
         )}
 
       </div>
@@ -4968,6 +5002,7 @@ export default function ProjectSetupWizard() {
               Array.isArray(cfg.entities) && cfg.entities.length > 0
                 ? cfg.entities
                 : [{ code: '', prefix: '', name: '' }],
+            netProfitRoll: cfg.retained_earnings_roll?.enabled ?? false,
           },
         })
       })
@@ -5178,7 +5213,7 @@ export default function ProjectSetupWizard() {
       s.id === 'rebuild' ? { ...s, status: runRebuild ? 'pending' : 'skipped', detail: runRebuild ? undefined : 'Rebuild checkbox not selected' } : s
     ))
 
-    const { gl, coa, ob, partner, fte, projectName, fyEndMonth, entities: wizardEntities } = state
+    const { gl, coa, ob, partner, fte, netProfitRoll, projectName, fyEndMonth, entities: wizardEntities } = state
     const fyStart = fyStartFromEndMonth(fyEndMonth)
 
     // ---- Helper: run one async step, mark done/failed, return false on failure ----
@@ -5350,6 +5385,10 @@ export default function ProjectSetupWizard() {
         sales_label: 'Sales',
         cost_label: 'Cost of materials',
         account_mapping_mode: coa.accountMappingMode,
+        // Year-end close net-profit roll: a simple on/off. The target account
+        // auto-resolves and opening balances come from the OB data, so accounts /
+        // opening are left empty.
+        retained_earnings_roll: { enabled: netProfitRoll, accounts: {}, opening: {} },
       }),
       () => `Project "${projectName}" saved (fy_start_month=${fyStart}, account_mapping_mode=${coa.accountMappingMode})`,
     )
@@ -5957,7 +5996,7 @@ export default function ProjectSetupWizard() {
               entities={state.entities}
             />
           )}
-          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} />}
+          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} netProfitRoll={state.netProfitRoll} />}
           {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} entities={state.entities} />}
           {step === 6 && (
             <StepAdditionalInformation

@@ -7077,6 +7077,16 @@ export interface ProjectConfig {
    *  'library' (default) — fill gaps from the Finssentials library (most-frequent).
    *  'exclusive'         — leave unmatched accounts unmapped (no library fill). */
   account_mapping_mode?: AccountMappingMode
+  /** Year-end close: carry the prior-year P&L result forward into retained earnings
+   *  (Gewinnvortrag) each year. Removes the year-over-year imbalance growth that a
+   *  first-year-only opening balance (carry_forward) otherwise produces. The target
+   *  account is auto-resolved; opening balances come from the OB data, so the wizard
+   *  only sets `enabled` (accounts/opening left empty). */
+  retained_earnings_roll?: {
+    enabled: boolean
+    accounts: Record<string, string>
+    opening: Record<string, number>
+  }
 }
 
 /** Backend GET /api/v1/projects/{id} returns the config NESTED under `config`,
