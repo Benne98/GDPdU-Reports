@@ -6340,7 +6340,8 @@ export const api = {
     put(`/api/v1/projects/${id}`, config),
 
   rebuildProject: (id = 'default'): Promise<RebuildResponse> =>
-    post(`/api/v1/projects/${id}/rebuild`, {}),
+    // The rebuild endpoint requires an explicit confirm=true (422 otherwise).
+    post(`/api/v1/projects/${id}/rebuild`, { confirm: true }),
 
   fetchRetainedEarningsAccounts: (id = 'default'): Promise<RetainedEarningsAccountsResponse> =>
     get(`/api/v1/projects/${id}/retained-earnings-accounts`),
