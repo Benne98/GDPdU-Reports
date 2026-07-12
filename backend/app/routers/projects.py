@@ -110,6 +110,52 @@ class RetainedEarningsAccountsResponse(BaseModel):
     entities: list[ReAccountEntity] = Field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- #
+# Setup status — what has already been committed, for a re-entrant wizard
+# --------------------------------------------------------------------------- #
+class GlEntityStatus(BaseModel):
+    prefix: str
+    name: str
+    fiscal_years: list[int] = Field(default_factory=list)
+    rows: int = 0
+
+
+class GlStatus(BaseModel):
+    loaded: bool = False
+    entities: list[GlEntityStatus] = Field(default_factory=list)
+    total_rows: int = 0
+
+
+class CoaStatus(BaseModel):
+    loaded: bool = False
+    #: distinct classified accounts (dim_gl_account rows with a statement level_0).
+    mapped_accounts: int = 0
+    entities: int = 0
+
+
+class ObStatus(BaseModel):
+    loaded: bool = False
+    #: distinct (entity, account, year) opening-balance rows.
+    rows: int = 0
+    entities: int = 0
+
+
+class PartnerStatus(BaseModel):
+    customers: int = 0
+    suppliers: int = 0
+
+
+class SetupStatusResponse(BaseModel):
+    """What is already committed for a project — drives the wizard's
+    'already loaded' badges so a user can re-open Setup, see their data, and
+    add more (e.g. partner master) without re-uploading everything."""
+
+    gl: GlStatus = Field(default_factory=GlStatus)
+    coa: CoaStatus = Field(default_factory=CoaStatus)
+    opening_balances: ObStatus = Field(default_factory=ObStatus)
+    partners: PartnerStatus = Field(default_factory=PartnerStatus)
+
+
 class ProjectConfig(BaseModel):
     """Wizard answers persisted per project (mirrors etl.project_config.DEFAULT_CONFIG)."""
 
@@ -522,6 +568,93 @@ def get_retained_earnings_accounts(
         for ep in sorted(by_ent)
     ]
     return RetainedEarningsAccountsResponse(entities=entities)
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/v1/projects/{project_id}/setup-status
+# --------------------------------------------------------------------------- #
+@router.get("/{project_id}/setup-status", response_model=SetupStatusResponse)
+def get_setup_status(
+    project_id: str,
+    _user: _UserDep,
+    session: _SessionDep,
+) -> SetupStatusResponse:
+    """Report what has already been committed, so the wizard can prefill and show
+    'already loaded' badges. Read-only; each probe degrades to empty on a missing
+    table (partial schema) rather than failing the whole response."""
+
+    def _scalar(sql: str, default=0):
+        try:
+            v = session.execute(text(sql)).scalar()
+            return v if v is not None else default
+        except Exception:  # noqa: BLE001 — missing table / partial schema → empty
+            return default
+
+    # ---- GL: per-entity fiscal years + rows (name from dim_legal_entity) ----
+    gl = GlStatus()
+    try:
+        names = {
+            str(r[0]): (str(r[1]) if r[1] is not None else str(r[0]))
+            for r in session.execute(
+                text("SELECT entity_prefix, entity_name FROM dim_legal_entity")
+            ).fetchall()
+        }
+        rows = session.execute(text(
+            "SELECT entity_prefix, fiscal_year, COUNT(*) "
+            "FROM fact_gl_line "
+            "WHERE entity_prefix IS NOT NULL "
+            "GROUP BY entity_prefix, fiscal_year "
+            "ORDER BY entity_prefix, fiscal_year"
+        )).fetchall()
+        by_pfx: dict[str, GlEntityStatus] = {}
+        for pfx, fy, n in rows:
+            pfx = str(pfx)
+            es = by_pfx.setdefault(pfx, GlEntityStatus(prefix=pfx, name=names.get(pfx, pfx)))
+            if fy is not None:
+                es.fiscal_years.append(int(fy))
+            es.rows += int(n or 0)
+            gl.total_rows += int(n or 0)
+        gl.entities = [by_pfx[p] for p in sorted(by_pfx)]
+        gl.loaded = gl.total_rows > 0
+    except Exception:  # noqa: BLE001
+        gl = GlStatus()
+
+    # ---- CoA: classified accounts (have a statement level_0) ----
+    coa = CoaStatus(
+        mapped_accounts=int(_scalar(
+            "SELECT COUNT(DISTINCT account_number_group) FROM dim_gl_account "
+            "WHERE level_0 IS NOT NULL AND level_0 <> ''"
+        )),
+        entities=int(_scalar(
+            "SELECT COUNT(DISTINCT entity_prefix) FROM dim_gl_account"
+        )),
+    )
+    coa.loaded = coa.mapped_accounts > 0
+
+    # ---- Opening balances: opening_balance-tagged fact rows ----
+    ob = ObStatus(
+        rows=int(_scalar(
+            "SELECT COUNT(*) FROM fact_gl_line f "
+            "JOIN fact_gl_entry e ON e.journal_entry_group_number = f.journal_entry_group_number "
+            "AND e.fiscal_year = f.fiscal_year "
+            "WHERE e.entry_type = 'opening_balance'"
+        )),
+        entities=int(_scalar(
+            "SELECT COUNT(DISTINCT f.entity_prefix) FROM fact_gl_line f "
+            "JOIN fact_gl_entry e ON e.journal_entry_group_number = f.journal_entry_group_number "
+            "AND e.fiscal_year = f.fiscal_year "
+            "WHERE e.entry_type = 'opening_balance'"
+        )),
+    )
+    ob.loaded = ob.rows > 0
+
+    # ---- Partner master ----
+    partners = PartnerStatus(
+        customers=int(_scalar("SELECT COUNT(*) FROM dim_customer")),
+        suppliers=int(_scalar("SELECT COUNT(*) FROM dim_supplier")),
+    )
+
+    return SetupStatusResponse(gl=gl, coa=coa, opening_balances=ob, partners=partners)
 
 
 # --------------------------------------------------------------------------- #
