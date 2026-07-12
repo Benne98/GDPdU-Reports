@@ -7066,6 +7066,47 @@ export type PartnerMasterSource = 'files' | 'gdpdu'
 
 export type AccountMappingMode = 'library' | 'exclusive'
 
+// ── GL setup blob — compact config persisted for re-entrant wizard restore ────
+
+/** Per-entity slice of the persisted GL setup blob. */
+export interface GlSetupEntityBlob {
+  entityCode:        string
+  entityLabel?:      string
+  formatGroupId?:    string
+  /** Column mapping profile — opaque to api.ts; cast to Profile in the wizard. */
+  assembledProfile?: Record<string, unknown>
+  validationOk?:     boolean
+  entityAssignments?: Record<string, string>
+  headerOverride?:   'auto' | 'yes' | 'no'
+}
+
+/** Per-format-group slice of the persisted GL setup blob. */
+export interface GlSetupFormatGroupBlob {
+  id:                   string
+  label:                string
+  representativeIndex:  number
+  columnCount:          number
+  headers:              string[]
+  headersConfirmed:     boolean
+  mapping:              Record<string, string>
+  partnerColumnsMode:   string
+  partnerColumnsSplit?: Record<string, string>
+  /** Transform options (sign/decimal/date/linking) — opaque to api.ts. */
+  opts:                 Record<string, unknown>
+  memberIndices:        number[]
+}
+
+/**
+ * Compact GL wizard config persisted after the first Finish commit.
+ * Stored verbatim in admin_project_config.gl_setup (JSONB).
+ * The wizard restores WizardGlState from this when setupStatus.gl.loaded is true.
+ */
+export interface GlSetupBlob {
+  years:        number[]
+  entities:     GlSetupEntityBlob[]
+  formatGroups: GlSetupFormatGroupBlob[]
+}
+
 export interface ProjectConfig {
   name:                  string
   fy_start_month:        number
@@ -7090,6 +7131,14 @@ export interface ProjectConfig {
     accounts: Record<string, string>
     opening: Record<string, number>
   }
+  /**
+   * Compact GL wizard config persisted after Finish for re-entrant restore.
+   * Absent until the wizard has completed at least one Finish commit.
+   * When present and setupStatus.gl.loaded is true, the wizard reconstructs
+   * the full GL step UI (year picker, format groups, column mappings, options)
+   * from this blob instead of showing an empty collect step.
+   */
+  gl_setup?: GlSetupBlob
 }
 
 /** Backend GET /api/v1/projects/{id} returns the config NESTED under `config`,

@@ -32,7 +32,7 @@
 
 import { type Dispatch, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import PartnerMasterEditor from '../components/masters/PartnerMasterEditor'
-import { api, type ProjectConfigResponse, type AccountMappingMode, type SetupStatus } from '../lib/api'
+import { api, type ProjectConfigResponse, type AccountMappingMode, type SetupStatus, type GlSetupBlob } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Stepper, StepCard, NavButtons } from '../components/ingest/IngestStepCard'
 import EntitySourceSelector, { type EntitySource } from '../components/ingest/EntitySourceSelector'
@@ -5087,6 +5087,99 @@ function LoadingScreen() {
 }
 
 // ---------------------------------------------------------------------------
+// GL setup persistence helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Serialise the current GL wizard state into a compact blob for persistence in
+ * admin_project_config.gl_setup.  Called at Finish commit time (Step 1 PUT).
+ * yearFiles are ephemeral (uploaded files), so only the configuration is saved:
+ * fiscal years, format groups (headers/mapping/opts), and per-entity profile.
+ */
+function buildGlSetupBlob(gl: WizardGlState): GlSetupBlob {
+  return {
+    years: gl.years,
+    entities: gl.entities.map(e => ({
+      entityCode:        e.entityCode,
+      entityLabel:       e.entityLabel,
+      formatGroupId:     e.formatGroupId,
+      assembledProfile:  e.assembledProfile as Record<string, unknown> | undefined,
+      validationOk:      e.validationOk,
+      entityAssignments: e.entityAssignments,
+      headerOverride:    e.headerOverride,
+    })),
+    formatGroups: gl.formatGroups.map(g => ({
+      id:                  g.id,
+      label:               g.label,
+      representativeIndex: g.representativeIndex,
+      columnCount:         g.columnCount,
+      headers:             g.headers,
+      headersConfirmed:    g.headersConfirmed,
+      mapping:             g.mapping,
+      partnerColumnsMode:  g.partnerColumnsMode,
+      partnerColumnsSplit: g.partnerColumnsSplit as Record<string, string> | undefined,
+      opts:                g.opts as unknown as Record<string, unknown>,
+      memberIndices:       g.memberIndices,
+    })),
+  }
+}
+
+/**
+ * Reconstruct a WizardGlState from a persisted GlSetupBlob.
+ *
+ * Each entity receives a sentinel combinedFileId (`committed:<code>`) so that
+ * the derived glSubPhase evaluates to 'configure' rather than 'collect' — the
+ * UI renders the full format-group + mapping view instead of the upload step.
+ *
+ * combinedColumns is populated from the entity's format group headers so that
+ * GlGroupConfigPanel can display the column mapping without needing the original
+ * uploaded file.  yearFiles are left empty (the raw bytes are gone; the committed
+ * data is in the DB).  validationOk defaults to true so the Next gate passes.
+ */
+function restoreGlStateFromBlob(blob: GlSetupBlob, _status: SetupStatus): WizardGlState {
+  const groupById = new Map(blob.formatGroups.map(g => [g.id, g]))
+
+  const entities: GlEntityState[] = blob.entities.map(e => {
+    const grp = e.formatGroupId ? groupById.get(e.formatGroupId) : undefined
+    // Use the group's confirmed headers as the stand-in for combinedColumns so
+    // GlGroupConfigPanel can derive sourceColumns for the mapping display.
+    const combinedColumns = grp ? [...grp.headers] : undefined
+
+    return {
+      ...defaultGlEntityState(),
+      entityCode:        e.entityCode,
+      entityLabel:       e.entityLabel,
+      yearFiles:         {},   // ephemeral — files already committed to DB
+      // Sentinel: truthy → allCombined = true → glSubPhase = 'configure'
+      combinedFileId:    `committed:${e.entityCode || 'entity'}`,
+      combinedColumns,
+      formatGroupId:     e.formatGroupId,
+      assembledProfile:  e.assembledProfile as Profile | undefined,
+      validationOk:      e.validationOk ?? true,
+      entityAssignments: e.entityAssignments,
+      headerOverride:    e.headerOverride,
+      headersConfirmed:  true,
+    }
+  })
+
+  const formatGroups: GlFormatGroup[] = blob.formatGroups.map(g => ({
+    id:                  g.id,
+    label:               g.label,
+    representativeIndex: g.representativeIndex,
+    columnCount:         g.columnCount,
+    headers:             g.headers,
+    headersConfirmed:    g.headersConfirmed,
+    mapping:             g.mapping,
+    partnerColumnsMode:  g.partnerColumnsMode as PartnerColumnsMode,
+    partnerColumnsSplit: g.partnerColumnsSplit as PartnerColumnsSplit | undefined,
+    opts:                g.opts as unknown as OptionsState,
+    memberIndices:       g.memberIndices,
+  }))
+
+  return { years: blob.years, entities, formatGroups }
+}
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -5099,6 +5192,18 @@ export default function ProjectSetupWizard() {
   const [dataResetAllowed, setDataResetAllowed] = useState(false)
   /** Null until the setup-status endpoint responds. Used for "already loaded" badges. */
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null)
+  /**
+   * Holds the gl_setup blob from getProject until fetchSetupStatus resolves.
+   * The two mount effects race; whichever completes second triggers the GL restore
+   * by checking the other's ref.  Cleared after restore to prevent double-dispatch.
+   */
+  const pendingGlSetupRef = useRef<GlSetupBlob | null>(null)
+  /**
+   * Mirror of setupStatus as a ref so the getProject callback can read it
+   * synchronously even when the fetchSetupStatus callback ran first and
+   * setSetupStatus hasn't re-rendered yet.
+   */
+  const setupStatusRef = useRef<SetupStatus | null>(null)
   /** True once the Statement Structure step has resolved (auto-pass or explicit apply). */
   const [structureResolved, setStructureResolved] = useState(false)
 
@@ -5159,6 +5264,21 @@ export default function ProjectSetupWizard() {
             },
           },
         })
+
+        // GL re-entrant restore: if a gl_setup blob was persisted, schedule
+        // restoration.  Two effects race; whichever completes second wins.
+        //   • fetchSetupStatus ran first → setupStatusRef.current is set → restore now.
+        //   • fetchSetupStatus runs later → store blob in ref; that effect restores.
+        if (cfg.gl_setup && typeof cfg.gl_setup === 'object') {
+          const blob = cfg.gl_setup as GlSetupBlob
+          if (setupStatusRef.current?.gl.loaded) {
+            // fetchSetupStatus already resolved — restore immediately
+            dispatch({ type: 'PREFILL', partial: { gl: restoreGlStateFromBlob(blob, setupStatusRef.current) } })
+          } else {
+            // fetchSetupStatus not yet resolved — park blob for it to pick up
+            pendingGlSetupRef.current = blob
+          }
+        }
       })
       .catch(() => {
         // Backend not yet live or 404 — start with defaults, no error shown
@@ -5174,12 +5294,26 @@ export default function ProjectSetupWizard() {
 
   // ---------------------------------------------------------------------------
   // Fetch setup-status on mount — drives "already loaded" badges on each step.
+  // Also triggers GL state restoration when a gl_setup blob is available
+  // (either already parked in pendingGlSetupRef by the getProject effect, or
+  // by being the slower of the two effects so getProject ran first).
   // Defensive: any error leaves setupStatus null so the wizard is never blocked.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false
     api.fetchSetupStatus(PROJECT_ID).then(s => {
-      if (!cancelled) setSetupStatus(s)
+      if (cancelled) return
+      // Always update the ref synchronously before the state update so the
+      // getProject callback can read setupStatusRef.current even before a re-render.
+      setupStatusRef.current = s
+      setSetupStatus(s)
+
+      // GL re-entrant restore: if getProject already parked a blob, restore now.
+      if (s.gl.loaded && pendingGlSetupRef.current) {
+        const blob = pendingGlSetupRef.current
+        pendingGlSetupRef.current = null   // consume — prevent double dispatch
+        dispatch({ type: 'PREFILL', partial: { gl: restoreGlStateFromBlob(blob, s) } })
+      }
     }).catch(() => {
       // No-op: badges are informational; absence is safe.
     })
@@ -5220,6 +5354,35 @@ export default function ProjectSetupWizard() {
     state.gl.entities.every(e =>
       state.gl.years.some(y => e.yearFiles[y] !== undefined)
     )
+
+  // ---------------------------------------------------------------------------
+  // GL re-entrant pass-through gate
+  // Three footer cases for step 2 collect phase:
+  //   (a) Fresh setup OR re-open with new files staged   → "Combine files & continue"
+  //   (b) Re-open, nothing new staged (pass-through)     → plain "Next", advance step
+  //   (c) Re-open, user uploads new files after re-open  → back to (a)
+  // ---------------------------------------------------------------------------
+
+  /** True when the backend confirms GL data is already committed to the DB. */
+  const glAlreadyLoaded = setupStatus?.gl.loaded === true
+
+  /**
+   * True when the user has uploaded at least one new year-file this session.
+   * yearFiles entries with sentinel combinedFileId (restored state) have empty
+   * yearFiles {}, so this stays false until the user actually picks a file.
+   */
+  const hasNewStagedGlFiles = state.gl.entities.some(e =>
+    Object.values(e.yearFiles).some(yf => yf !== undefined)
+  )
+
+  /**
+   * True when we are in collect phase, the GL data is already committed, and the
+   * user has not staged any new files — this is a review/pass-through re-open.
+   * In this state the footer should show a plain "Next" that advances the step
+   * instead of "Combine files & continue" which would attempt a batch combine.
+   */
+  const glCollectIsPassThrough =
+    step === 2 && glSubPhase === 'collect' && glAlreadyLoaded && !hasNewStagedGlFiles
 
   // ---------------------------------------------------------------------------
   // Batch combine state — driven from the footer Next button in collect phase
@@ -5314,12 +5477,16 @@ export default function ProjectSetupWizard() {
     if (step === 1) return state.fyEndMonth < 1 || state.fyEndMonth > 12
     // Step 2 (GL): sub-phase-aware gate.
     if (step === 2) {
+      // Pass-through: GL already committed, no new files staged → always allow Next.
+      // This covers both the normal restored case (glSubPhase='configure') and the
+      // fallback where gl_setup was absent so glSubPhase='collect' (no entities ready).
+      if (glCollectIsPassThrough) return false
       if (state.gl.years.length === 0) return true
       // collect — Next triggers batch combine; enabled once every entity has all year-slots filled
       if (glSubPhase === 'collect') return !allEntitiesReadyToCombine || batchCombining
       // assign — user must complete GlFormatAssignmentStep before advancing
       if (glSubPhase === 'assign') return true
-      // configure — all entities must pass validation
+      // configure — all entities must pass validation (undefined = never validated; true/false ok)
       return state.gl.entities.some(e => e.validationOk === undefined)
     }
     // Step 3 (CoA): blocked only for multi-entity projects that haven't confirmed
@@ -5557,6 +5724,12 @@ export default function ProjectSetupWizard() {
         // auto-resolves and opening balances come from the OB data, so accounts /
         // opening are left empty.
         retained_earnings_roll: { enabled: netProfitRoll, accounts: {}, opening: {} },
+        // Persist the GL wizard configuration so the step can be pre-populated on
+        // re-open (year picker, format groups, column mappings, transform options).
+        // Only meaningful when GL entities are configured; an empty WizardGlState
+        // (fresh first run with no entities) persists an empty blob — that's fine,
+        // the restore path guards on setupStatus.gl.loaded being true.
+        gl_setup: buildGlSetupBlob(gl),
       }),
       () => `Project "${projectName}" saved (fy_start_month=${fyStart}, account_mapping_mode=${coa.accountMappingMode})`,
     )
@@ -6227,19 +6400,23 @@ export default function ProjectSetupWizard() {
               setStep(s => Math.max(0, s - 1))
             }}
             onNext={() => {
-              // GL collect phase: Next triggers batch combine instead of advancing the step.
-              // The phase transition (collect → assign/configure) happens automatically via
-              // derived glSubPhase once entities get their combinedFileId set.
+              // GL collect phase: behaviour depends on whether data is already committed.
+              //   (b) pass-through re-open (already loaded, nothing new staged) → advance
+              //   (a)/(c) fresh setup or new files staged → batch combine
               if (step === 2 && glSubPhase === 'collect') {
+                if (glCollectIsPassThrough) {
+                  setStep(s => Math.min(totalSteps - 1, s + 1))
+                  return
+                }
                 void batchCombineGlEntities()
                 return
               }
               setStep(s => Math.min(totalSteps - 1, s + 1))
             }}
             nextDisabled={isNextDisabled()}
-            nextLoading={step === 2 && glSubPhase === 'collect' && batchCombining}
+            nextLoading={step === 2 && glSubPhase === 'collect' && !glCollectIsPassThrough && batchCombining}
             nextLabel={
-              step === 2 && glSubPhase === 'collect'
+              step === 2 && glSubPhase === 'collect' && !glCollectIsPassThrough
                 ? 'Combine files & continue'
                 : step === 2 && glSubPhase === 'assign'
                 ? 'Complete format assignment above'

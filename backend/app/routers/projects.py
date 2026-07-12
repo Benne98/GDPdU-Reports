@@ -171,6 +171,10 @@ class ProjectConfig(BaseModel):
     retained_earnings_roll: RetainedEarningsRollConfig = Field(
         default_factory=RetainedEarningsRollConfig
     )
+    #: Opaque GL wizard config blob (years, format groups, per-entity mapping) persisted
+    #: after the wizard Finish commit for re-entrant wizard restore.  The backend stores
+    #: this as-is; the frontend uses it to pre-populate the GL step on re-open.
+    gl_setup: Optional[Any] = Field(None)
 
 
 class ProjectResponse(BaseModel):
@@ -196,6 +200,8 @@ class ProjectPutRequest(BaseModel):
     cost_label: Optional[str] = None
     account_mapping_mode: Optional[str] = None
     retained_earnings_roll: Optional[RetainedEarningsRollConfig] = None
+    #: Opaque GL setup blob — stored as-is; see ProjectConfig.gl_setup.
+    gl_setup: Optional[Any] = None
 
 
 class RebuildRequest(BaseModel):
@@ -431,6 +437,9 @@ def _validated_config_from_put(body: ProjectPutRequest) -> dict[str, Any]:
         # Pydantic already coerced enabled:bool / accounts:{str:str} / opening:
         # {str:float}; the ETL resolver re-sanitises defensively at rebuild time.
         cfg["retained_earnings_roll"] = body.retained_earnings_roll.model_dump()
+    if body.gl_setup is not None:
+        # Opaque blob — stored verbatim; the backend never inspects the internals.
+        cfg["gl_setup"] = body.gl_setup
     return cfg
 
 

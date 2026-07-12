@@ -79,6 +79,8 @@ class TestGetProject:
             "net_profit_source", "mapping_source", "partner_master_source",
             "sales_label", "cost_label", "account_mapping_mode",
             "retained_earnings_roll",
+            # gl_setup: compact GL wizard config for re-entrant wizard restore.
+            "gl_setup",
         }
         # OPTIONAL retained-earnings roll ships OFF by default (golden parity).
         assert cfg["retained_earnings_roll"] == {

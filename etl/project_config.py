@@ -69,6 +69,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "accounts": {},
         "opening": {},
     },
+    # Compact GL wizard config persisted after Finish for re-entrant wizard restore.
+    # Absent until the wizard completes its first Finish commit.  The frontend uses
+    # this to pre-populate year picker, format groups, column mappings, and options
+    # on re-open so the user sees the same configured view rather than an empty
+    # collect step.  Stored as opaque JSON; the backend never reads the internals.
+    "gl_setup": None,
 }
 
 #: Config keys persisted (anything else in a PUT body is ignored).
