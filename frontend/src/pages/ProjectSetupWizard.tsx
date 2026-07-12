@@ -32,7 +32,7 @@
 
 import { type Dispatch, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import PartnerMasterEditor from '../components/masters/PartnerMasterEditor'
-import { api, type ProjectConfigResponse, type AccountMappingMode } from '../lib/api'
+import { api, type ProjectConfigResponse, type AccountMappingMode, type SetupStatus } from '../lib/api'
 import { useAuth } from '../context/AuthContext'
 import { Stepper, StepCard, NavButtons } from '../components/ingest/IngestStepCard'
 import EntitySourceSelector, { type EntitySource } from '../components/ingest/EntitySourceSelector'
@@ -940,6 +940,7 @@ function StepGlBookings({
   dispatch,
   batchCombining,
   batchCombineErrors,
+  setupStatus,
 }: {
   gl: WizardGlState
   fyEndMonth: number
@@ -948,6 +949,7 @@ function StepGlBookings({
   batchCombining: boolean
   /** Per-entity errors from the last batchCombineGlEntities call. */
   batchCombineErrors: Array<{ index: number; entityCode: string; error: string }>
+  setupStatus?: SetupStatus | null
 }) {
   function toggleYear(y: number) {
     const next = gl.years.includes(y)
@@ -1080,6 +1082,39 @@ function StepGlBookings({
           </p>
         )}
       </div>
+
+      {/* ── Already-loaded badge ── */}
+      {setupStatus?.gl.loaded && (() => {
+        const allFy = setupStatus.gl.entities.flatMap(e => e.fiscal_years)
+        const minFy = allFy.length > 0 ? Math.min(...allFy) : null
+        const maxFy = allFy.length > 0 ? Math.max(...allFy) : null
+        const fyRange = minFy !== null && maxFy !== null
+          ? (minFy === maxFy ? `FY${minFy}` : `FY${minFy}–${maxFy}`)
+          : '—'
+        const n = setupStatus.gl.entities.length
+        return (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            <p className="font-semibold">
+              Already loaded — {n} {n === 1 ? 'entity' : 'entities'}, {fyRange},{' '}
+              {setupStatus.gl.total_rows.toLocaleString()} rows
+            </p>
+            {setupStatus.gl.entities.length > 0 && (
+              <ul className="mt-1.5 space-y-0.5 text-xs text-emerald-700">
+                {setupStatus.gl.entities.map(e => (
+                  <li key={e.prefix}>
+                    <span className="font-mono">{e.prefix}</span>
+                    {e.name ? ` (${e.name})` : ''}: FY {e.fiscal_years.join(', ')},{' '}
+                    {e.rows.toLocaleString()} rows
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-1.5 text-xs text-emerald-700">
+              Re-upload only to replace the existing data. Steps with no new file are skipped at Finish.
+            </p>
+          </div>
+        )
+      })()}
 
       {/* ── COLLECT phase: year picker + entity upload cards ── */}
       {(glSubPhase === 'collect' || glSubPhase === 'configure') && (
@@ -1628,11 +1663,13 @@ function StepChartOfAccounts({
   gl,
   dispatch,
   entities,
+  setupStatus,
 }: {
   coa: WizardCoaState
   gl: WizardGlState
   dispatch: Dispatch<WizardAction>
   entities: WizardState['entities']
+  setupStatus?: SetupStatus | null
 }) {
   // Auto-singleton: for single-entity projects skip the assignment UI and auto-create one group.
   // Mirrors the GL single-entity auto-group logic (~line 654 in StepGlBookings).
@@ -1728,6 +1765,20 @@ function StepChartOfAccounts({
       subtitle="Configure how accounts are classified into the P&L and Balance Sheet hierarchy."
     >
       <div className="space-y-6">
+
+        {/* ── Already-loaded badge ── */}
+        {setupStatus?.coa.loaded && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            <p className="font-semibold">
+              Already loaded — {setupStatus.coa.mapped_accounts.toLocaleString()} accounts classified
+              across {setupStatus.coa.entities} {setupStatus.coa.entities === 1 ? 'entity' : 'entities'}
+            </p>
+            <p className="mt-1 text-xs text-emerald-700">
+              Re-upload a mapping file only to replace the existing classification. Steps with no new
+              file are skipped at Finish.
+            </p>
+          </div>
+        )}
 
         {/* ------------------------------------------------------------------ */}
         {/* Assignment step (multi-entity only, hides once assigned)            */}
@@ -1874,11 +1925,13 @@ function StepOpeningBalances({
   dispatch,
   entities,
   netProfitRoll,
+  setupStatus,
 }: {
   ob: WizardObState
   dispatch: Dispatch<WizardAction>
   entities: WizardState['entities']
   netProfitRoll: boolean
+  setupStatus?: SetupStatus | null
 }) {
   const validEntities = entities.filter(e => e.code.trim())
   const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
@@ -2076,6 +2129,21 @@ function StepOpeningBalances({
       subtitle="Tell the pipeline how balance sheet opening balances are supplied in your data."
     >
       <div className="space-y-6">
+
+        {/* ── Already-loaded badge ── */}
+        {setupStatus?.opening_balances.loaded && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            <p className="font-semibold">
+              Already loaded — {setupStatus.opening_balances.rows.toLocaleString()} opening-balance rows
+              for {setupStatus.opening_balances.entities}{' '}
+              {setupStatus.opening_balances.entities === 1 ? 'entity' : 'entities'}
+            </p>
+            <p className="mt-1 text-xs text-emerald-700">
+              Upload a new file only to replace the existing opening balances. Steps with no new file
+              are skipped at Finish.
+            </p>
+          </div>
+        )}
 
         {/* ------------------------------------------------------------------ */}
         {/* Option radio group                                                   */}
@@ -3224,10 +3292,12 @@ function StepPartnerMaster({
   partner,
   dispatch,
   entities,
+  setupStatus,
 }: {
   partner: WizardPartnerState
   dispatch: Dispatch<WizardAction>
   entities: WizardState['entities']
+  setupStatus?: SetupStatus | null
 }) {
   const validEntities = entities.filter(e => e.code.trim())
   const defaultEntitySource: EntitySource = validEntities.length > 1 ? 'per_entity' : 'combined'
@@ -3247,6 +3317,20 @@ function StepPartnerMaster({
       subtitle="Upload customer or supplier master data and map the join key and name fields."
     >
       <div className="space-y-6">
+
+        {/* ── Already-loaded badge ── */}
+        {setupStatus && (setupStatus.partners.customers > 0 || setupStatus.partners.suppliers > 0) && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            <p className="font-semibold">
+              Already loaded — {setupStatus.partners.customers.toLocaleString()} customers
+              {' · '}{setupStatus.partners.suppliers.toLocaleString()} suppliers
+            </p>
+            <p className="mt-1 text-xs text-emerald-700">
+              Upload new files only to replace or extend the existing partner master. Steps with no
+              new file are skipped at Finish.
+            </p>
+          </div>
+        )}
 
         {/* ------------------------------------------------------------------ */}
         {/* Entity source selector — shown always as a pre-step                 */}
@@ -3997,9 +4081,11 @@ function buildInitialCommitSteps(state: WizardState): CommitStepState[] {
 function StepReview({
   state,
   onRunSetup,
+  setupStatus,
 }: {
   state: WizardState
   onRunSetup: (runRebuild: boolean) => void
+  setupStatus?: SetupStatus | null
 }) {
   const startMonth = fyStartFromEndMonth(state.fyEndMonth)
 
@@ -4148,6 +4234,47 @@ function StepReview({
             </tbody>
           </table>
         </div>
+
+        {/* ── Already-committed summary ── */}
+        {setupStatus && (
+          setupStatus.gl.loaded ||
+          setupStatus.coa.loaded ||
+          setupStatus.opening_balances.loaded ||
+          setupStatus.partners.customers > 0 ||
+          setupStatus.partners.suppliers > 0
+        ) && (() => {
+          const lines: string[] = []
+          if (setupStatus!.gl.loaded) {
+            const allFy = setupStatus!.gl.entities.flatMap(e => e.fiscal_years)
+            const minFy = allFy.length > 0 ? Math.min(...allFy) : null
+            const maxFy = allFy.length > 0 ? Math.max(...allFy) : null
+            const fyRange = minFy !== null && maxFy !== null
+              ? (minFy === maxFy ? `FY${minFy}` : `FY${minFy}–${maxFy}`)
+              : '—'
+            lines.push(`GL: ${setupStatus!.gl.entities.length} entities, ${fyRange}, ${setupStatus!.gl.total_rows.toLocaleString()} rows`)
+          }
+          if (setupStatus!.coa.loaded) {
+            lines.push(`CoA: ${setupStatus!.coa.mapped_accounts.toLocaleString()} accounts across ${setupStatus!.coa.entities} entities`)
+          }
+          if (setupStatus!.opening_balances.loaded) {
+            lines.push(`Opening balances: ${setupStatus!.opening_balances.rows.toLocaleString()} rows for ${setupStatus!.opening_balances.entities} entities`)
+          }
+          if (setupStatus!.partners.customers > 0 || setupStatus!.partners.suppliers > 0) {
+            lines.push(`Partners: ${setupStatus!.partners.customers.toLocaleString()} customers · ${setupStatus!.partners.suppliers.toLocaleString()} suppliers`)
+          }
+          return (
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+              <p className="font-semibold mb-1.5">Already in the database</p>
+              <ul className="space-y-0.5 text-xs text-emerald-700">
+                {lines.map(l => <li key={l}>{l}</li>)}
+              </ul>
+              <p className="mt-1.5 text-xs text-emerald-700">
+                Steps with no new file staged above are skipped at Finish — existing data is preserved.
+                Re-upload on a step to replace its data.
+              </p>
+            </div>
+          )
+        })()}
 
         {/* A full rebuild always runs as the final commit step (see the sequence
             below) — no separate opt-in/info box needed. */}
@@ -4970,6 +5097,8 @@ export default function ProjectSetupWizard() {
   const [loading, setLoading] = useState(true)
   /** Mirrors data_reset_allowed from GET /projects/{id}. Only true on non-live stacks. */
   const [dataResetAllowed, setDataResetAllowed] = useState(false)
+  /** Null until the setup-status endpoint responds. Used for "already loaded" badges. */
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null)
   /** True once the Statement Structure step has resolved (auto-pass or explicit apply). */
   const [structureResolved, setStructureResolved] = useState(false)
 
@@ -4993,6 +5122,18 @@ export default function ProjectSetupWizard() {
         // explicitly signals this stack allows resets.
         setDataResetAllowed(data.data_reset_allowed === true)
 
+        // Reverse-map opening_balance_mode (backend) → wizard ob.mode:
+        //   'in_data'       → 'in_data'       (OB rows are embedded in the GL export)
+        //   'carry_forward' → 'file_first_year' (separate file, first FY only)
+        //   'file'          → 'file_all'        (separate file, all FYs)
+        const obModeMap: Record<string, WizardObState['mode']> = {
+          in_data:       'in_data',
+          carry_forward: 'file_first_year',
+          file:          'file_all',
+        }
+        const restoredObMode: WizardObState['mode'] =
+          obModeMap[cfg.opening_balance_mode ?? ''] ?? 'in_data'
+
         dispatch({
           type: 'PREFILL',
           partial: {
@@ -5003,6 +5144,19 @@ export default function ProjectSetupWizard() {
                 ? cfg.entities
                 : [{ code: '', prefix: '', name: '' }],
             netProfitRoll: cfg.retained_earnings_roll?.enabled ?? false,
+            // Restore opening-balance mode from persisted config.
+            // PREFILL shallow-merges, so we set the full ob slice.
+            // At mount ob = {}, so only mode is non-default here.
+            ob: { mode: restoredObMode },
+            // Restore CoA account-mapping mode. Build the full coa slice
+            // (matching defaultState) so the shallow merge is safe.
+            coa: {
+              groups: [],
+              accountMappingMode: (cfg.account_mapping_mode === 'exclusive'
+                ? 'exclusive'
+                : 'library') as AccountMappingMode,
+              assigned: false,
+            },
           },
         })
       })
@@ -5016,6 +5170,20 @@ export default function ProjectSetupWizard() {
     return () => {
       cancelled = true
     }
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Fetch setup-status on mount — drives "already loaded" badges on each step.
+  // Defensive: any error leaves setupStatus null so the wizard is never blocked.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let cancelled = false
+    api.fetchSetupStatus(PROJECT_ID).then(s => {
+      if (!cancelled) setSetupStatus(s)
+    }).catch(() => {
+      // No-op: badges are informational; absence is safe.
+    })
+    return () => { cancelled = true }
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -5986,6 +6154,7 @@ export default function ProjectSetupWizard() {
               dispatch={dispatch}
               batchCombining={batchCombining}
               batchCombineErrors={batchCombineErrors}
+              setupStatus={setupStatus}
             />
           )}
           {step === 3 && (
@@ -5994,10 +6163,11 @@ export default function ProjectSetupWizard() {
               gl={state.gl}
               dispatch={dispatch}
               entities={state.entities}
+              setupStatus={setupStatus}
             />
           )}
-          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} netProfitRoll={state.netProfitRoll} />}
-          {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} entities={state.entities} />}
+          {step === 4 && <StepOpeningBalances ob={state.ob} dispatch={dispatch} entities={state.entities} netProfitRoll={state.netProfitRoll} setupStatus={setupStatus} />}
+          {step === 5 && <StepPartnerMaster partner={state.partner} dispatch={dispatch} entities={state.entities} setupStatus={setupStatus} />}
           {step === 6 && (
             <StepAdditionalInformation
               fte={state.fte}
@@ -6019,7 +6189,7 @@ export default function ProjectSetupWizard() {
             />
           )}
           {step === 8 && !finishStarted && (
-            <StepReview state={state} onRunSetup={handleRunSetup} />
+            <StepReview state={state} onRunSetup={handleRunSetup} setupStatus={setupStatus} />
           )}
           {step === 8 && finishStarted && (
             <FinishPanel

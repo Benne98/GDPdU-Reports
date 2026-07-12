@@ -6336,6 +6336,9 @@ export const api = {
   getProject: (id = 'default'): Promise<ProjectConfigResponse> =>
     get(`/api/v1/projects/${id}`),
 
+  fetchSetupStatus: (id = 'default'): Promise<SetupStatus> =>
+    get(`/api/v1/projects/${id}/setup-status`),
+
   putProject: (id = 'default', config: ProjectConfig): Promise<ProjectConfigResponse> =>
     put(`/api/v1/projects/${id}`, config),
 
@@ -7106,6 +7109,37 @@ export interface ProjectConfigResponse {
 export interface RebuildResponse {
   status:  string
   message: string
+}
+
+// ── Setup status ──────────────────────────────────────────────────────────────
+
+export interface SetupStatusGlEntity {
+  prefix:       string
+  name:         string
+  fiscal_years: number[]
+  rows:         number
+}
+
+export interface SetupStatus {
+  gl: {
+    loaded:     boolean
+    entities:   SetupStatusGlEntity[]
+    total_rows: number
+  }
+  coa: {
+    loaded:          boolean
+    mapped_accounts: number
+    entities:        number
+  }
+  opening_balances: {
+    loaded:   boolean
+    rows:     number
+    entities: number
+  }
+  partners: {
+    customers: number
+    suppliers: number
+  }
 }
 
 // ─── Admin types ──────────────────────────────────────────────────────────────
