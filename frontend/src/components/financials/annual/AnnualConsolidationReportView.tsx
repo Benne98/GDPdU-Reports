@@ -24,6 +24,7 @@ import {
 
 import {
   buildAnnualConsolidationCommentMarkerMap,
+  isGenericSnapshotBulletText,
   prepareAnnualConsolidationReportBullets,
 } from './annualReportMarkers'
 
@@ -87,7 +88,7 @@ export default function AnnualConsolidationReportView({
     [consol, ytdLabel],
   )
 
-  const { narrative: fetchedNarrative, narrativeBusy } = useAnnualStatementNarrative(
+  const { narrative: fetchedNarrative, narrativeBusy, apiNarrative } = useAnnualStatementNarrative(
     statement,
     year,
     month,
@@ -132,8 +133,23 @@ export default function AnnualConsolidationReportView({
       text: b.text,
       tone: (b.tone as PlNarrativeBullet['tone']) ?? 'neutral',
     }))
-    return prepareAnnualConsolidationReportBullets(clientRaw, consol.rows, checkOpen)
-  }, [narrative, clientNarrative, consol.rows, checkOpen])
+    const clientPrepared = prepareAnnualConsolidationReportBullets(clientRaw, consol.rows, checkOpen)
+    if (clientPrepared.length) return clientPrepared
+
+    // Last-resort: show raw API narrative bullets without consolidation-row anchoring.
+    // Activates when the snapshot was cold (404) AND all consolidation row values are
+    // below materiality threshold — e.g. during a data-repair window. No table markers
+    // are placed in this mode but the narrative panel still shows meaningful text.
+    const rawApi = (apiNarrative?.bullets ?? []).filter(b => !isGenericSnapshotBulletText(b.text))
+    return rawApi.map((b, i) => ({
+      index: i + 1,
+      line_code: b.line_code,
+      label: b.label ?? '',
+      priority: 0,
+      text: b.text,
+      tone: (b.tone as PlNarrativeBullet['tone']) ?? 'neutral',
+    }))
+  }, [narrative, clientNarrative, consol.rows, checkOpen, apiNarrative])
 
   const commentMarkersByLineCode = useMemo(
     () => buildAnnualConsolidationCommentMarkerMap(bullets, consol.rows, checkOpen),

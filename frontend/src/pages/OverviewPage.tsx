@@ -25,6 +25,7 @@ import type { FinTab } from '../components/financials/financialsTabs'
 import OverviewGroupTile from '../components/financials/overview/OverviewGroupTile'
 import OverviewBriefingBlock from '../components/financials/overview/OverviewBriefingBlock'
 import OverviewMarketWatch from '../components/financials/overview/OverviewMarketWatch'
+import OverviewEntityBreakdownTile from '../components/financials/overview/OverviewEntityBreakdownTile'
 import { useOverviewBriefing } from '../components/financials/overview/useOverviewBriefing'
 import DuPontTree from '../components/cockpit/DuPontTree'
 import type { DrillDownRequest } from '../components/cockpit/EbitTable'
@@ -238,6 +239,12 @@ export default function OverviewPage() {
                 onClose={() => setDrill(null)}
               />
             )}
+
+            <OverviewEntityBreakdownTile
+              periodParams={periodParams}
+              resetKey={resetKey}
+              onNavigateTab={onNavigateTab}
+            />
 
             <OverviewMarketWatch period={cockpitPeriod} entity={ent} />
 
