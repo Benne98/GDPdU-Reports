@@ -381,6 +381,40 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
     return out
 
 
+def _stage_na_fill(session: Session, scope: RebuildScope) -> dict:
+    """Fill ``dim_gl_na`` (BS net-asset classification) so the CF NA side + WC render.
+
+    ``dim_gl_na`` is populated at LOAD time ONLY from the CoA's NA columns; the
+    ``bs_pl_master`` CoA that Project Setup uses does not carry them, so
+    ``l7_na_description`` (and on a truly-fresh load ``l6``) is NULL.  The NA UPSERT in
+    ``_stage_cf_fill`` (``dim_gl_na`` ⋈ ``lib_cf_mapping`` on ``(l6, l7)``) then matches
+    0 rows → ``dim_gl_cf`` gets no BS-account rows → the CF working-capital Δ lines and
+    the WC statement are empty.  This stage fills the missing NA classification
+    (``etl.na_fill``): l7 from the NA library else ``dim_gl_account.level_3``; l6 kept
+    when present (never a membership flip → WC totals unchanged), filled only when NULL
+    from the library.
+
+    ORDER — runs AFTER ``_stage_structure_recon_refresh`` and BEFORE ``_stage_cf_fill``:
+      * AFTER structure_recon because the l7 fallback is ``level_3`` and the BS-account
+        selection is ``level_0='BS'`` — both only final once ``statement_backfill`` /
+        the BS re-seed have run.
+      * BEFORE cf_fill because cf_fill's NA UPSERT READS ``dim_gl_na`` — the fill must
+        land first so the BS-account rows of ``dim_gl_cf`` populate this same rebuild.
+
+    ADDITIVE / IDEMPOTENT / NO-OP: only fills NULLs (a complete ``dim_gl_na`` is left
+    untouched → golden parity), and writes nothing when the sources are absent
+    (partial schema / no NA library and no level_3).
+    """
+    try:
+        from etl.na_fill import fill_dim_gl_na
+
+        return fill_dim_gl_na(session, scope)
+    except Exception as exc:  # noqa: BLE001 — absent tables / partial schema => no-op
+        logger.warning("rebuild: na fill skipped (%s)", exc)
+        return {"filled_l7": 0, "filled_l6": 0, "inserted": 0, "total_na": 0,
+                "noop": True, "skipped": True, "error": str(exc)}
+
+
 def _stage_cf_fill(session: Session, scope: RebuildScope) -> dict:
     """Populate ``dim_gl_cf`` from ``lib_cf_mapping`` so the CF statement renders.
 
@@ -517,12 +551,18 @@ def rebuild_project(
 
         if mode == "full":
             summary["structure_recon"] = _stage_structure_recon_refresh(session, sc)
+            # NA fill: fill dim_gl_na's BS classification (l6/l7) so cf_fill's NA UPSERT
+            # + the WC statement render.  Runs AFTER structure_recon (l7 fallback is
+            # level_3 / selection is level_0='BS', final only post-backfill) and BEFORE
+            # cf_fill (whose NA UPSERT reads dim_gl_na).  Additive + no-op on absent
+            # sources → golden live-vs-rebuild parity preserved.
+            summary["na_fill"] = _stage_na_fill(session, sc)
             # CF fill: populate dim_gl_cf from lib_cf_mapping so the CF statement
             # renders after a fresh Project-Setup load.  Runs AFTER structure_recon
             # (whose statement_backfill has set every posted PL account's
-            # level_0='PL') and after dim_gl_na (load-time) — so both UPSERT joins see
-            # complete inputs.  Idempotent + strict no-op on absent CF library →
-            # golden live-vs-rebuild parity preserved.
+            # level_0='PL') and after na_fill (dim_gl_na now classified) — so both
+            # UPSERT joins see complete inputs.  Idempotent + strict no-op on absent CF
+            # library → golden live-vs-rebuild parity preserved.
             summary["cf_fill"] = _stage_cf_fill(session, sc)
 
         if commit:
