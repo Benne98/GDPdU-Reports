@@ -95,6 +95,60 @@ def _total_output_keur(session: Session, as_of: date, entity: Optional[str]) -> 
     return 0.0
 
 
+def gl_personnel_expenses_keur(
+    session: Session,
+    first_fy: int,
+    last_fy: int,
+    fy_end_month: int,
+    entity_names: list[str],
+    view_mode: str,
+) -> dict[str, float]:
+    """GL-derived personnel expenses (EURk) per entity/year for the FTE workbook.
+
+    FORMULA:
+        GL personnel expenses (EURk) for entity e, year fy
+          = abs( PERSONNEL_EXPENSES P&L line YTD for (e, fy) ) / 1000
+
+    PERSONNEL_EXPENSES is presented as a NEGATIVE (expense) amount in the P&L, so
+    abs() yields a positive magnitude; the subprocess re-applies the sign as
+    ``-abs(val)`` when it writes the cell — do not negate here.
+
+    Keys: ``entity{idx+1}_FY{yyyy}`` — matches the frontend PEX grid and the
+    alt-key lookup in fte_development_verformelt.py.
+
+    Scope:
+      * consolidated (``view_mode != 'per_entity'``) → group figures, entity=None,
+        emitted under ``entity1_*`` (ei=0).
+      * per_entity → iterate ``entity_names`` in order; entity e is resolved by
+        build_pl_annual_compat's own resolver (its ``entity`` arg = legal_entity_code).
+
+    Worked example: PERSONNEL_EXPENSES ytd = -1,234,000 → 1234.0 under
+    ``entity1_FY2023``.
+    Edge cases: missing line or None ytd → 0.0; single combined entity → only
+    ``entity1_*`` keys.
+    """
+    out: dict[str, float] = {}
+    month = int(fy_end_month or 12)
+    per_entity = str(view_mode or "").strip().lower() == "per_entity"
+    targets: list[tuple[int, Optional[str]]] = (
+        list(enumerate(entity_names or [])) if per_entity else [(0, None)]
+    )
+    for ei, entity in targets:
+        for fy in range(int(first_fy), int(last_fy) + 1):
+            eurk = 0.0
+            try:
+                pl = build_pl_annual_compat(session, year=fy, month=month, entity=entity)
+                for row in pl.get("rows") or []:
+                    if row.get("line_code") == "PERSONNEL_EXPENSES":
+                        ytd = (row.get("amounts") or {}).get("ytd")
+                        eurk = round(abs(float(ytd or 0)) / 1000.0, 1)
+                        break
+            except Exception:
+                eurk = 0.0
+            out[f"entity{ei + 1}_FY{fy}"] = eurk
+    return out
+
+
 def _ordered_dates(anchor: date, compare_dates: list[date]) -> list[date]:
     dates = sorted({anchor, *compare_dates})
     return dates

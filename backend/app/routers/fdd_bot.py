@@ -1615,7 +1615,10 @@ def run_databook_gl_master(
 
 
 @router.post("/run/fte_development")
-def run_fte_development(req: FteDevelopmentRequest):
+def run_fte_development(
+    req: FteDevelopmentRequest,
+    session: Annotated[Session, Depends(get_session)],
+):
     """Build historical FTE Actuals table from personaltable uploads."""
     run_id = _make_run_id("fte_")
     run_d = _run_dir(req.session_id, run_id)
@@ -1629,6 +1632,23 @@ def run_fte_development(req: FteDevelopmentRequest):
             detail="No resolvable personaltable uploads (check file_id and session_id).",
         )
 
+    view_mode = (req.view_mode or "consolidated").strip()
+
+    # Auto-derive GL personnel expenses when the client sends no manual PEX grid.
+    # An explicit pex_values payload is kept verbatim (back-compat).
+    pex_values: dict[str, Any] = dict(req.pex_values or {})
+    if not pex_values:
+        from app.services.personnel_accounting import gl_personnel_expenses_keur
+
+        pex_values = gl_personnel_expenses_keur(
+            session,
+            first_fy=int(req.first_fy),
+            last_fy=int(req.last_fy),
+            fy_end_month=int(req.fy_end_month or 12),
+            entity_names=list(req.entity_names),
+            view_mode=view_mode,
+        )
+
     config: dict[str, Any] = {
         "session_id": req.session_id,
         "case_id": req.session_id,
@@ -1636,7 +1656,7 @@ def run_fte_development(req: FteDevelopmentRequest):
         "output_file_path": output_folder,
         "output_folder": output_folder,
         "output_filename": f"{req.session_id}_FTE_Development.xlsx",
-        "view_mode": (req.view_mode or "consolidated").strip(),
+        "view_mode": view_mode,
         "upload_mode": (req.upload_mode or "per_fy_grid").strip(),
         "first_fy": int(req.first_fy),
         "last_fy": int(req.last_fy),
@@ -1647,8 +1667,8 @@ def run_fte_development(req: FteDevelopmentRequest):
         "dimensions": list(req.dimensions or []),
         "preset_metrics": list(req.preset_metrics or ["fte", "payroll"]),
         "custom_metrics": list(req.custom_metrics or []),
-        "pex_view_mode": str(req.pex_view_mode or "consolidated"),
-        "pex_values": dict(req.pex_values or {}),
+        "pex_view_mode": str(req.pex_view_mode or view_mode or "consolidated"),
+        "pex_values": pex_values,
         "fy_end_month": int(req.fy_end_month or 12),
         "fy_end_day": int(req.fy_end_day or 31),
         "formula_mode": bool(req.formula_mode),
