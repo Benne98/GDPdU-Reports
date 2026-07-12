@@ -381,6 +381,37 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
     return out
 
 
+def _stage_cf_fill(session: Session, scope: RebuildScope) -> dict:
+    """Populate ``dim_gl_cf`` from ``lib_cf_mapping`` so the CF statement renders.
+
+    The CF reader (``fin_compat_cf`` / ``fin_compat_cf_sql``) maps GL grains to CF
+    lines via ``dim_gl_cf``; an EMPTY ``dim_gl_cf`` renders NOTHING.  The population
+    used to live ONLY in ``backend/scripts/populate_dim_gl_cf.py`` (never invoked by
+    the rebuild), so a fresh Project-Setup load left the CF statement blank.  This
+    stage wires the same two idempotent UPSERTs (``etl.cf_fill``) into the rebuild.
+
+    ORDER — runs LAST, AFTER ``_stage_structure_recon_refresh`` (and thus after the
+    classification refresh / account-library fill / statement backfill), because the
+    P&L UPSERT joins ``dim_gl_account`` on ``level_0='PL'`` and ``level_3`` — both are
+    only guaranteed complete once ``statement_backfill`` has set every posted PL
+    account's ``level_0='PL'`` and the library fill has classified missing years.
+    The NA UPSERT joins ``dim_gl_na``, which is populated at LOAD time (pre-rebuild).
+
+    NO-OP / GOLDEN PARITY: strictly reproduces the same rows on a DB whose
+    ``dim_gl_cf`` is already correct (``ON CONFLICT DO UPDATE``), and writes nothing
+    when the CF library / source dims are absent or empty (partial schema / no CF
+    library) — so the golden live-vs-rebuild equivalence is preserved.
+    """
+    try:
+        from etl.cf_fill import populate_dim_gl_cf
+
+        return populate_dim_gl_cf(session, scope)
+    except Exception as exc:  # noqa: BLE001 — absent tables / partial schema => no-op
+        logger.warning("rebuild: cf fill skipped (%s)", exc)
+        return {"na_rows": 0, "pl_rows": 0, "total": 0, "noop": True,
+                "skipped": True, "error": str(exc)}
+
+
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
@@ -486,6 +517,13 @@ def rebuild_project(
 
         if mode == "full":
             summary["structure_recon"] = _stage_structure_recon_refresh(session, sc)
+            # CF fill: populate dim_gl_cf from lib_cf_mapping so the CF statement
+            # renders after a fresh Project-Setup load.  Runs AFTER structure_recon
+            # (whose statement_backfill has set every posted PL account's
+            # level_0='PL') and after dim_gl_na (load-time) — so both UPSERT joins see
+            # complete inputs.  Idempotent + strict no-op on absent CF library →
+            # golden live-vs-rebuild parity preserved.
+            summary["cf_fill"] = _stage_cf_fill(session, sc)
 
         if commit:
             session.commit()

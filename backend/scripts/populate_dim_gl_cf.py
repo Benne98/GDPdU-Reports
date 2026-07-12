@@ -34,44 +34,19 @@ import sys
 from pathlib import Path
 
 _BACKEND = Path(__file__).resolve().parent.parent
-if str(_BACKEND) not in sys.path:
-    sys.path.insert(0, str(_BACKEND))
+_REPO = _BACKEND.parent
+for _p in (str(_BACKEND), str(_REPO)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session as SASession
 
 from app.db import engine
 
-# Set-based UPSERT for the BS/NA side.
-_NA_UPSERT = """
-INSERT INTO dim_gl_cf (account_number_group, fiscal_year, l1, l2, l3, l4, l5, cf_mapping)
-SELECT na.account_number_group, na.fiscal_year,
-       lib.l1, lib.l2, lib.l3, lib.l4, lib.l5, lib.cf_mapping
-FROM dim_gl_na na
-JOIN lib_cf_mapping lib
-  ON lib.key_kind = 'na'
- AND lib.key_1 = na.l6_na_mapping
- AND lib.key_2 = na.l7_na_description
-ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
-  l1 = EXCLUDED.l1, l2 = EXCLUDED.l2, l3 = EXCLUDED.l3,
-  l4 = EXCLUDED.l4, l5 = EXCLUDED.l5, cf_mapping = EXCLUDED.cf_mapping;
-"""
-
-# Set-based UPSERT for the P&L side (level_3 keyed).
-_PL_UPSERT = """
-INSERT INTO dim_gl_cf (account_number_group, fiscal_year, l1, l2, l3, l4, l5, cf_mapping)
-SELECT a.account_number_group, a.fiscal_year,
-       lib.l1, lib.l2, lib.l3, lib.l4, lib.l5, lib.cf_mapping
-FROM dim_gl_account a
-JOIN lib_cf_mapping lib
-  ON lib.key_kind = 'pl_level3'
- AND lib.key_1 = 'PL'
- AND lib.key_2 = a.level_3
-WHERE a.level_0 = 'PL'
-ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
-  l1 = EXCLUDED.l1, l2 = EXCLUDED.l2, l3 = EXCLUDED.l3,
-  l4 = EXCLUDED.l4, l5 = EXCLUDED.l5, cf_mapping = EXCLUDED.cf_mapping;
-"""
+# SINGLE SOURCE OF TRUTH for the two UPSERTs lives in the ETL module so the rebuild
+# stage (etl.cf_fill.populate_dim_gl_cf) and this standalone script cannot drift.
+from etl.cf_fill import _NA_UPSERT, _PL_UPSERT
 
 # Unmatched diagnostics.
 _NA_UNMATCHED = """
