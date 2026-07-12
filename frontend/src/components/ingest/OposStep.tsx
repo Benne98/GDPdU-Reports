@@ -8,7 +8,7 @@
  *                   side column and writes fact_opos_debitor + fact_opos_kreditor in one step.
  *
  * Flow (per_side): entity source selection -> upload (per FY / per entity x FY) ->
- *   preview -> column mapping -> per-slot commit.
+ *   step-by-step column mapping (StepColumnMapper) -> per-slot commit.
  *
  * Aging computation (is_open bucketing, DSO/DPO) is not performed in the UI — see
  * docs/financial-logic.md (F3/F4). Data is stored pass-through; aging_band is NULL.
@@ -20,6 +20,11 @@ import PerEntityPager from './PerEntityPager'
 import PerYearPager from './PerYearPager'
 import { uploadOposFile, commitOpos, commitOposCombined, type OposSide } from '../../lib/gdpduApi'
 import { glFiscalYearLabel } from '../../lib/fiscalYear'
+import StepColumnMapper from '../mapper/StepColumnMapper'
+import { fromNamedPreview } from '../mapper/normalizePreview'
+import { buildOposSteps, toOposResult } from '../mapper/oposSteps'
+import type { Answers } from '../mapper/stepMapperTypes'
+import FileDrop from '../budget/chat/FileDrop'
 
 // ---------------------------------------------------------------------------
 // State shapes — exported so ProjectSetupWizard can reference them in
@@ -77,22 +82,6 @@ export interface WizardOposState {
 }
 
 // ---------------------------------------------------------------------------
-// Target field definitions — same for both sides
-// ---------------------------------------------------------------------------
-
-const OPOS_TARGET_FIELDS: Array<{ key: string; label: string; hint?: string; required: boolean }> = [
-  { key: 'konto',               label: 'Account',                      required: true  },
-  { key: 'belegart',            label: 'Document type',                required: false },
-  { key: 'beleg_no',            label: 'Document number',              required: false },
-  { key: 'referenz',            label: 'Reference',                    required: false },
-  { key: 'net_due_date',        label: 'Net due date',                 required: false },
-  { key: 'amount_hauswaehrung', label: 'Amount in house currency (signed)',
-    hint: 'Positive = debit; negative = credit. Ensure sign convention matches your source.',
-    required: false },
-  { key: 'posting_date',        label: 'Posting date',                 required: false },
-]
-
-// ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
 
@@ -103,41 +92,6 @@ interface OposStepProps {
   fyEndMonth: number
   /** Patch the top-level opos state (shallow-merged by the wizard reducer). */
   onPatch: (patch: Partial<WizardOposState>) => void
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function SampleTable({ columns, sample }: { columns: string[]; sample: Record<string, unknown>[] }) {
-  if (sample.length === 0) return null
-  const cols = columns.slice(0, 8)
-  return (
-    <div className="overflow-x-auto rounded-md border border-slate-100">
-      <table className="min-w-full text-xs">
-        <thead className="bg-slate-50">
-          <tr>
-            {cols.map(c => (
-              <th key={c} className="px-2 py-1.5 text-left font-medium text-slate-600 whitespace-nowrap">
-                {c}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100">
-          {sample.slice(0, 3).map((row, i) => (
-            <tr key={i} className="even:bg-slate-50/50">
-              {cols.map(c => (
-                <td key={c} className="px-2 py-1.5 text-slate-700 whitespace-nowrap">
-                  {String(row[c] ?? '')}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +130,18 @@ function OposSidePanel({ side, sideState, entities, fyLabels, onPatchSide }: Opo
   const previewColumns = previewUpload?.columns ?? []
   const previewSample  = previewUpload?.sample  ?? []
   const hasUploads     = sideState.uploads.some(u => !!u.file_id)
+
+  // Seed mapper from existing wizard state
+  const mapperInitial = useMemo((): Answers => {
+    const ans: Answers = {}
+    for (const [field, col] of Object.entries(sideState.columnMap)) {
+      ans[field] = { t: 'column', id: col }
+    }
+    if (sideState.entityColumn)
+      ans['entity_column'] = { t: 'column', id: sideState.entityColumn }
+    return ans
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewColumns.join(','), sideState.columnMap, sideState.entityColumn])
 
   async function handleFileUpload(
     entityIndex: number,
@@ -262,41 +228,22 @@ function OposSidePanel({ side, sideState, entities, fyLabels, onPatchSide }: Opo
 
     return (
       <div key={slotKey} className="space-y-2">
-        <label
-          className={[
-            'flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-5 cursor-pointer transition',
-            staged
-              ? 'border-emerald-300 bg-emerald-50'
-              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50/50',
-          ].join(' ')}
-        >
-          <input
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            className="sr-only"
-            disabled={isUp}
-            onChange={e => {
-              const f = e.target.files?.[0]
-              if (f) void handleFileUpload(entityIndex, entityName, fyLabel, f)
-              e.target.value = ''
-            }}
-          />
-          {isUp ? (
-            <span className="text-sm text-blue-600">Uploading…</span>
-          ) : staged ? (
-            <>
-              <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
-              {existing?.columns && (
-                <span className="text-xs text-slate-500">{existing.columns.length} columns detected</span>
-              )}
-              <span className="text-xs text-slate-400 italic">Click to replace</span>
-            </>
-          ) : (
-            <span className="text-sm text-slate-600">
-              Drop .xlsx / .csv or click to browse
-            </span>
-          )}
-        </label>
+        {staged && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
+            {existing?.columns && (
+              <span className="text-xs text-slate-500">({existing.columns.length} columns)</span>
+            )}
+          </div>
+        )}
+
+        <FileDrop
+          onFile={f => void handleFileUpload(entityIndex, entityName, fyLabel, f)}
+          accept=".xlsx,.xls,.csv"
+          loading={isUp}
+          label={staged ? 'Replace file' : 'Drop .xlsx / .csv here'}
+          hint={staged ? 'Drop or click Browse to select a different file' : 'or click Browse to select'}
+        />
 
         {upErr && <p className="text-xs text-red-600">{upErr}</p>}
 
@@ -337,27 +284,6 @@ function OposSidePanel({ side, sideState, entities, fyLabels, onPatchSide }: Opo
         dataLabel={`${sideLabel} open-items data`}
       />
 
-      {/* Entity column (combined mode, after first upload) */}
-      {viewMode === 'combined' && hasUploads && previewColumns.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-xs font-medium text-slate-700">
-            Entity column (company code)
-            <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-          </p>
-          <select
-            value={sideState.entityColumn ?? ''}
-            onChange={e => onPatchSide({ entityColumn: e.target.value || undefined })}
-            className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">-- Select entity column --</option>
-            {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <p className="text-xs text-slate-400">
-            Column identifying the legal entity per row (e.g. company code).
-          </p>
-        </div>
-      )}
-
       {/* Upload zones */}
       <div className="space-y-3">
         <p className="text-sm font-medium text-slate-700">
@@ -396,61 +322,35 @@ function OposSidePanel({ side, sideState, entities, fyLabels, onPatchSide }: Opo
         )}
       </div>
 
-      {/* Preview + column mapping — only after first upload */}
+      {/* Column mapping — shown after first upload via StepColumnMapper */}
       {hasUploads && previewColumns.length > 0 && (
-        <div className="space-y-5">
-
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-slate-600">
-              Sample data (from first uploaded file)
-            </p>
-            <SampleTable columns={previewColumns} sample={previewSample} />
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
+            <div className="h-px flex-1 bg-slate-200" />
+            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Column mapping
+            </span>
+            <div className="h-px flex-1 bg-slate-200" />
           </div>
-
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              <div className="h-px flex-1 bg-slate-200" />
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Column mapping
-              </span>
-              <div className="h-px flex-1 bg-slate-200" />
-            </div>
-            <p className="text-xs text-slate-500">
-              Map source columns to OPOS target fields. Account is required; all other
-              fields are optional. The same mapping is applied to all uploaded files on this side.
-            </p>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {OPOS_TARGET_FIELDS.map(field => (
-                <div key={field.key} className="space-y-1">
-                  <label className="text-xs font-medium text-slate-700">
-                    {field.label}
-                    {field.required && <span className="ml-0.5 text-red-500" aria-hidden>*</span>}
-                  </label>
-                  {field.hint && (
-                    <p className="text-[12px] text-slate-400">{field.hint}</p>
-                  )}
-                  <select
-                    value={sideState.columnMap[field.key] ?? ''}
-                    onChange={e => {
-                      const nextMap = { ...sideState.columnMap }
-                      if (e.target.value) nextMap[field.key] = e.target.value
-                      else delete nextMap[field.key]
-                      onPatchSide({ columnMap: nextMap })
-                    }}
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Not mapped --</option>
-                    {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-              ))}
-            </div>
-            {!sideState.columnMap['konto'] && (
-              <p className="text-xs text-amber-700">
-                Map the Account column before committing.
-              </p>
-            )}
-          </div>
+          <p className="text-xs text-slate-500">
+            Map source columns to OPOS target fields. Account is required; all other
+            fields are optional.
+            {viewMode === 'combined' && ' Then identify the entity column.'}
+            {' '}The same mapping is applied to all uploaded files on this side.
+          </p>
+          <StepColumnMapper
+            key={previewColumns.join(',')}
+            preview={fromNamedPreview(previewColumns, previewSample)}
+            buildSteps={() => buildOposSteps('per_side', viewMode)}
+            toResult={toOposResult}
+            initial={mapperInitial}
+            onComplete={r =>
+              onPatchSide({
+                columnMap: r.columnMap,
+                entityColumn: r.entityColumn,
+              })
+            }
+          />
         </div>
       )}
     </div>
@@ -490,24 +390,38 @@ function OposCombinedSidesPanel({
 
   // Commit prerequisites: at least one target field mapped, a side column, and a
   // distinct debitor/kreditor value for the split.
-  const hasMap         = Object.keys(combinedSides.columnMap).length > 0
-  const hasSideConfig  =
+  const hasMap        = Object.keys(combinedSides.columnMap).length > 0
+  const hasSideConfig =
     !!combinedSides.sideColumn &&
     !!combinedSides.debitorValue &&
     !!combinedSides.kreditorValue &&
     combinedSides.debitorValue !== combinedSides.kreditorValue
-  const canCommit      = hasMap && hasSideConfig
+  const canCommit     = hasMap && hasSideConfig
 
-  // Unique values from the selected sideColumn in the sample rows (for picker UX)
-  const sideColumnSampleValues = useMemo(() => {
-    if (!combinedSides.sideColumn || previewSample.length === 0) return []
-    const vals = new Set<string>()
-    for (const row of previewSample) {
-      const v = row[combinedSides.sideColumn!]
-      if (v != null && v !== '') vals.add(String(v))
+  // Seed mapper from existing wizard state
+  const mapperInitial = useMemo((): Answers => {
+    const ans: Answers = {}
+    for (const [field, col] of Object.entries(combinedSides.columnMap)) {
+      ans[field] = { t: 'column', id: col }
     }
-    return [...vals].slice(0, 20)
-  }, [combinedSides.sideColumn, previewSample])
+    if (combinedSides.entityColumn)
+      ans['entity_column'] = { t: 'column', id: combinedSides.entityColumn }
+    if (combinedSides.sideColumn)
+      ans['side_column'] = { t: 'column', id: combinedSides.sideColumn }
+    if (combinedSides.debitorValue)
+      ans['debitor_value'] = { t: 'choice', value: combinedSides.debitorValue }
+    if (combinedSides.kreditorValue)
+      ans['kreditor_value'] = { t: 'choice', value: combinedSides.kreditorValue }
+    return ans
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    previewColumns.join(','),
+    combinedSides.columnMap,
+    combinedSides.entityColumn,
+    combinedSides.sideColumn,
+    combinedSides.debitorValue,
+    combinedSides.kreditorValue,
+  ])
 
   function getUpload(entityIndex: number, fyLabel: string) {
     return combinedSides.uploads.find(u => u.entity_index === entityIndex && u.fy_label === fyLabel)
@@ -610,39 +524,23 @@ function OposCombinedSidesPanel({
 
     return (
       <div key={slotKey} className="space-y-2">
-        <label
-          className={[
-            'flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-5 cursor-pointer transition',
-            staged
-              ? 'border-emerald-300 bg-emerald-50'
-              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50/50',
-          ].join(' ')}
-        >
-          <input
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            className="sr-only"
-            disabled={isUp}
-            onChange={e => {
-              const f = e.target.files?.[0]
-              if (f) void handleFileUpload(entityIndex, entityName, fyLabel, f)
-              e.target.value = ''
-            }}
-          />
-          {isUp ? (
-            <span className="text-sm text-blue-600">Uploading…</span>
-          ) : staged ? (
-            <>
-              <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
-              {existing?.columns && (
-                <span className="text-xs text-slate-500">{existing.columns.length} columns detected</span>
-              )}
-              <span className="text-xs text-slate-400 italic">Click to replace</span>
-            </>
-          ) : (
-            <span className="text-sm text-slate-600">Drop .xlsx / .csv or click to browse</span>
-          )}
-        </label>
+        {staged && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
+            {existing?.columns && (
+              <span className="text-xs text-slate-500">({existing.columns.length} columns)</span>
+            )}
+          </div>
+        )}
+
+        <FileDrop
+          onFile={f => void handleFileUpload(entityIndex, entityName, fyLabel, f)}
+          accept=".xlsx,.xls,.csv"
+          loading={isUp}
+          label={staged ? 'Replace file' : 'Drop .xlsx / .csv here'}
+          hint={staged ? 'Drop or click Browse to select a different file' : 'or click Browse to select'}
+        />
+
         {upErr && <p className="text-xs text-red-600">{upErr}</p>}
 
         {staged && (
@@ -684,27 +582,6 @@ function OposCombinedSidesPanel({
         dataLabel="combined OPOS data (both sides)"
       />
 
-      {/* Entity column (combined entity mode, after first upload) */}
-      {combinedSides.viewMode === 'combined' && hasUploads && previewColumns.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-xs font-medium text-slate-700">
-            Entity column (company code)
-            <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-          </p>
-          <select
-            value={combinedSides.entityColumn ?? ''}
-            onChange={e => onPatch({ entityColumn: e.target.value || undefined })}
-            className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">-- Select entity column --</option>
-            {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <p className="text-xs text-slate-400">
-            Column identifying the legal entity per row (e.g. company code).
-          </p>
-        </div>
-      )}
-
       {/* Upload zones */}
       <div className="space-y-3">
         <p className="text-sm font-medium text-slate-700">
@@ -744,134 +621,39 @@ function OposCombinedSidesPanel({
         )}
       </div>
 
-      {/* Preview + column mapping + side discriminator — only after first upload */}
+      {/* Column mapping + side discriminator — shown after first upload via StepColumnMapper */}
       {hasUploads && previewColumns.length > 0 && (
         <div className="space-y-5">
-
-          {/* Sample preview */}
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-slate-600">
-              Sample data (from first uploaded file)
-            </p>
-            <SampleTable columns={previewColumns} sample={previewSample} />
-          </div>
-
-          {/* Column mapping */}
           <div className="space-y-3">
             <div className="flex items-center gap-3">
               <div className="h-px flex-1 bg-slate-200" />
               <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Column mapping
+                Column mapping &amp; side discriminator
               </span>
               <div className="h-px flex-1 bg-slate-200" />
             </div>
             <p className="text-xs text-slate-500">
-              Map source columns to OPOS target fields. The same mapping applies to both
-              Debitor and Kreditor rows in the file.
+              Map source columns to OPOS target fields, then identify the side discriminator column
+              and the values that distinguish Debitor (AR) from Kreditor (AP) rows.
+              {combinedSides.viewMode === 'combined' && ' Then identify the entity column.'}
+              {' '}The same mapping applies to both sides in the file.
             </p>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {OPOS_TARGET_FIELDS.map(field => (
-                <div key={field.key} className="space-y-1">
-                  <label className="text-xs font-medium text-slate-700">
-                    {field.label}
-                    {field.required && <span className="ml-0.5 text-red-500" aria-hidden>*</span>}
-                  </label>
-                  {field.hint && (
-                    <p className="text-[12px] text-slate-400">{field.hint}</p>
-                  )}
-                  <select
-                    value={combinedSides.columnMap[field.key] ?? ''}
-                    onChange={e => {
-                      const nextMap = { ...combinedSides.columnMap }
-                      if (e.target.value) nextMap[field.key] = e.target.value
-                      else delete nextMap[field.key]
-                      onPatch({ columnMap: nextMap })
-                    }}
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Not mapped --</option>
-                    {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Side discriminator */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              <div className="h-px flex-1 bg-slate-200" />
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Side discriminator
-              </span>
-              <div className="h-px flex-1 bg-slate-200" />
-            </div>
-            <p className="text-xs text-slate-500">
-              Select the column that identifies whether each row belongs to Debitor (AR) or
-              Kreditor (AP), then specify the corresponding values.
-            </p>
-
-            {/* Side column selector */}
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-700">
-                Side column
-                <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-              </label>
-              <select
-                value={combinedSides.sideColumn ?? ''}
-                onChange={e => onPatch({ sideColumn: e.target.value || undefined })}
-                className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="">-- Select column --</option>
-                {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-
-            {/* Debitor / Kreditor value pickers */}
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-700">Value for Debitor (AR)</label>
-                {sideColumnSampleValues.length > 0 ? (
-                  <select
-                    value={combinedSides.debitorValue ?? ''}
-                    onChange={e => onPatch({ debitorValue: e.target.value || undefined })}
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Select value --</option>
-                    {sideColumnSampleValues.map(v => <option key={v} value={v}>{v}</option>)}
-                  </select>
-                ) : (
-                  <input
-                    type="text"
-                    value={combinedSides.debitorValue ?? ''}
-                    onChange={e => onPatch({ debitorValue: e.target.value || undefined })}
-                    placeholder="e.g. D, Debitor, AR"
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                )}
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-slate-700">Value for Kreditor (AP)</label>
-                {sideColumnSampleValues.length > 0 ? (
-                  <select
-                    value={combinedSides.kreditorValue ?? ''}
-                    onChange={e => onPatch({ kreditorValue: e.target.value || undefined })}
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Select value --</option>
-                    {sideColumnSampleValues.map(v => <option key={v} value={v}>{v}</option>)}
-                  </select>
-                ) : (
-                  <input
-                    type="text"
-                    value={combinedSides.kreditorValue ?? ''}
-                    onChange={e => onPatch({ kreditorValue: e.target.value || undefined })}
-                    placeholder="e.g. K, Kreditor, AP"
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                )}
-              </div>
-            </div>
+            <StepColumnMapper
+              key={previewColumns.join(',')}
+              preview={fromNamedPreview(previewColumns, previewSample)}
+              buildSteps={() => buildOposSteps('combined_sides', combinedSides.viewMode)}
+              toResult={toOposResult}
+              initial={mapperInitial}
+              onComplete={r =>
+                onPatch({
+                  columnMap: r.columnMap,
+                  entityColumn: r.entityColumn,
+                  sideColumn: r.sideColumn,
+                  debitorValue: r.debitorValue,
+                  kreditorValue: r.kreditorValue,
+                })
+              }
+            />
           </div>
 
           {/* Commit hint — split runs server-side on the side column */}
@@ -888,7 +670,6 @@ function OposCombinedSidesPanel({
               )}
             </p>
           </div>
-
         </div>
       )}
     </div>

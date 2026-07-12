@@ -2,18 +2,23 @@
  * AnlagenStep.tsx — DRAFT provisioning sub-flow for Fixed-Asset Register (D3).
  *
  * Flow: entity source selection -> upload (per FY / per entity x FY) ->
- *       preview -> column mapping -> dimension selection -> per-slot commit.
+ *       step-by-step column mapping (StepColumnMapper) -> per-slot commit.
  *
  * Roll-forward (carry AHK/NBV to next period) and depreciation schedules are
  * NOT computed in the UI.  This is a data-provisioning scaffold only.
  */
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import EntitySourceSelector, { type EntitySource } from './EntitySourceSelector'
 import PerEntityPager from './PerEntityPager'
 import PerYearPager from './PerYearPager'
 import { uploadAnlagenFile, commitAnlagen } from '../../lib/gdpduApi'
 import { glFiscalYearLabel } from '../../lib/fiscalYear'
+import StepColumnMapper from '../mapper/StepColumnMapper'
+import { fromNamedPreview } from '../mapper/normalizePreview'
+import { buildAnlagenSteps, toAnlagenResult } from '../mapper/anlagenSteps'
+import type { Answers } from '../mapper/stepMapperTypes'
+import FileDrop from '../budget/chat/FileDrop'
 
 // ---------------------------------------------------------------------------
 // State shapes — exported so ProjectSetupWizard can reference them in
@@ -47,26 +52,6 @@ export interface WizardAnlagenState {
     bilanzpositionCol?: string
   }
 }
-
-// ---------------------------------------------------------------------------
-// Target field definitions
-// ---------------------------------------------------------------------------
-
-const ANLAGEN_TARGET_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
-  { key: 'asset_id',            label: 'Anlage (asset ID)',                required: true  },
-  { key: 'asset_label',         label: 'Anlagenbezeichnung',               required: false },
-  { key: 'asset_sub_no',        label: 'Asset sub-number',        required: false },
-  { key: 'asset_class',         label: 'Asset class',             required: false },
-  { key: 'segment',             label: 'Segment',                 required: false },
-  { key: 'bilanzposition',      label: 'Balance sheet line',      required: false },
-  { key: 'capitalization_date', label: 'Capitalization date',     required: false },
-  { key: 'opening_cost_ahk',    label: 'Opening cost (AHK)',      required: false },
-  { key: 'additions_zugang',    label: 'Additions',               required: false },
-  { key: 'disposals_abgang',    label: 'Disposals',               required: false },
-  { key: 'transfers_umbuchung', label: 'Transfers',               required: false },
-  { key: 'depreciation',        label: 'Depreciation',            required: false },
-  { key: 'nbv',                 label: 'Net book value (NBV)',     required: false },
-]
 
 // ---------------------------------------------------------------------------
 // Props
@@ -114,35 +99,6 @@ function suggestColumnMap(columns: string[], existing: Record<string, string>): 
   return next
 }
 
-function SampleTable({ columns, sample }: { columns: string[]; sample: Record<string, unknown>[] }) {
-  if (sample.length === 0) return null
-  const cols = columns.slice(0, 8)
-  return (
-    <div className="overflow-x-auto rounded-md border border-slate-100">
-      <table className="min-w-full text-xs">
-        <thead className="bg-slate-50">
-          <tr>
-            {cols.map(c => (
-              <th key={c} className="px-2 py-1.5 text-left font-medium text-slate-600 whitespace-nowrap">{c}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100">
-          {sample.slice(0, 3).map((row, i) => (
-            <tr key={i} className="even:bg-slate-50/50">
-              {cols.map(c => (
-                <td key={c} className="px-2 py-1.5 text-slate-700 whitespace-nowrap">
-                  {String(row[c] ?? '')}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -179,6 +135,26 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
   const previewSample  = previewUpload?.sample  ?? []
 
   const hasUploads = anlagen.uploads.some(u => !!u.file_id)
+
+  // Build initial answers: seed from suggestColumnMap (alias auto-detect) +
+  // any previously confirmed entity column / dimensions from wizard state.
+  const mapperInitial = useMemo((): Answers => {
+    const suggested = suggestColumnMap(previewColumns, anlagen.columnMap)
+    const ans: Answers = {}
+    for (const [field, col] of Object.entries(suggested)) {
+      ans[field] = { t: 'column', id: col }
+    }
+    if (anlagen.entityColumn)
+      ans['entity_column'] = { t: 'column', id: anlagen.entityColumn }
+    if (anlagen.dimensions.segmentCol)
+      ans['segmentCol'] = { t: 'column', id: anlagen.dimensions.segmentCol }
+    if (anlagen.dimensions.assetClassCol)
+      ans['assetClassCol'] = { t: 'column', id: anlagen.dimensions.assetClassCol }
+    if (anlagen.dimensions.bilanzpositionCol)
+      ans['bilanzpositionCol'] = { t: 'column', id: anlagen.dimensions.bilanzpositionCol }
+    return ans
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewColumns.join(','), anlagen.columnMap, anlagen.entityColumn, anlagen.dimensions])
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -266,43 +242,27 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
     const comMsg    = commitMsg[slotKey] ?? ''
     const comErr    = commitErr[slotKey] ?? ''
     const staged    = !!existing?.file_id
-    const hasMap    = Object.keys(anlagen.columnMap).length > 0
+    // Gate commit on the required asset_id field being mapped
+    const hasMap    = !!anlagen.columnMap['asset_id']
 
     return (
       <div key={slotKey} className="space-y-2">
-        <label
-          className={[
-            'flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-5 cursor-pointer transition',
-            staged
-              ? 'border-emerald-300 bg-emerald-50'
-              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50/50',
-          ].join(' ')}
-        >
-          <input
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            className="sr-only"
-            disabled={isUp}
-            onChange={e => {
-              const f = e.target.files?.[0]
-              if (f) void handleFileUpload(entityIndex, entityName, fyLabel, f)
-              e.target.value = ''
-            }}
-          />
-          {isUp ? (
-            <span className="text-sm text-blue-600">Uploading…</span>
-          ) : staged ? (
-            <>
-              <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
-              {existing?.columns && (
-                <span className="text-xs text-slate-500">{existing.columns.length} columns detected</span>
-              )}
-              <span className="text-xs text-slate-400 italic">Click to replace</span>
-            </>
-          ) : (
-            <span className="text-sm text-slate-600">Drop .xlsx / .csv or click to browse</span>
-          )}
-        </label>
+        {staged && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-emerald-700">File staged — {fyLabel}</span>
+            {existing?.columns && (
+              <span className="text-xs text-slate-500">({existing.columns.length} columns)</span>
+            )}
+          </div>
+        )}
+
+        <FileDrop
+          onFile={f => void handleFileUpload(entityIndex, entityName, fyLabel, f)}
+          accept=".xlsx,.xls,.csv"
+          loading={isUp}
+          label={staged ? 'Replace file' : 'Drop .xlsx / .csv here'}
+          hint={staged ? 'Drop or click Browse to select a different file' : 'or click Browse to select'}
+        />
 
         {upErr && <p className="text-xs text-red-600">{upErr}</p>}
 
@@ -313,7 +273,7 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
               disabled={isCom || !hasMap}
               onClick={() => void handleCommit(entityIndex, entityPrefix, fyLabel)}
               className="rounded-md border border-blue-300 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-40 transition"
-              title={!hasMap ? 'Map at least one target field before committing' : undefined}
+              title={!hasMap ? 'Map the Asset ID column before committing' : undefined}
             >
               {isCom ? 'Committing…' : `Commit ${fyLabel}`}
             </button>
@@ -351,27 +311,6 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
         }
         dataLabel="Fixed-asset register data"
       />
-
-      {/* Entity column (combined mode, shown after first upload) */}
-      {viewMode === 'combined' && hasUploads && previewColumns.length > 0 && (
-        <div className="space-y-1.5">
-          <p className="text-xs font-medium text-slate-700">
-            Entity column
-            <span className="ml-0.5 text-red-500" aria-hidden>*</span>
-          </p>
-          <select
-            value={anlagen.entityColumn ?? ''}
-            onChange={e => onPatch({ entityColumn: e.target.value || undefined })}
-            className="rounded-md border border-slate-300 px-2 py-1.5 text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          >
-            <option value="">-- Select entity column (e.g. company code) --</option>
-            {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <p className="text-xs text-slate-400">
-            Column identifying the legal entity per row in the combined file.
-          </p>
-        </div>
-      )}
 
       {/* Upload zones */}
       <div className="space-y-3">
@@ -411,102 +350,38 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
         )}
       </div>
 
-      {/* Preview + column mapping + dimensions — only after first upload */}
+      {/* Column mapping — shown after first upload via StepColumnMapper */}
       {hasUploads && previewColumns.length > 0 && (
-        <div className="space-y-5">
-
-          {/* Sample preview */}
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-slate-600">
-              Sample data (from first uploaded file)
-            </p>
-            <SampleTable columns={previewColumns} sample={previewSample} />
+        <div className="space-y-3">
+          <div className="flex items-center gap-3">
+            <div className="h-px flex-1 bg-slate-200" />
+            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Column mapping
+            </span>
+            <div className="h-px flex-1 bg-slate-200" />
           </div>
-
-          {/* Column mapping */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              <div className="h-px flex-1 bg-slate-200" />
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Column mapping
-              </span>
-              <div className="h-px flex-1 bg-slate-200" />
-            </div>
-            <p className="text-xs text-slate-500">
-              Map source columns to fixed-asset register target fields. Asset ID is required; all
-              other fields are optional. The same mapping is applied to all uploaded files.
-            </p>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {ANLAGEN_TARGET_FIELDS.map(field => (
-                <div key={field.key} className="space-y-1">
-                  <label className="text-xs font-medium text-slate-700">
-                    {field.label}
-                    {field.required && <span className="ml-0.5 text-red-500" aria-hidden>*</span>}
-                  </label>
-                  <select
-                    value={anlagen.columnMap[field.key] ?? ''}
-                    onChange={e => {
-                      const nextMap = { ...anlagen.columnMap }
-                      if (e.target.value) nextMap[field.key] = e.target.value
-                      else delete nextMap[field.key]
-                      onPatch({ columnMap: nextMap })
-                    }}
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Not mapped --</option>
-                    {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-              ))}
-            </div>
-            {!anlagen.columnMap['asset_id'] && (
-              <p className="text-xs text-amber-700">
-                Map the Asset ID column before committing.
-              </p>
-            )}
-          </div>
-
-          {/* Dimension / breakdown selection */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-3">
-              <div className="h-px flex-1 bg-slate-200" />
-              <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                Breakdown dimensions (optional)
-              </span>
-              <div className="h-px flex-1 bg-slate-200" />
-            </div>
-            <p className="text-xs text-slate-500">
-              Identify which columns to use as breakdown dimensions in drill-downs.
-            </p>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              {(
-                [
-                  ['segmentCol',       'Segment column'],
-                  ['assetClassCol',    'Asset class column'],
-                  ['bilanzpositionCol','Balance sheet line column'],
-                ] as [keyof WizardAnlagenState['dimensions'], string][]
-              ).map(([dimKey, dimLabel]) => (
-                <div key={dimKey} className="space-y-1">
-                  <label className="text-xs font-medium text-slate-700">{dimLabel}</label>
-                  <select
-                    value={anlagen.dimensions[dimKey] ?? ''}
-                    onChange={e =>
-                      onPatch({
-                        dimensions: {
-                          ...anlagen.dimensions,
-                          [dimKey]: e.target.value || undefined,
-                        },
-                      })
-                    }
-                    className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="">-- Not selected --</option>
-                    {previewColumns.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                </div>
-              ))}
-            </div>
-          </div>
+          <p className="text-xs text-slate-500">
+            Map source columns to fixed-asset register target fields. Asset ID is required; all
+            other fields are optional.
+            {viewMode === 'combined' && ' Then identify the entity column.'}
+            {' '}Segment, asset-class, and balance-sheet line columns can be assigned as
+            drill-down dimensions. The same mapping is applied to all uploaded files.
+          </p>
+          <StepColumnMapper
+            key={previewColumns.join(',')}
+            preview={fromNamedPreview(previewColumns, previewSample)}
+            buildSteps={() => buildAnlagenSteps(viewMode)}
+            toResult={toAnlagenResult}
+            initial={mapperInitial}
+            onComplete={r =>
+              onPatch({
+                columnMap: r.columnMap,
+                entityColumn: r.entityColumn,
+                dimensions: r.dimensions,
+                provided: true,
+              })
+            }
+          />
         </div>
       )}
     </div>

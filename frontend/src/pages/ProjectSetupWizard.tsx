@@ -96,11 +96,12 @@ import {
   type CandidatePosition,
   type AccountMappingAssignment,
 } from '../lib/gdpduApi'
-import FteColumnMapper, { type FteMappingPayload } from '../components/fdd-bot/FteColumnMapper'
-import FteDimensionPicker, { type FteDimension } from '../components/fdd-bot/FteDimensionPicker'
-import FtePexGrid from '../components/fdd-bot/FtePexGrid'
-import type { AdaptiveCardInput } from '../components/fdd-bot/useFddBot'
-import DatasetSelector from '../components/ingest/DatasetSelector'
+import StepColumnMapper from '../components/mapper/StepColumnMapper'
+import { fromLetterPreview } from '../components/mapper/normalizePreview'
+import { fetchPersonaltablePreview } from '../components/fdd-bot/fteMapperUtils'
+import { buildFteSteps, toFteResult } from '../components/mapper/fteSteps'
+import FileDrop from '../components/budget/chat/FileDrop'
+import DatasetSelector, { type AdditionalDataset } from '../components/ingest/DatasetSelector'
 import PerYearPager from '../components/ingest/PerYearPager'
 import {
   buildInitialCoaAssignment,
@@ -726,13 +727,6 @@ const WIZARD_STEPS = [
   'Statement structure',    // 7 — unknown CoA position classification
   'Review & Finish',        // 8
 ] as const
-
-/** Preset metric options for FTE Development — exact string values from rasa/actions/fte_flow.py. */
-const FTE_PRESET_METRIC_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: 'fte',              label: 'Average FTEs # (whole numbers)' },
-  { value: 'payroll',          label: 'Payroll accounting (EURk)' },
-  { value: 'avg_cost_per_fte', label: 'Average cost per FTE (EURk)' },
-]
 
 // ---------------------------------------------------------------------------
 // Shared primitives
@@ -3516,7 +3510,24 @@ function StepAdditionalInformation({
   const validEntities = entities.filter(e => e.code.trim())
   const [uploading, setUploading] = useState<Record<string, boolean>>({})
   const [uploadError, setUploadError] = useState<Record<string, string>>({})
-  const [customDraft, setCustomDraft] = useState({ source_col: '', output_label: '' })
+  const [activeDataset, setActiveDataset] = useState<AdditionalDataset | null>(null)
+
+  // FTE column-mapping preview — fetched once per previewFileId change
+  const [ftePreview, setFtePreview] = useState<import('../components/mapper/stepMapperTypes').NormalizedPreview | null>(null)
+  const [ftePreviewLoading, setFtePreviewLoading] = useState(false)
+  const [ftePreviewErr, setFtePreviewErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!fte.previewFileId) { setFtePreview(null); return }
+    let cancelled = false
+    setFtePreviewLoading(true)
+    setFtePreviewErr(null)
+    fetchPersonaltablePreview(fte.sessionId, fte.previewFileId)
+      .then(raw => { if (!cancelled) setFtePreview(fromLetterPreview(raw)) })
+      .catch(e => { if (!cancelled) setFtePreviewErr(e instanceof Error ? e.message : 'Preview failed') })
+      .finally(() => { if (!cancelled) setFtePreviewLoading(false) })
+    return () => { cancelled = true }
+  }, [fte.sessionId, fte.previewFileId])
 
   // Derive FY labels from GL years using the fiscal-year label helper (mirrors GL step).
   // Fall back to a 4-year default range when no GL years are selected yet.
@@ -3579,60 +3590,34 @@ function StepAdditionalInformation({
     const err = uploadError[slotKey] ?? ''
     return (
       <div key={slotKey} className="space-y-1.5">
-        <label
-          className={`flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-6 cursor-pointer transition ${
-            existing
-              ? 'border-emerald-300 bg-emerald-50'
-              : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50/50'
-          }`}
-        >
-          <input
-            type="file"
-            accept=".xlsx"
-            className="sr-only"
-            disabled={isUploading}
-            onChange={e => {
-              const f = e.target.files?.[0]
-              if (f) void handleFileUpload(entityIndex, entityName, fyLabel, f)
-              e.target.value = ''
-            }}
-          />
-          {isUploading ? (
-            <span className="text-sm text-blue-600">Uploading…</span>
-          ) : existing ? (
-            <>
-              <svg className="h-5 w-5 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-              <span className="text-sm text-emerald-700 font-medium">File uploaded — {fyLabel}</span>
-              <span className="text-xs text-slate-500">Click to replace</span>
-            </>
-          ) : (
-            <>
-              <svg className="h-6 w-6 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-              </svg>
-              <span className="text-sm text-slate-600">Drop .xlsx or click to browse</span>
-            </>
-          )}
-        </label>
+        {existing && (
+          <div className="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
+            <svg className="h-4 w-4 shrink-0 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+            <span className="text-sm font-medium text-emerald-700">Uploaded — {fyLabel}</span>
+            <span className="ml-1 text-xs text-slate-500">Drop or click below to replace</span>
+          </div>
+        )}
+        <FileDrop
+          onFile={f => void handleFileUpload(entityIndex, entityName, fyLabel, f)}
+          accept=".xlsx"
+          loading={isUploading}
+          label={existing ? 'Replace file' : 'Drop personnel file here'}
+          hint={fyLabel}
+        />
         {err && <p className="text-xs text-red-600">{err}</p>}
       </div>
     )
   }
 
-  // AdaptiveCardInput shape required by FtePexGrid
-  const pexInput: AdaptiveCardInput = {
-    id: 'fte_pex_values',
-    type: 'fte_pex_grid',
-    label: 'Personnel expenses (EURk)',
-    options: fyLabels.map(fy => ({ label: fy, value: fy })),
-    entity_count:
-      fte.pexViewMode === 'per_entity' ? Math.max(1, validEntities.length) : 1,
-    default_entity_names:
-      fte.pexViewMode === 'per_entity'
-        ? validEntities.map(e => e.name || e.code)
-        : [validEntities[0]?.name || validEntities[0]?.code || 'Entity 1'],
+  /** Toggle a dataset on/off; clear activeDataset when toggled off. */
+  function handleToggle(key: AdditionalDataset, value: boolean) {
+    dispatch({ type: 'TOGGLE_DATASET', dataset: key, value })
+    if (!value && activeDataset === key) {
+      const next = (['fte', 'anlagen', 'opos'] as const).find(k => k !== key && additionalDatasets[k])
+      setActiveDataset(next ?? null)
+    }
   }
 
   return (
@@ -3647,13 +3632,16 @@ function StepAdditionalInformation({
         {/* ------------------------------------------------------------------ */}
         <DatasetSelector
           selection={additionalDatasets}
-          onToggle={(dataset, value) => dispatch({ type: 'TOGGLE_DATASET', dataset, value })}
+          onToggle={handleToggle}
+          activeDataset={activeDataset}
+          onOpen={setActiveDataset}
+          providedMap={{ fte: fte.provided, anlagen: anlagen.provided, opos: opos.provided }}
         />
 
         {/* ------------------------------------------------------------------ */}
-        {/* FTE provisioning — visible only when additionalDatasets.fte is true */}
+        {/* FTE provisioning — visible only when FTE tab is active            */}
         {/* ------------------------------------------------------------------ */}
-        {additionalDatasets.fte && (
+        {activeDataset === 'fte' && additionalDatasets.fte && (
           <div className="space-y-8">
 
             {/* a. Intro */}
@@ -3739,220 +3727,51 @@ function StepAdditionalInformation({
               )}
             </div>
 
-            {/* Sections d–h — visible only after at least one file is uploaded */}
+            {/* Column mapping — visible only after at least one file is uploaded */}
             {hasUploads && fte.previewFileId && (
-              <>
-                {/* d. FTE column mapping */}
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3">
-                    <div className="h-px flex-1 bg-slate-200" />
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                      FTE column mapping
-                    </span>
-                    <div className="h-px flex-1 bg-slate-200" />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    Map source columns for FTE tenure calculation (headcount months or entry/exit dates).
-                  </p>
-                  <FteColumnMapper
-                    sessionId={fte.sessionId}
-                    previewFileId={fte.previewFileId}
-                    mode="fte"
-                    uploadMode={fte.uploadMode}
-                    initialTenureMode={fte.tenureMode}
-                    onSubmit={(mapping: FteMappingPayload) => {
-                      patch({
-                        fteMapping: mapping as Record<string, unknown>,
-                        tenureMode: mapping.tenure_mode ?? fte.tenureMode,
-                        provided: true,
-                      })
-                    }}
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <div className="h-px flex-1 bg-slate-200" />
+                  <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+                    Column mapping
+                  </span>
+                  <div className="h-px flex-1 bg-slate-200" />
+                </div>
+                <p className="text-xs text-slate-500">
+                  Map FTE tenure, payroll cost, breakdown dimensions, and output metrics
+                  in one guided flow. Use Undo / Redo to revise earlier answers.
+                </p>
+                {ftePreviewLoading && (
+                  <p className="text-sm text-slate-500">Loading column preview…</p>
+                )}
+                {ftePreviewErr && (
+                  <p className="text-sm text-red-600">{ftePreviewErr}</p>
+                )}
+                {ftePreview && (
+                  <StepColumnMapper
+                    preview={ftePreview}
+                    buildSteps={a => buildFteSteps(a, fte.uploadMode)}
+                    toResult={a => toFteResult(a, ftePreview)}
+                    completeLabel="Confirm mapping"
+                    onComplete={r => patch({
+                      fteMapping:    r.fteMapping,
+                      payrollMapping: r.payrollMapping,
+                      tenureMode:    r.tenureMode,
+                      payrollMode:   r.payrollMode,
+                      dimensions:    r.dimensions,
+                      presetMetrics: r.presetMetrics,
+                      customMetrics: r.customMetrics,
+                      provided:      true,
+                    })}
                   />
-                </div>
-
-                {/* e. Payroll column mapping */}
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3">
-                    <div className="h-px flex-1 bg-slate-200" />
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                      Payroll column mapping
-                    </span>
-                    <div className="h-px flex-1 bg-slate-200" />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    Map source columns for personnel cost (payroll) per employee.
-                  </p>
-                  <FteColumnMapper
-                    sessionId={fte.sessionId}
-                    previewFileId={fte.previewFileId}
-                    mode="payroll"
-                    uploadMode={fte.uploadMode}
-                    initialPayrollMode={fte.payrollMode}
-                    onSubmit={(mapping: FteMappingPayload) => {
-                      patch({
-                        payrollMapping: mapping as Record<string, unknown>,
-                        payrollMode: mapping.payroll_mode ?? fte.payrollMode,
-                        provided: true,
-                      })
-                    }}
-                  />
-                </div>
-
-                {/* f. Breakdown dimensions */}
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3">
-                    <div className="h-px flex-1 bg-slate-200" />
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                      Breakdown dimensions (optional, max 3)
-                    </span>
-                    <div className="h-px flex-1 bg-slate-200" />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    Select up to 3 columns to use as breakdown dimensions in the output workbook.
-                  </p>
-                  <FteDimensionPicker
-                    sessionId={fte.sessionId}
-                    previewFileId={fte.previewFileId}
-                    onSubmit={(dims: FteDimension[]) => {
-                      patch({ dimensions: dims })
-                    }}
-                  />
-                </div>
-
-                {/* g. Output metrics */}
-                <div className="space-y-4">
-                  <div className="flex items-center gap-3">
-                    <div className="h-px flex-1 bg-slate-200" />
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                      Output metrics
-                    </span>
-                    <div className="h-px flex-1 bg-slate-200" />
-                  </div>
-
-                  {/* Preset metrics */}
-                  <div className="space-y-2">
-                    <p className="text-xs font-semibold text-slate-600">Preset metrics</p>
-                    {FTE_PRESET_METRIC_OPTIONS.map(opt => (
-                      <label key={opt.value} className="flex items-center gap-3 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          className="accent-blue-600 h-4 w-4"
-                          checked={fte.presetMetrics.includes(opt.value)}
-                          onChange={e => {
-                            const next = e.target.checked
-                              ? [...fte.presetMetrics, opt.value]
-                              : fte.presetMetrics.filter(m => m !== opt.value)
-                            patch({ presetMetrics: next })
-                          }}
-                        />
-                        <span className="text-sm text-slate-800">{opt.label}</span>
-                      </label>
-                    ))}
-                  </div>
-
-                  {/* Custom output columns */}
-                  <div className="space-y-2">
-                    <p className="text-xs font-semibold text-slate-600">
-                      Custom output columns (source column → output label)
-                    </p>
-                    {fte.customMetrics.map((m, i) => (
-                      <div key={m.source_col || i} className="flex items-center gap-2 text-sm">
-                        <span className="font-mono bg-slate-100 rounded px-2 py-0.5 text-xs text-slate-700">
-                          {m.source_col}
-                        </span>
-                        <span className="text-slate-400">→</span>
-                        <span className="text-slate-800">{m.output_label}</span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            patch({ customMetrics: fte.customMetrics.filter((_, j) => j !== i) })
-                          }
-                          className="ml-auto text-xs text-red-500 hover:text-red-700 transition"
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    ))}
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        placeholder="Source column name"
-                        value={customDraft.source_col}
-                        onChange={e => setCustomDraft(d => ({ ...d, source_col: e.target.value }))}
-                        className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                      />
-                      <input
-                        type="text"
-                        placeholder="Output label"
-                        value={customDraft.output_label}
-                        onChange={e => setCustomDraft(d => ({ ...d, output_label: e.target.value }))}
-                        className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                      />
-                      <button
-                        type="button"
-                        disabled={!customDraft.source_col.trim() || !customDraft.output_label.trim()}
-                        onClick={() => {
-                          if (!customDraft.source_col.trim() || !customDraft.output_label.trim()) return
-                          patch({ customMetrics: [...fte.customMetrics, { ...customDraft }] })
-                          setCustomDraft({ source_col: '', output_label: '' })
-                        }}
-                        className="rounded border border-blue-300 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-40 transition"
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* h. PEX — GL personnel expenses grid */}
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3">
-                    <div className="h-px flex-1 bg-slate-200" />
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
-                      Personnel expenses from GL (PEX) — optional
-                    </span>
-                    <div className="h-px flex-1 bg-slate-200" />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    Enter GL personnel expense totals in EURk per entity and fiscal year.
-                    Used for variance analysis between GL and payroll data. Leave blank if unavailable.
-                  </p>
-                  <div className="flex gap-4 mb-2">
-                    {(
-                      [['consolidated', 'Consolidated'], ['per_entity', 'Per entity']] as const
-                    ).map(([val, label]) => (
-                      <label key={val} className="flex items-center gap-2 cursor-pointer text-sm">
-                        <input
-                          type="radio"
-                          name="pexViewMode"
-                          value={val}
-                          checked={fte.pexViewMode === val}
-                          onChange={() => patch({ pexViewMode: val })}
-                          className="accent-blue-600"
-                        />
-                        <span className="text-slate-700">{label}</span>
-                      </label>
-                    ))}
-                  </div>
-                  <FtePexGrid
-                    input={pexInput}
-                    values={{ fte_pex_values: fte.pexValues }}
-                    onChange={(vals: Record<string, number | string>) => {
-                      const numVals: Record<string, number> = {}
-                      for (const [k, v] of Object.entries(vals)) {
-                        if (v !== '' && !Number.isNaN(Number(v))) numVals[k] = Number(v)
-                      }
-                      patch({ pexValues: numVals })
-                    }}
-                  />
-                </div>
-              </>
+                )}
+              </div>
             )}
           </div>
         )}
 
-        {/* Anlagen provisioning — visible only when additionalDatasets.anlagen is true */}
-        {additionalDatasets.anlagen && (
+        {/* Anlagen provisioning — visible only when Anlagen tab is active */}
+        {activeDataset === 'anlagen' && additionalDatasets.anlagen && (
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <div className="h-px flex-1 bg-slate-200" />
@@ -3971,8 +3790,8 @@ function StepAdditionalInformation({
           </div>
         )}
 
-        {/* OPOS provisioning — visible only when additionalDatasets.opos is true */}
-        {additionalDatasets.opos && (
+        {/* OPOS provisioning — visible only when OPOS tab is active */}
+        {activeDataset === 'opos' && additionalDatasets.opos && (
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <div className="h-px flex-1 bg-slate-200" />
@@ -6224,8 +6043,7 @@ export default function ProjectSetupWizard() {
         dimensions:      fte.dimensions,
         preset_metrics:  fte.presetMetrics,
         custom_metrics:  fte.customMetrics,
-        pex_view_mode:   fte.pexViewMode,
-        pex_values:      fte.pexValues,
+        pex_values:      {},   // backend auto-derives GL personnel expenses
         fy_end_month:    fyEndMonth,
         fy_end_day:      31,
         formula_mode:    true,

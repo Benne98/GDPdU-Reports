@@ -12,6 +12,7 @@
     "dev:v4": "vite --mode v4",
     "dev:merged": "vite --mode merged",
     "dev:v5": "vite --mode v5",
+    "dev:v5-e2e": "vite --mode v5-e2e",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
@@ -41,6 +42,7 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
     "typescript": "^5.9.3",
-    "vite": "^5.4.8"
+    "vite": "^5.4.8",
+    "vitest": "^4.1.10"
   }
 }
