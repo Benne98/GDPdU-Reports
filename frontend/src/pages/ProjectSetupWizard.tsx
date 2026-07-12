@@ -5324,6 +5324,12 @@ export default function ProjectSetupWizard() {
     // passable — per-group config warnings show inline but don't hard-block.
     if (step === 3) {
       const configurableEntities = state.entities.filter(e => e.code.trim())
+      // Re-entry: when the CoA was already classified in a prior setup
+      // (setupStatus.coa.loaded — Project Setup is being re-opened after the initial
+      // run), don't force the user to re-click "Confirm assignment"; allow Next
+      // directly. During the INITIAL setup coa.loaded is false, so the assignment
+      // must still be confirmed as before.
+      if (setupStatus?.coa.loaded) return false
       if (configurableEntities.length > 1 && !state.coa.assigned) return true
       return false
     }
