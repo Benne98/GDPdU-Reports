@@ -16,21 +16,46 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
-from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from gst_excel_theme import THEME  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    LAYOUT_NA,
+    LAYOUT_PL,
+    FILL_YELLOW,
+    apply_subtotal_row_style,
+    check_rows_after_table,
+    collapse_check_outline_rows,
+    hide_helper_column_group,
+    paint_check_source_yellow,
+    paint_grey_white_canvas,
+    paint_header_band,
+    prune_zero_value_rows,
+    write_kpi_section_title_row,
+)
+from databook_periods import (  # noqa: E402
+    display_bs_period_labels,
+    display_reporting_columns_from_df,
+    ordered_reporting_columns_from_df,
+    split_fy_and_ytd,
+)
 from report_row_layout import build_lead_bs_row_structure, l3_order_from_mapping  # noqa: E402
+from databook_runtime import load_argv_config, path_value  # noqa: E402
+
+_argv_cfg = load_argv_config()
 
 # ================================================
 # DESKTOP DEFAULTS
 # ================================================
-from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+from databook_workbook import BS_RECON_MAPPING_FILE, MASTER_WORKBOOK_STR  # noqa: E402
 
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 
-INPUT_FILE = MASTER_WORKBOOK_STR
-MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
-PL_LEAD_FILE = Path(MASTER_WORKBOOK_STR)
+INPUT_FILE = path_value(_argv_cfg, "input_file", MASTER_WORKBOOK_STR)
+PL_LEAD_FILE = Path(path_value(_argv_cfg, "pl_master_file", MASTER_WORKBOOK_STR))
 PL_LEAD_FILENAME = PL_LEAD_FILE.name
+MAPPING_FILE_BS = BS_RECON_MAPPING_FILE
+
+FY_END_MONTH = int(_argv_cfg.get("fy_end_month") or 12)
+LTM_MONTH = _argv_cfg.get("ltm_month") or "2023-7"
 
 SHEET_MASTER = "Master_BS"
 SHEET_OUT = "Lead_BS"
@@ -64,9 +89,11 @@ NET_ASSETS_COMPONENT_TOTALS = [
     "Other",
 ]
 
-MAP_START_COL = 5
-MAP_END_COL = 9
-POS_COL = 10
+_COL_LAYOUT = LAYOUT_NA
+MAP_START_COL = _COL_LAYOUT.map_start_col
+MAP_END_COL = _COL_LAYOUT.map_end_col
+TECH_SPACER_COL = _COL_LAYOUT.spacer_col
+POS_COL = _COL_LAYOUT.pos_col
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
@@ -116,6 +143,13 @@ FILL_KPI = THEME.fill_subtotal
 
 FONT_KPI = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.text_kpi, italic=False, bold=False)
 FONT_KPI_ITALIC = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.text_kpi, italic=True, bold=False)
+FONT_KPI_TITLE = Font(
+    name=THEME.font_name,
+    size=THEME.font_size,
+    color="00A7B5",
+    italic=True,
+    bold=True,
+)
 
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center")
 ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
@@ -145,7 +179,7 @@ def detect_year_columns(df_: pd.DataFrame) -> list[str]:
 
 
 def detect_reporting_period_columns(df_: pd.DataFrame) -> list[str]:
-    periods = ordered_reporting_columns_from_df(df_)
+    periods = display_reporting_columns_from_df(df_)
     if not periods:
         raise ValueError("Keine FY/YTD-Spalten im Master_BS gefunden.")
     return periods
@@ -238,7 +272,7 @@ def is_fy_period_label(period: str) -> bool:
 
 
 def compute_lead_is_layout(n_years: int):
-    pos1 = 10
+    pos1 = LAYOUT_PL.pos_col
     y1 = list(range(pos1 + 1, pos1 + 1 + n_years))
     cagr1 = y1[-1] + 1
     spacer = cagr1 + 1
@@ -285,14 +319,15 @@ def find_row_by_label_contains(ws_, col_idx, needle):
     return None
 
 
-def detect_period_bucket_cols(ws_):
+def detect_period_bucket_cols(ws_, period_labels: list[str]):
+    period_set = {str(p).strip() for p in period_labels}
     period_to_cols = {}
     for cc in range(1, ws_.max_column + 1):
         v = ws_.cell(HEADER_ROW_7, cc).value
         if not isinstance(v, str):
             continue
         period = v.strip()
-        if not is_fy_period_label(period):
+        if period not in period_set:
             continue
         bucket_map = {}
         steps = 0
@@ -328,12 +363,15 @@ if LEAD_IS_SHEET not in wb_pl.sheetnames:
     wb_pl.close()
     raise RuntimeError(f"Sheet '{LEAD_IS_SHEET}' fehlt in {PL_LEAD_FILE}.")
 ws_is = wb_pl[LEAD_IS_SHEET]
-IS_LABEL_COL = 10
+IS_LABEL_COL = LAYOUT_PL.pos_col
 is_row_cogs = find_row_by_label_contains(ws_is, IS_LABEL_COL, "cost of goods sold")
 is_row_ns = find_row_by_label_contains(ws_is, IS_LABEL_COL, "net sales")
 if is_row_cogs is None or is_row_ns is None:
     wb_pl.close()
-    raise RuntimeError("Konnte 'Cost of goods sold' oder 'Net sales' in Lead_IS (Spalte J) nicht finden.")
+    raise RuntimeError(
+        f"Konnte 'Cost of goods sold' oder 'Net sales' in Lead_IS "
+        f"(Spalte {col_letter(IS_LABEL_COL)}) nicht finden."
+    )
 
 wb = load_workbook(INPUT_FILE)
 if SHEET_MASTER not in wb.sheetnames:
@@ -345,6 +383,7 @@ ws = wb.create_sheet(SHEET_OUT)
 
 df_bs = pd.read_excel(INPUT_FILE, sheet_name=SHEET_MASTER, engine="openpyxl")
 PERIODS = detect_reporting_period_columns(df_bs)
+DISPLAY_PERIODS = display_bs_period_labels(PERIODS, FY_END_MONTH, LTM_MONTH)
 FY_COLS, YTD_COLS = split_fy_and_ytd(PERIODS)
 Y_COLS = list(range(POS_COL + 1, POS_COL + 1 + len(PERIODS)))
 IS_YEAR_COLS = detect_lead_is_proforma_year_cols(ws_is, PERIODS)
@@ -413,6 +452,14 @@ net_assets_row = {
 }
 row_structure.insert(insert_idx if insert_idx is not None else len(row_structure), net_assets_row)
 
+row_structure = prune_zero_value_rows(
+    row_structure,
+    df_bs,
+    PERIODS,
+    source_col=source_col or SOURCE_COL_CANDIDATES[0],
+    bucket_col=l5_col,
+)
+
 for i, r in enumerate(row_structure):
     r["_idx"] = i
     r["_excel_row"] = DATA_START_ROW + i
@@ -461,7 +508,7 @@ ws.cell(HEADER_ROW, POS_COL, UNIT_LABEL).font = FONT_HEADER
 ws.cell(HEADER_ROW, POS_COL).alignment = ALIGN_LEFT
 ws.cell(HEADER_ROW, POS_COL).fill = FILL_HEADER
 
-for idx, y in enumerate(PERIODS):
+for idx, y in enumerate(DISPLAY_PERIODS):
     cc = Y_COLS[idx]
     h = ws.cell(HEADER_ROW, cc, y)
     h.font = FONT_HEADER
@@ -469,6 +516,8 @@ for idx, y in enumerate(PERIODS):
     h.fill = FILL_HEADER
 
 for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
+    if cc == TECH_SPACER_COL:
+        continue
     ws.cell(HEADER_ROW, cc).border = BOTTOM_BORDER
 
 for c in range(MAP_START_COL, MAP_END_COL + 1):
@@ -591,13 +640,18 @@ for i, r in enumerate(row_structure):
         is_equity_total = r["type"] == "total_l5" and r.get("label") == "Equity"
         is_net_assets = r["type"] == "total_extra" and r.get("label") == NET_ASSETS_LABEL
         border_style = TOP_BOTTOM_BORDER if (is_equity_total or is_net_assets) else BORDER_SUBTOTAL_TOP
-        for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
-            ws.cell(excel_row, cc).fill = FILL_SUBTOTAL
-        ws.cell(excel_row, POS_COL).border = border_style
-        for cc in Y_COLS:
-            ws.cell(excel_row, cc).border = border_style
+        apply_subtotal_row_style(
+            ws,
+            excel_row,
+            layout=LAYOUT_NA,
+            pos_col=POS_COL,
+            value_cols=Y_COLS,
+            fill=FILL_SUBTOTAL,
+            pos_border=border_style,
+            value_border=border_style,
+        )
     else:
-        for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
+        for cc in Y_COLS:
             ws.cell(excel_row, cc).fill = FILL_WHITE
 
 row_inventory = find_row_by_label_contains(ws, POS_COL, "Inventories")
@@ -606,7 +660,16 @@ row_pay = find_row_by_label_contains(ws, POS_COL, "trade payables")
 row_twc = bucket_total_row.get("TWC")
 row_owc = bucket_total_row.get("OWC")
 
-KPI_START_ROW = LAST_TABLE_ROW + 1
+KPI_TITLE_ROW = LAST_TABLE_ROW + 1
+write_kpi_section_title_row(
+    ws,
+    KPI_TITLE_ROW,
+    title_cols=Y_COLS,
+    label_col=POS_COL,
+    title_text="KPIs",
+    fill_end_col=Y_COLS[-1],
+)
+KPI_START_ROW = LAST_TABLE_ROW + 2
 kpi_labels = [
     "TWC in % of net sales",
     "NWC in % of net sales",
@@ -615,6 +678,7 @@ kpi_labels = [
     "DPO",
 ]
 KPI_ROWS = set(range(KPI_START_ROW, KPI_START_ROW + len(kpi_labels)))
+KPI_BAND_ROWS = KPI_ROWS | {KPI_TITLE_ROW}
 
 for i_kpi, label in enumerate(kpi_labels):
     rr = KPI_START_ROW + i_kpi
@@ -696,7 +760,8 @@ for y_idx in range(len(PERIODS)):
     )
 
 KPI_END_ROW = NET_SALES_HELPER_ROW
-CHECK_ROW = KPI_END_ROW + 2
+_check_rows = check_rows_after_table(KPI_END_ROW, 1)
+CHECK_ROW = _check_rows[0]
 
 check_rows_to_collapse = []
 source_rows_yellow = set()
@@ -716,13 +781,13 @@ if net_assets_rownum is not None and equity_rownum is not None:
         c.number_format = NUM_FMT_INT
 
 check_rows_to_collapse.append(CHECK_ROW)
-current_row = CHECK_ROW + 1
+current_row = CHECK_ROW + 2
 
 if BS_BUCKET_SHEET not in wb.sheetnames:
     print(f"Hinweis: Sheet '{BS_BUCKET_SHEET}' fehlt — Bucket-Checks werden übersprungen.")
 else:
     ws_bs = wb[BS_BUCKET_SHEET]
-    period_bucket_cols = detect_period_bucket_cols(ws_bs)
+    period_bucket_cols = detect_period_bucket_cols(ws_bs, DISPLAY_PERIODS)
     bs_total_assets_row = find_row_in_col_any(ws_bs, POS_COL, ["Total assets"])
     bs_total_el_row = find_row_in_col_any(
         ws_bs, POS_COL, ["Total equity & liabilities", "Total equity & liabilities "],
@@ -739,17 +804,17 @@ else:
             ws.cell(src_row, POS_COL).alignment = ALIGN_LEFT
             ws.cell(delta_row, POS_COL, "Check").font = FONT_CHECK_RED
             ws.cell(delta_row, POS_COL).alignment = ALIGN_LEFT
-            ws.cell(src_row, POS_COL).fill = FILL_SOURCE
+            ws.cell(src_row, POS_COL).fill = FILL_YELLOW
             for cc in Y_COLS:
-                ws.cell(src_row, cc).fill = FILL_SOURCE
+                ws.cell(src_row, cc).fill = FILL_YELLOW
             source_rows_yellow.add(src_row)
 
-            for y_idx, year in enumerate(PERIODS):
-                period = year
-                if period not in period_bucket_cols:
+            for y_idx, period in enumerate(PERIODS):
+                display_period = DISPLAY_PERIODS[y_idx]
+                if display_period not in period_bucket_cols:
                     avail = sorted(period_bucket_cols.keys())
-                    period = avail[y_idx] if y_idx < len(avail) else avail[0]
-                bucket_colL = col_letter(period_bucket_cols[period][bucket])
+                    display_period = avail[y_idx] if y_idx < len(avail) else avail[0]
+                bucket_colL = col_letter(period_bucket_cols[display_period][bucket])
                 src_cell = ws.cell(src_row, Y_COLS[y_idx])
                 src_cell.value = (
                     f"='{BS_BUCKET_SHEET}'!{bucket_colL}{bs_total_assets_row}"
@@ -766,54 +831,47 @@ else:
                 d.font = FONT_CHECK_RED
 
             check_rows_to_collapse.extend([src_row, delta_row])
-            current_row += 2
+            current_row = delta_row + 2
 
-for rr in check_rows_to_collapse:
-    ws.row_dimensions[rr].outlineLevel = 2
-    ws.row_dimensions[rr].hidden = True
+collapse_check_outline_rows(ws, check_rows_to_collapse)
 
 ws.sheet_view.showOutlineSymbols = True
 
-FILL_END_ROW = current_row + 25
-FILL_END_COL = Y_COLS[-1] + 10
+FILL_END_ROW = max(LAST_TABLE_ROW, current_row) + 100
+FILL_END_COL = Y_COLS[-1] + 40
+
+layout = LAYOUT_NA
 
 for rr in range(1, FILL_END_ROW + 1):
     if rr != PROJECT_TITLE_ROW:
         ws.row_dimensions[rr].height = ROW_HEIGHT
 
+paint_grey_white_canvas(ws, layout, last_row=FILL_END_ROW, last_col=Y_COLS[-1])
+
+for src_row in source_rows_yellow:
+    paint_check_source_yellow(ws, src_row, [POS_COL, *Y_COLS])
+
 for rr in range(1, FILL_END_ROW + 1):
-    for cc in range(1, POS_COL):
-        ws.cell(rr, cc).fill = FILL_GREY
     for cc in range(POS_COL, FILL_END_COL + 1):
         if rr in source_rows_yellow and cc in ([POS_COL] + Y_COLS):
             continue
         if rr in (HEADER_ROW_7, HEADER_ROW) and cc in ([POS_COL] + Y_COLS):
             continue
-        if rr in KPI_ROWS and cc in ([POS_COL] + Y_COLS):
+        if rr in KPI_BAND_ROWS and cc in ([POS_COL] + Y_COLS):
             ws.cell(rr, cc).fill = FILL_KPI
             continue
-        ws.cell(rr, cc).fill = FILL_WHITE
+        if ws.cell(rr, cc).fill.fill_type is None:
+            ws.cell(rr, cc).fill = FILL_WHITE
 
-for cc in range(MAP_START_COL, MAP_END_COL + 1):
-    ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
-
-for cc in [POS_COL] + Y_COLS:
-    ws.cell(HEADER_ROW_7, cc).fill = FILL_HEADER
-    ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
-
-for cc in range(1, MAP_END_COL + 1):
-    col_l = col_letter(cc)
-    ws.column_dimensions[col_l].outlineLevel = 1
-    ws.column_dimensions[col_l].hidden = True
-
-apply_zero_row_conditional_formatting(
+paint_header_band(
     ws,
-    first_row=DATA_START_ROW,
-    last_row=LAST_TABLE_ROW,
-    year_col_indices=Y_COLS,
-    style_start_col=POS_COL,
-    style_end_col=Y_COLS[-1],
+    layout,
+    header_rows=[HEADER_ROW_7, HEADER_ROW],
+    period_cols=Y_COLS,
+    spacer_cols={TECH_SPACER_COL},
 )
+
+hide_helper_column_group(ws, layout)
 
 wb.save(INPUT_FILE)
 print(f"Fertig. Reiter '{SHEET_OUT}' gespeichert in:\n{INPUT_FILE}")

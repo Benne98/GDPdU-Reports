@@ -53,6 +53,7 @@ export interface AdaptiveCardInput {
     | 'folder_picker'
     | 'folder_drop'
     | 'sortable_list'
+    | 'checkbox'
   /** susa_grid: one .xlsx per cell vs folder of 12 monthly workbooks */
   grid_mode?: 'single_file' | 'folder'
   /** number inputs: optional min/max (browser native steppers) */
@@ -67,6 +68,8 @@ export interface AdaptiveCardInput {
   required?: boolean
   accept?: string
   entity_count?: number
+  /** When set, entity name is fixed (single-row grids e.g. fixed assets). */
+  fixed_entity_name?: string
   /** In compact cards: 2 = full width row in 2-column grid */
   span?: 1 | 2
   /** Consecutive inputs with the same key render in one horizontal row */
@@ -112,6 +115,8 @@ export interface AdaptiveCardPayload {
   /** Secondary action button (e.g. AP/AR not identifiable) */
   secondary_submit_label?: string
   secondary_submit_id?: string
+  /** "link" = subtle text link; default = full-width secondary button */
+  secondary_submit_variant?: 'link' | 'button'
   /** script_job card: async run metadata (not rendered as a form) */
   run_id?: string
   session_id?: string
@@ -223,6 +228,7 @@ const COLUMN_CARD_IDS = new Set([
   'opos_columns',
   'opos_snapshots',
   'fa_rollf_columns',
+  'fte_columns',
   'bs_value_columns',
   'bs_period_calc',
   'top_labels',
@@ -555,6 +561,22 @@ export function useFddBot() {
             addMessage({ role: 'bot', text: msg.text })
           }
         }
+
+        if (!filtered.length) return false
+
+        const submittedCard =
+          typeof payload === 'object' && payload !== null && !Array.isArray(payload) && payload.card
+            ? String(payload.card)
+            : ''
+        if (submittedCard) {
+          const responseCards = filtered
+            .map(m => m.custom?.card)
+            .filter((c): c is string => Boolean(c))
+          if (responseCards.length > 0 && responseCards.every(c => c === submittedCard)) {
+            return false
+          }
+        }
+
         return true
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') {
@@ -611,7 +633,6 @@ export function useFddBot() {
           sheet_names: row.sheet_names,
           headers: row.headers?.length ? row.headers : undefined,
         }
-        addMessage({ role: 'bot', text: `✓ ${file.name} uploaded — ready for the next step.` })
         return row
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Upload error'

@@ -217,7 +217,7 @@ export function buildDuPontNarrative(data: DuPontData): { title: string; body: s
         `Receivables days ${fmtVal(dso?.value ?? null, 'days')} (${fmtDeltaPlain(delta(dso?.value ?? null, dso?.pm ?? null), 'days')}), ` +
         `payables days ${fmtVal(dpo?.value ?? null, 'days')} (${fmtDeltaPlain(delta(dpo?.value ?? null, dpo?.pm ?? null), 'days')}), ` +
         `inventory days ${fmtVal(dio?.value ?? null, 'days')} (${fmtDeltaPlain(delta(dio?.value ?? null, dio?.pm ?? null), 'days')}). ` +
-        `Where sales or payables move materially, validate against receivables and payables ageing.`,
+        `Where sales or payables move materially, validate against receivables and payables aging.`,
     })
   }
 

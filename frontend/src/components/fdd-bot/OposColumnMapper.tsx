@@ -19,18 +19,19 @@ interface PreviewData {
   rows: string[][]
 }
 
-export type OposRole = 'partner_id' | 'partner_name' | 'amount' | 'due_date'
+export type OposRole =
+  | 'partner'
+  | 'amount'
+  | 'due_date'
 
 const ROLES: { key: OposRole; label: string; slot: string }[] = [
-  { key: 'partner_id', label: 'Partner ID (Debitor/Kreditor)', slot: 'opos_partner_id_col' },
-  { key: 'partner_name', label: 'Partner name', slot: 'opos_partner_name_col' },
+  { key: 'partner', label: 'Partner (Debitor/Kreditor)', slot: 'opos_partner_col' },
   { key: 'amount', label: 'Amount', slot: 'opos_amount_col' },
   { key: 'due_date', label: 'Due date', slot: 'opos_due_date_col' },
 ]
 
 const ROLE_COLORS: Record<OposRole, string> = {
-  partner_id: '#2563EB',
-  partner_name: '#7C3AED',
+  partner: '#2563EB',
   amount: '#059669',
   due_date: '#D97706',
 }
@@ -40,8 +41,34 @@ interface Props {
   previewFileId: string
   sheetName?: string
   headerRow?: number
+  snapshotsJson?: string
   disabled?: boolean
   onSubmit: (payload: Record<string, string>) => void | Promise<void>
+  onReupload?: () => void | Promise<void>
+}
+
+function buildSubmitPayload(
+  assignments: Partial<Record<OposRole, string>>,
+  headerByLetter: Map<string, string>,
+): Record<string, string> {
+  const payload: Record<string, string> = {}
+  const letters: Record<string, string> = {}
+  for (const role of ROLES) {
+    const letter = assignments[role.key]
+    const header = letter ? headerByLetter.get(letter) : ''
+    if (letter) {
+      letters[role.key === 'partner' ? 'partner' : role.key] = letter
+    }
+    if (header) {
+      payload[role.slot] = header
+      if (role.key === 'partner') {
+        payload.opos_partner_id_col = header
+        payload.opos_partner_name_col = header
+      }
+    }
+  }
+  payload.opos_column_letters_json = JSON.stringify(letters)
+  return payload
 }
 
 export default function OposColumnMapper({
@@ -49,8 +76,10 @@ export default function OposColumnMapper({
   previewFileId,
   sheetName = '',
   headerRow = 0,
+  snapshotsJson = '[]',
   disabled,
   onSubmit,
+  onReupload,
 }: Props) {
   const [preview, setPreview] = useState<PreviewData | null>(null)
   const [loading, setLoading] = useState(true)
@@ -59,9 +88,20 @@ export default function OposColumnMapper({
   const [history, setHistory] = useState<Partial<Record<OposRole, string>>[]>([])
   const [stepIndex, setStepIndex] = useState(0)
   const [submitting, setSubmitting] = useState(false)
+  const [dueDateWarning, setDueDateWarning] = useState<number | null>(null)
+  const [pendingPayload, setPendingPayload] = useState<Record<string, string> | null>(null)
 
   const currentRole = ROLES[stepIndex]?.key
   const allMapped = ROLES.every(r => assignments[r.key]?.trim())
+
+  const snapshots = useMemo(() => {
+    try {
+      const parsed = JSON.parse(snapshotsJson || '[]')
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }, [snapshotsJson])
 
   const headerByLetter = useMemo(() => {
     const map = new Map<string, string>()
@@ -77,8 +117,12 @@ export default function OposColumnMapper({
       setLoading(true)
       setError(null)
       try {
-        if (!previewFileId.trim()) throw new Error('No file — please upload your open-items file first.')
-        if (!sessionId.trim()) throw new Error('No session — please refresh the conversation.')
+        if (!previewFileId.trim()) {
+          throw new Error('No file — please upload your OPOS file first.')
+        }
+        if (!sessionId.trim()) {
+          throw new Error('No session — please refresh the conversation.')
+        }
         const base = getApiBaseUrl()
         const params = new URLSearchParams({
           session_id: sessionId,
@@ -128,6 +172,8 @@ export default function OposColumnMapper({
     }
     next[currentRole] = letter
     setAssignments(next)
+    setDueDateWarning(null)
+    setPendingPayload(null)
 
     const nextStep = ROLES.findIndex(r => !next[r.key])
     setStepIndex(nextStep >= 0 ? nextStep : ROLES.length - 1)
@@ -138,32 +184,85 @@ export default function OposColumnMapper({
     const prev = history[history.length - 1]
     setHistory(h => h.slice(0, -1))
     setAssignments(prev)
+    setDueDateWarning(null)
+    setPendingPayload(null)
     const nextStep = ROLES.findIndex(r => !prev[r.key])
     setStepIndex(nextStep >= 0 ? nextStep : 0)
   }
 
-  const handleSubmit = useCallback(async () => {
+  const auditMissingDueDates = async (payload: Record<string, string>): Promise<number> => {
+    if (!snapshots.length) return 0
+    let letters: Record<string, string> = {}
+    try {
+      letters = JSON.parse(payload.opos_column_letters_json || '{}') as Record<string, string>
+    } catch {
+      return 0
+    }
+    if (!letters.partner && !letters.due_date) return 0
+
+    const base = getApiBaseUrl()
+    const resp = await fetch(`${base}/api/v1/fdd/opos/audit-due-dates`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        column_letters: letters,
+        snapshots,
+      }),
+    })
+    if (!resp.ok) return 0
+    const data = (await resp.json()) as { total_excluded?: number }
+    return Number(data.total_excluded || 0)
+  }
+
+  const finalizeSubmit = async (payload: Record<string, string>) => {
+    setDueDateWarning(null)
+    setPendingPayload(null)
+    await onSubmit(payload)
+  }
+
+  const handleSubmit = async () => {
     if (!allMapped || submitting || disabled) return
     setSubmitting(true)
     try {
-      const payload: Record<string, string> = {}
-      for (const role of ROLES) {
-        const letter = assignments[role.key]
-        const header = letter ? headerByLetter.get(letter) : ''
-        if (header) payload[role.slot] = header
+      const payload = buildSubmitPayload(assignments, headerByLetter)
+      const excluded = await auditMissingDueDates(payload)
+      if (excluded > 0) {
+        setDueDateWarning(excluded)
+        setPendingPayload(payload)
+        return
       }
-      await onSubmit(payload)
+      await finalizeSubmit(payload)
     } finally {
       setSubmitting(false)
     }
-  }, [allMapped, assignments, disabled, headerByLetter, onSubmit, submitting])
+  }
 
-  useEffect(() => {
-    if (allMapped && !submitting && !disabled) void handleSubmit()
-  }, [allMapped, submitting, disabled, handleSubmit])
+  const handleContinueDespiteWarning = async () => {
+    if (!pendingPayload || submitting || disabled) return
+    setSubmitting(true)
+    try {
+      await finalizeSubmit(pendingPayload)
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
-  if (loading) return <p className="text-sm text-slate-500">Loading OPOS preview…</p>
-  if (error && !preview) return <p className="text-sm text-red-600">{error}</p>
+  const handleReupload = async () => {
+    if (submitting || disabled) return
+    setDueDateWarning(null)
+    setPendingPayload(null)
+    if (onReupload) {
+      await onReupload()
+    }
+  }
+
+  if (loading) {
+    return <p className="text-sm text-slate-500">Loading OPOS preview…</p>
+  }
+  if (error && !preview) {
+    return <p className="text-sm text-red-600">{error}</p>
+  }
   if (!preview) return null
 
   return (
@@ -188,17 +287,6 @@ export default function OposColumnMapper({
             </span>
           )
         })}
-        {history.length > 0 && (
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={undoLast}
-            className="ml-auto inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-          >
-            <Undo2 size={14} />
-            Undo
-          </button>
-        )}
       </div>
 
       <div className="overflow-x-auto overflow-y-auto max-h-[320px] rounded-lg border border-slate-200 w-full">
@@ -238,7 +326,9 @@ export default function OposColumnMapper({
                     <td
                       key={ci}
                       className="px-2 py-0.5 border border-slate-100 whitespace-nowrap max-w-[120px] truncate"
-                      style={{ background: role ? `${ROLE_COLORS[role]}18` : undefined }}
+                      style={{
+                        background: role ? `${ROLE_COLORS[role]}18` : undefined,
+                      }}
                     >
                       {cell}
                     </td>
@@ -249,7 +339,64 @@ export default function OposColumnMapper({
           </tbody>
         </table>
       </div>
+
+      {dueDateWarning !== null && dueDateWarning > 0 && (
+        <div
+          className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
+          role="alert"
+        >
+          <p className="font-medium">
+            {dueDateWarning.toLocaleString('en-US')} row{dueDateWarning === 1 ? '' : 's'} will be
+            excluded due to missing due dates.
+          </p>
+          <p className="mt-1 text-amber-900">
+            Do you want to continue anyway, or correct the file and re-upload?
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={disabled || submitting}
+              onClick={handleContinueDespiteWarning}
+              className="rounded-md bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50"
+            >
+              Continue anyway
+            </button>
+            <button
+              type="button"
+              disabled={disabled || submitting}
+              onClick={handleReupload}
+              className="rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+            >
+              Re-upload files
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2 self-start">
+        {history.length > 0 && (
+          <button
+            type="button"
+            disabled={disabled || submitting}
+            onClick={undoLast}
+            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+          >
+            <Undo2 size={14} />
+            Undo
+          </button>
+        )}
+        {!dueDateWarning && (
+          <button
+            type="button"
+            disabled={!allMapped || submitting || disabled}
+            onClick={handleSubmit}
+            className="rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            style={{ background: '#1E40AF' }}
+          >
+            {submitting ? 'Checking…' : 'Continue'}
+          </button>
+        )}
+      </div>
     </div>
   )
 }
-

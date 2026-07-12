@@ -660,15 +660,174 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 # ─── Output paths & source sheet copy ──────────────────────────────────────────
 
 
-def build_output_file_path(cfg: dict) -> str:
+def session_workbook_path(cfg: dict) -> str:
+    """Canonical per-session workbook: {output_dir}/{case_id}_SuSa_Master.xlsx."""
     output_dir = str(cfg["output_file_path"]).strip()
     case_id = str(cfg.get("case_id", "")).strip()
     if not output_dir:
         raise ValueError("CONFIG['output_file_path'] muss gesetzt sein.")
     if not case_id:
-        raise ValueError("CONFIG['case_id'] muss gesetzt sein, um den Output-Dateinamen zu bilden.")
+        raise ValueError("CONFIG['case_id'] muss gesetzt sein.")
     os.makedirs(output_dir, exist_ok=True)
-    return os.path.join(output_dir, f"{case_id}_Output.xlsx")
+    return os.path.join(output_dir, f"{case_id}_SuSa_Master.xlsx")
+
+
+def _workbook_filename_stem(cfg: dict) -> str:
+    """Prefer project title for session workbook name: {ProjectName}_Workbook.xlsx."""
+    import re
+
+    for key in ("title", "project_name"):
+        raw = str(cfg.get(key) or "").strip()
+        if raw:
+            safe = re.sub(r"[^\w\-]+", "_", raw).strip("_")
+            if safe:
+                return safe[:80]
+    case_id = str(cfg.get("case_id") or "").strip()
+    return case_id or "Workbook"
+
+
+def build_output_file_path(cfg: dict) -> str:
+    output_dir = str(cfg["output_file_path"]).strip()
+    stem = _workbook_filename_stem(cfg)
+    if not output_dir:
+        raise ValueError("CONFIG['output_file_path'] muss gesetzt sein.")
+    os.makedirs(output_dir, exist_ok=True)
+
+    if cfg.get("use_separate_workbook"):
+        suffix = str(cfg.get("separate_workbook_suffix") or "Output").strip()
+        safe_suffix = re.sub(r"[^\w\-]+", "_", suffix).strip("_") or "Output"
+        return os.path.join(output_dir, f"{stem}_{safe_suffix}.xlsx")
+
+    explicit = str(
+        cfg.get("output_workbook_path")
+        or cfg.get("master_workbook_path")
+        or cfg.get("db_master_workbook_path")
+        or cfg.get("master_pl_path")
+        or ""
+    ).strip()
+    if explicit:
+        explicit_path = os.path.abspath(explicit)
+        if os.path.isfile(explicit_path):
+            return explicit_path
+
+    case_id = str(cfg.get("case_id") or "").strip()
+    project_name = str(cfg.get("title") or cfg.get("project_name") or "").strip()
+    try:
+        from databook_paths import resolve_existing_master_path
+
+        resolved = resolve_existing_master_path(
+            output_dir,
+            session_id=case_id,
+            project_name=project_name or "Project",
+        )
+        if resolved is not None:
+            return str(resolved)
+    except OSError:
+        pass
+
+    databook_master = os.path.join(output_dir, f"{stem}_Master.xlsx")
+    workbook_path = os.path.join(output_dir, f"{stem}_Workbook.xlsx")
+    legacy_master = os.path.join(output_dir, f"{case_id}_SuSa_Master.xlsx")
+    legacy_output = os.path.join(output_dir, f"{case_id}_Output.xlsx")
+    for candidate in (databook_master, workbook_path, legacy_master, legacy_output):
+        if os.path.isfile(candidate):
+            return candidate
+    if cfg.get("use_session_workbook", True):
+        return databook_master
+    return os.path.join(output_dir, f"{stem}_Output.xlsx")
+
+
+def find_session_output_file(cfg: dict) -> str | None:
+    """Return an existing session output workbook path, if any."""
+    path = build_output_file_path(cfg)
+    if os.path.isfile(path):
+        return path
+
+    output_dir = str(cfg.get("output_file_path") or "").strip()
+    case_id = str(cfg.get("case_id") or "").strip()
+    if not output_dir:
+        return None
+
+    candidates: list[str] = []
+    stem = _workbook_filename_stem(cfg)
+    candidates.append(os.path.join(output_dir, f"{stem}_Master.xlsx"))
+    if case_id:
+        candidates.extend(
+            (
+                os.path.join(output_dir, f"{case_id}_SuSa_Master.xlsx"),
+                os.path.join(output_dir, f"{case_id}_Output.xlsx"),
+            )
+        )
+    candidates.append(os.path.join(output_dir, f"{stem}_Workbook.xlsx"))
+    candidates.append(os.path.join(output_dir, f"{stem}_Output.xlsx"))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    try:
+        from pathlib import Path
+
+        workbooks = sorted(
+            (
+                p
+                for p in Path(output_dir).glob("*")
+                if p.is_file() and p.suffix.lower() == ".xlsx" and p.name.endswith(("_Master.xlsx", "_Workbook.xlsx"))
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if workbooks:
+            return str(workbooks[0])
+    except OSError:
+        pass
+    return None
+
+
+def touch_session_workbook(cfg: dict) -> str:
+    """Deprecated: session workbooks are created by the first script run, not pre-seeded."""
+    return build_output_file_path(cfg)
+
+
+def open_session_workbook(cfg: dict) -> Workbook:
+    """Load session master if it exists; otherwise create an empty workbook."""
+    path = build_output_file_path(cfg)
+    if os.path.isfile(path):
+        return load_workbook(path)
+    if not cfg.get("use_separate_workbook"):
+        output_dir = str(cfg.get("output_file_path") or "").strip()
+        if output_dir:
+            try:
+                from databook_paths import resolve_existing_master_path
+
+                resolved = resolve_existing_master_path(
+                    output_dir,
+                    session_id=str(cfg.get("case_id") or "").strip(),
+                    project_name=str(cfg.get("title") or cfg.get("project_name") or "Project").strip(),
+                )
+                if resolved is not None and resolved.is_file():
+                    return load_workbook(str(resolved))
+            except OSError:
+                pass
+    wb = Workbook()
+    if wb.sheetnames:
+        default = wb.active
+        wb.remove(default)
+    return wb
+
+
+def prune_init_placeholder_sheet(wb: Workbook) -> None:
+    """Drop empty bootstrap sheet once real output sheets exist."""
+    if "__init__" in wb.sheetnames and len(wb.sheetnames) > 1:
+        del wb["__init__"]
+
+
+def replace_workbook_sheet(wb: Workbook, sheet_name: str):
+    """Delete sheet_name if present and return a fresh worksheet with that title."""
+    prune_init_placeholder_sheet(wb)
+    title = str(sheet_name or "Sheet1")[:31]
+    if title in wb.sheetnames:
+        del wb[title]
+    return wb.create_sheet(title)
 
 
 def build_source_sheet_name(cfg: dict) -> str:
@@ -864,7 +1023,7 @@ def write_export_df_to_sheet(wb, export_df, target_sheet_name: str, **kwargs):
 
 
 def _normalize_header_name(name: str) -> str:
-    s = str(name).strip().lower()
+    s = str(name).replace("\u00a0", " ").strip().lower()
     s = re.sub(r"\s+", " ", s)
     return s
 

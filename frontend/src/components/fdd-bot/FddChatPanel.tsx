@@ -16,9 +16,7 @@ export type FddChatPanelProps = {
   mode: FddPanelMode
   preloadedFile?: File | null
   bot: FddBotApi
-  /** Distance from viewport top — leave room for e.g. “Modus wechseln” above the panel */
   topOffsetPx?: number
-  /** Gap from viewport bottom so the panel does not fill the full screen height */
   bottomOffsetPx?: number
 }
 

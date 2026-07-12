@@ -4,11 +4,14 @@
 
 import { getApiBaseUrl } from '../../lib/api'
 import {
+  buildBuildDatabookCard,
   buildFileAttachmentCard,
   buildNextActionCard,
+  buildOposPostOutputCard,
+  buildStrandPostOutputCard,
   scriptDisplayLabel,
 } from './nextActionCard'
-import type { AdaptiveCardPayload, ChatMessage } from './useFddBot'
+import type { ChatMessage } from './useFddBot'
 
 export interface ScriptJobPayload {
   run_id: string
@@ -31,9 +34,40 @@ export interface RunStatusResponse {
 const INITIAL_WAIT_MS = 60_000
 const POLL_INTERVAL_MS = 3_000
 const MAX_STATUS_NULL_POLLS = 10
+const RASA_URL = (import.meta.env.VITE_RASA_URL as string | undefined)?.trim() || '/rasa'
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function oposHasMultipleSnapshots(sessionId: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`${RASA_URL}/conversations/${encodeURIComponent(sessionId)}/tracker`)
+    if (!resp.ok) return false
+    const data = (await resp.json()) as { slots?: Record<string, unknown> }
+    const slots = data.slots ?? {}
+    let raw = slots.opos_snapshots_json
+    if (raw !== null && typeof raw === 'object' && 'value' in (raw as object)) {
+      raw = (raw as { value: unknown }).value
+    }
+    if (typeof raw !== 'string' || !raw.trim()) return false
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) && parsed.length > 1
+  } catch {
+    return false
+  }
+}
+
+function postScriptNextCard(job: ScriptJobPayload, multipleSnapshots?: boolean) {
+  if (job.script_key === 'opos') {
+    return buildOposPostOutputCard(Boolean(multipleSnapshots))
+  }
+  if (job.script_key === 'fixed_assets_rollf' || job.script_key === 'fte_payroll') {
+    return buildStrandPostOutputCard(job.script_key)
+  }
+  return buildNextActionCard(
+    'You can start another output while the current run finishes in the background.',
+  )
 }
 
 async function fetchRunStatus(sessionId: string, runId: string): Promise<RunStatusResponse | null> {
@@ -99,6 +133,8 @@ export async function pollScriptJob(
     }
 
     if (status?.status === 'done' && status.output_file) {
+      const multipleSnapshots =
+        job.script_key === 'opos' ? await oposHasMultipleSnapshots(job.session_id) : false
       if (releasedEarly) {
         addMessage({
           role: 'bot',
@@ -118,7 +154,7 @@ export async function pollScriptJob(
         })
         addMessage({
           role: 'bot',
-          custom: buildNextActionCard(completionSubtitle(job, status)),
+          custom: postScriptNextCard(job, multipleSnapshots),
         })
       }
       setScriptJobLoading(false)
@@ -141,11 +177,11 @@ export async function pollScriptJob(
     if (!releasedEarly && Date.now() >= deadline) {
       releasedEarly = true
       addMessage({ role: 'bot', text: longerRunningText(job) })
+      const multipleSnapshots =
+        job.script_key === 'opos' ? await oposHasMultipleSnapshots(job.session_id) : false
       addMessage({
         role: 'bot',
-        custom: buildNextActionCard(
-          'You can start another output while the current run finishes in the background.',
-        ),
+        custom: postScriptNextCard(job, multipleSnapshots),
       })
       setScriptJobLoading(false)
     }

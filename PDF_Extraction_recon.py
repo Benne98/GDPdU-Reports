@@ -258,7 +258,7 @@ def write_final_excel(all_data: Dict[int, Dict], cfg: Dict[str, Any]) -> None:
         review_col = ws.max_column + 1
         ws.cell(1, review_col, "Review")
         header_cell = ws.cell(1, review_col)
-        header_cell.font = Font(name="GT Walsheim LC Light", size=8, bold=True)
+        header_cell.font = Font(name="Inter", size=8, bold=True)
         header_cell.fill = PatternFill(fill_type="solid", fgColor="F2F2F2")
         header_cell.border = Border(bottom=Side(style="thin"))
 
@@ -327,7 +327,7 @@ def write_final_excel(all_data: Dict[int, Dict], cfg: Dict[str, Any]) -> None:
         for r in range(2, ws.max_row + 1):
             if ws.cell(r, col_german).value:
                 last_data_row = r
-        review_font = Font(name="GT Walsheim LC Light", size=8)
+        review_font = Font(name="Inter", size=8)
         white_fill = PatternFill(fill_type="solid", fgColor="FFFFFF")
         for r in range(2, last_data_row + 1):
             c = ws.cell(r, review_col)

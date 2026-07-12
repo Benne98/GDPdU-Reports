@@ -330,6 +330,56 @@ slots:
     mappings:
       - type: custom
 
+  fte_employment_col:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_months_col:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_payroll_cols_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_periods_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  strand_run_script:
+    type: text
+    mappings:
+      - type: custom
+
+  strand_separate_workbook:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_group_col_1:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_group_col_2:
+    type: text
+    mappings:
+      - type: custom
+
   # ── OPOS (Creditor / Debitor Aging) ──
   opos_snapshots_json:
     type: text
@@ -356,6 +406,11 @@ slots:
     mappings:
       - type: custom
 
+  opos_column_letters_json:
+    type: text
+    mappings:
+      - type: custom
+
   opos_side:
     type: text
     mappings:
@@ -372,6 +427,26 @@ slots:
       - type: custom
 
   opos_sort_bucket_keys_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_display_bucket_keys_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_pending_rerun:
+    type: text
+    mappings:
+      - type: custom
+
+  fa_pending_rerun:
+    type: text
+    mappings:
+      - type: custom
+
+  fte_pending_rerun:
     type: text
     mappings:
       - type: custom
@@ -935,6 +1010,11 @@ slots:
     mappings:
       - type: custom
 
+  db_extract_financial_statements:
+    type: text
+    mappings:
+      - type: custom
+
   db_recon_entity_order:
     type: list
     mappings:
@@ -947,6 +1027,12 @@ slots:
 
   db_master_workbook_path:
     type: text
+    mappings:
+      - type: custom
+
+  db_master_imported:
+    type: bool
+    influence_conversation: false
     mappings:
       - type: custom
 
@@ -1251,15 +1337,29 @@ actions:
   - action_enter_fa_filter_checkpoint
   - action_process_fa_filter_checkpoint
   - action_run_fa_rollf
+  - action_show_fte_files
+  - action_process_fte_files
+  - action_process_fte_columns
+  - action_reshow_fte_columns
+  - action_process_fte_grouping
+  - action_show_fte_grouping
+  - action_enter_fte_filter_checkpoint
+  - action_process_fte_filter_checkpoint
+  - action_enter_strand_run_target
+  - action_process_strand_run_target
+  - action_run_fte_payroll
   - action_show_opos_snapshots
   - action_process_opos_snapshots
   - action_reshow_opos_columns
   - action_process_opos_columns
   - action_process_opos_missing_due_date
+  - action_process_opos_display_buckets
   - action_process_opos_sort
   - action_process_opos_buckets
   - action_enter_opos_filter_checkpoint
   - action_process_opos_filter_checkpoint
+  - action_process_opos_post_output
+  - action_process_strand_post_output
   - action_show_opos_review
   - action_run_opos
   - action_show_fa_rollf_files
@@ -1276,6 +1376,8 @@ actions:
   - action_finish_filters
   - action_run_databook
   - action_process_databook_susa_format
+  - action_show_databook_master_upload
+  - action_process_databook_master_upload
   - action_process_databook_entity_count
   - action_show_databook_entity_count
   - action_process_databook_entities
@@ -1289,10 +1391,18 @@ actions:
   - action_process_databook_adjustments
   - action_process_databook_adjustments_upload
   - action_process_databook_l4_sort
+  - action_show_databook_fs_extract_choice
+  - action_process_databook_fs_extract_choice
+  - action_show_databook_fs_extract_placeholder
+  - action_process_databook_fs_extract_placeholder
   - action_process_databook_fs_upload
   - action_process_databook_fs_review_upload
   - action_process_databook_recon_order
   - action_process_databook_recon_labels
+  - action_show_databook_extended_tables
+  - action_process_databook_extended_tables
+  - action_show_databook_master_next_action
+  - action_process_databook_master_next_action
   - action_process_databook_sort
   - action_process_next_action
 

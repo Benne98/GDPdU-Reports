@@ -16,19 +16,30 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
-from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from gst_excel_theme import THEME  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    LAYOUT_PL,
+    check_row_groups_after_table,
+    collapse_check_outline_rows,
+    find_recon_aggregated_year_cols,
+    hide_helper_column_group,
+    paint_grey_white_canvas,
+)
+from databook_periods import display_reporting_columns_from_df, ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
 from report_row_layout import build_lead_is_row_structure, l3_order_from_mapping  # noqa: E402
 
 # ==================================================
 # DESKTOP DEFAULTS
 # ==================================================
-from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+from databook_workbook import MASTER_WORKBOOK_STR, PL_RECON_MAPPING_FILE  # noqa: E402
+from databook_runtime import load_argv_config, path_value  # noqa: E402
+
+_argv_cfg = load_argv_config()
 
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 
-INPUT_FILE = MASTER_WORKBOOK_STR
-MAPPING_FILE = str(DESKTOP_DIR / "PL_recon_Mapping.xlsx")
+INPUT_FILE = path_value(_argv_cfg, "input_file", MASTER_WORKBOOK_STR)
+MAPPING_FILE = PL_RECON_MAPPING_FILE
 SHEET_MASTER = "Master_PL"
 SHEET_OUT = "Lead_IS"
 SHEET_RECON = "PL_Reconciliation"
@@ -64,7 +75,7 @@ PL_TOTALS_CONFIG_RAW = [
     },
     {
         "label": "Gross profit",
-        "components": ["Total output", "Cost of goods sold"],
+        "components": ["Net sales", "Cost of goods sold", "Δ Finished goods & WIP"],
         "insert_after": "Cost of goods sold",
     },
     {
@@ -103,8 +114,10 @@ KPI_LABEL_RENAME = {
 }
 KPI_BOLD_LABELS = {"Gross margin", "EBITDA margin", "EBIT margin"}
 
-MAP_START_COL = 5
-MAP_END_COL = 8
+_COL_LAYOUT = LAYOUT_PL
+MAP_START_COL = _COL_LAYOUT.map_start_col
+MAP_END_COL = _COL_LAYOUT.map_end_col
+TECH_SPACER_COL = _COL_LAYOUT.spacer_col
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
@@ -189,7 +202,7 @@ def detect_year_columns(df_: pd.DataFrame) -> list[str]:
 
 
 def detect_reporting_period_columns(df_: pd.DataFrame) -> list[str]:
-    periods = ordered_reporting_columns_from_df(df_)
+    periods = display_reporting_columns_from_df(df_)
     if not periods:
         raise ValueError("Keine FY/YTD-Spalten gefunden (erwartet z. B. FY22A, YTD25A).")
     return periods
@@ -219,8 +232,8 @@ def resolve_source_section_column(df_: pd.DataFrame) -> str:
     return SOURCE_COL_CANDIDATES[0]
 
 
-def compute_lead_is_layout(n_years: int):
-    pos1 = 10
+def compute_lead_is_layout(n_years: int, pos1: int | None = None):
+    pos1 = pos1 if pos1 is not None else LAYOUT_PL.pos_col
     y1 = list(range(pos1 + 1, pos1 + 1 + n_years))
     cagr1 = y1[-1] + 1
     spacer = cagr1 + 1
@@ -260,32 +273,6 @@ def cagr_formula(first_col, last_col, excel_row, cagr_n: int) -> str:
         f'=IFERROR((({col_letter(last_col)}{excel_row}/'
         f'{col_letter(first_col)}{excel_row})^(1/{cagr_n})-1)*100,"n/a")'
     )
-
-
-def find_recon_consolidation_year_cols(ws_recon, years: list[str]) -> dict[str, int]:
-    recon_con_start = None
-    for cc in range(1, ws_recon.max_column + 1):
-        v = ws_recon.cell(RECON_BLOCK_TITLE_ROW, cc).value
-        if isinstance(v, str) and v.strip() == "Consolidation":
-            recon_con_start = cc
-            break
-    if recon_con_start is None:
-        raise RuntimeError("Could not find 'Consolidation' block in PL_Reconciliation (row 7).")
-
-    recon_year_col: dict[str, int] = {}
-    for cc in range(recon_con_start, ws_recon.max_column + 1):
-        v = ws_recon.cell(RECON_HEADER_ROW, cc).value
-        if isinstance(v, str):
-            key = v.strip()
-            if key in years:
-                recon_year_col[key] = cc
-        if len(recon_year_col) >= len(years):
-            break
-
-    missing = [y for y in years if y not in recon_year_col]
-    if missing:
-        raise RuntimeError(f"Consolidation block missing year headers: {missing}")
-    return recon_year_col
 
 
 TOP_BORDER_ONLY_N = {norm_pl(x) for x in TOP_BORDER_ONLY}
@@ -415,14 +402,17 @@ for cc in range(POS2_COL, CAGR2_COL + 1):
 cagr_range_txt = f"{year_short(FY_COLS[0])} - {year_short(FY_COLS[-1])}"
 for cagr_col in (CAGR1_COL, CAGR2_COL):
     ws.cell(HEADER_ROW_7, cagr_col, "CAGR").alignment = ALIGN_RIGHT
-    ws.cell(HEADER_ROW_7, cagr_col).font = FONT_BASE_BOLD
+    ws.cell(HEADER_ROW_7, cagr_col).font = FONT_CAGR_BOLD
     ws.cell(HEADER_ROW, cagr_col, cagr_range_txt).alignment = ALIGN_RIGHT
-    ws.cell(HEADER_ROW, cagr_col).font = FONT_BASE_BOLD
+    ws.cell(HEADER_ROW, cagr_col).font = FONT_CAGR_BOLD
     ws.cell(HEADER_ROW, cagr_col).fill = FILL_HEADER
 
 ws.column_dimensions[col_letter(CAGR1_COL)].width = 12
 ws.column_dimensions[col_letter(CAGR2_COL)].width = 12
 
+for c in range(MAP_START_COL, MAP_END_COL + 1):
+    ws.cell(HEADER_ROW_7, c).fill = FILL_HEADER
+    ws.cell(HEADER_ROW_7, c).font = FONT_HEADER
 ws.cell(HEADER_ROW, MAP_START_COL + 0, "Reported").font = FONT_HEADER
 ws.cell(HEADER_ROW, MAP_START_COL + 1, "").font = FONT_HEADER
 ws.cell(HEADER_ROW, MAP_START_COL + 2, "L3").font = FONT_HEADER
@@ -622,6 +612,8 @@ for r in row_structure:
         continue
     excel_row = r["_excel_row"]
     border_to_set = TOP_BOTTOM_BORDER if label in TOP_AND_BOTTOM_N else TOP_BORDER
+    for cc in range(MAP_START_COL, MAP_END_COL + 1):
+        ws.cell(excel_row, cc).border = border_to_set
     ws.cell(excel_row, POS1_COL).border = border_to_set
     for c in Y1_COLS:
         ws.cell(excel_row, c).border = border_to_set
@@ -710,15 +702,17 @@ for base in kpi_lines:
 
 KPI_LAST_ROW = kpi_row - 1
 
-CHECK_SRC_ROW = KPI_LAST_ROW + 2
-CHECK_DELTA_ROW = KPI_LAST_ROW + 3
+_check_rows = check_row_groups_after_table(KPI_LAST_ROW, [2])
+CHECK_SRC_ROW, CHECK_DELTA_ROW = _check_rows
 NET_RESULT_LABEL = norm_pl("Net result")
 NET_RESULT_ROW = row_index[NET_RESULT_LABEL]
 
 if SHEET_RECON not in wb.sheetnames:
     raise RuntimeError("Sheet 'PL_Reconciliation' not found for check.")
 ws_recon = wb[SHEET_RECON]
-recon_year_col = find_recon_consolidation_year_cols(ws_recon, FY_COLS)
+recon_year_col = find_recon_aggregated_year_cols(
+    ws_recon, FY_COLS, block_title_row=RECON_BLOCK_TITLE_ROW, header_row=RECON_HEADER_ROW
+)
 
 recon_net_row = None
 for rr in range(1, ws_recon.max_row + 1):
@@ -777,9 +771,8 @@ for rr in range(2, MAX_USED_ROW + 1):
     ws.row_dimensions[rr].height = 12
 
 FILL_END_COL = CAGR2_COL + 10
+paint_grey_white_canvas(ws, _COL_LAYOUT, last_row=MAX_USED_ROW, last_col=FILL_END_COL)
 for rr in range(1, MAX_USED_ROW + 1):
-    for cc in range(1, POS1_COL):
-        ws.cell(rr, cc).fill = FILL_GREY
     for cc in range(POS1_COL, FILL_END_COL + 1):
         ws.cell(rr, cc).fill = FILL_WHITE
 
@@ -791,6 +784,7 @@ for cc in range(POS2_COL, CAGR2_COL + 1):
     ws.cell(HEADER_ROW_7, cc).fill = FILL_HEADER7
     ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
 for cc in range(MAP_START_COL, MAP_END_COL + 1):
+    ws.cell(HEADER_ROW_7, cc).fill = FILL_HEADER
     ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
 
 for rr in range(KPI_TITLE_ROW, KPI_LAST_ROW + 1):
@@ -830,25 +824,12 @@ table_cols_source_yellow = [POS1_COL] + Y1_COLS + [POS2_COL] + Y2_COLS
 for cc in table_cols_source_yellow:
     ws.cell(CHECK_SRC_ROW, cc).fill = FILL_YELLOW
 
-for rr in (CHECK_SRC_ROW, CHECK_DELTA_ROW):
-    ws.row_dimensions[rr].outlineLevel = 2
-    ws.row_dimensions[rr].hidden = True
+collapse_check_outline_rows(ws, [CHECK_SRC_ROW, CHECK_DELTA_ROW])
 
-ws.column_dimensions.group("A", "I", hidden=True)
-ws.column_dimensions["J"].collapsed = True
+hide_helper_column_group(ws, _COL_LAYOUT)
 ws.sheet_properties.outlinePr.summaryBelow = True
 ws.sheet_properties.outlinePr.summaryRight = True
 ws.sheet_view.showOutlineSymbols = True
-
-apply_zero_row_conditional_formatting(
-    ws,
-    first_row=DATA_START_ROW,
-    last_row=LAST_TABLE_ROW,
-    year_col_indices=Y1_COLS + Y2_COLS,
-    style_start_col=POS1_COL,
-    style_end_col=CAGR2_COL,
-    exclude_cols={SPACER_COL},
-)
 
 wb.save(INPUT_FILE)
 print(f"Fertig. Reiter '{SHEET_OUT}' gespeichert in: {INPUT_FILE}")

@@ -20,3 +20,13 @@ def path_value(cfg: dict[str, Any], key: str, default: str) -> str:
     paths = cfg.get("paths") or {}
     val = paths.get(key)
     return str(val) if val else default
+
+
+def apply_custom_entity_order(
+    individual_entities: list[str],
+    entity_order: list[str],
+) -> list[str]:
+    """Apply drag-and-drop entity order; append any entities not in the list."""
+    order = [e for e in entity_order if e in individual_entities]
+    remaining = [e for e in individual_entities if e not in order]
+    return order + remaining

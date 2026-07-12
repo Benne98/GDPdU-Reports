@@ -41,8 +41,8 @@ router = APIRouter(prefix="/api/v1/fdd", tags=["fdd-bot"])
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
-# Root of the project (one level up from backend/)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# Repo root: backend/app/routers/fdd_bot.py → parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BACKEND_ROOT = PROJECT_ROOT / "backend"
 
 # SuSabyYear + susa_column_mapping live at repo root (same as script cwd).
@@ -78,8 +78,10 @@ SCRIPTS: dict[str, Path] = {
     "bs_bucket": PROJECT_ROOT / "BS_Bucket.py",
     "lead_bs": PROJECT_ROOT / "Lead_BS.py",
     "working_capital": PROJECT_ROOT / "Working_capital.py",
+    "cashflow": PROJECT_ROOT / "cashflow.py",
     "fixed_assets_rollf": PROJECT_ROOT / "fixed_assets_rollf.py",
     "opos": PROJECT_ROOT / "opos.py",
+    "fte_payroll": PROJECT_ROOT / "FTE_payroll.py",
 }
 
 
@@ -188,7 +190,9 @@ def _normalize_fa_rollf_config(config: dict, session_id: str) -> dict:
         raise ValueError("Fixed assets rollforward config has no valid periods")
     cfg["periods"] = normalized
     cfg["file_path"] = normalized[0]["file_path"]
-    cfg["sheet_name"] = normalized[0]["sheet_name"]
+    from databook_workbook import FA_ROLLF_OUTPUT_SHEET
+
+    cfg["sheet_name"] = FA_ROLLF_OUTPUT_SHEET
     return cfg
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -288,9 +292,15 @@ def _resolve_output_files(session_id: str, config: dict, output_folder: str) -> 
     explicit_out = str(config.get("output_path") or "").strip()
     if explicit_out and os.path.isfile(explicit_out):
         return explicit_out, os.path.basename(explicit_out)
-    output_file = os.path.join(output_folder, f"{session_id}_Output.xlsx")
-    if os.path.isfile(output_file):
-        return output_file, os.path.basename(output_file)
+
+    from funktionssammlung import find_session_output_file
+
+    cfg = dict(config)
+    cfg.setdefault("case_id", session_id)
+    cfg["output_file_path"] = output_folder
+    resolved = find_session_output_file(cfg)
+    if resolved:
+        return resolved, os.path.basename(resolved)
     return None, None
 
 
@@ -861,6 +871,19 @@ class RunRequest(BaseModel):
     config: dict
 
 
+class OposAuditDueDatesRequest(BaseModel):
+    session_id: str
+    column_letters: dict[str, str] = Field(default_factory=dict)
+    snapshots: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FteAuditColumnsRequest(BaseModel):
+    session_id: str
+    periods: list[dict[str, Any]] = Field(default_factory=list)
+    columns: dict[str, str] = Field(default_factory=dict)
+    header_row: int = 0
+
+
 class DatabookRequest(BaseModel):
     session_id: str
     entity_files: list[Any] = Field(default_factory=list)
@@ -897,9 +920,42 @@ class DatabookSusaRequest(BaseModel):
     bs_mapping_path: Optional[str] = None
     pl_mapping_path: Optional[str] = None
     strict_mapping: bool = False
+    project_name: str = "Project"
 
 
-# ─── Script execution helpers ──────────────────────────────────────────────────
+def _databook_master_path(
+    session_id: str,
+    output_folder: str,
+    *,
+    project_name: str = "Project",
+    master_path: str = "",
+) -> Path:
+    from databook_helpers import master_workbook_path, resolve_existing_master_path
+
+    if master_path:
+        explicit = Path(master_path).expanduser()
+        if explicit.is_file():
+            return explicit.resolve()
+    existing = resolve_existing_master_path(
+        output_folder,
+        session_id=session_id,
+        project_name=project_name,
+    )
+    if existing:
+        return existing
+    return master_workbook_path(session_id, output_folder, project_name)
+
+
+def _reorder_databook_master(master_path: str) -> None:
+    """Apply standard tab order to session master workbook."""
+    if not master_path or not os.path.isfile(master_path):
+        return
+    try:
+        from databook_workbook import reorder_workbook_file
+
+        reorder_workbook_file(master_path)
+    except Exception as exc:
+        logger.warning("fdd: sheet reorder failed for %s: %s", master_path, exc)
 
 
 def _prepare_run_artifacts(
@@ -923,6 +979,8 @@ def _prepare_run_artifacts(
     config["output_file_path"] = output_folder
     config["case_id"] = session_id
     config["run_id"] = run_id
+    if script_key not in ("bubble",):
+        config.setdefault("use_session_workbook", True)
 
     if script_key == "bubble" and not str(config.get("output_path") or "").strip():
         config["output_path"] = os.path.join(output_folder, f"{session_id}_Bubble_Output.xlsx")
@@ -1365,19 +1423,11 @@ def susa_preview(
 # ─── Run: OPOS Aging ───────────────────────────────────────────────────────────
 
 
-def _normalize_opos_config(config: dict, session_id: str) -> dict:
-    """Resolve snapshot file_ids to paths and infer sheet names."""
-    cfg = dict(config)
-    partner_col = str((cfg.get("columns") or {}).get("partner_id") or "").strip()
-    raw_snaps = cfg.get("snapshots")
-    if not isinstance(raw_snaps, list) or not raw_snaps:
-        fp = str(cfg.get("file_path") or "").strip()
-        as_of = str(cfg.get("as_of") or "").strip()
-        if fp and as_of:
-            raw_snaps = [{"as_of": as_of, "file_path": fp, "sheet_name": cfg.get("sheet_name", "")}]
-        else:
-            raise ValueError("OPOS config requires snapshots[] or file_path+as_of")
-
+def _normalize_opos_side_snapshots(
+    raw_snaps: list,
+    session_id: str,
+    partner_col: str = "",
+) -> list[dict]:
     from opos import resolve_snapshot_sheet_name
 
     normalized: list[dict] = []
@@ -1394,10 +1444,43 @@ def _normalize_opos_config(config: dict, session_id: str) -> dict:
         if not fp:
             raise ValueError(f"OPOS snapshot file not found for session {session_id}")
         snap["file_path"] = fp
-        if not str(snap.get("sheet_name") or "").strip():
+        if not str(snap.get("sheet_name") or "").strip() and partner_col:
             snap["sheet_name"] = resolve_snapshot_sheet_name(fp, partner_col, "")
         normalized.append(snap)
+    return normalized
 
+
+def _normalize_opos_config(config: dict, session_id: str) -> dict:
+    """Resolve snapshot file_ids to paths and infer sheet names."""
+    cfg = dict(config)
+    partner_col = str((cfg.get("columns") or {}).get("partner_id") or "").strip()
+    sides = cfg.get("sides")
+    if isinstance(sides, dict) and sides:
+        for side in ("debitor", "kreditor"):
+            block = dict(sides.get(side) or {})
+            raw_snaps = block.get("snapshots")
+            if not isinstance(raw_snaps, list) or not raw_snaps:
+                raise ValueError(f"OPOS config sides.{side} requires snapshots[]")
+            block["snapshots"] = _normalize_opos_side_snapshots(
+                raw_snaps, session_id, partner_col=""
+            )
+            sides[side] = block
+        cfg["sides"] = sides
+        first = sides["debitor"]["snapshots"][0]
+        cfg["file_path"] = first["file_path"]
+        cfg["sheet_name"] = first.get("sheet_name", "")
+        return cfg
+
+    raw_snaps = cfg.get("snapshots")
+    if not isinstance(raw_snaps, list) or not raw_snaps:
+        fp = str(cfg.get("file_path") or "").strip()
+        as_of = str(cfg.get("as_of") or "").strip()
+        if fp and as_of:
+            raw_snaps = [{"as_of": as_of, "file_path": fp, "sheet_name": cfg.get("sheet_name", "")}]
+        else:
+            raise ValueError("OPOS config requires snapshots[] or file_path+as_of")
+
+    normalized = _normalize_opos_side_snapshots(raw_snaps, session_id, partner_col=partner_col)
     if not normalized:
         raise ValueError("OPOS config has no valid snapshots")
     cfg["snapshots"] = normalized
@@ -1437,6 +1520,70 @@ def opos_preview(
     return _workbook_matrix_preview(session_id, file_id, sheet_name, sheet_index, header_row, max_rows)
 
 
+def _flatten_opos_snapshots_for_audit(
+    snapshots: list[dict[str, Any]],
+    session_id: str,
+) -> list[dict[str, str]]:
+    """Expand dual debitor/kreditor rows into flat snapshot dicts with resolved paths."""
+    out: list[dict[str, str]] = []
+    dual = bool(
+        snapshots
+        and isinstance(snapshots[0], dict)
+        and "debitor" in snapshots[0]
+        and "kreditor" in snapshots[0]
+    )
+    for item in snapshots:
+        if not isinstance(item, dict):
+            continue
+        as_of = str(item.get("as_of") or "").strip()
+        if not as_of:
+            continue
+        blocks: list[dict[str, str]]
+        if dual:
+            blocks = []
+            for side in ("debitor", "kreditor"):
+                raw = item.get(side) if isinstance(item.get(side), dict) else {}
+                blocks.append(
+                    {
+                        "file_id": str(raw.get("file_id") or "").strip(),
+                        "file_path": str(raw.get("file_path") or "").strip(),
+                        "sheet_name": str(raw.get("sheet_name") or "").strip(),
+                    }
+                )
+        else:
+            blocks = [
+                {
+                    "file_id": str(item.get("file_id") or "").strip(),
+                    "file_path": str(item.get("file_path") or "").strip(),
+                    "sheet_name": str(item.get("sheet_name") or "").strip(),
+                }
+            ]
+        for block in blocks:
+            fp = block["file_path"]
+            if not fp and block["file_id"]:
+                resolved = _file_path_for_id(session_id, block["file_id"])
+                if resolved:
+                    fp = str(resolved)
+            if not fp:
+                continue
+            out.append({"as_of": as_of, "file_path": fp, "sheet_name": block["sheet_name"]})
+    return out
+
+
+@router.post("/opos/audit-due-dates")
+def opos_audit_due_dates(req: OposAuditDueDatesRequest):
+    """Count OPOS rows with partner id but missing due date (debitor + kreditor)."""
+    from opos import audit_missing_due_date_rows
+
+    letters = dict(req.column_letters or {})
+    if not letters:
+        raise HTTPException(status_code=400, detail="column_letters is required")
+    snaps = _flatten_opos_snapshots_for_audit(req.snapshots, req.session_id)
+    if not snaps:
+        raise HTTPException(status_code=400, detail="No valid snapshots to audit")
+    return audit_missing_due_date_rows(snaps, column_letters=letters)
+
+
 # ─── Fixed Assets Rollforward preview + run ───────────────────────────────────
 
 
@@ -1468,6 +1615,108 @@ def run_fixed_assets_rollf_async(req: RunRequest):
     except ValueError as exc:
         return {"success": False, "message": str(exc)}
     return _start_async_script_job(req.session_id, req.file_id, config, "fixed_assets_rollf")
+
+
+def _normalize_fte_payroll_config(config: dict, session_id: str) -> dict:
+    """Resolve period file_ids to paths and infer sheet names."""
+    cfg = dict(config)
+    raw_periods = cfg.get("periods")
+    if not isinstance(raw_periods, list) or not raw_periods:
+        raise ValueError("FTE payroll config requires periods[]")
+
+    from FTE_payroll import _resolve_sheet_name
+
+    normalized: list[dict] = []
+    for item in raw_periods:
+        if not isinstance(item, dict):
+            continue
+        period = dict(item)
+        label = str(period.get("label") or "").strip()
+        if not label:
+            continue
+        fid = str(period.get("file_id") or "").strip()
+        fp = str(period.get("file_path") or "").strip()
+        if not fp and fid:
+            resolved = _file_path_for_id(session_id, fid)
+            if resolved:
+                fp = str(resolved)
+        if not fp:
+            raise ValueError(f"FTE payroll period '{label}' file not found for session {session_id}")
+        period["file_path"] = fp
+        sheet = str(period.get("sheet_name") or "").strip()
+        period["sheet_name"] = _resolve_sheet_name(fp, sheet)
+        normalized.append(period)
+
+    if not normalized:
+        raise ValueError("FTE payroll config has no valid periods")
+    cfg["periods"] = normalized
+    cfg["file_path"] = normalized[0]["file_path"]
+    cfg["sheet_name"] = str(cfg.get("sheet_name") or "FTE Development").strip()
+    master = str(cfg.get("master_pl_path") or "").strip()
+    if not master:
+        master_slot = str(cfg.get("db_master_workbook_path") or "").strip()
+        if master_slot and os.path.isfile(master_slot):
+            cfg["master_pl_path"] = master_slot
+    return cfg
+
+
+@router.post("/fte_payroll/audit-columns")
+def fte_audit_columns(req: FteAuditColumnsRequest):
+    """Count FTE rows with invalid employment rate or annual working time."""
+    from FTE_payroll import audit_invalid_fte_columns
+
+    cols = dict(req.columns or {})
+    if not cols.get("employment") or not cols.get("months_sum"):
+        raise HTTPException(status_code=400, detail="columns.employment and columns.months_sum are required")
+
+    normalized: list[dict] = []
+    for item in req.periods or []:
+        if not isinstance(item, dict):
+            continue
+        period = dict(item)
+        fid = str(period.get("file_id") or "").strip()
+        fp = str(period.get("file_path") or "").strip()
+        if not fp and fid:
+            resolved = _file_path_for_id(req.session_id, fid)
+            if resolved:
+                fp = str(resolved)
+        if not fp:
+            continue
+        period["file_path"] = fp
+        normalized.append(period)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="No valid periods to audit")
+    return audit_invalid_fte_columns(normalized, cols, header_row=int(req.header_row or 0))
+
+
+@router.get("/fte_payroll/preview")
+def fte_payroll_preview(
+    session_id: str = Query(...),
+    file_id: str = Query(...),
+    sheet_name: str = Query(""),
+    sheet_index: int = Query(0, ge=0),
+    header_row: int = Query(0, ge=0),
+    max_rows: int = Query(12, ge=1, le=30),
+):
+    return _workbook_matrix_preview(session_id, file_id, sheet_name, sheet_index, header_row, max_rows)
+
+
+@router.post("/run/fte_payroll")
+def run_fte_payroll_endpoint(req: RunRequest):
+    try:
+        config = _normalize_fte_payroll_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _prepare_and_run(req.session_id, req.file_id, config, "fte_payroll")
+
+
+@router.post("/run/fte_payroll/async")
+def run_fte_payroll_async(req: RunRequest):
+    try:
+        config = _normalize_fte_payroll_config(dict(req.config), req.session_id)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    return _start_async_script_job(req.session_id, req.file_id, config, "fte_payroll")
 
 
 # ─── Run: Databook — SuSa step ────────────────────────────────────────────────
@@ -1507,9 +1756,7 @@ def run_databook_susa(req: DatabookSusaRequest):
             detail="No uploaded files could be resolved for Databook (check file_id and session_id).",
         )
 
-    from databook_helpers import master_workbook_path
-
-    master = master_workbook_path(req.session_id, output_folder)
+    master = _databook_master_path(req.session_id, output_folder, project_name=req.project_name)
     out_xlsx = str(master)
     flat_paths = [p for cell in resolved_cells for p in cell["paths"]]
 
@@ -1626,9 +1873,7 @@ def run_databook(req: DatabookRequest):
             status_code=400,
             detail="No resolvable entity_year_files for Databook. Upload files via the trial balance grid and interpretation steps.",
         )
-    from databook_helpers import master_workbook_path
-
-    master = master_workbook_path(req.session_id, output_folder)
+    master = _databook_master_path(req.session_id, output_folder, project_name=req.project_name)
     out_xlsx = str(master)
     fy_end_month = int(getattr(req, "fy_end_month", None) or 12)
     fiscal_start_month = int(getattr(req, "fiscal_start_month", None) or ((fy_end_month % 12) + 1))
@@ -1719,6 +1964,7 @@ class DatabookConsolidationRequest(BaseModel):
     consolidation_file_id: str
     output_folder: str = ""
     master_path: str = ""
+    project_name: str = "Project"
     fy_end_month: Optional[int] = None
     fy_end_day: Optional[int] = None
     fiscal_start_month: Optional[int] = None
@@ -1728,6 +1974,7 @@ class DatabookConsolidationTemplateRequest(BaseModel):
     session_id: str
     output_folder: str = ""
     master_path: str = ""
+    project_name: str = "Project"
     period_level: str = "yearly"
     first_fy: Optional[int] = None
     ltm_month: Optional[str] = None
@@ -1740,6 +1987,7 @@ class DatabookAdjustmentsTemplateRequest(BaseModel):
     session_id: str
     output_folder: str = ""
     master_path: str = ""
+    project_name: str = "Project"
     first_fy: Optional[int] = None
     ltm_month: Optional[str] = None
     fy_end_month: Optional[int] = None
@@ -1752,6 +2000,21 @@ class DatabookAdjustmentsRequest(BaseModel):
     adjustments_file_id: str
     output_folder: str = ""
     master_path: str = ""
+    project_name: str = "Project"
+
+
+class DatabookImportMasterRequest(BaseModel):
+    session_id: str
+    master_file_id: str
+    output_folder: str = ""
+    project_name: str = "Project"
+
+
+class DatabookExtractEntitiesRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    project_name: str = "Project"
 
 
 class DatabookPdfExtractionRequest(BaseModel):
@@ -1784,27 +2047,86 @@ class DatabookReconPipelineRequest(BaseModel):
     entity_order: list[str] = Field(default_factory=list)
 
 
+class DatabookReconCoreRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    project_name: str = "Project"
+    company_name: str = "Group"
+    entity_order: list[str] = Field(default_factory=list)
+    l4_sort_basis: str = "latest_fy"
+
+
+class DatabookExtendedTablesRequest(BaseModel):
+    session_id: str
+    output_folder: str = ""
+    master_path: str = ""
+    project_name: str = "Project"
+    company_name: str = "Group"
+    entity_order: list[str] = Field(default_factory=list)
+    l4_sort_basis: str = "latest_fy"
+
+
 # ─── Run: Databook — post-SuSa steps ─────────────────────────────────────────
+
+
+@router.post("/run/databook/import-master")
+def run_databook_import_master(req: DatabookImportMasterRequest):
+    import shutil
+
+    from databook_helpers import extract_master_entities
+
+    uploaded = _file_path_for_id(req.session_id, req.master_file_id)
+    if not uploaded or not uploaded.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded master file not found.")
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = _databook_master_path(req.session_id, output_folder, project_name=req.project_name)
+    master.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(uploaded, master)
+    entities = extract_master_entities(master)
+
+    return {
+        "success": True,
+        "master_path": str(master.resolve()),
+        "output_file": str(master.resolve()),
+        "output_filename": master.name,
+        "entities": entities,
+    }
+
+
+@router.post("/run/databook/extract-entities")
+def run_databook_extract_entities(req: DatabookExtractEntitiesRequest):
+    """Return entity names from session master (or explicit master_path)."""
+    from databook_helpers import extract_master_entities
+
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
+    if not master.is_file():
+        raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
+    return {"success": True, "entities": extract_master_entities(master)}
 
 
 @router.post("/run/databook/consolidation-template")
 def run_databook_consolidation_template(req: DatabookConsolidationTemplateRequest):
-    from databook_helpers import consolidation_template_path, master_workbook_path
+    from databook_helpers import consolidation_template_path
 
     sess = _session_dir(req.session_id)
     run_id = _make_run_id("db_cons_tpl_")
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-
-    if req.master_path:
-        master = Path(req.master_path).expanduser()
-        if master.is_file():
-            master = master.resolve()
-    else:
-        master = master_workbook_path(req.session_id, output_folder)
-        if master.is_file():
-            master = master.resolve()
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
     template_out = consolidation_template_path(req.session_id, output_folder)
     period_level = str(req.period_level or "yearly").strip().lower()
     if period_level not in ("yearly", "monthly"):
@@ -1845,22 +2167,19 @@ def run_databook_consolidation_template(req: DatabookConsolidationTemplateReques
 
 @router.post("/run/databook/adjustments-template")
 def run_databook_adjustments_template(req: DatabookAdjustmentsTemplateRequest):
-    from databook_helpers import adjustments_template_path, master_workbook_path
+    from databook_helpers import adjustments_template_path
 
     sess = _session_dir(req.session_id)
     run_id = _make_run_id("db_adj_tpl_")
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-
-    if req.master_path:
-        master = Path(req.master_path).expanduser()
-        if master.is_file():
-            master = master.resolve()
-    else:
-        master = master_workbook_path(req.session_id, output_folder)
-        if master.is_file():
-            master = master.resolve()
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
     template_out = adjustments_template_path(req.session_id, output_folder)
 
     fy_end_month = int(req.fy_end_month or 12)
@@ -1893,21 +2212,17 @@ def run_databook_adjustments_template(req: DatabookAdjustmentsTemplateRequest):
 
 @router.post("/run/databook/adjustments")
 def run_databook_adjustments(req: DatabookAdjustmentsRequest):
-    from databook_helpers import master_workbook_path
-
     sess = _session_dir(req.session_id)
     run_id = _make_run_id("db_adj_")
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-    if req.master_path:
-        master = Path(req.master_path).expanduser()
-        if master.is_file():
-            master = master.resolve()
-    else:
-        master = master_workbook_path(req.session_id, output_folder)
-        if master.is_file():
-            master = master.resolve()
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
 
     adj_path = _file_path_for_id(req.session_id, req.adjustments_file_id)
     if not adj_path or not adj_path.is_file():
@@ -1929,15 +2244,16 @@ def run_databook_adjustments(req: DatabookAdjustmentsRequest):
 
 @router.post("/run/databook/consolidation")
 def run_databook_consolidation(req: DatabookConsolidationRequest):
-    from databook_helpers import master_workbook_path
-
     sess = _session_dir(req.session_id)
     run_id = _make_run_id("db_cons_")
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-    master = Path(req.master_path) if req.master_path else master_workbook_path(
-        req.session_id, output_folder
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
     )
     cons_path = _file_path_for_id(req.session_id, req.consolidation_file_id)
     if not cons_path or not cons_path.is_file():
@@ -2031,7 +2347,6 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
     from databook_helpers import (
         ensure_pl_mapping_file,
         extract_fs_check_values,
-        master_workbook_path,
         prepare_master_pl_for_recon,
     )
 
@@ -2040,8 +2355,11 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-    master = Path(req.master_path) if req.master_path else master_workbook_path(
-        req.session_id, output_folder
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
     )
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
@@ -2097,16 +2415,213 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
     return result
 
 
+def _default_recon_display_titles() -> dict[str, str]:
+    return {
+        "aggregated_title": "Aggregated",
+        "consolidation_title": "Consolidation",
+        "difference_title": "Difference",
+        "financial_statements_title": "Financial statements",
+        "ic_display_name": "IC eliminations",
+    }
+
+
+@router.post("/run/databook/recon-core")
+def run_databook_recon_core(req: DatabookReconCoreRequest):
+    """Run PL then BS reconciliation and append both sheets to the session master."""
+    from databook_workbook import BS_RECON_MAPPING_FILE
+
+    from databook_helpers import (
+        ensure_pl_mapping_file,
+        prepare_master_pl_for_recon,
+    )
+
+    run_id = _make_run_id("db_recon_core_")
+    run_d = _run_dir(req.session_id, run_id)
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
+    if not master.is_file():
+        raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
+
+    prepare_master_pl_for_recon(master)
+    master_str = str(master)
+    entity_order = list(req.entity_order)
+    l4_sort_basis = str(req.l4_sort_basis or "latest_fy").strip().lower()
+    titles = _default_recon_display_titles()
+    pl_mapping = ensure_pl_mapping_file()
+    recon_pl_target = master_str
+    recon_bs_target = master_str
+
+    pl_config = {
+        "project_name": req.project_name,
+        "company_name": req.company_name,
+        "sort_by": "custom",
+        "l4_sort_basis": l4_sort_basis,
+        "entity_order": entity_order,
+        "show_fs_check": True,
+        "fs_check_values": {"entities": [], "consolidation": []},
+        "display": {"titles": titles},
+        "pl_config": {"display_label_map": {}},
+        "paths": {
+            "source_file": master_str,
+            "source_sheet": "Master_PL",
+            "source_engine": "openpyxl",
+            "target_file": recon_pl_target,
+            "report_sheet": "PL_Reconciliation",
+            "audit_master_sheet": "Master_PL",
+            "mapping_file": str(pl_mapping),
+            "append_to_master": False,
+            "master_file": master_str,
+        },
+    }
+    pl_config_path = run_d / "recon_pl_config.json"
+    pl_config_path.write_text(json.dumps(pl_config, ensure_ascii=False, indent=2), encoding="utf-8")
+    pl_result = _run_script(SCRIPTS["recon_pl"], pl_config_path)
+    if not pl_result.get("success"):
+        pl_result["failed_step"] = "recon_pl"
+        pl_result["master_path"] = master_str
+        return pl_result
+
+    bs_config = {
+        "project_name": req.project_name,
+        "company_name": req.company_name,
+        "entity_order": entity_order,
+        "l4_sort_basis": l4_sort_basis,
+        "show_bs_checks": True,
+        "display": {"titles": titles},
+        "paths": {
+            "source_file": master_str,
+            "target_file": recon_bs_target,
+            "master_file": master_str,
+            "mapping_file": BS_RECON_MAPPING_FILE,
+            "report_sheet": "BS_Reconciliation",
+            "append_to_master": False,
+        },
+    }
+    bs_config_path = run_d / "recon_bs_config.json"
+    bs_config_path.write_text(json.dumps(bs_config, ensure_ascii=False, indent=2), encoding="utf-8")
+    bs_result = _run_script(SCRIPTS["recon_bs"], bs_config_path)
+    if not bs_result.get("success"):
+        bs_result["failed_step"] = "recon_bs"
+        bs_result["master_path"] = master_str
+        return bs_result
+
+    _reorder_databook_master(master_str)
+    return {
+        "success": True,
+        "message": "PL and BS reconciliation tables added to the master databook.",
+        "output_file": master_str,
+        "output_filename": master.name,
+        "master_path": master_str,
+        "run_id": run_id,
+        "session_id": req.session_id,
+    }
+
+
+@router.post("/run/databook/extended-tables")
+def run_databook_extended_tables(req: DatabookExtendedTablesRequest):
+    """Run BS bucket, Lead_IS, Lead_BS, Working capital, and Cashflow on session master."""
+    from databook_workbook import BS_RECON_MAPPING_FILE, CF_NA_L3_ORDER_FILE, PL_RECON_MAPPING_FILE
+
+    from databook_helpers import prepare_master_pl_for_recon
+
+    run_id = _make_run_id("db_ext_tables_")
+    run_d = _run_dir(req.session_id, run_id)
+    output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
+    )
+    if not master.is_file():
+        raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
+
+    prepare_master_pl_for_recon(master)
+    master_str = str(master)
+    entity_order = list(req.entity_order)
+    l4_sort_basis = str(req.l4_sort_basis or "latest_fy").strip().lower()
+    shared_paths = {
+        "mapping_source": "db",
+        "master_file": master_str,
+        "input_file": master_str,
+        "mapping_file": BS_RECON_MAPPING_FILE,
+        "pl_mapping_file": PL_RECON_MAPPING_FILE,
+        "cf_na_l3_order_file": CF_NA_L3_ORDER_FILE,
+    }
+    base = {
+        "project_name": req.project_name,
+        "company_name": req.company_name,
+        "entity_order": entity_order,
+        "l4_sort_basis": l4_sort_basis,
+        "paths": dict(shared_paths),
+    }
+
+    steps: list[tuple[str, dict]] = [
+        ("bs_bucket", {**base, "paths": {**base["paths"], "input_file": master_str}}),
+        ("lead_is", {**base, "paths": {**base["paths"], "input_file": master_str}}),
+        (
+            "lead_bs",
+            {
+                **base,
+                "paths": {
+                    **base["paths"],
+                    "input_file": master_str,
+                    "pl_master_file": master_str,
+                },
+            },
+        ),
+        (
+            "working_capital",
+            {**base, "paths": {**base["paths"], "input_file": master_str, "master_file": master_str}},
+        ),
+        ("cashflow", {**base, "paths": {**base["paths"], "input_file": master_str, "master_file": master_str}}),
+    ]
+
+    messages: list[str] = []
+    for script_key, config in steps:
+        script = SCRIPTS.get(script_key)
+        if not script or not script.is_file():
+            raise HTTPException(status_code=500, detail=f"Script not found: {script_key}")
+        config_path = run_d / f"{script_key}_config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        result = _run_script(script, config_path)
+        if not result.get("success"):
+            result["failed_step"] = script_key
+            result["master_path"] = master_str
+            return result
+        if result.get("message"):
+            messages.append(str(result["message"]))
+
+    _reorder_databook_master(master_str)
+    return {
+        "success": True,
+        "message": "\n".join(messages) if messages else "Extended tables completed.",
+        "output_file": master_str,
+        "output_filename": master.name,
+        "master_path": master_str,
+        "run_id": run_id,
+        "session_id": req.session_id,
+    }
+
+
 @router.post("/run/databook/recon-pipeline")
 def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
     """Run PL/BS recon, BS bucket, Lead_IS, Lead_BS, Working_capital on session master."""
-    from databook_helpers import master_workbook_path, prepare_master_pl_for_recon
+    from databook_helpers import prepare_master_pl_for_recon
 
     run_id = _make_run_id("db_recon_pipe_")
     run_d = _run_dir(req.session_id, run_id)
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
-    master = Path(req.master_path) if req.master_path else master_workbook_path(
-        req.session_id, output_folder
+    master = _databook_master_path(
+        req.session_id,
+        output_folder,
+        project_name=req.project_name,
+        master_path=req.master_path,
     )
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
@@ -2202,6 +2717,7 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
         if result.get("message"):
             messages.append(str(result["message"]))
 
+    _reorder_databook_master(master_str)
     return {
         "success": True,
         "message": "\n".join(messages) if messages else "Recon pipeline completed.",
@@ -2227,6 +2743,7 @@ def download_template(
     fy_end_month: Optional[int] = Query(None),
     fy_end_day: Optional[int] = Query(None),
     fiscal_start_month: Optional[int] = Query(None),
+    project_name: str = Query("Project"),
 ):
     """
     Serve an XLSX template for the given name.
@@ -2236,7 +2753,6 @@ def download_template(
         from databook_helpers import (
             build_consolidation_template_from_config,
             consolidation_template_path,
-            master_workbook_path,
         )
 
         resolved_folder = _resolve_output_folder(output_folder or None, session_id)
@@ -2248,7 +2764,7 @@ def download_template(
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-        master = master_workbook_path(session_id, resolved_folder)
+        master = _databook_master_path(session_id, resolved_folder, project_name=project_name)
         if master.is_file():
             master = master.resolve()
         level = str(period_level or "yearly").strip().lower()
@@ -2282,7 +2798,6 @@ def download_template(
         from databook_helpers import (
             adjustments_template_path,
             build_adjustments_template_from_config,
-            master_workbook_path,
         )
 
         resolved_folder = _resolve_output_folder(output_folder or None, session_id)
@@ -2294,7 +2809,7 @@ def download_template(
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-        master = master_workbook_path(session_id, resolved_folder)
+        master = _databook_master_path(session_id, resolved_folder, project_name=project_name)
         if master.is_file():
             master = master.resolve()
         fy_end_m = int(fy_end_month or 12)

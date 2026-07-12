@@ -29,25 +29,11 @@ from openpyxl.utils import get_column_letter
 
 from funktionssammlung import apply_filters, compute_amount, get_period, pick_colors_hardcoded
 
-# -----------------------------------------------------------------------------
-# Font (optional GT Walsheim; falls back to default sans)
-# -----------------------------------------------------------------------------
-_FONT_CANDIDATES = [
-    os.environ.get("GT_WALSHEIM_FONT", "").strip(),
-    "/Library/Fonts/GT-Walsheim-LC-Light.ttf",
-    r"C:\WINDOWS\FONTS\GT-WALSHEIM-LC-LIGHT.TTF",
-]
-FONT_PATH = next((p for p in _FONT_CANDIDATES if p and os.path.isfile(p)), "")
-FONT_PROP = fm.FontProperties()
-try:
-    if FONT_PATH:
-        fm.FontManager.addfont(FONT_PATH)
-        FONT_PROP = fm.FontProperties(fname=FONT_PATH)
-        plt.rcParams["font.family"] = FONT_PROP.get_name()
-        plt.rcParams["font.weight"] = "normal"
-        plt.rcParams["font.size"] = 7
-except Exception:
-    FONT_PROP = fm.FontProperties()
+# Font — Inter / system sans-serif
+FONT_PROP = fm.FontProperties(family="sans-serif")
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.weight"] = "normal"
+plt.rcParams["font.size"] = 7
 
 # -----------------------------------------------------------------------------
 # INPUT (Beispiel — Pfade anpassen)

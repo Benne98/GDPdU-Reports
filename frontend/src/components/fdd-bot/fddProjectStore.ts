@@ -52,6 +52,7 @@ export interface FddProjectRecord {
   id: string
   name: string
   senderId: string
+  createdAt: string
   updatedAt: string
   snapshot: FddProjectSnapshot
 }
@@ -84,6 +85,7 @@ export function createEmptyProject(name = DEFAULT_PROJECT_NAME): FddProjectRecor
     id: makeProjectId(),
     name,
     senderId: makeSenderId(),
+    createdAt: now,
     updatedAt: now,
     snapshot: emptySnapshot(),
   }
@@ -106,9 +108,7 @@ function writeProjects(projects: FddProjectRecord[]): void {
 }
 
 export function listProjectSummaries(): FddProjectSummary[] {
-  return readProjectsRaw()
-    .map(({ id, name, updatedAt }) => ({ id, name, updatedAt }))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  return readProjectsRaw().map(({ id, name, updatedAt }) => ({ id, name, updatedAt }))
 }
 
 export function getProject(id: string): FddProjectRecord | null {
@@ -130,11 +130,13 @@ export function setActiveProjectId(id: string): void {
 export function upsertProject(record: FddProjectRecord): void {
   const projects = readProjectsRaw()
   const idx = projects.findIndex(p => p.id === record.id)
-  const next = { ...record, updatedAt: new Date().toISOString() }
+  const now = new Date().toISOString()
+  const createdAt = idx >= 0 ? (projects[idx].createdAt || projects[idx].updatedAt || now) : now
+  const next = { ...record, createdAt, updatedAt: now }
   if (idx >= 0) {
     projects[idx] = next
   } else {
-    projects.unshift(next)
+    projects.push(next)
   }
   writeProjects(projects)
 }

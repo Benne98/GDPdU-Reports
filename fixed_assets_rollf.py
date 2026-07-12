@@ -5,7 +5,7 @@ import json
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,22 +29,36 @@ from funktionssammlung import (  # noqa: E402
     build_output_file_path,
     build_sumifs_formula_body,
     ensure_output_writable,
+    open_session_workbook,
+    replace_workbook_sheet,
     resolve_column_names_to_df,
     source_range_ref,
     write_source_df_to_ws,
 )
 from gst_excel_theme import THEME  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    AGGREGATED_BLOCK_TITLE,
+    BS_RECON_SHEET,
+    FONT_MAPPING,
+    bs_recon_aggregated_ref,
+    check_row_groups_after_table,
+    collapse_check_portfolio,
+    find_bs_recon_row_contains,
+    find_recon_block_start_col,
+)
+from databook_workbook import FA_ROLLF_OUTPUT_SHEET  # noqa: E402
 
-GROUP_CRIT_COL_START = 2  # B, C — SUMIFS criteria per group level
-POS_COL = 10  # J — labels
-FIRST_DATA_COL = 11  # K
+FA_TABLE_TITLE = "FA roll forward"
+
+FREE_COL = 1
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
-TABLE_TITLE_ROW = 7
+TABLE_TITLE_ROW = 6
+HEADER_ROW_7 = 7
 HEADER_ROW = 8
 DATA_START_ROW = 9
 
-SPACER_WIDTH = 1.14
+MAP_COL_WIDTH = 12  # databook helper block (Lead_BS, cashflow, Working_capital, …)
 VALUE_COL_WIDTH = 8.0
 LABEL_COL_WIDTH = 32.0
 ROW_HEIGHT = 12
@@ -70,6 +84,7 @@ _MONTH_ABBR = {
 FONT_BASE = THEME.font_base
 FONT_BOLD = THEME.font_bold
 FONT_HEADER = THEME.font_header
+FONT_CHECK_RED = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.delta_negative)
 FONT_PROJECT = Font(name=THEME.font_name, size=THEME.font_size_title, color=THEME.text_brand_title)
 FONT_SUBTITLE = Font(name=THEME.font_name, size=THEME.font_size_subtitle, color=THEME.text_brand_title)
 FILL_GREY = THEME.fill_tech
@@ -77,7 +92,7 @@ FILL_HEADER = THEME.fill_header
 FILL_SUBTOTAL = THEME.fill_subtotal
 FILL_WHITE = THEME.fill_white
 FILL_PERIOD = THEME.fill_period
-FILL_YELLOW = PatternFill("solid", fgColor="FFFF99")
+FILL_YELLOW = PatternFill("solid", fgColor="FFFF00")
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center")
 ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
 ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
@@ -90,7 +105,46 @@ MOVEMENT_LABELS = {
     "disposals": "Disp.",
     "depreciation": "D&A",
 }
-AMOUNT_KEYS = ("opening", *MOVEMENT_KEYS, "closing")
+@dataclass(frozen=True)
+class FaLayout:
+    """Grey helper block A..(POS-1) with spacer cols between group criteria; POS = table start."""
+
+    helper_start_col: int
+    helper_end_col: int
+    group_crit_cols: tuple[int, ...]
+    pos_col: int
+    first_data_col: int
+
+
+def fa_column_layout(num_group_cols: int) -> FaLayout:
+    """A..POS-1 grey (placeholders + 1–2 criteria cols + internal spacers), like databook."""
+    n = max(0, min(2, int(num_group_cols)))
+    col = 1
+    # leading placeholder (A)
+    group_cols: list[int] = []
+    col += 1
+    for i in range(n):
+        if i > 0:
+            col += 1  # spacer between criteria columns
+        group_cols.append(col)
+        col += 1
+    col += 1  # trailing spacer before POS
+    helper_end = col - 1
+    pos_col = col
+    return FaLayout(
+        helper_start_col=1,
+        helper_end_col=helper_end,
+        group_crit_cols=tuple(group_cols),
+        pos_col=pos_col,
+        first_data_col=pos_col + 1,
+    )
+
+
+# Default export for tests / one-level grouping.
+_DEFAULT_LAYOUT = fa_column_layout(1)
+POS_COL = _DEFAULT_LAYOUT.pos_col
+FIRST_DATA_COL = _DEFAULT_LAYOUT.first_data_col
+GROUP_CRIT_COL_START = _DEFAULT_LAYOUT.group_crit_cols[0] if _DEFAULT_LAYOUT.group_crit_cols else 2
 
 _FY_GRID_RE = re.compile(r"^FY(19|20)\d{2}$", re.IGNORECASE)
 _YTD_GRID_RE = re.compile(r"^YTD(19|20)\d{2}$", re.IGNORECASE)
@@ -155,14 +209,17 @@ def grid_label_to_display(label: str, *, fy_end_month: int = 12) -> str:
 
 
 def source_sheet_name(period_label: str, *, fy_end_month: int = 12) -> str:
-    return f"__SOURCE__{grid_label_to_display(period_label, fy_end_month=fy_end_month)}"[:31]
+    display = grid_label_to_display(period_label, fy_end_month=fy_end_month)
+    return f"__SOURCE__FA_{display}"[:31]
 
 
 def _sentence_case_title(text: str) -> str:
     parts = str(text or "").strip().split()
     if not parts:
         return ""
-    return parts[0].capitalize() + ((" " + " ".join(p.lower() for p in parts[1:])) if len(parts) > 1 else "")
+    return parts[0].capitalize() + (
+        (" " + " ".join(p.lower() for p in parts[1:])) if len(parts) > 1 else ""
+    )
 
 
 def _parse_numeric(series: pd.Series) -> pd.Series:
@@ -202,7 +259,13 @@ def normalize_config(cfg: dict) -> dict:
         fp = str(p.get("file_path") or "").strip()
         if not label or not fp:
             continue
-        norm_periods.append({"label": label, "file_path": fp, "sheet_name": str(p.get("sheet_name") or "").strip()})
+        norm_periods.append(
+            {
+                "label": label,
+                "file_path": fp,
+                "sheet_name": str(p.get("sheet_name") or "").strip(),
+            }
+        )
     if not norm_periods:
         raise ValueError("periods[] has no valid entries")
     out["periods"] = norm_periods
@@ -210,7 +273,7 @@ def normalize_config(cfg: dict) -> dict:
     out["unit_label"] = str(out.get("unit_label") or UNIT_LABEL)
     scale = out.get("amount_scale")
     out["amount_scale"] = float(scale) if scale not in (None, "", 0) else 1000.0
-    out["sheet_name"] = str(out.get("sheet_name") or "Fixed assets rollforward")
+    out["sheet_name"] = str(out.get("sheet_name") or FA_ROLLF_OUTPUT_SHEET)
     out["total_label"] = str(out.get("total_label") or "Fixed assets")
     out["formula_mode"] = bool(out.get("formula_mode", True))
     bal = str(out.get("balance_check_col") or "Lfd Buchwert").strip()
@@ -238,6 +301,7 @@ def load_period_dataframe(spec: PeriodSpec, header_row: int) -> pd.DataFrame:
     return pd.read_excel(spec.file_path, sheet_name=sheet, header=header_row)
 
 
+
 def _amount_column_names(cfg: dict) -> list[str]:
     cols = cfg["columns"]
     return [cols["opening"], cols["additions"], cols["disposals"], *cols["depreciation_cols"]]
@@ -247,7 +311,10 @@ def _depreciation_cols_from_cfg(cfg: dict) -> list[str]:
     return list(cfg["columns"]["depreciation_cols"])
 
 
-def aggregate_period(df: pd.DataFrame, cfg: dict) -> tuple[dict[tuple[str, ...], dict[str, float]], pd.DataFrame]:
+def aggregate_period(
+    df: pd.DataFrame,
+    cfg: dict,
+) -> tuple[dict[tuple[str, ...], dict[str, float]], pd.DataFrame]:
     group_cols = list(cfg.get("group_cols") or [])
     amount_names = _amount_column_names(cfg)
     all_needed = list(group_cols) + amount_names
@@ -317,7 +384,11 @@ def visible_movements_for_agg(agg: dict[tuple[str, ...], dict[str, float]]) -> l
     return visible
 
 
-def build_row_specs(group_cols: list[str], keys: list[tuple[str, ...]], sort_values: dict[tuple[str, ...], float] | None = None) -> list[RowSpec]:
+def build_row_specs(
+    group_cols: list[str],
+    keys: list[tuple[str, ...]],
+    sort_values: dict[tuple[str, ...], float] | None = None,
+) -> list[RowSpec]:
     if not group_cols:
         return []
 
@@ -326,7 +397,10 @@ def build_row_specs(group_cols: list[str], keys: list[tuple[str, ...]], sort_val
         return (val, (k[0] if k else "").lower())
 
     if len(group_cols) == 1:
-        return [RowSpec(row_type="leaf", label=k[0] if k else "", level=1, group_key=k) for k in sorted(keys, key=_sort_key)]
+        return [
+            RowSpec(row_type="leaf", label=k[0] if k else "", level=1, group_key=k)
+            for k in sorted(keys, key=_sort_key)
+        ]
     by_l1: dict[str, list[tuple[str, ...]]] = defaultdict(list)
     for k in keys:
         by_l1[k[0] if k else ""].append(k)
@@ -345,10 +419,11 @@ def build_bridge_columns(
     source_aggs: list[dict[tuple[str, ...], dict[str, float]]],
     *,
     fy_end_month: int = 12,
+    first_data_col: int = FIRST_DATA_COL,
 ) -> tuple[list[BridgeColumn], list[int]]:
     """Dec22A | Add | Disp | D&A | Dec23A | … — each segment from its own source period."""
     columns: list[BridgeColumn] = []
-    col = FIRST_DATA_COL
+    col = first_data_col
     n = len(period_labels)
     if n == 0:
         return columns, []
@@ -401,10 +476,19 @@ def _divide_by_scale(cfg: dict) -> bool:
     return float(cfg.get("amount_scale") or 1000) == 1000.0
 
 
-def _group_sumifs_pairs(source_sheet: str, header_map: dict[str, int], group_cols: list[str], row_idx: int) -> list[tuple[str, str]]:
+def _group_sumifs_pairs(
+    source_sheet: str,
+    header_map: dict[str, int],
+    group_cols: list[str],
+    row_idx: int,
+    *,
+    group_crit_cols: tuple[int, ...],
+) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for i, gc in enumerate(group_cols):
-        col_idx = GROUP_CRIT_COL_START + i
+        if i >= len(group_crit_cols):
+            break
+        col_idx = group_crit_cols[i]
         rng = source_range_ref(source_sheet, header_map, gc)
         crit = f"${col_letter(col_idx)}{row_idx}"
         pairs.append((rng, crit))
@@ -418,25 +502,66 @@ def _formula_filter_branches(cfg: dict, source_sheet: str, header_map: dict[str,
         return [[]]
 
 
-def _fa_sumifs_formula(source_sheet: str, header_map: dict[str, int], amount_header: str, row_idx: int, group_cols: list[str], cfg: dict) -> str:
+def _fa_sumifs_formula(
+    source_sheet: str,
+    header_map: dict[str, int],
+    amount_header: str,
+    row_idx: int,
+    group_cols: list[str],
+    cfg: dict,
+    *,
+    group_crit_cols: tuple[int, ...],
+) -> str:
     amount_rng = source_range_ref(source_sheet, header_map, amount_header)
-    base_pairs = _group_sumifs_pairs(source_sheet, header_map, group_cols, row_idx)
+    base_pairs = _group_sumifs_pairs(
+        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+    )
     filter_branches = _formula_filter_branches(cfg, source_sheet, header_map)
-    body = build_sumifs_formula_body(amount_rng, base_pairs, filter_branches, divide_by_1000=_divide_by_scale(cfg))
-    return f'=IFERROR({body},"")'
+    body = build_sumifs_formula_body(
+        amount_rng,
+        base_pairs,
+        filter_branches,
+        divide_by_1000=_divide_by_scale(cfg),
+    )
+    return f"=IFERROR({body},\"\")"
 
 
-def _fa_depreciation_formula(source_sheet: str, header_map: dict[str, int], row_idx: int, group_cols: list[str], cfg: dict) -> str:
+def _fa_depreciation_formula(
+    source_sheet: str,
+    header_map: dict[str, int],
+    row_idx: int,
+    group_cols: list[str],
+    cfg: dict,
+    *,
+    group_crit_cols: tuple[int, ...],
+) -> str:
     headers = _depreciation_cols_from_cfg(cfg)
     if len(headers) == 1:
-        return _fa_sumifs_formula(source_sheet, header_map, headers[0], row_idx, group_cols, cfg)
+        return _fa_sumifs_formula(
+            source_sheet,
+            header_map,
+            headers[0],
+            row_idx,
+            group_cols,
+            cfg,
+            group_crit_cols=group_crit_cols,
+        )
     parts: list[str] = []
-    base_pairs = _group_sumifs_pairs(source_sheet, header_map, group_cols, row_idx)
+    base_pairs = _group_sumifs_pairs(
+        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+    )
     filter_branches = _formula_filter_branches(cfg, source_sheet, header_map)
     for hdr in headers:
         amount_rng = source_range_ref(source_sheet, header_map, hdr)
-        parts.append(build_sumifs_formula_body(amount_rng, base_pairs, filter_branches, divide_by_1000=_divide_by_scale(cfg)))
-    return f'=IFERROR({"+".join(parts)},"")'
+        parts.append(
+            build_sumifs_formula_body(
+                amount_rng,
+                base_pairs,
+                filter_branches,
+                divide_by_1000=_divide_by_scale(cfg),
+            )
+        )
+    return f"=IFERROR({'+'.join(parts)},\"\")"
 
 
 def _parent_sum_formula(row_idx: int, child_rows: list[int], col_idx: int) -> str:
@@ -446,7 +571,7 @@ def _parent_sum_formula(row_idx: int, child_rows: list[int], col_idx: int) -> st
     if len(refs) == 1:
         return f"={refs[0]}"
     inner = "+".join(f"IFERROR({r},0)" for r in refs)
-    return f'=IFERROR({inner},"")'
+    return f"=IFERROR({inner},\"\")"
 
 
 def _bridge_delta_formula(total_row: int, next_period_col: int, prev_period_col: int, movement_cols: list[int]) -> str:
@@ -473,50 +598,150 @@ def _build_bridge_segments(columns: list[BridgeColumn]) -> list[tuple[int, list[
     return segments
 
 
-def _source_total_formula(source_sheet: str, header_map: dict[str, int], balance_header: str, cfg: dict) -> str:
+def _source_total_formula(
+    source_sheet: str,
+    header_map: dict[str, int],
+    balance_header: str,
+    cfg: dict,
+) -> str:
     try:
         rng = source_range_ref(source_sheet, header_map, balance_header)
     except ValueError:
         rng = source_range_ref(source_sheet, header_map, cfg["columns"]["opening"])
     if _divide_by_scale(cfg):
-        return f'=IFERROR(SUM({rng})/1000,"")'
+        return f"=IFERROR(SUM({rng})/1000,\"\")"
     scale = float(cfg["amount_scale"])
-    return f'=IFERROR(SUM({rng})/{scale},"")'
+    return f"=IFERROR(SUM({rng})/{scale},\"\")"
 
 
-def _apply_sheet_layout(ws, *, last_used_col: int, last_fill_row: int) -> None:
-    """Grey helper columns A–I, white data area — aligned with BS_Bucket."""
+def _apply_fa_row_border_band(
+    ws,
+    row: int,
+    layout: FaLayout,
+    border: Border,
+    *,
+    last_used_col: int,
+) -> None:
+    """Subtotal/header borders on filled helper cols + table; skip A and spacer columns."""
+    for cc in layout.group_crit_cols:
+        ws.cell(row, cc).border = border
+    for cc in range(layout.pos_col, last_used_col + 1):
+        ws.cell(row, cc).border = border
+
+
+def _apply_sheet_layout(
+    ws,
+    layout: FaLayout,
+    *,
+    last_used_col: int,
+    last_fill_row: int,
+) -> None:
+    """Grey full helper block A..spacer; white from POS onward."""
     fill_end_col = last_used_col + 40
     for rr in range(1, last_fill_row + 1):
         ws.row_dimensions[rr].height = ROW_HEIGHT if rr != PROJECT_TITLE_ROW else 36
-        for cc in range(1, POS_COL):
+        for cc in range(layout.helper_start_col, layout.pos_col):
             ws.cell(rr, cc).fill = FILL_GREY
-        for cc in range(POS_COL, fill_end_col + 1):
+        for cc in range(layout.pos_col, fill_end_col + 1):
             ws.cell(rr, cc).fill = FILL_WHITE
 
-    for cc in range(1, POS_COL):
+    for cc in range(layout.helper_start_col, layout.pos_col):
         cl = col_letter(cc)
         ws.column_dimensions[cl].outlineLevel = 2
         ws.column_dimensions[cl].hidden = True
-    ws.column_dimensions[col_letter(POS_COL)].outlineLevel = 0
-    ws.column_dimensions[col_letter(POS_COL)].hidden = False
+    ws.column_dimensions[col_letter(layout.helper_end_col)].collapsed = True
+
+    pos_letter = col_letter(layout.pos_col)
+    ws.column_dimensions[pos_letter].outlineLevel = 0
+    ws.column_dimensions[pos_letter].hidden = False
 
 
-def _style_value_cell(cell, *, bold: bool = False, fill=None) -> None:
+def _paint_header_band(
+    ws,
+    layout: FaLayout,
+    columns: list[BridgeColumn],
+    *,
+    unit_label: str,
+    group_col_labels: list[str] | None = None,
+) -> None:
+    labels = group_col_labels or []
+    for i, crit_col in enumerate(layout.group_crit_cols):
+        label = labels[i] if i < len(labels) else ""
+        ws.cell(HEADER_ROW_7, crit_col).fill = FILL_HEADER
+        ws.cell(HEADER_ROW_7, crit_col).font = FONT_HEADER
+        hc = ws.cell(HEADER_ROW, crit_col, label)
+        hc.font = FONT_HEADER
+        hc.alignment = ALIGN_RIGHT
+        hc.border = BORDER_HEADER_BOTTOM
+        hc.fill = FILL_HEADER
+
+    for bc in columns:
+        ws.cell(HEADER_ROW_7, bc.col_idx).fill = (
+            FILL_PERIOD if bc.kind == "period" else FILL_HEADER
+        )
+        ws.cell(HEADER_ROW_7, bc.col_idx).font = FONT_HEADER
+        ws.cell(HEADER_ROW_7, bc.col_idx).alignment = ALIGN_RIGHT
+
+        hc = ws.cell(HEADER_ROW, bc.col_idx, bc.header)
+        hc.font = FONT_HEADER
+        hc.alignment = ALIGN_RIGHT
+        hc.border = BORDER_HEADER_BOTTOM
+        hc.fill = FILL_PERIOD if bc.kind == "period" else FILL_HEADER
+
+    pos_top = ws.cell(HEADER_ROW_7, layout.pos_col)
+    pos_top.fill = FILL_HEADER
+    pos_top.font = FONT_HEADER
+    pos_top.alignment = ALIGN_LEFT
+
+    pos_hdr = ws.cell(HEADER_ROW, layout.pos_col, unit_label)
+    pos_hdr.fill = FILL_HEADER
+    pos_hdr.border = BORDER_HEADER_BOTTOM
+    pos_hdr.font = FONT_HEADER
+    pos_hdr.alignment = ALIGN_LEFT
+
+
+def _table_band_cols(layout: FaLayout, columns: list[BridgeColumn], last_used_col: int) -> list[int]:
+    cols = {layout.pos_col, *{bc.col_idx for bc in columns if not bc.hidden}}
+    return sorted(c for c in cols if layout.pos_col <= c <= last_used_col)
+
+
+def _paint_check_source_yellow(
+    ws,
+    layout: FaLayout,
+    source_row: int,
+    table_cols: list[int],
+) -> None:
+    for col_idx in table_cols:
+        ws.cell(source_row, col_idx).fill = FILL_YELLOW
+
+
+def _style_value_cell(cell, *, bold: bool = False, fill=None, red: bool = False) -> None:
     cell.number_format = NUM_FMT
     cell.alignment = ALIGN_RIGHT
-    cell.font = FONT_BOLD if bold else FONT_BASE
+    if red:
+        cell.font = FONT_CHECK_RED
+    else:
+        cell.font = FONT_BOLD if bold else FONT_BASE
     if fill is not None:
         cell.fill = fill
 
 
-def write_workbook(cfg: dict, source_aggs: list[dict], source_dfs: list[pd.DataFrame], source_header_maps: list[dict[str, int]]) -> str:
+def write_workbook(
+    cfg: dict,
+    source_aggs: list[dict],
+    source_dfs: list[pd.DataFrame],
+    source_header_maps: list[dict[str, int]],
+) -> str:
     cfg = normalize_config(cfg)
     out_path = build_output_file_path(cfg)
     ensure_output_writable(out_path)
 
     group_cols = cfg["group_cols"]
+    layout = fa_column_layout(len(group_cols))
     period_labels = [p["label"] for p in cfg["periods"]]
+    period_display_labels = [
+        grid_label_to_display(lbl, fy_end_month=_fy_end_month_from_cfg(cfg)) for lbl in period_labels
+    ]
     formula_mode = bool(cfg.get("formula_mode", True))
 
     all_keys: set[tuple[str, ...]] = set()
@@ -528,52 +753,91 @@ def write_workbook(cfg: dict, source_aggs: list[dict], source_dfs: list[pd.DataF
 
     row_specs = build_row_specs(group_cols, keys, sort_values)
     fy_end_month = _fy_end_month_from_cfg(cfg)
-    columns, _spacer_cols = build_bridge_columns(period_labels, source_aggs, fy_end_month=fy_end_month)
+    columns, _spacer_cols = build_bridge_columns(
+        period_labels,
+        source_aggs,
+        fy_end_month=fy_end_month,
+        first_data_col=layout.first_data_col,
+    )
     period_col_indices = [c.col_idx for c in columns if c.kind == "period"]
-    last_used_col = max((c.col_idx for c in columns), default=FIRST_DATA_COL)
+    last_used_col = max((c.col_idx for c in columns), default=layout.first_data_col)
     opening_header = cfg["columns"]["opening"]
+    group_crit_cols = layout.group_crit_cols
 
     detail_rows: list[int] = []
+    parent_rows: list[int] = []
     excel_rows: list[tuple[RowSpec, int]] = []
     r = DATA_START_ROW
     for spec in row_specs:
         excel_rows.append((spec, r))
         if spec.row_type == "leaf":
             detail_rows.append(r)
+        elif spec.row_type == "parent":
+            parent_rows.append(r)
         r += 1
     total_row = r
     last_table_row = total_row
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = cfg["sheet_name"][:31]
+    wb = open_session_workbook(cfg)
+    ws = replace_workbook_sheet(wb, cfg["sheet_name"][:31])
 
     project = _sentence_case_title(str(cfg.get("title") or cfg.get("project_name") or "Project"))
     company = str(cfg.get("company") or cfg.get("group_name") or "").strip()
     sheet_label = str(cfg.get("sheet_name") or "Fixed assets rollforward").strip()
 
-    ws.cell(PROJECT_TITLE_ROW, POS_COL, project).font = FONT_PROJECT
-    ws.cell(SUBTITLE_ROW, POS_COL, company).font = FONT_SUBTITLE
+    ws.cell(PROJECT_TITLE_ROW, layout.pos_col, project).font = FONT_PROJECT
+    ws.cell(SUBTITLE_ROW, layout.pos_col, company).font = FONT_SUBTITLE
 
-    table_heading = f"{sheet_label} | {company}" if company else sheet_label
-    table_title = ws.cell(TABLE_TITLE_ROW, POS_COL, table_heading)
-    table_title.font = FONT_BASE
+    period_range = ""
+    if period_display_labels:
+        period_range = f" {period_display_labels[0]} - {period_display_labels[-1]}"
+    table_heading = (
+        f"{company} | {FA_TABLE_TITLE}{period_range}" if company else f"{FA_TABLE_TITLE}{period_range}"
+    )
+    table_title = ws.cell(TABLE_TITLE_ROW, layout.pos_col, table_heading)
+    table_title.font = FONT_HEADER
     table_title.alignment = ALIGN_LEFT
 
-    ws.cell(HEADER_ROW, POS_COL, cfg["unit_label"]).font = FONT_HEADER
-    ws.cell(HEADER_ROW, POS_COL).alignment = ALIGN_LEFT
-    ws.cell(HEADER_ROW, POS_COL).fill = FILL_HEADER
-    ws.cell(HEADER_ROW, POS_COL).border = BORDER_HEADER_BOTTOM
+    _paint_header_band(
+        ws,
+        layout,
+        columns,
+        unit_label=cfg["unit_label"],
+        group_col_labels=group_cols,
+    )
 
     for bc in columns:
-        hc = ws.cell(HEADER_ROW, bc.col_idx, bc.header)
-        hc.font = FONT_HEADER
-        hc.alignment = ALIGN_CENTER
-        hc.fill = FILL_PERIOD if bc.kind == "period" else FILL_HEADER
-        hc.border = BORDER_HEADER_BOTTOM
         if bc.hidden:
             ws.column_dimensions[col_letter(bc.col_idx)].hidden = True
             ws.column_dimensions[col_letter(bc.col_idx)].width = 0
+
+    for spec, er in excel_rows:
+        display = spec.label
+        if spec.level == 2:
+            display = f"{INDENT}{display}"
+        ws.cell(er, layout.pos_col, display).alignment = ALIGN_LEFT
+        ws.cell(er, layout.pos_col).font = FONT_BASE
+        if spec.group_key is not None and layout.group_crit_cols:
+            for i, val in enumerate(spec.group_key):
+                if i < len(group_cols) and i < len(layout.group_crit_cols):
+                    cell = ws.cell(er, layout.group_crit_cols[i], val)
+                    cell.font = FONT_MAPPING
+
+        is_parent = spec.row_type == "parent"
+        if is_parent:
+            ws.row_dimensions[er].outlineLevel = 0
+            _apply_fa_row_border_band(
+                ws, er, layout, BORDER_SUBTOTAL_TOP, last_used_col=last_used_col
+            )
+        elif spec.row_type == "leaf" and len(group_cols) >= 2:
+            ws.row_dimensions[er].outlineLevel = 1
+
+    total_spec_label = cfg["total_label"]
+    ws.cell(total_row, layout.pos_col, total_spec_label).alignment = ALIGN_LEFT
+    ws.cell(total_row, layout.pos_col).font = FONT_BOLD
+    _apply_fa_row_border_band(
+        ws, total_row, layout, BORDER_SUBTOTAL_TOP, last_used_col=last_used_col
+    )
 
     leaf_rows_by_parent: dict[str, list[int]] = defaultdict(list)
     if len(group_cols) >= 2:
@@ -582,79 +846,93 @@ def write_workbook(cfg: dict, source_aggs: list[dict], source_dfs: list[pd.DataF
                 leaf_rows_by_parent[spec.group_key[0]].append(er)
 
     for spec, er in excel_rows:
-        display = spec.label
-        if spec.level == 2:
-            display = f"{INDENT}{display}"
-        ws.cell(er, POS_COL, display).alignment = ALIGN_LEFT
-        ws.cell(er, POS_COL).font = FONT_BASE
-        if spec.group_key is not None:
-            for i, val in enumerate(spec.group_key):
-                if i < len(group_cols):
-                    ws.cell(er, GROUP_CRIT_COL_START + i, val)
-
-        is_parent = spec.row_type == "parent"
-        if is_parent:
-            ws.row_dimensions[er].outlineLevel = 0
-        elif spec.row_type == "leaf" and len(group_cols) >= 2:
-            ws.row_dimensions[er].outlineLevel = 1
-
-    total_spec_label = cfg["total_label"]
-    ws.cell(total_row, POS_COL, total_spec_label).alignment = ALIGN_LEFT
-    ws.cell(total_row, POS_COL).font = FONT_BOLD
-    ws.cell(total_row, POS_COL).border = BORDER_SUBTOTAL_TOP
-
-    for spec, er in excel_rows:
         is_parent = spec.row_type == "parent"
         row_fill = FILL_SUBTOTAL if is_parent else FILL_WHITE
+
         for bc in columns:
             cell = ws.cell(er, bc.col_idx)
             period_fill = FILL_PERIOD if bc.kind == "period" and not is_parent else row_fill
             cell.fill = period_fill
+
             if not formula_mode:
                 continue
+
             pi = bc.source_period_idx or 0
             src = source_sheet_name(period_labels[pi], fy_end_month=fy_end_month)
             hmap = source_header_maps[pi]
+
             if is_parent:
                 child_rows = leaf_rows_by_parent.get(spec.label, [])
                 cell.value = _parent_sum_formula(er, child_rows, bc.col_idx)
             elif bc.kind == "period":
-                cell.value = _fa_sumifs_formula(src, hmap, opening_header, er, group_cols, cfg)
+                cell.value = _fa_sumifs_formula(
+                    src, hmap, opening_header, er, group_cols, cfg, group_crit_cols=group_crit_cols
+                )
             elif bc.kind == "movement":
                 mk = bc.movement_key or "additions"
                 if mk == "depreciation":
-                    cell.value = _fa_depreciation_formula(src, hmap, er, group_cols, cfg)
+                    cell.value = _fa_depreciation_formula(
+                        src, hmap, er, group_cols, cfg, group_crit_cols=group_crit_cols
+                    )
                 else:
-                    cell.value = _fa_sumifs_formula(src, hmap, cfg["columns"][mk], er, group_cols, cfg)
+                    cell.value = _fa_sumifs_formula(
+                        src, hmap, cfg["columns"][mk], er, group_cols, cfg, group_crit_cols=group_crit_cols
+                    )
+
             _style_value_cell(cell, bold=is_parent, fill=period_fill if bc.kind == "period" and not is_parent else row_fill)
 
     for bc in columns:
-        leaf_only = [r for spec, r in excel_rows if spec.row_type == "leaf"]
-        cell = ws.cell(total_row, bc.col_idx)
-        if formula_mode and leaf_only:
-            cell.value = build_chunked_row_sum_formula(leaf_only, bc.col_idx)
-        cell.font = FONT_BOLD
-        cell.number_format = NUM_FMT
-        cell.alignment = ALIGN_RIGHT
-        cell.fill = FILL_SUBTOTAL
-        cell.border = BORDER_SUBTOTAL_TOP
+        if bc.kind == "period":
+            leaf_only = [r for spec, r in excel_rows if spec.row_type == "leaf"]
+            cell = ws.cell(total_row, bc.col_idx)
+            if formula_mode and leaf_only:
+                cell.value = build_chunked_row_sum_formula(leaf_only, bc.col_idx)
+            cell.font = FONT_BOLD
+            cell.number_format = NUM_FMT
+            cell.alignment = ALIGN_RIGHT
+            cell.fill = FILL_SUBTOTAL
+            cell.border = BORDER_SUBTOTAL_TOP
+        elif bc.kind == "movement":
+            leaf_only = [r for spec, r in excel_rows if spec.row_type == "leaf"]
+            cell = ws.cell(total_row, bc.col_idx)
+            if formula_mode and leaf_only:
+                cell.value = build_chunked_row_sum_formula(leaf_only, bc.col_idx)
+            cell.font = FONT_BOLD
+            cell.number_format = NUM_FMT
+            cell.alignment = ALIGN_RIGHT
+            cell.fill = FILL_SUBTOTAL
+            cell.border = BORDER_SUBTOTAL_TOP
 
     for i, df in enumerate(source_dfs):
         sheet_title = source_sheet_name(period_labels[i], fy_end_month=fy_end_month)
+        if sheet_title in wb.sheetnames:
+            del wb[sheet_title]
         src_ws = wb.create_sheet(sheet_title)
         stub_cfg = {
             "file_path": cfg["periods"][i]["file_path"],
-            "sheet_name": _resolve_sheet_name(cfg["periods"][i]["file_path"], cfg["periods"][i].get("sheet_name", "")),
+            "sheet_name": _resolve_sheet_name(
+                cfg["periods"][i]["file_path"], cfg["periods"][i].get("sheet_name", "")
+            ),
         }
         write_source_df_to_ws(src_ws, df, stub_cfg)
 
-    check_source_row = last_table_row + 4
-    check_delta_row = last_table_row + 5
-    bridge_check_row = last_table_row + 8
+    (
+        check_source_row,
+        check_delta_row,
+        check_bsrec_row,
+        check_bsrec_delta_row,
+        bridge_check_row,
+    ) = check_row_groups_after_table(last_table_row, [2, 2, 1])
     bridge_segments = _build_bridge_segments(columns)
 
-    for label, rr in (("Source - Fixed asset files", check_source_row), ("Check", check_delta_row), ("Bridge check", bridge_check_row)):
-        c = ws.cell(rr, POS_COL, label)
+    for label, rr in (
+        ("Source - Fixed asset files", check_source_row),
+        ("Check", check_delta_row),
+        ("Source - BS Reconciliation", check_bsrec_row),
+        ("Check", check_bsrec_delta_row),
+        ("Bridge check", bridge_check_row),
+    ):
+        c = ws.cell(rr, layout.pos_col, label)
         c.alignment = ALIGN_LEFT
         c.font = FONT_BASE
 
@@ -670,48 +948,76 @@ def write_workbook(cfg: dict, source_aggs: list[dict], source_dfs: list[pd.DataF
         if formula_mode:
             src_cell.value = _source_total_formula(src, hmap, opening_header, cfg)
         _style_value_cell(src_cell)
-        if col in period_col_indices:
-            src_cell.fill = FILL_YELLOW
 
         total_cell = ws.cell(total_row, col)
         delta_cell = ws.cell(check_delta_row, col)
         delta_cell.value = f"={total_cell.coordinate}-{src_cell.coordinate}"
-        _style_value_cell(delta_cell)
+        _style_value_cell(delta_cell, red=True)
+
+        bs_cell = ws.cell(check_bsrec_row, col)
+        if formula_mode and BS_RECON_SHEET in wb.sheetnames:
+            ws_rec = wb[BS_RECON_SHEET]
+            agg_start = find_recon_block_start_col(ws_rec, AGGREGATED_BLOCK_TITLE)
+            fa_row = find_bs_recon_row_contains(ws_rec, str(cfg.get("total_label") or "Fixed assets"))
+            if agg_start is not None and fa_row is not None:
+                rec_col = agg_start + (bc.source_period_idx or 0)
+                bs_cell.value = bs_recon_aggregated_ref(fa_row, rec_col)
+        _style_value_cell(bs_cell)
+
+        bs_delta = ws.cell(check_bsrec_delta_row, col)
+        bs_delta.value = f"={total_cell.coordinate}-{bs_cell.coordinate}"
+        _style_value_cell(bs_delta, red=True)
 
     for prev_col, mov_cols, next_col in bridge_segments:
         delta_cell = ws.cell(bridge_check_row, next_col)
         delta_cell.value = _bridge_delta_formula(total_row, next_col, prev_col, mov_cols)
-        _style_value_cell(delta_cell)
+        _style_value_cell(delta_cell, red=True)
 
-    ws.column_dimensions[col_letter(POS_COL)].width = LABEL_COL_WIDTH
+    ws.column_dimensions[col_letter(layout.pos_col)].width = LABEL_COL_WIDTH
+    for cc in range(layout.helper_start_col, layout.pos_col):
+        ws.column_dimensions[col_letter(cc)].width = MAP_COL_WIDTH
     for bc in columns:
         if not bc.hidden:
             ws.column_dimensions[col_letter(bc.col_idx)].width = VALUE_COL_WIDTH
 
-    for rr in (check_source_row, check_delta_row, bridge_check_row):
-        ws.row_dimensions[rr].outlineLevel = 2
-        ws.row_dimensions[rr].hidden = True
+    collapse_check_portfolio(ws, [check_source_row, bridge_check_row])
 
     ws.sheet_view.showOutlineSymbols = True
     ws.sheet_properties.outlinePr.summaryBelow = True
     ws.sheet_properties.outlinePr.applyStyles = True
 
-    _apply_sheet_layout(ws, last_used_col=last_used_col, last_fill_row=bridge_check_row + 100)
+    _apply_sheet_layout(
+        ws,
+        layout,
+        last_used_col=last_used_col,
+        last_fill_row=bridge_check_row + 100,
+    )
 
-    ws.cell(HEADER_ROW, POS_COL).fill = FILL_HEADER
-    for bc in columns:
-        hc = ws.cell(HEADER_ROW, bc.col_idx)
-        hc.fill = FILL_PERIOD if bc.kind == "period" else FILL_HEADER
-        hc.font = FONT_HEADER
-        hc.border = BORDER_HEADER_BOTTOM
+    _paint_header_band(
+        ws,
+        layout,
+        columns,
+        unit_label=cfg["unit_label"],
+        group_col_labels=group_cols,
+    )
+    for spec, er in excel_rows:
+        if spec.row_type == "parent":
+            for bc in columns:
+                ws.cell(er, bc.col_idx).fill = FILL_SUBTOTAL
+        else:
+            for bc in columns:
+                if bc.kind == "period":
+                    ws.cell(er, bc.col_idx).fill = FILL_PERIOD
     for bc in columns:
         ws.cell(total_row, bc.col_idx).fill = FILL_SUBTOTAL
         ws.cell(total_row, bc.col_idx).border = BORDER_SUBTOTAL_TOP
-    for bc in columns:
-        if bc.kind != "period":
-            continue
-        ws.cell(check_source_row, bc.col_idx).fill = FILL_YELLOW
+    table_cols = _table_band_cols(layout, columns, last_used_col)
+    _paint_check_source_yellow(ws, layout, check_source_row, table_cols)
+    _paint_check_source_yellow(ws, layout, check_bsrec_row, table_cols)
 
+    from databook_workbook import reorder_workbook_sheets
+
+    reorder_workbook_sheets(wb)
     wb.save(out_path)
     return out_path
 
@@ -719,7 +1025,9 @@ def write_workbook(cfg: dict, source_aggs: list[dict], source_dfs: list[pd.DataF
 def run_fixed_assets_rollf(cfg: dict) -> str:
     cfg = normalize_config(cfg)
     header_row = int(cfg["header_row"])
-    period_specs = [PeriodSpec(p["label"], p["file_path"], p.get("sheet_name", "")) for p in cfg["periods"]]
+    period_specs = [
+        PeriodSpec(p["label"], p["file_path"], p.get("sheet_name", "")) for p in cfg["periods"]
+    ]
 
     source_aggs: list[dict[tuple[str, ...], dict[str, float]]] = []
     source_dfs: list[pd.DataFrame] = []
@@ -732,7 +1040,10 @@ def run_fixed_assets_rollf(cfg: dict) -> str:
         source_dfs.append(work)
         tmp_wb = Workbook()
         tmp_ws = tmp_wb.active
-        stub = {"file_path": spec.file_path, "sheet_name": _resolve_sheet_name(spec.file_path, spec.sheet_name)}
+        stub = {
+            "file_path": spec.file_path,
+            "sheet_name": _resolve_sheet_name(spec.file_path, spec.sheet_name),
+        }
         write_source_df_to_ws(tmp_ws, work, stub)
         source_header_maps.append(_get_sheet_header_map(tmp_ws))
 
@@ -750,4 +1061,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

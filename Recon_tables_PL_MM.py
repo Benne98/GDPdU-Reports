@@ -16,9 +16,28 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+from databook_workbook import (  # noqa: E402
+    BS_RECON_MAPPING_FILE,
+    CF_NA_L3_ORDER_FILE,
+    MASTER_WORKBOOK_STR,
+    PL_RECON_MAPPING_FILE,
+    remove_stale_entity_recon_sheets,
+    sanitize_entity_recon_sheet_name,
+)
 
-from gst_excel_theme import THEME, apply_recon_portfolio_layout, apply_zero_row_conditional_formatting  # noqa: E402
+from gst_excel_theme import THEME, apply_recon_portfolio_layout  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    LAYOUT_PL,
+    apply_databook_row_border_band,
+    assign_recon_block_columns,
+    build_entity_recon_blocks,
+    check_row_groups_after_table,
+    collapse_check_portfolio,
+    paint_grey_white_canvas,
+    prune_zero_value_rows,
+    refresh_master_sheet,
+    write_fs_check_section,
+)
 from report_row_layout import (  # noqa: E402
     build_pl_row_structure,
     l3_order_from_mapping,
@@ -32,7 +51,7 @@ DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 DEFAULT_SOURCE_FILE = MASTER_WORKBOOK_STR
 DEFAULT_SOURCE_SHEET = "Master_PL"
 DEFAULT_TARGET_FILE = MASTER_WORKBOOK_STR
-DEFAULT_MAPPING_FILE = str(DESKTOP_DIR / "PL_recon_Mapping.xlsx")
+DEFAULT_MAPPING_FILE = PL_RECON_MAPPING_FILE
 DEFAULT_MAPPING_SHEET_INDEX = 0
 DEFAULT_MAPPING_ENGINE = "openpyxl"
 
@@ -46,7 +65,7 @@ REPORTED_FILTER_VALUE = "reported"
 
 MAPPING_REQUIRED_COLUMNS = {"L3"}
 
-CHECK_TITLE_LABEL   = "Check - Financial statements"
+CHECK_TITLE_LABEL   = "Source - Financial statements"
 CHECK_DIFF_LABEL    = "Difference to trial balances"
 NET_RESULT_TECH_KEY = "Net result"
 
@@ -127,17 +146,19 @@ IC_MASTER_ENTITY_DEFAULT = "Consolidation"
 
 BLANK_TOKENS = {"", "nan", "none", "null"}
 
-# Layout
-MAP_START_COL    = 5   # E
-MAP_END_COL      = 8   # H
-POS_COL          = 10  # J
-FIRST_ENTITY_COL = 11  # K
+# Layout — A free | B..E helpers | F spacer | G POS
+_COL_LAYOUT = LAYOUT_PL
+MAP_START_COL = _COL_LAYOUT.map_start_col
+MAP_END_COL = _COL_LAYOUT.map_end_col
+TECH_SPACER_COL = _COL_LAYOUT.spacer_col
+POS_COL = _COL_LAYOUT.pos_col
+FIRST_ENTITY_COL = _COL_LAYOUT.first_value_col
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW      = 2
 
 TITLE_ROW = 6
-TITLE_COL = 10
+TITLE_COL = POS_COL
 
 ENTITY_CODE_ROW = 3
 HEADER_ROW      = 8
@@ -503,6 +524,16 @@ def build_fs_check_value_map(fs_cfg: dict, individual_entities: list[str], years
     return result
 
 
+def build_fs_check_value_map_for_entity(
+    fs_cfg: dict,
+    entity: str,
+    individual_entities: list[str],
+    years: list[str],
+) -> dict:
+    full = build_fs_check_value_map(fs_cfg, individual_entities, years)
+    return {entity: dict(full.get(entity, {}))}
+
+
 def load_mapping_df(cfg: dict) -> pd.DataFrame:
     mapping_file = str(cfg.get("paths", {}).get("mapping_file") or DEFAULT_MAPPING_FILE)
     map_df = pd.read_excel(
@@ -843,6 +874,15 @@ def build_blocks(cfg: dict, individual_entities: list[str], has_ic: bool) -> lis
     return blocks
 
 
+def build_entity_blocks(cfg: dict, entity: str) -> list[dict]:
+    return build_entity_recon_blocks(
+        entity,
+        cfg["display"]["titles"],
+        first_col=FIRST_ENTITY_COL,
+        n_years=len(YEARS),
+    )
+
+
 def entity_block_lookup(blocks: list[dict], key: str) -> dict:
     return next(bb for bb in blocks if bb["key"] == key)
 
@@ -852,53 +892,25 @@ def ic_sign(block: dict) -> int:
 
 
 # =============================================
-# MAIN
+# SHEET WRITER
 # =============================================
 
-def main():
-    global YEARS
+def write_pl_reconciliation_sheet(
+    wb,
+    sheet_name: str,
+    *,
+    cfg: dict,
+    df: pd.DataFrame,
+    row_structure: list,
+    blocks: list[dict],
+    individual_entities: list[str],
+    fs_check_value_map: dict,
+    is_entity_sheet: bool = False,
+) -> None:
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
 
-    cfg = load_config_from_argv()
-
-    df = load_source_df(cfg)
-    YEARS = detect_year_columns(df)
-    print(f"Verwende Source-Spalte für Reported/Adjusted: {SOURCE_COL_NAME}")
-
-    map_df        = load_mapping_df(cfg)
-    l3_order      = l3_order_from_mapping(map_df)
-    row_structure = build_pl_row_structure(
-        df,
-        l3_order,
-        cfg,
-        source_col=SOURCE_COL_NAME,
-        display_label_fn=lambda lbl: technical_to_display_label(lbl, cfg),
-    )
-    row_structure = apply_totals_to_row_structure(row_structure, cfg)
-    row_structure = prune_nan_zero_blocks(row_structure, df, YEARS, source_col=SOURCE_COL_NAME)
-    row_structure = prune_row_structure(row_structure)
-
-    individual_entities, has_ic = build_sorted_entities(df, cfg, YEARS)
-    blocks = build_blocks(cfg, individual_entities, has_ic)
-
-    fs_check_value_map = build_fs_check_value_map(cfg["fs_check_values"], individual_entities, YEARS)
-
-    target_file = cfg["paths"]["target_file"]
-    target_path = Path(target_file).resolve()
-    report_sheet = cfg["paths"]["report_sheet"]
-    audit_sheet = cfg["paths"]["audit_master_sheet"]
-
-    if target_path.is_file():
-        wb = load_workbook(target_file)
-        for sn in (report_sheet, audit_sheet):
-            if sn in wb.sheetnames:
-                del wb[sn]
-        ws = wb.create_sheet(report_sheet)
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = report_sheet
-
-    # ---------------------------------------------------
     # PROJECT & REPORT TITLE
     # ---------------------------------------------------
     pt           = ws.cell(PROJECT_TITLE_ROW, POS_COL, f"Project {cfg['project_name']}")
@@ -906,16 +918,22 @@ def main():
     pt.alignment = ALIGN_LEFT
     ws.row_dimensions[PROJECT_TITLE_ROW].height = PROJECT_TITLE_ROW_HEIGHT
 
+    title_name = (
+        individual_entities[0]
+        if is_entity_sheet and individual_entities
+        else cfg["company_name"]
+    )
+
     st = ws.cell(
         SUBTITLE_ROW,
         POS_COL,
-        f"{cfg['company_name']} Reconciliation - Income statement"
+        f"{title_name} Reconciliation - Income statement"
     )
     st.font      = FONT_SUBTITLE
     st.alignment = ALIGN_LEFT
 
     title_text = (
-        f"{cfg['company_name']} | Reconciliation (trial balances) "
+        f"{title_name} | Reconciliation (trial balances) "
         f"{YEARS[0]} - {YEARS[-1]}"
     )
     tc           = ws.cell(TITLE_ROW, TITLE_COL, title_text)
@@ -923,16 +941,8 @@ def main():
     tc.alignment = ALIGN_LEFT
 
     # ---------------------------------------------------
-    # AUDIT MASTER SHEET
+    # MASTER RANGES
     # ---------------------------------------------------
-    ws_master = wb.create_sheet(audit_sheet)
-
-    for c_idx, colname in enumerate(df.columns, start=1):
-        ws_master.cell(1, c_idx, colname)
-    for r_idx, row in enumerate(df.itertuples(index=False, name=None), start=2):
-        for c_idx, val in enumerate(row, start=1):
-            ws_master.cell(r_idx, c_idx, val)
-
     MASTER_START = 2
     MASTER_END   = len(df) + 1
 
@@ -951,6 +961,7 @@ def main():
     # BLOCK PLAN
     # ---------------------------------------------------
     LAST_USED_COL = blocks[-1]["spacer_col"] if blocks else FIRST_ENTITY_COL
+    LAST_VALUE_COL = max(b["year_endcol"] for b in blocks) if blocks else POS_COL
 
     # ---------------------------------------------------
     # HEADERS
@@ -978,8 +989,9 @@ def main():
             t           = ws.cell(BLOCK_TITLE_ROW, b["year_startcol"], b["title"])
             t.font      = FONT_BASE_BOLD
             t.alignment = ALIGN_CENTER
-            ws.cell(BLOCK_TITLE_ROW, b["poscol"]).value = None
-            ws.cell(BLOCK_TITLE_ROW, b["poscol"]).fill = FILL_WHITE
+            if b.get("kind") not in {"difference", "fs"}:
+                ws.cell(BLOCK_TITLE_ROW, b["poscol"]).value = None
+                ws.cell(BLOCK_TITLE_ROW, b["poscol"]).fill = FILL_WHITE
         else:
             ws.merge_cells(
                 start_row=BLOCK_TITLE_ROW,
@@ -1019,7 +1031,7 @@ def main():
         for y_idx, year in enumerate(YEARS):
             h           = ws.cell(HEADER_ROW, b["year_startcol"] + y_idx, year)
             h.font      = FONT_HEADER
-            h.alignment = ALIGN_CENTER
+            h.alignment = ALIGN_RIGHT
 
         ws.column_dimensions[col_letter(b["spacer_col"])].width = SPACER_WIDTH
 
@@ -1173,80 +1185,20 @@ def main():
                     cell.value = None
 
                 elif b["kind"] == "difference":
+                    fs_block = entity_block_lookup(blocks, "Financial statements")
+                    fs_ref = f"{col_letter(fs_block['year_startcol'] + y_idx)}{excel_row}"
                     if any(bb["kind"] == "consolidation" for bb in blocks):
-                        fs_block  = entity_block_lookup(blocks, "Financial statements")
                         con_block = entity_block_lookup(blocks, "Consolidation")
-                        fs_ref    = f"{col_letter(fs_block['year_startcol'] + y_idx)}{excel_row}"
-                        con_ref   = f"{col_letter(con_block['year_startcol'] + y_idx)}{excel_row}"
+                        con_ref = f"{col_letter(con_block['year_startcol'] + y_idx)}{excel_row}"
                         cell.value = f"={fs_ref}-{con_ref}"
+                    elif is_entity_sheet:
+                        ent_block = next(bb for bb in blocks if bb["kind"] == "entity")
+                        ent_ref = f"{col_letter(ent_block['year_startcol'] + y_idx)}{excel_row}"
+                        cell.value = f"={fs_ref}-{ent_ref}"
                     else:
                         cell.value = None
 
-    # ---------------------------------------------------
-    # FS CHECK
-    # ---------------------------------------------------
-    if cfg.get("show_fs_check", True):
-        CHECK_TITLE_ROW = LAST_TABLE_ROW + 2
-        CHECK_DIFF_ROW  = LAST_TABLE_ROW + 3
-
-        net_label      = normalize_technical_pl_key(NET_RESULT_TECH_KEY)
-        NET_RESULT_ROW = row_index.get(net_label, LAST_TABLE_ROW)
-
-        ct           = ws.cell(CHECK_TITLE_ROW, POS_COL, CHECK_TITLE_LABEL)
-        ct.font      = FONT_BASE
-        ct.alignment = ALIGN_LEFT
-
-        for b in blocks:
-            if b["kind"] not in {"entity", "consolidation"}:
-                continue
-
-            entity_key = b["key"]
-            year_map   = fs_check_value_map.get(entity_key, {})
-
-            for y_idx, year in enumerate(YEARS):
-                val             = year_map.get(year, 0)
-                c               = ws.cell(CHECK_TITLE_ROW, b["year_startcol"] + y_idx, val)
-                c.number_format = NUM_FMT_INT
-                c.alignment     = ALIGN_RIGHT
-                c.font          = FONT_BASE
-
-        dl           = ws.cell(CHECK_DIFF_ROW, POS_COL, CHECK_DIFF_LABEL)
-        dl.font      = FONT_BASE
-        dl.alignment = ALIGN_LEFT
-
-        for b in blocks:
-            if b["kind"] not in {"entity", "consolidation"}:
-                continue
-
-            for y_idx, year in enumerate(YEARS):
-                net_cell  = ws.cell(NET_RESULT_ROW,  b["year_startcol"] + y_idx)
-                chk_cell  = ws.cell(CHECK_TITLE_ROW, b["year_startcol"] + y_idx)
-
-                diff_cell               = ws.cell(CHECK_DIFF_ROW, b["year_startcol"] + y_idx)
-                diff_cell.value         = f"={net_cell.coordinate}-{chk_cell.coordinate}"
-                diff_cell.number_format = NUM_FMT_INT
-                diff_cell.alignment     = ALIGN_RIGHT
-                diff_cell.font          = FONT_BASE
-
-                ws.conditional_formatting.add(
-                    diff_cell.coordinate,
-                    CellIsRule(
-                        operator="notEqual",
-                        formula=["0"],
-                        font=DIFF_FONT,
-                    )
-                )
-
-        for rr in (CHECK_TITLE_ROW, CHECK_DIFF_ROW):
-            ws.row_dimensions[rr].outlineLevel = 2
-            ws.row_dimensions[rr].hidden       = True
-
-        LAST_CONTENT_ROW = CHECK_DIFF_ROW
-
-    else:
-        CHECK_TITLE_ROW  = None
-        CHECK_DIFF_ROW   = None
-        LAST_CONTENT_ROW = LAST_TABLE_ROW
+    LAST_CONTENT_ROW = LAST_TABLE_ROW
 
     # ---------------------------------------------------
     # COLUMN WIDTHS
@@ -1261,26 +1213,23 @@ def main():
         ws.column_dimensions[col_letter(b["spacer_col"])].width = SPACER_WIDTH
 
     # ---------------------------------------------------
-    # ROW HEIGHTS
+    # FILLS
     # ---------------------------------------------------
     FILL_END_ROW = LAST_CONTENT_ROW + FILL_PADDING_ROWS
+    FILL_END_COL = LAST_USED_COL + FILL_PADDING_COLS
+    sheet_layout = LAYOUT_PL
+
     for rr in range(1, FILL_END_ROW + 1):
         if rr == PROJECT_TITLE_ROW:
             continue
         ws.row_dimensions[rr].height = ROW_HEIGHT
 
-    # ---------------------------------------------------
-    # FILLS
-    # ---------------------------------------------------
-    FILL_END_COL = LAST_USED_COL + FILL_PADDING_COLS
-
-    for rr in range(1, FILL_END_ROW + 1):
-        for cc in range(1, POS_COL):
-            ws.cell(rr, cc).fill = FILL_TECH
-
-    for rr in range(1, FILL_END_ROW + 1):
-        for cc in range(POS_COL, FILL_END_COL + 1):
-            ws.cell(rr, cc).fill = FILL_WHITE
+    paint_grey_white_canvas(
+        ws,
+        sheet_layout,
+        last_row=FILL_END_ROW,
+        last_col=LAST_USED_COL,
+    )
 
     for rr in range(DATA_START_ROW, LAST_TABLE_ROW + 1):
         for cc in range(MAP_START_COL, MAP_END_COL + 1):
@@ -1305,20 +1254,9 @@ def main():
         )
         if r["type"] == "subtotal" and not is_real_subtotal:
             continue
-        for cc in range(POS_COL, FILL_END_COL + 1):
+        for cc in range(POS_COL, LAST_VALUE_COL + 1):
             cell = ws.cell(excel_row, cc)
             cell.fill = FILL_SUBTOTAL
-
-    if CHECK_TITLE_ROW is not None:
-        for c in range(1, LAST_USED_COL + 1):
-            if c in spacer_cols:
-                continue
-            ws.cell(CHECK_TITLE_ROW, c).fill = CHECK_FILL
-        if CHECK_DIFF_ROW is not None:
-            for c in range(1, LAST_USED_COL + 1):
-                if c in spacer_cols:
-                    continue
-                ws.cell(CHECK_DIFF_ROW, c).fill = CHECK_FILL
 
     # ---------------------------------------------------
     # BORDERS
@@ -1338,13 +1276,14 @@ def main():
             else BORDER_SUBTOTAL_TOP
         )
 
-        ws.cell(excel_row, POS_COL).border = border_to_set
-
-        for b in blocks:
-            if b.get("has_plpos"):
-                ws.cell(excel_row, b["poscol"]).border = border_to_set
-            for y_idx in range(len(YEARS)):
-                ws.cell(excel_row, b["year_startcol"] + y_idx).border = border_to_set
+        apply_databook_row_border_band(
+            ws,
+            excel_row,
+            LAYOUT_PL,
+            border_to_set,
+            last_used_col=LAST_VALUE_COL,
+            skip_cols=spacer_cols,
+        )
 
     apply_recon_portfolio_layout(
         ws,
@@ -1355,25 +1294,135 @@ def main():
         entity_code_row=ENTITY_CODE_ROW,
         last_used_col=LAST_USED_COL,
         spacer_cols=spacer_cols,
+        tech_layout=sheet_layout,
+        visible_block_kinds=frozenset({"entity", "difference", "fs"})
+        if is_entity_sheet
+        else frozenset({"consolidation", "difference", "fs"}),
     )
 
     ws.row_dimensions[HEADER_ROW].height = ROW_HEIGHT
     ws.row_dimensions[BLOCK_TITLE_ROW].height = ROW_HEIGHT
 
-    recon_year_cf_cols = []
-    for b in blocks:
-        for y_idx in range(len(YEARS)):
-            recon_year_cf_cols.append(b["year_startcol"] + y_idx)
+    for sc in spacer_cols:
+        for rr in range(1, LAST_TABLE_ROW + 120):
+            ws.cell(rr, sc).border = Border()
+            ws.cell(rr, sc).fill = FILL_WHITE
 
-    apply_zero_row_conditional_formatting(
-        ws,
-        first_row=DATA_START_ROW,
-        last_row=LAST_TABLE_ROW,
-        year_col_indices=recon_year_cf_cols,
-        style_start_col=POS_COL,
-        style_end_col=LAST_USED_COL,
-        exclude_cols=spacer_cols,
+    if cfg.get("show_fs_check", True):
+        _check_rows = check_row_groups_after_table(LAST_TABLE_ROW, [2])
+        CHECK_TITLE_ROW, CHECK_DIFF_ROW = _check_rows
+        net_label = normalize_technical_pl_key(NET_RESULT_TECH_KEY)
+        NET_RESULT_ROW = row_index.get(net_label, LAST_TABLE_ROW)
+        write_fs_check_section(
+            ws,
+            blocks=blocks,
+            years=YEARS,
+            source_row=CHECK_TITLE_ROW,
+            delta_row=CHECK_DIFF_ROW,
+            anchor_row=NET_RESULT_ROW,
+            pos_col=POS_COL,
+            block_kinds=frozenset({"entity"}) if is_entity_sheet else frozenset({"entity", "consolidation"}),
+            yellow_block_kinds=frozenset({"entity"})
+            if is_entity_sheet
+            else frozenset({"entity", "aggregated", "ic", "consolidation"}),
+            spacer_cols=spacer_cols,
+            source_values=fs_check_value_map if any(fs_check_value_map.values()) else None,
+            source_label=CHECK_TITLE_LABEL,
+            delta_label=CHECK_DIFF_LABEL,
+            num_fmt=NUM_FMT_INT,
+        )
+        collapse_check_portfolio(ws, [CHECK_TITLE_ROW, CHECK_DIFF_ROW])
+
+
+# =============================================
+# MAIN
+# =============================================
+
+def main():
+    global YEARS
+
+    cfg = load_config_from_argv()
+
+    df = load_source_df(cfg)
+    YEARS = detect_year_columns(df)
+    print(f"Verwende Source-Spalte für Reported/Adjusted: {SOURCE_COL_NAME}")
+
+    map_df        = load_mapping_df(cfg)
+    l3_order      = l3_order_from_mapping(map_df)
+    row_structure = build_pl_row_structure(
+        df,
+        l3_order,
+        cfg,
+        source_col=SOURCE_COL_NAME,
+        display_label_fn=lambda lbl: technical_to_display_label(lbl, cfg),
     )
+    row_structure = apply_totals_to_row_structure(row_structure, cfg)
+    row_structure = prune_nan_zero_blocks(row_structure, df, YEARS, source_col=SOURCE_COL_NAME)
+    row_structure = prune_zero_value_rows(
+        row_structure,
+        df,
+        YEARS,
+        source_col=SOURCE_COL_NAME,
+    )
+    row_structure = prune_row_structure(row_structure)
+
+    individual_entities, has_ic = build_sorted_entities(df, cfg, YEARS)
+    group_blocks = build_blocks(cfg, individual_entities, has_ic)
+    fs_check_value_map = build_fs_check_value_map(cfg["fs_check_values"], individual_entities, YEARS)
+
+    target_file = cfg["paths"]["target_file"]
+    target_path = Path(target_file).resolve()
+    report_sheet = cfg["paths"]["report_sheet"]
+    audit_sheet = cfg["paths"]["audit_master_sheet"]
+
+    if target_path.is_file():
+        wb = load_workbook(target_file)
+    else:
+        wb = Workbook()
+        if wb.sheetnames:
+            wb.remove(wb.active)
+
+    remove_stale_entity_recon_sheets(wb, individual_entities)
+
+    if audit_sheet not in wb.sheetnames:
+        ws_master = wb.create_sheet(audit_sheet)
+        for c_idx, colname in enumerate(df.columns, start=1):
+            ws_master.cell(1, c_idx, colname)
+        for r_idx, row in enumerate(df.itertuples(index=False, name=None), start=2):
+            for c_idx, val in enumerate(row, start=1):
+                ws_master.cell(r_idx, c_idx, val)
+
+    refresh_master_sheet(wb, df, audit_sheet)
+
+    write_pl_reconciliation_sheet(
+        wb,
+        report_sheet,
+        cfg=cfg,
+        df=df,
+        row_structure=row_structure,
+        blocks=group_blocks,
+        individual_entities=individual_entities,
+        fs_check_value_map=fs_check_value_map,
+        is_entity_sheet=False,
+    )
+
+    for entity in individual_entities:
+        entity_sheet = sanitize_entity_recon_sheet_name(entity, "pl")
+        entity_blocks = build_entity_blocks(cfg, entity)
+        entity_fs_map = build_fs_check_value_map_for_entity(
+            cfg["fs_check_values"], entity, individual_entities, YEARS,
+        )
+        write_pl_reconciliation_sheet(
+            wb,
+            entity_sheet,
+            cfg=cfg,
+            df=df,
+            row_structure=row_structure,
+            blocks=entity_blocks,
+            individual_entities=[entity],
+            fs_check_value_map=entity_fs_map,
+            is_entity_sheet=True,
+        )
 
     # ---------------------------------------------------
     # SAVE

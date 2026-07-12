@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+from databook_excel_layout import collapse_check_portfolio  # noqa: E402
 from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
 
 L4_SORT_BASIS = "latest_fy"
@@ -112,7 +113,7 @@ REPEAT_POS_WIDTH = 32
 # ==================================================
 # STYLES
 # ==================================================
-FONT_NAME = "GT Walsheim LC Light"
+FONT_NAME = "Inter"
 FONT_SIZE = 8
 
 COLOR_GREY   = "F4F3F2"
@@ -786,11 +787,9 @@ for b in blocks:
             ws_bs.column_dimensions[col].hidden = False
 
 # ==================================================
-# OUTLINE / COLLAPSE: Check rows (same level as ENTITY_CODE_ROW)
+# OUTLINE / COLLAPSE: Check rows (single portfolio)
 # ==================================================
-for rr in (CHECK_FS_ROW, CHECK_DELTA_ROW, CHECK_BAL_ROW):
-    ws_bs.row_dimensions[rr].outlineLevel = 2
-    ws_bs.row_dimensions[rr].hidden = True
+collapse_check_portfolio(ws_bs, [CHECK_FS_ROW, CHECK_DELTA_ROW, CHECK_BAL_ROW])
 
 # ==================================================
 # COLLAPSE BS POSITION COLUMNS for Difference & FS

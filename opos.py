@@ -34,6 +34,18 @@ from gst_excel_theme import (  # noqa: E402
     apply_recon_portfolio_layout,
     apply_zero_row_conditional_formatting,
 )
+from databook_excel_layout import (  # noqa: E402
+    AGGREGATED_BLOCK_TITLE,
+    BS_RECON_SHEET,
+    DIFF_FONT,
+    FILL_YELLOW,
+    LAYOUT_BS,
+    bs_recon_aggregated_ref,
+    check_row_groups_after_table,
+    collapse_check_portfolio,
+    find_recon_block_col_for_period_label,
+    paint_check_source_yellow,
+)
 
 MONTH_ABBR = {
     1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
@@ -49,19 +61,19 @@ SORT_METRIC_TOTAL = "__total__"
 SIDE_LABELS = {
     "debitor": {
         "partner_header": "Debitors",
-        "detail_sheet": "Trade debtors ageing detail",
-        "summary_sheet": "Trade debtors ageing",
+        "detail_sheet": "Trade debtors aging detail",
+        "summary_sheet": "Trade debtors aging",
         "sum_label": "Trade receivables (sum)",
         "reported_label": "Trade receivables (reported)",
-        "subtitle": "Trade debtor's ageing",
+        "subtitle": "Trade debtor's aging",
     },
     "kreditor": {
         "partner_header": "Creditors",
-        "detail_sheet": "Trade creditors ageing detail",
-        "summary_sheet": "Trade creditors ageing",
+        "detail_sheet": "Trade creditors aging detail",
+        "summary_sheet": "Trade creditors aging",
         "sum_label": "Trade payables (sum)",
         "reported_label": "Trade payables (reported)",
-        "subtitle": "Trade creditor's ageing",
+        "subtitle": "Trade creditor's aging",
     },
 }
 
@@ -72,7 +84,8 @@ SUMMARY_ROLLUP = (
     ("over_60", ">60 days", ("overdue_61_90", "overdue_91_180", "overdue_over_180")),
 )
 
-POS_COL = 10
+POS_COL = 4
+HELPER_SPACER_COL = 3
 SPACER_WIDTH = 1.14
 VALUE_COL_WIDTH = 8
 REPEAT_POS_WIDTH = 28
@@ -89,6 +102,7 @@ LABEL_COL_MAX_WIDTH = 36
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
+TABLE_TITLE_ROW = 6
 BUCKET_BOUND_ROW_LO = 3
 BUCKET_BOUND_ROW_HI = 4
 BLOCK_TITLE_ROW = 7
@@ -99,9 +113,11 @@ KEY_COL = 2
 FONT_BASE = THEME.font_base
 FONT_BOLD = THEME.font_bold
 FONT_HEADER = THEME.font_header
+FONT_MAPPING = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.text_header)
 FONT_TITLE = Font(name=THEME.font_name, size=THEME.font_size, bold=True, color=THEME.text_brand_title)
 FONT_PROJECT = Font(name=THEME.font_name, size=THEME.font_size_title, color=THEME.text_brand_title)
 FONT_SUBTITLE = Font(name=THEME.font_name, size=THEME.font_size_subtitle, color=THEME.text_brand_title)
+FONT_CHECK_RED = DIFF_FONT
 FILL_HEADER = THEME.fill_header
 FILL_SUBTOTAL = THEME.fill_subtotal
 FILL_WHITE = THEME.fill_white
@@ -116,6 +132,15 @@ BORDER_SUBTOTAL_TB = Border(
     bottom=THEME.border_subtotal_top.top,
 )
 BORDER_MEDIUM_LEFT = Side(style="medium", color=THEME.border_strong)
+NO_BORDER = Border()
+
+
+def _clear_helper_spacer_header(ws, rows: tuple[int, ...] = (BLOCK_TITLE_ROW, HEADER_ROW)) -> None:
+    """Helper tech spacer (col C) stays white — no header band styling."""
+    for row in rows:
+        cell = ws.cell(row, HELPER_SPACER_COL)
+        cell.fill = FILL_WHITE
+        cell.border = NO_BORDER
 
 _ZERO_TOL = 1e-9
 
@@ -223,8 +248,116 @@ def resolve_snapshot_sheet_name(file_path: str, partner_col: str, preferred: str
     return names[0]
 
 
-def source_sheet_name_for_label(period_label: str) -> str:
+def _side_source_prefix(side: str) -> str:
+    return "AR" if str(side).strip().lower() == "debitor" else "AP"
+
+
+def _source_sheet_prefix_for_side(side: str) -> str:
+    return f"__SOURCE__{_side_source_prefix(side)}_"
+
+
+INTERNAL_OPOS_COLUMNS = {
+    "partner_id": "__OPOS_PARTNER__",
+    "partner_name": "__OPOS_PARTNER__",
+    "amount": "__OPOS_AMOUNT__",
+    "due_date": "__OPOS_DUE__",
+}
+
+
+def source_sheet_name_for_label(period_label: str, side: str | None = None) -> str:
+    if side:
+        return f"__SOURCE__{_side_source_prefix(side)}_{period_label}"[:31]
     return f"__SOURCE__{period_label}"[:31]
+
+
+def cfg_with_internal_columns(cfg: dict) -> dict:
+    return {**cfg, "columns": dict(INTERNAL_OPOS_COLUMNS)}
+
+
+def _opos_processing_cfg(cfg: dict) -> dict:
+    return cfg_with_internal_columns(cfg) if cfg.get("column_letters") else cfg
+
+
+def header_at_column_letter(
+    file_path: str,
+    sheet_name: str,
+    col_letter: str,
+    *,
+    header_row: int = 0,
+) -> str:
+    from openpyxl.utils import column_index_from_string
+
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[0]]
+        ci = column_index_from_string(str(col_letter or "").strip().upper())
+        val = ws.cell(header_row + 1, ci).value
+    finally:
+        wb.close()
+    return str(val or "").strip()
+
+
+def resolve_opos_columns_from_letters(
+    file_path: str,
+    sheet_name: str,
+    letters: dict[str, str],
+    *,
+    header_row: int = 0,
+) -> dict[str, str]:
+    """Resolve actual header names from column letters in a workbook."""
+    partner_letter = str(
+        letters.get("partner") or letters.get("partner_id") or ""
+    ).strip().upper()
+    amount_letter = str(letters.get("amount") or "").strip().upper()
+    due_letter = str(letters.get("due_date") or "").strip().upper()
+    if not all([partner_letter, amount_letter, due_letter]):
+        raise ValueError("column_letters must include partner, amount, and due_date")
+    if not str(sheet_name or "").strip():
+        sheet_name = pd.ExcelFile(file_path, engine="openpyxl").sheet_names[0]
+    partner = header_at_column_letter(file_path, sheet_name, partner_letter, header_row=header_row)
+    if not partner:
+        raise ValueError(f"Empty partner header at column {partner_letter} in {file_path}")
+    return _canonicalize_partner_columns(
+        {
+            "partner_id": partner,
+            "partner_name": partner,
+            "amount": header_at_column_letter(
+                file_path, sheet_name, amount_letter, header_row=header_row
+            ),
+            "due_date": header_at_column_letter(
+                file_path, sheet_name, due_letter, header_row=header_row
+            ),
+        }
+    )
+
+
+def _resolve_columns_for_snapshot(snap: dict, cfg: dict) -> dict[str, str]:
+    letters = cfg.get("column_letters")
+    if letters:
+        return resolve_opos_columns_from_letters(
+            snap["file_path"],
+            str(snap.get("sheet_name") or "").strip(),
+            letters,
+            header_row=int(cfg.get("header_row") or 0),
+        )
+    return dict(cfg["columns"])
+
+
+def _rename_df_to_internal_columns(df: pd.DataFrame, resolved: dict[str, str]) -> pd.DataFrame:
+    out = df.copy()
+    mapping: dict[str, str] = {}
+    pid_src = str(resolved.get("partner_id") or "").strip()
+    if pid_src and pid_src in out.columns:
+        mapping[pid_src] = INTERNAL_OPOS_COLUMNS["partner_id"]
+    amt_src = str(resolved.get("amount") or "").strip()
+    if amt_src and amt_src in out.columns:
+        mapping[amt_src] = INTERNAL_OPOS_COLUMNS["amount"]
+    due_src = str(resolved.get("due_date") or "").strip()
+    if due_src and due_src in out.columns:
+        mapping[due_src] = INTERNAL_OPOS_COLUMNS["due_date"]
+    if mapping:
+        out = out.rename(columns=mapping)
+    return out
 
 
 def _bucket_col_width(bucket_key: str | None) -> float:
@@ -262,13 +395,77 @@ def _normalize_top_bucket_cfg(cfg: dict) -> dict:
     return tb
 
 
+def _canonicalize_partner_columns(cols: dict) -> dict[str, str]:
+    pid = str(cols.get("partner_id") or cols.get("partner") or "").strip()
+    pname = str(cols.get("partner_name") or "").strip()
+    if not pid and pname:
+        pid = pname
+    if not pid:
+        raise ValueError("CONFIG columns missing partner column")
+    out = dict(cols)
+    out["partner_id"] = pid
+    out["partner_name"] = pid
+    return out
+
+
 def normalize_config(raw: dict) -> dict:
     cfg = dict(raw or {})
-    cols = dict(cfg.get("columns") or {})
+    if cfg.get("sides"):
+        return _normalize_combined_config(cfg)
+    return _normalize_single_side_config(cfg)
+
+
+def _normalize_combined_config(cfg: dict) -> dict:
+    letters = dict(cfg.get("column_letters") or {})
+    if not letters:
+        raise ValueError("CONFIG column_letters required for combined debitor/kreditor run")
+    base = {
+        k: cfg[k]
+        for k in (
+            "title",
+            "company",
+            "sort",
+            "top_bucket",
+            "top_n_subtotal",
+            "filters",
+            "formula_mode",
+            "output_file_path",
+            "case_id",
+            "run_id",
+            "header_row",
+        )
+        if k in cfg
+    }
+    sides_out: dict[str, dict] = {}
+    for side in ("debitor", "kreditor"):
+        block = dict((cfg.get("sides") or {}).get(side) or {})
+        side_cfg = {**base, **block, "side": side, "column_letters": letters}
+        sides_out[side] = _normalize_single_side_config(side_cfg)
+    out = dict(sides_out["debitor"])
+    out["sides"] = sides_out
+    out["column_letters"] = letters
+    return out
+
+
+def _normalize_single_side_config(cfg: dict) -> dict:
+    cfg = dict(cfg or {})
+    letters = cfg.get("column_letters")
     required = ("partner_id", "partner_name", "amount", "due_date")
-    missing = [k for k in required if not str(cols.get(k) or "").strip()]
-    if missing:
-        raise ValueError(f"CONFIG columns missing: {missing}")
+    if letters:
+        snapshots = _coerce_snapshots(cfg)
+        first = snapshots[0]
+        resolved = resolve_opos_columns_from_letters(
+            first["file_path"],
+            str(first.get("sheet_name") or "").strip(),
+            letters,
+            header_row=int(cfg.get("header_row") or 0),
+        )
+        cols = resolved
+    else:
+        cols = _canonicalize_partner_columns(dict(cfg.get("columns") or {}))
+        missing = [k for k in required if not str(cols.get(k) or "").strip()]
+        if missing:
+            raise ValueError(f"CONFIG columns missing: {missing}")
 
     partner_id = str(cols["partner_id"]).strip()
     side = str(cfg.get("side") or detect_side_from_partner_col(partner_id)).strip().lower()
@@ -277,9 +474,15 @@ def normalize_config(raw: dict) -> dict:
 
     snapshots = _coerce_snapshots(cfg)
     for snap in snapshots:
-        snap["sheet_name"] = resolve_snapshot_sheet_name(
-            snap["file_path"], partner_id, snap.get("sheet_name", "")
-        )
+        if not str(snap.get("sheet_name") or "").strip():
+            if letters:
+                snap["sheet_name"] = pd.ExcelFile(
+                    snap["file_path"], engine="openpyxl"
+                ).sheet_names[0]
+            else:
+                snap["sheet_name"] = resolve_snapshot_sheet_name(
+                    snap["file_path"], partner_id, snap.get("sheet_name", "")
+                )
 
     ab = dict(cfg.get("aging_buckets") or {})
     include_current = bool(ab.get("include_current", True))
@@ -305,10 +508,15 @@ def normalize_config(raw: dict) -> dict:
     filters.setdefault("enabled", False)
     filters.setdefault("rules", [])
 
+    column_values = (
+        dict(INTERNAL_OPOS_COLUMNS)
+        if letters
+        else {k: str(cols[k]).strip() for k in required}
+    )
     cfg.update(
         {
             "side": side,
-            "columns": {k: str(cols[k]).strip() for k in required},
+            "columns": column_values,
             "snapshots": snapshots,
             "aging_buckets": {
                 "mode": "fixed",
@@ -326,6 +534,8 @@ def normalize_config(raw: dict) -> dict:
             "base_sheet_name": str(cfg.get("base_sheet_name") or "Source").strip(),
         }
     )
+    if letters:
+        cfg["column_letters"] = dict(letters)
     for key in ("output_file_path", "case_id"):
         if not str(cfg.get(key) or "").strip():
             raise ValueError(f"CONFIG missing required key: {key}")
@@ -400,7 +610,7 @@ def _display_partner_name(pid: str, name: str) -> str:
 
 def build_partner_meta_from_snapshots(cfg: dict) -> dict[str, str]:
     """Partner display names from full snapshot rows (incl. rows without due date)."""
-    cols = cfg["columns"]
+    processing_cfg = _opos_processing_cfg(cfg)
     meta: dict[str, str] = {}
     for snap in cfg["snapshots"]:
         df = pd.read_excel(
@@ -408,9 +618,12 @@ def build_partner_meta_from_snapshots(cfg: dict) -> dict[str, str]:
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        d = apply_filters(df.copy(), cfg)
-        ids = _clean_text_series(d[cols["partner_id"]])
-        names = _clean_text_series(d[cols["partner_name"]])
+        if cfg.get("column_letters"):
+            resolved = _resolve_columns_for_snapshot(snap, cfg)
+            df = _rename_df_to_internal_columns(df, resolved)
+        d = apply_filters(df.copy(), processing_cfg)
+        ids = _clean_text_series(d[processing_cfg["columns"]["partner_id"]])
+        names = _clean_text_series(d[processing_cfg["columns"]["partner_name"]])
         for pid, name in zip(ids, names):
             if not pid:
                 continue
@@ -419,19 +632,6 @@ def build_partner_meta_from_snapshots(cfg: dict) -> dict[str, str]:
             elif pid not in meta:
                 meta[pid] = pid
     return {pid: _display_partner_name(pid, name) for pid, name in meta.items()}
-
-
-def _fill_partner_names_in_df(
-    df: pd.DataFrame, cfg: dict, partner_meta: dict[str, str]
-) -> pd.DataFrame:
-    """Propagate display name to every source row so SUMIFS can match on name only."""
-    cols = cfg["columns"]
-    out = df.copy()
-    ids = _clean_text_series(out[cols["partner_id"]])
-    out[cols["partner_name"]] = [
-        _display_partner_name(pid, partner_meta.get(pid, pid)) for pid in ids
-    ]
-    return out
 
 
 def preprocess_opos_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -453,15 +653,12 @@ def preprocess_opos_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 def audit_missing_due_date_rows(
     snapshots: list[dict],
-    columns: dict[str, str],
+    columns: dict | None = None,
+    *,
+    column_letters: dict | None = None,
+    header_row: int = 0,
 ) -> dict:
     """Rows with partner id but missing due date — same rule as preprocess_opos_input."""
-    required = ("partner_id", "partner_name", "amount", "due_date")
-    missing_cols = [k for k in required if not str(columns.get(k) or "").strip()]
-    if missing_cols:
-        raise ValueError(f"columns missing for due-date audit: {missing_cols}")
-
-    col_map = {k: str(columns[k]).strip() for k in required}
     total_excluded = 0
     details: list[dict] = []
     for snap in snapshots:
@@ -470,6 +667,13 @@ def audit_missing_due_date_rows(
         if not fp or not os.path.isfile(fp):
             continue
         sheet = str(snap.get("sheet_name") or "").strip()
+        if column_letters:
+            col_map = resolve_opos_columns_from_letters(
+                fp, sheet, column_letters, header_row=header_row
+            )
+        else:
+            col_map = _canonicalize_partner_columns(columns or {})
+        col_map = {k: str(col_map[k]).strip() for k in ("partner_id", "partner_name", "amount", "due_date")}
         if not sheet:
             sheet = resolve_snapshot_sheet_name(fp, col_map["partner_id"], "")
         df = pd.read_excel(fp, sheet_name=sheet, engine="openpyxl")
@@ -550,7 +754,7 @@ def _partner_sort_score(
             total += sum(float(bmap.get(b.key, 0.0)) for b in buckets)
         else:
             total += sum(float(bmap.get(k, 0.0)) for k in sort_keys)
-    return total
+    return abs(total)
 
 
 def _label_for_top_range(start: int, end: int) -> str:
@@ -653,8 +857,7 @@ def aggregate_opos(
     periods: list[AsOfPeriod],
     buckets: list[AgingBucket],
 ) -> tuple[dict[str, dict[str, dict[str, float]]], list[str], dict[str, str]]:
-    """period_label -> partner_name -> bucket_key -> kEUR amount (grouped by display name)."""
-    meta = _partner_display_meta(cfg, snapshot_dfs)
+    """period_label -> partner key -> bucket_key -> kEUR (grouped by mapper partner column)."""
     sort_keys, sort_periods = _opos_sort_context(cfg, periods, buckets)
     bucket_key_list = [b.key for b in buckets]
 
@@ -675,39 +878,50 @@ def aggregate_opos(
             pid_s = str(pid).strip()
             if not pid_s:
                 continue
-            names = grp["_partner_name"]
-            names = names[(names != "") & names.notna()]
-            raw_name = names.iloc[0] if len(names) else pid_s
-            gkey = _display_partner_name(pid_s, meta.get(pid_s, raw_name))
             bucket_sums = grp.groupby("_bucket")["_keur"].sum().to_dict()
             row = grid[period.label].setdefault(
-                gkey, {k: 0.0 for k in bucket_key_list}
+                pid_s, {k: 0.0 for k in bucket_key_list}
             )
             for bk, val in bucket_sums.items():
                 if bk in row:
                     row[bk] = float(row.get(bk, 0.0)) + float(val)
-            partner_meta[gkey] = gkey
+            partner_meta[pid_s] = pid_s
 
     scores: dict[str, float] = {}
-    for gkey in partner_meta:
-        scores[gkey] = _partner_sort_score(gkey, grid, sort_periods, sort_keys, buckets)
+    for pid in partner_meta:
+        scores[pid] = _partner_sort_score(pid, grid, sort_periods, sort_keys, buckets)
 
-    partner_order = sorted(partner_meta.keys(), key=lambda k: (-scores.get(k, 0.0), k.lower()))
+    partner_order = sorted(
+        partner_meta.keys(), key=lambda k: (-scores.get(k, 0.0), k.lower())
+    )
     return grid, partner_order, partner_meta
 
 
+def _partner_display_header(cfg: dict) -> str:
+    cols = cfg.get("columns") or {}
+    name = str(cols.get("partner_id") or cols.get("partner_name") or "").strip()
+    if name and not name.startswith("__OPOS_"):
+        return name
+    side = str(cfg.get("side") or "debitor").strip().lower()
+    return SIDE_LABELS.get(side, SIDE_LABELS["debitor"])["partner_header"]
+
+
+def _formula_cfg(cfg: dict) -> dict:
+    return cfg_with_internal_columns(cfg) if cfg.get("column_letters") else cfg
+
+
 def get_opos_excel_layout(cfg: dict) -> dict:
-    """A–C collapsed; formula key in B; partner label in J; bucket bounds rows 3–4."""
+    """A spacer | B formula key | C spacer | D POS (partner label)."""
     use_formulas = bool(cfg.get("formula_mode", True))
     return {
         "key_col": KEY_COL,
         "label_col": POS_COL,
-        "col_offset": 3,
+        "col_offset": 1,
         "bucket_bound_lo_row": BUCKET_BOUND_ROW_LO if use_formulas else None,
         "bucket_bound_hi_row": BUCKET_BOUND_ROW_HI if use_formulas else None,
         "header_row": HEADER_ROW,
         "data_start_row": DATA_START_ROW,
-        "helper_right_col": 3,
+        "helper_right_col": HELPER_SPACER_COL,
     }
 
 
@@ -745,15 +959,21 @@ def write_opos_formula_key_column(
     partner_row_names: dict[int, str],
     footer_rows: dict[str, int],
 ) -> None:
-    """Collapsed helper column B (same partner text as visible column J)."""
+    """Collapsed helper column B: partner id for SUMIFS (label in visible column J)."""
     key_col = layout["key_col"]
     header_row = layout["header_row"]
     helper_right = layout["helper_right_col"]
-    partner_col_name = str(cfg["columns"]["partner_name"]).strip()
+    partner_col_name = _partner_display_header(cfg)
 
     hdr = ws.cell(header_row, key_col, partner_col_name)
     hdr.font = FONT_HEADER
     hdr.alignment = ALIGN_LEFT
+    hdr.fill = FILL_HEADER
+    hdr.border = THEME.border_header_bottom
+    if header_row > 1:
+        ws.cell(header_row - 1, key_col).fill = FILL_HEADER
+
+    _clear_helper_spacer_header(ws)
 
     for c in range(1, helper_right + 1):
         if c != key_col:
@@ -764,7 +984,7 @@ def write_opos_formula_key_column(
             if c != key_col:
                 ws.cell(row_idx, c).value = None
         cell = ws.cell(row_idx, key_col, pname)
-        cell.font = FONT_BASE
+        cell.font = FONT_MAPPING
         cell.alignment = ALIGN_LEFT
 
     for row_idx in footer_rows.values():
@@ -799,7 +1019,12 @@ def _value_col_count(buckets: list[AgingBucket]) -> int:
     return len(buckets) + 1
 
 
-def build_opos_blocks(periods: list[AsOfPeriod], buckets: list[AgingBucket]) -> list[dict]:
+def build_opos_blocks(
+    periods: list[AsOfPeriod],
+    buckets: list[AgingBucket],
+    *,
+    side: str | None = None,
+) -> list[dict]:
     """First block: partner col J + values; later blocks: values only + spacers."""
     blocks: list[dict] = []
     n_val = _value_col_count(buckets)
@@ -812,7 +1037,7 @@ def build_opos_blocks(periods: list[AsOfPeriod], buckets: list[AgingBucket]) -> 
                     "has_plpos": True,
                     "kind": "period",
                     "key": period.label,
-                    "source_sheet": source_sheet_name_for_label(period.label),
+                    "source_sheet": source_sheet_name_for_label(period.label, side),
                     "startcol": POS_COL,
                     "poscol": POS_COL,
                     "year_startcol": POS_COL + 1,
@@ -828,7 +1053,7 @@ def build_opos_blocks(periods: list[AsOfPeriod], buckets: list[AgingBucket]) -> 
                     "has_plpos": False,
                     "kind": "period",
                     "key": period.label,
-                    "source_sheet": source_sheet_name_for_label(period.label),
+                    "source_sheet": source_sheet_name_for_label(period.label, side),
                     "startcol": current_col,
                     "year_startcol": current_col,
                     "year_endcol": current_col + n_val - 1,
@@ -853,6 +1078,7 @@ def enrich_opos_source_df(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def load_snapshot_dataframes(cfg: dict) -> dict[str, pd.DataFrame]:
+    processing_cfg = _opos_processing_cfg(cfg)
     out: dict[str, pd.DataFrame] = {}
     for snap in cfg["snapshots"]:
         dt = pd.Timestamp(snap["as_of"]).normalize()
@@ -862,7 +1088,10 @@ def load_snapshot_dataframes(cfg: dict) -> dict[str, pd.DataFrame]:
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        out[label] = preprocess_opos_input(df, cfg)
+        if cfg.get("column_letters"):
+            resolved = _resolve_columns_for_snapshot(snap, cfg)
+            df = _rename_df_to_internal_columns(df, resolved)
+        out[label] = preprocess_opos_input(df, processing_cfg)
     return out
 
 
@@ -908,28 +1137,35 @@ def _format_due_date_column(ws, df: pd.DataFrame, cfg: dict) -> None:
 def bootstrap_opos_workbook(
     cfg: dict,
     output_path: str,
-    *,
-    partner_meta: dict[str, str] | None = None,
 ) -> None:
-    """Write one __SOURCE__{label} sheet per snapshot (values only)."""
-    if partner_meta is None:
-        partner_meta = build_partner_meta_from_snapshots(cfg)
-    wb = Workbook()
-    wb.remove(wb.active)
+    """Write one __SOURCE__{side}_{label} sheet per snapshot (values only)."""
+    side = str(cfg.get("side") or "debitor").strip().lower()
+    prefix = _source_sheet_prefix_for_side(side)
+    processing_cfg = _opos_processing_cfg(cfg)
+    if os.path.isfile(output_path):
+        wb = load_workbook(output_path)
+        for sn in list(wb.sheetnames):
+            if str(sn).startswith(prefix):
+                del wb[sn]
+    else:
+        wb = Workbook()
+        wb.remove(wb.active)
     for snap in sorted(cfg["snapshots"], key=lambda s: pd.Timestamp(s["as_of"])):
         dt = pd.Timestamp(snap["as_of"]).normalize()
         label = as_of_period_label(dt)
-        title = source_sheet_name_for_label(label)
+        title = source_sheet_name_for_label(label, side)
         ws = wb.create_sheet(title)
         df = pd.read_excel(
             snap["file_path"],
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        df = _fill_partner_names_in_df(df, cfg, partner_meta)
-        snap_cfg = {**cfg, "file_path": snap["file_path"], "sheet_name": snap["sheet_name"]}
+        if cfg.get("column_letters"):
+            resolved = _resolve_columns_for_snapshot(snap, cfg)
+            df = _rename_df_to_internal_columns(df, resolved)
+        snap_cfg = {**processing_cfg, "file_path": snap["file_path"], "sheet_name": snap["sheet_name"]}
         write_source_df_to_ws(ws, df, snap_cfg)
-        _format_due_date_column(ws, df, cfg)
+        _format_due_date_column(ws, df, processing_cfg)
     wb.save(output_path)
     wb.close()
 
@@ -983,8 +1219,8 @@ def _opos_sumifs_criteria(
 
     base_pairs: list[tuple[str, str]] = []
     if partner_row is not None:
-        partner_rng = source_range_ref(source_sheet, src_header, cols["partner_name"])
-        partner_ref = f"${col_letter(POS_COL)}{partner_row}"
+        partner_rng = source_range_ref(source_sheet, src_header, cols["partner_id"])
+        partner_ref = f"${col_letter(KEY_COL)}{partner_row}"
         base_pairs.append((partner_rng, partner_ref))
 
     lo_date, hi_date = bucket_due_bounds(bucket, period.date)
@@ -1112,7 +1348,13 @@ def _set_num(cell, value, bold: bool = False):
     cell.alignment = ALIGN_RIGHT
 
 
-def _write_block_headers(ws, block: dict, buckets: list[AgingBucket]) -> None:
+def _write_block_headers(
+    ws,
+    block: dict,
+    buckets: list[AgingBucket],
+    *,
+    partner_header: str = UNIT_LABEL,
+) -> None:
     value_headers = [b.label for b in buckets] + ["Total"]
     plabel = block["period"].label
 
@@ -1130,7 +1372,7 @@ def _write_block_headers(ws, block: dict, buckets: list[AgingBucket]) -> None:
         pos_title.value = None
         pos_title.fill = FILL_HEADER
 
-        hpos = ws.cell(HEADER_ROW, block["poscol"], UNIT_LABEL)
+        hpos = ws.cell(HEADER_ROW, block["poscol"], partner_header)
         hpos.font = FONT_HEADER
         hpos.fill = FILL_HEADER
         hpos.alignment = ALIGN_LEFT
@@ -1216,6 +1458,10 @@ def _opos_total_col_indices(blocks: list[dict]) -> list[int]:
     return [b["year_endcol"] for b in blocks]
 
 
+def _opos_helper_border_cols() -> list[int]:
+    return [KEY_COL]
+
+
 def _style_opos_row_band(
     ws,
     row: int,
@@ -1228,6 +1474,12 @@ def _style_opos_row_band(
     border_bottom: bool = False,
 ) -> None:
     medium = THEME.border_subtotal_top.top
+    for cc in _opos_helper_border_cols():
+        cell = ws.cell(row, cc)
+        if border_top:
+            _merge_cell_border(cell, top=medium)
+        if border_bottom:
+            _merge_cell_border(cell, bottom=medium)
     for cc in range(table_left, table_right + 1):
         cell = ws.cell(row, cc)
         if bold:
@@ -1304,6 +1556,22 @@ def apply_opos_detail_row_styles(
     )
 
 
+def _collapse_opos_helper_columns(ws) -> None:
+    for cc in range(1, POS_COL):
+        letter = col_letter(cc)
+        ws.column_dimensions[letter].outlineLevel = 2
+        ws.column_dimensions[letter].hidden = True
+    ws.column_dimensions[col_letter(HELPER_SPACER_COL)].collapsed = True
+
+
+def _apply_opos_top_bucket_outlines(ws, top_bucket_rows: list[dict] | None) -> None:
+    for spec in top_bucket_rows or []:
+        br = int(spec["row"])
+        for pr in spec.get("partner_rows") or []:
+            ws.row_dimensions[int(pr)].outlineLevel = 1
+        ws.row_dimensions[br].outlineLevel = 0
+
+
 def apply_opos_sheet_formatting(
     ws,
     blocks: list[dict],
@@ -1351,6 +1619,8 @@ def apply_opos_sheet_formatting(
             ws.cell(BLOCK_TITLE_ROW, block["poscol"]).fill = FILL_HEADER
             ws.cell(HEADER_ROW, block["poscol"]).fill = FILL_HEADER
 
+    _clear_helper_spacer_header(ws)
+
     ws.row_dimensions[HEADER_ROW].height = ROW_HEIGHT
     ws.row_dimensions[BLOCK_TITLE_ROW].height = ROW_HEIGHT
     for rr in range(1, fill_end_row + 1):
@@ -1383,6 +1653,12 @@ def apply_opos_sheet_formatting(
             footer_rows=footer_rows,
         )
 
+    _collapse_opos_helper_columns(ws)
+    if top_bucket_rows:
+        _apply_opos_top_bucket_outlines(ws, top_bucket_rows)
+    ws.sheet_view.showOutlineSymbols = True
+    ws.sheet_properties.outlinePr.summaryBelow = True
+
 
 def write_detail_sheet(
     ws,
@@ -1401,10 +1677,15 @@ def write_detail_sheet(
 
     ws.cell(PROJECT_TITLE_ROW, POS_COL, f"Project {cfg['title']}").font = FONT_PROJECT
     ws.cell(SUBTITLE_ROW, POS_COL, f"{cfg['company']} | {labels['subtitle']}").font = FONT_SUBTITLE
+    ws.cell(
+        TABLE_TITLE_ROW,
+        POS_COL,
+        f"{cfg['company']} | {labels['subtitle']}",
+    ).font = FONT_TITLE
 
-    blocks = build_opos_blocks(periods, buckets)
+    blocks = build_opos_blocks(periods, buckets, side=cfg.get("side"))
     for block in blocks:
-        _write_block_headers(ws, block, buckets)
+        _write_block_headers(ws, block, buckets, partner_header=labels["partner_header"])
     if use_formulas:
         write_opos_bucket_bound_rows(ws, blocks, buckets)
 
@@ -1419,9 +1700,8 @@ def write_detail_sheet(
     for line in detail_lines:
         if line.kind == "partner":
             pid = str(line.partner_id)
-            pname = _display_partner_name(pid, partner_meta.get(pid, pid))
             ws.row_dimensions[row_idx].height = ROW_HEIGHT
-            ws.cell(row_idx, POS_COL, pname).font = FONT_BASE
+            ws.cell(row_idx, POS_COL, pid).font = FONT_BASE
             ws.cell(row_idx, POS_COL).alignment = ALIGN_LEFT
 
             for block in blocks:
@@ -1438,7 +1718,7 @@ def write_detail_sheet(
 
             partner_rows.append(row_idx)
             partner_row_pids[row_idx] = pid
-            partner_row_names[row_idx] = pname
+            partner_row_names[row_idx] = pid
             segment_partner_rows.append(row_idx)
             last_row = row_idx
             row_idx += 1
@@ -1509,10 +1789,9 @@ def write_detail_sheet(
             _set_num(ws.cell(reported_row, cc), 0.0, bold=True)
 
     excel_layout = get_opos_excel_layout(cfg)
-    if use_formulas:
-        write_opos_formula_key_column(
-            ws, excel_layout, cfg, partner_row_names, footer_rows
-        )
+    write_opos_formula_key_column(
+        ws, excel_layout, cfg, partner_row_names, footer_rows
+    )
 
     last_col = max(b["spacer_col"] for b in blocks)
     apply_opos_sheet_formatting(
@@ -1554,10 +1833,16 @@ def write_summary_sheet(
 
     value_start = POS_COL + 1
     last_col = POS_COL + len(periods)
-    title_cell = ws.cell(BLOCK_TITLE_ROW, POS_COL, labels["summary_sheet"])
-    title_cell.font = FONT_BASE
+    title_cell = ws.cell(
+        TABLE_TITLE_ROW,
+        POS_COL,
+        f"{cfg['company']} | {labels['summary_sheet']}",
+    )
+    title_cell.font = FONT_TITLE
     title_cell.alignment = ALIGN_LEFT
-    title_cell.fill = FILL_WHITE
+
+    for cc in range(value_start, last_col + 1):
+        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_HEADER
 
     hpos = ws.cell(HEADER_ROW, POS_COL, UNIT_LABEL)
     hpos.font = FONT_HEADER
@@ -1618,8 +1903,15 @@ def write_summary_sheet(
             ws.row_dimensions[rr].height = ROW_HEIGHT
 
     for cc in range(POS_COL, last_col + 1):
-        ws.cell(HEADER_ROW, cc).border = THEME.border_header_bottom
+        ws.cell(TABLE_TITLE_ROW, cc).fill = FILL_WHITE
+        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_HEADER if cc >= value_start else FILL_WHITE
         ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
+        ws.cell(HEADER_ROW, cc).border = THEME.border_header_bottom
+
+    for cc in range(last_col + 1, fill_end_col + 1):
+        ws.cell(TABLE_TITLE_ROW, cc).fill = FILL_WHITE
+        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_WHITE
+        ws.cell(HEADER_ROW, cc).fill = FILL_WHITE
 
     apply_zero_row_conditional_formatting(
         ws,
@@ -1656,6 +1948,8 @@ def write_summary_sheet(
     for i in range(len(periods)):
         ws.column_dimensions[col_letter(value_start + i)].width = SUMMARY_VALUE_COL_WIDTH
 
+    _collapse_opos_helper_columns(ws)
+
     return {
         "summary_rows": summary_rows,
         "footer_rows": footer_rows,
@@ -1672,6 +1966,7 @@ def apply_opos_detail_formulas(
     buckets: list[AgingBucket],
     layout: dict,
 ) -> None:
+    fcfg = _formula_cfg(cfg)
     labels = SIDE_LABELS[cfg["side"]]
     ws = wb[labels["detail_sheet"]]
 
@@ -1683,16 +1978,22 @@ def apply_opos_detail_formulas(
     top_bucket_rows = layout.get("top_bucket_rows") or []
     footer_rows = layout["footer_rows"]
 
+    header_maps: dict[str, dict] = {}
+    for block in blocks:
+        source_sheet = block["source_sheet"]
+        if source_sheet not in header_maps:
+            header_maps[source_sheet] = _get_sheet_header_map(wb[source_sheet])
+
     for row_idx in partner_row_pids:
         for block in blocks:
             period = block["period"]
             source_sheet = block["source_sheet"]
-            src_header = _get_sheet_header_map(wb[source_sheet])
+            src_header = header_maps[source_sheet]
             cc = block["year_startcol"]
             bucket_ccs: list[int] = []
             for b in bucket_cols:
                 formula = _opos_sumifs_formula(
-                    source_sheet, src_header, cfg, period, b, cc, row_idx
+                    source_sheet, src_header, fcfg, period, b, cc, row_idx
                 )
                 _set_cell_formula(ws.cell(row_idx, cc), formula)
                 bucket_ccs.append(cc)
@@ -1752,6 +2053,7 @@ def apply_opos_summary_formulas(
     buckets: list[AgingBucket],
     layout: dict,
 ) -> None:
+    fcfg = _formula_cfg(cfg)
     labels = SIDE_LABELS[cfg["side"]]
     ws = wb[labels["summary_sheet"]]
     summary_rows = layout["summary_rows"]
@@ -1759,16 +2061,22 @@ def apply_opos_summary_formulas(
     bucket_cols = layout.get("bucket_cols") or list(buckets)
     value_start = POS_COL + 1
 
+    header_maps: dict[str, dict] = {}
+    for period in periods:
+        source_sheet = source_sheet_name_for_label(period.label, cfg.get("side"))
+        if source_sheet not in header_maps:
+            header_maps[source_sheet] = _get_sheet_header_map(wb[source_sheet])
+
     for bucket in bucket_cols:
         row_idx = summary_rows[bucket.key]
         for i, period in enumerate(periods):
             col_idx = value_start + i
-            source_sheet = source_sheet_name_for_label(period.label)
-            src_header = _get_sheet_header_map(wb[source_sheet])
+            source_sheet = source_sheet_name_for_label(period.label, cfg.get("side"))
+            src_header = header_maps[source_sheet]
             body = _opos_sumifs_criteria(
                 source_sheet,
                 src_header,
-                cfg,
+                fcfg,
                 period,
                 bucket,
                 col_idx=None,
@@ -1795,26 +2103,223 @@ def apply_opos_summary_formulas(
         ws.cell(reported_row, col_idx).font = FONT_BOLD
 
 
-def run_opos(cfg: dict) -> str:
+def _opos_bs_recon_row_needle(side: str) -> str:
+    return "trade receivables" if side == "debitor" else "trade payables"
+
+
+def _opos_bs_recon_row(ws_rec, side: str) -> int | None:
+    needle = _opos_bs_recon_row_needle(side)
+    pos_col = LAYOUT_BS.pos_col
+    fallback: int | None = None
+    for rr in range(1, ws_rec.max_row + 1):
+        v = ws_rec.cell(rr, pos_col).value
+        if not isinstance(v, str):
+            continue
+        vs = v.strip().lower()
+        if vs == needle:
+            return rr
+        if needle in vs and fallback is None:
+            fallback = rr
+    return fallback
+
+
+def _opos_bs_recon_reported_formula(wb, side: str, period_label: str) -> str | None:
+    if BS_RECON_SHEET not in wb.sheetnames:
+        return None
+    ws_rec = wb[BS_RECON_SHEET]
+    row = _opos_bs_recon_row(ws_rec, side)
+    if row is None:
+        return None
+    col = find_recon_block_col_for_period_label(ws_rec, AGGREGATED_BLOCK_TITLE, period_label)
+    if col is None:
+        return None
+    return bs_recon_aggregated_ref(row, col)
+
+
+def _apply_opos_bs_recon_cell(cell, wb, side: str, period_label: str, *, bold: bool = False) -> bool:
+    formula = _opos_bs_recon_reported_formula(wb, side, period_label)
+    if not formula:
+        return False
+    cell.value = formula
+    cell.number_format = NUM_FMT
+    cell.font = FONT_BOLD if bold else FONT_BASE
+    return True
+
+
+def apply_opos_bs_recon_reported_refs(
+    wb,
+    cfg: dict,
+    periods: list[AsOfPeriod],
+    detail_layout: dict,
+    summary_layout: dict,
+) -> None:
+    if BS_RECON_SHEET not in wb.sheetnames:
+        return
+    labels = SIDE_LABELS[cfg["side"]]
+    side = cfg["side"]
+
+    if labels["detail_sheet"] in wb.sheetnames:
+        ws_detail = wb[labels["detail_sheet"]]
+        bucket_cols = detail_layout.get("bucket_cols") or []
+        reported_row = detail_layout["footer_rows"]["reported"]
+        for block in detail_layout["blocks"]:
+            tot_col = block["year_startcol"] + len(bucket_cols)
+            _apply_opos_bs_recon_cell(
+                ws_detail.cell(reported_row, tot_col),
+                wb,
+                side,
+                block["period"].label,
+                bold=True,
+            )
+
+    if labels["summary_sheet"] not in wb.sheetnames:
+        return
+    ws_summary = wb[labels["summary_sheet"]]
+    value_start = POS_COL + 1
+    reported_row_sum = summary_layout["footer_rows"]["reported"]
+    for i, period in enumerate(periods):
+        _apply_opos_bs_recon_cell(
+            ws_summary.cell(reported_row_sum, value_start + i),
+            wb,
+            side,
+            period.label,
+            bold=True,
+        )
+
+
+def _apply_opos_check_section(
+    wb,
+    ws,
+    cfg: dict,
+    *,
+    is_detail: bool,
+    layout: dict,
+    periods: list[AsOfPeriod],
+) -> None:
+    if BS_RECON_SHEET not in wb.sheetnames:
+        return
+    from openpyxl.formatting.rule import CellIsRule
+
+    footer_rows = layout["footer_rows"]
+    reported_row = footer_rows["reported"]
+    anchor_row = footer_rows["total"] if is_detail else footer_rows["sum"]
+    check_source_row, check_delta_row = check_row_groups_after_table(reported_row, [2])
+
+    ws.cell(check_source_row, POS_COL, "Source - BS Reconciliation").font = FONT_BASE
+    ws.cell(check_source_row, POS_COL).alignment = ALIGN_LEFT
+    ws.cell(check_delta_row, POS_COL, "Check").font = FONT_CHECK_RED
+    ws.cell(check_delta_row, POS_COL).alignment = ALIGN_LEFT
+
+    yellow_cols: list[int] = []
+    side = cfg["side"]
+    table_right = layout["last_col"]
+
+    if is_detail:
+        bucket_cols = layout.get("bucket_cols") or []
+        for block in layout["blocks"]:
+            tot_col = block["year_startcol"] + len(bucket_cols)
+            if not _apply_opos_bs_recon_cell(
+                ws.cell(check_source_row, tot_col),
+                wb,
+                side,
+                block["period"].label,
+            ):
+                continue
+            yellow_cols.append(tot_col)
+            anchor_cell = ws.cell(anchor_row, tot_col)
+            delta_cell = ws.cell(check_delta_row, tot_col)
+            delta_cell.value = f"={anchor_cell.coordinate}-{ws.cell(check_source_row, tot_col).coordinate}"
+            delta_cell.number_format = NUM_FMT
+            delta_cell.font = FONT_CHECK_RED
+            ws.conditional_formatting.add(
+                delta_cell.coordinate,
+                CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+            )
+    else:
+        value_start = POS_COL + 1
+        for i, period in enumerate(periods):
+            col_idx = value_start + i
+            if not _apply_opos_bs_recon_cell(
+                ws.cell(check_source_row, col_idx),
+                wb,
+                side,
+                period.label,
+            ):
+                continue
+            yellow_cols.append(col_idx)
+            anchor_cell = ws.cell(anchor_row, col_idx)
+            delta_cell = ws.cell(check_delta_row, col_idx)
+            delta_cell.value = f"={anchor_cell.coordinate}-{ws.cell(check_source_row, col_idx).coordinate}"
+            delta_cell.number_format = NUM_FMT
+            delta_cell.font = FONT_CHECK_RED
+            ws.conditional_formatting.add(
+                delta_cell.coordinate,
+                CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+            )
+
+    if yellow_cols:
+        paint_check_source_yellow(
+            ws,
+            check_source_row,
+            list(range(POS_COL, table_right + 1)),
+        )
+
+    collapse_check_portfolio(ws, [check_source_row, check_delta_row])
+    ws.sheet_view.showOutlineSymbols = True
+    ws.sheet_properties.outlinePr.summaryBelow = True
+    ws.sheet_properties.outlinePr.applyStyles = True
+
+
+def apply_opos_check_sections(
+    wb,
+    cfg: dict,
+    periods: list[AsOfPeriod],
+    detail_layout: dict,
+    summary_layout: dict,
+) -> None:
+    labels = SIDE_LABELS[cfg["side"]]
+    if labels["detail_sheet"] in wb.sheetnames:
+        _apply_opos_check_section(
+            wb,
+            wb[labels["detail_sheet"]],
+            cfg,
+            is_detail=True,
+            layout=detail_layout,
+            periods=periods,
+        )
+    if labels["summary_sheet"] in wb.sheetnames:
+        _apply_opos_check_section(
+            wb,
+            wb[labels["summary_sheet"]],
+            cfg,
+            is_detail=False,
+            layout=summary_layout,
+            periods=periods,
+        )
+
+
+def _clear_opos_workbook_sheets(wb) -> None:
+    from databook_workbook import clear_opos_workbook_sheets
+
+    clear_opos_workbook_sheets(wb)
+
+
+def run_opos_side(cfg: dict, output_path: str) -> str:
     buckets = build_aging_bucket_defs(cfg)
     periods = build_opos_periods(cfg)
     labels = SIDE_LABELS[cfg["side"]]
     use_formulas = bool(cfg.get("formula_mode", True))
 
     snapshot_dfs = load_snapshot_dataframes(cfg)
-    full_partner_meta = build_partner_meta_from_snapshots(cfg)
     grid, partner_order, partner_meta = aggregate_opos(snapshot_dfs, cfg, periods, buckets)
     partner_order = filter_zero_partners(partner_order, grid, periods, buckets)
-    partner_meta = {
-        pid: full_partner_meta.get(pid, partner_meta.get(pid, pid)) for pid in partner_order
-    }
+    partner_meta = {pid: pid for pid in partner_order}
     summary = summary_from_grid(grid, periods, buckets)
 
-    output_path = build_output_file_path(cfg)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     ensure_output_writable(output_path)
 
-    bootstrap_opos_workbook(cfg, output_path, partner_meta=full_partner_meta)
+    bootstrap_opos_workbook(cfg, output_path)
     wb = load_workbook(output_path)
 
     for sn in (labels["detail_sheet"], labels["summary_sheet"]):
@@ -1831,12 +2336,15 @@ def run_opos(cfg: dict) -> str:
     if use_formulas:
         apply_opos_detail_formulas(wb, cfg, periods, buckets, detail_layout)
         apply_opos_summary_formulas(wb, cfg, periods, buckets, summary_layout)
+        apply_opos_bs_recon_reported_refs(wb, cfg, periods, detail_layout, summary_layout)
+        apply_opos_check_sections(wb, cfg, periods, detail_layout, summary_layout)
         apply_opos_detail_row_styles(
             ws_detail,
             detail_layout["blocks"],
             top_bucket_rows=detail_layout.get("top_bucket_rows"),
             footer_rows=detail_layout["footer_rows"],
         )
+        _apply_opos_top_bucket_outlines(ws_detail, detail_layout.get("top_bucket_rows"))
         n_formulas = _count_sheet_formulas(ws_detail)
         if partner_order and n_formulas == 0:
             raise RuntimeError("OPOS formula_mode: no formulas written despite partner rows.")
@@ -1845,10 +2353,36 @@ def run_opos(cfg: dict) -> str:
         if name.startswith("__SOURCE__"):
             wb[name].sheet_state = "visible"
 
+    from databook_workbook import reorder_workbook_sheets
+
+    reorder_workbook_sheets(wb)
     wb.calculation.fullCalcOnLoad = True
     wb.save(output_path)
     wb.close()
     return output_path
+
+
+def run_opos_combined(cfg: dict) -> str:
+    output_path = build_output_file_path(cfg)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    ensure_output_writable(output_path)
+    if os.path.isfile(output_path):
+        wb = load_workbook(output_path)
+        _clear_opos_workbook_sheets(wb)
+        wb.save(output_path)
+        wb.close()
+    for side in ("debitor", "kreditor"):
+        side_cfg = dict(cfg["sides"][side])
+        side_cfg["column_letters"] = cfg.get("column_letters") or side_cfg.get("column_letters")
+        run_opos_side(side_cfg, output_path)
+    return output_path
+
+
+def run_opos(cfg: dict) -> str:
+    if cfg.get("sides"):
+        return run_opos_combined(cfg)
+    output_path = build_output_file_path(cfg)
+    return run_opos_side(cfg, output_path)
 
 
 def main():

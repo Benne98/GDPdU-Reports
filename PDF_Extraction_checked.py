@@ -165,8 +165,8 @@ def run(config: dict) -> None:
         else:
             format_last_row_by_sheet[sheet] = max(check_rows)
 
-    font_default = Font(name="GT Walsheim LC Light", size=8, color="000000")
-    font_red = Font(name="GT Walsheim LC Light", size=8, color="9C0006")
+    font_default = Font(name="Inter", size=8, color="000000")
+    font_red = Font(name="Inter", size=8, color="9C0006")
 
     for sheet in SHEETS:
         ws = wb[sheet]

@@ -59,11 +59,16 @@ _DEFAULT_META_WIDTHS: dict[str, float] = {
 }
 _DEFAULT_AMOUNT_COL_WIDTH = 13.0
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-def master_workbook_path(session_id: str, output_folder: str | None = None) -> Path:
-    folder = Path(output_folder) if output_folder else PROJECT_ROOT / "uploads" / session_id / "output"
-    return folder / f"{session_id}_SuSa_Master.xlsx"
-
+from databook_paths import (  # noqa: E402
+    legacy_master_workbook_filename,
+    master_workbook_filename,
+    master_workbook_path,
+    resolve_existing_master_path,
+    sanitize_project_basename,
+)
 
 def consolidation_template_path(session_id: str, output_folder: str | None = None) -> Path:
     folder = Path(output_folder) if output_folder else PROJECT_ROOT / "uploads" / session_id / "output"
@@ -418,3 +423,44 @@ def extract_fs_check_values(checked_excel: Path) -> dict[str, Any]:
         except (TypeError, ValueError):
             values.append(0.0)
     return {"entities": [], "consolidation": values}
+
+
+def extract_master_entities(master_path: Path | str) -> list[str]:
+    """Unique entity names from Master_BS Entity column (fallback Master_PL), first-seen order."""
+    path = Path(master_path)
+    if not path.is_file():
+        return []
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if "Master_BS" in wb.sheetnames:
+            sheet_name = "Master_BS"
+        elif "Master_PL" in wb.sheetnames:
+            sheet_name = "Master_PL"
+        else:
+            return []
+
+        ws = wb[sheet_name]
+        entity_col = 1
+        for c in range(1, min(ws.max_column or 1, 50) + 1):
+            header = str(ws.cell(1, c).value or "").strip()
+            if header == "Entity":
+                entity_col = c
+                break
+
+        seen: list[str] = []
+        seen_lower: set[str] = set()
+        for r in range(2, (ws.max_row or 1) + 1):
+            raw = ws.cell(r, entity_col).value
+            if raw is None or str(raw).strip() == "":
+                continue
+            name = str(raw).strip()
+            key = name.lower()
+            if key in ("entity", "consolidation"):
+                continue
+            if key not in seen_lower:
+                seen.append(name)
+                seen_lower.add(key)
+        return seen
+    finally:
+        wb.close()

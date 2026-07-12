@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Font, Side
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
@@ -18,36 +18,63 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
+from gst_excel_theme import THEME  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    DIFF_FONT,
+    FILL_YELLOW,
+    LAYOUT_NA,
+    apply_subtotal_row_style,
+    check_row_groups_after_table,
+    collapse_check_portfolio,
+    detect_period_bucket_cols,
+    hide_helper_column_group,
+    paint_check_source_yellow,
+    paint_grey_white_canvas,
+    paint_header_band,
+    prune_zero_value_rows,
+    write_kpi_section_title_row,
+    write_mapping_header_row,
+)
 from databook_periods import (  # noqa: E402
     days_in_month_formula,
+    display_bs_period_labels,
     group_month_columns_by_reporting_fy,
-    master_fy_label,
     ordered_month_columns_from_df,
+    ordered_reporting_columns_from_df,
+    yearly_average_period_label,
 )
 from report_row_layout import (  # noqa: E402
-    WC_BUCKET_LABELS,
     build_working_capital_row_structure,
     l3_order_from_mapping,
+    load_na_l3_orders,
+    resolve_wc_kpi_rows,
 )
 
-from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+from databook_workbook import (  # noqa: E402
+    BS_RECON_MAPPING_FILE,
+    CF_NA_L3_ORDER_FILE,
+    MASTER_WORKBOOK_STR,
+)
 
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 DEFAULT_INPUT = MASTER_WORKBOOK_STR
-DEFAULT_MAPPING_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
+DEFAULT_MAPPING_BS = BS_RECON_MAPPING_FILE
+DEFAULT_CF_NA_L3_ORDER = CF_NA_L3_ORDER_FILE
 
 SHEET_MASTER_BS = "Master_BS"
 SHEET_MASTER_PL = "Master_PL"
 SHEET_PL_RECON = "PL_Reconciliation"
+SHEET_BS_BUCKET = "BS_Bucket"
 SHEET_OUT = "Working_Capital"
 
 SOURCE_COL_CANDIDATES = ("L5", "L6")
 REPORTED_FILTER_VALUE = "reported"
 
-MAP_START_COL = 5
-MAP_END_COL = 9
-POS_COL = 10
+_COL_LAYOUT = LAYOUT_NA
+MAP_START_COL = _COL_LAYOUT.map_start_col
+MAP_END_COL = _COL_LAYOUT.map_end_col
+TECH_SPACER_COL = _COL_LAYOUT.spacer_col
+POS_COL = _COL_LAYOUT.pos_col
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
@@ -75,29 +102,20 @@ FONT_SUBTITLE = Font(
     name=THEME.font_name, size=THEME.font_size_subtitle, color=THEME.text_brand_title
 )
 FONT_KPI = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.text_kpi)
-FONT_KPI_ITALIC = Font(
-    name=THEME.font_name, size=THEME.font_size, color=THEME.text_kpi, italic=True
-)
-FONT_KPI_SECTION = Font(
-    name=THEME.font_name, size=THEME.font_size, color=THEME.text_brand_title, bold=True
-)
+FONT_CHECK_RED = DIFF_FONT
 
 FILL_GREY = THEME.fill_tech
 FILL_WHITE = THEME.fill_white
 FILL_HEADER = THEME.fill_header
 FILL_SUBTOTAL = THEME.fill_subtotal
 FILL_KPI = THEME.fill_subtotal
-FILL_PERIOD = THEME.fill_period
 
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center")
 ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
 
 THIN_SIDE = Side(style="thin", color=THEME.border_color)
-TOP_BORDER = Border(top=THIN_SIDE)
-BOTTOM_BORDER = Border(bottom=THIN_SIDE)
 TOP_BOTTOM_BORDER = Border(top=THIN_SIDE, bottom=THIN_SIDE)
 BORDER_SUBTOTAL_TOP = THEME.border_subtotal_top
-BORDER_KPI_SECTION = THEME.border_kpi_section_top
 
 NUM_FMT_INT = "#,##0;(#,##0);-"
 NUM_FMT_KPI = "0.0;(0.0);-"
@@ -140,6 +158,7 @@ def resolve_config() -> dict:
     return {
         "input_file": path_value(raw, "input_file", path_value(raw, "master_file", DEFAULT_INPUT)),
         "mapping_file": paths.get("mapping_file") or DEFAULT_MAPPING_BS,
+        "cf_na_l3_order_file": paths.get("cf_na_l3_order_file") or DEFAULT_CF_NA_L3_ORDER,
         "project_name": str(raw.get("project_name") or "Desktop Test").strip(),
         "company_name": str(raw.get("company_name") or "Group").strip(),
         "fy_end_month": int(raw.get("fy_end_month") or 12),
@@ -246,7 +265,7 @@ def subtotal_span_for_l3(struct, idx: int, bucket: str, l3_label: str) -> tuple[
     k = idx - 1
     while (
         k >= 0
-        and struct[k]["type"] == "detail"
+        and struct[k]["type"] in {"detail", "detail_single"}
         and struct[k].get("NA") == bucket
         and struct[k].get("L3") == l3_label
     ):
@@ -266,10 +285,61 @@ def bucket_l4_refs(struct, bucket: str, col_l: str) -> list[str]:
     return refs
 
 
+def _find_row_in_col_any(ws_, col_idx: int, needles: list[str]) -> int | None:
+    normalized = [n.strip() for n in needles]
+    for rr in range(1, ws_.max_row + 1):
+        v = ws_.cell(rr, col_idx).value
+        if isinstance(v, str) and v.strip() in normalized:
+            return rr
+    return None
+
+
+def _wc_nwc_month_refs(
+    nwc_row: int,
+    month_cols: list[str],
+    period_index: dict[str, int],
+    y_cols: list[int],
+) -> list[str]:
+    refs: list[str] = []
+    for mc in month_cols:
+        if mc not in period_index:
+            continue
+        refs.append(f"{col_letter(y_cols[period_index[mc]])}{nwc_row}")
+    return refs
+
+
+def _bs_bucket_bucket_source_formula(
+    sheet_name: str,
+    bucket_cols: dict[str, int],
+    bucket: str,
+    assets_row: int,
+    el_row: int,
+) -> str:
+    col = col_letter(bucket_cols[bucket])
+    return f"='{sheet_name}'!{col}{assets_row}+'{sheet_name}'!{col}{el_row}"
+
+
+def _bs_bucket_nwc_source_formula(
+    sheet_name: str,
+    bucket_cols: dict[str, int],
+    assets_row: int,
+    el_row: int,
+) -> str:
+    twc_col = col_letter(bucket_cols["TWC"])
+    owc_col = col_letter(bucket_cols["OWC"])
+    return (
+        f"='{sheet_name}'!{twc_col}{assets_row}"
+        f"+'{sheet_name}'!{twc_col}{el_row}"
+        f"+'{sheet_name}'!{owc_col}{assets_row}"
+        f"+'{sheet_name}'!{owc_col}{el_row}"
+    )
+
+
 def main() -> None:
     cfg = resolve_config()
     input_file = cfg["input_file"]
     mapping_file = cfg["mapping_file"]
+    cf_na_l3_order_file = cfg["cf_na_l3_order_file"]
     project_name = cfg["project_name"]
     group_name = cfg["company_name"]
     fy_end_month = cfg["fy_end_month"]
@@ -277,6 +347,7 @@ def main() -> None:
     print("Working_capital —")
     print(f"  input:   {input_file}")
     print(f"  mapping: {mapping_file}")
+    print(f"  na_l3:   {cf_na_l3_order_file}")
 
     wb = load_workbook(input_file)
     if SHEET_MASTER_BS not in wb.sheetnames:
@@ -287,15 +358,15 @@ def main() -> None:
     ws = wb.create_sheet(SHEET_OUT)
 
     df_bs = pd.read_excel(input_file, sheet_name=SHEET_MASTER_BS, engine="openpyxl")
-    MONTHS = ordered_month_columns_from_df(df_bs)
-    if not MONTHS:
+    PERIODS = ordered_month_columns_from_df(df_bs)
+    if not PERIODS:
         raise ValueError("Keine Monats-Spalten im Master_BS gefunden.")
 
-    Y_COLS = list(range(POS_COL + 1, POS_COL + 1 + len(MONTHS)))
+    Y_COLS = list(range(POS_COL + 1, POS_COL + 1 + len(PERIODS)))
     source_col = resolve_source_section_column(df_bs)
     na_col = detect_na_bucket_col(df_bs)
 
-    required = {"Entity", "L2", "L3", "L4", na_col} | set(MONTHS)
+    required = {"Entity", "L2", "L3", "L4", na_col} | set(PERIODS)
     missing = required - set(df_bs.columns)
     if missing:
         raise ValueError(f"Master_BS fehlt Spalten: {missing}")
@@ -304,6 +375,9 @@ def main() -> None:
     if "L3" not in map_df.columns:
         raise ValueError("BS-Mapping muss Spalte 'L3' enthalten.")
     mapping_l3_order = l3_order_from_mapping(map_df)
+
+    na_l3_map_df = pd.read_excel(cf_na_l3_order_file, sheet_name=0, engine="openpyxl")
+    na_l3_order = load_na_l3_orders(na_l3_map_df, ["TWC", "OWC"])
 
     master_bs_ref = SHEET_MASTER_BS
     master_start = 2
@@ -318,12 +392,11 @@ def main() -> None:
     l3_rng = master_bs_range("L3")
     l4_rng = master_bs_range("L4")
     src_rng = master_bs_range(source_col) if source_col else None
-    month_rng = {m: master_bs_range(m) for m in MONTHS}
+    period_rng = {p: master_bs_range(p) for p in PERIODS}
 
-    df_pl = None
     pl_l3_rng = None
     pl_src_rng = None
-    pl_month_rng: dict[str, str] = {}
+    pl_period_rng: dict[str, str] = {}
     pl_l3_cogs = resolve_pl_l3_label(wb, "cogs")
     pl_l3_ns = resolve_pl_l3_label(wb, "net_sales")
 
@@ -341,46 +414,55 @@ def main() -> None:
 
             pl_l3_rng = master_pl_range("L3")
             pl_src_rng = master_pl_range(pl_source)
-            for m in MONTHS:
-                if m in df_pl.columns:
-                    pl_month_rng[m] = master_pl_range(m)
+            for p in PERIODS:
+                if p in df_pl.columns:
+                    pl_period_rng[p] = master_pl_range(p)
 
     row_structure = build_working_capital_row_structure(
         df_bs,
         mapping_l3_order,
-        {},
+        {"l4_sort_basis": "latest_fy"},
         source_col=source_col or na_col,
         bucket_col=na_col,
         normalize_bucket_fn=normalize_na_bucket,
+        na_l3_order=na_l3_order,
+    )
+    row_structure = prune_zero_value_rows(
+        row_structure,
+        df_bs,
+        PERIODS,
+        source_col=source_col or SOURCE_COL_CANDIDATES[0],
+        bucket_col=na_col,
     )
 
-    fy_groups = group_month_columns_by_reporting_fy(MONTHS, fy_end_month)
+    fy_groups = group_month_columns_by_reporting_fy(PERIODS, fy_end_month)
+    period_index = {p: i for i, p in enumerate(PERIODS)}
+    fy_avg_rows: list[dict] = []
     for fy_end_year, cols in fy_groups.items():
-        row_structure.append(
+        fy_avg_rows.append(
             {
                 "type": "fy_avg",
-                "label": f"Yearly average {master_fy_label(fy_end_year)}",
+                "label": f"Yearly average {yearly_average_period_label(fy_end_year, cols, PERIODS, fy_end_month)}",
                 "fy_end_year": fy_end_year,
                 "month_cols": cols,
             }
         )
 
-    row_structure.append({"type": "kpi_section", "label": "KPIs"})
-    for label, key in KPI_SPECS:
-        row_structure.append({"type": "kpi", "label": label, "kpi_key": key})
-
-    for i, r in enumerate(row_structure):
+    main_row_structure = list(row_structure)
+    for i, r in enumerate(main_row_structure):
         r["_idx"] = i
         r["_excel_row"] = DATA_START_ROW + i
 
-    LAST_TABLE_ROW = DATA_START_ROW + len(row_structure) - 1
+    LAST_TABLE_ROW = DATA_START_ROW + len(main_row_structure) - 1
     bucket_total_row: dict[str, int] = {}
     nwc_rownum: int | None = None
-    for r in row_structure:
+    for r in main_row_structure:
         if r["type"] == "total_na":
             bucket_total_row[r.get("bucket", "")] = r["_excel_row"]
         if r["type"] == "total_nwc":
             nwc_rownum = r["_excel_row"]
+
+    kpi_numerator_rows = resolve_wc_kpi_rows(main_row_structure)
 
     # Header / titles
     pt = ws.cell(PROJECT_TITLE_ROW, POS_COL, f"Project {project_name}")
@@ -392,17 +474,18 @@ def main() -> None:
     st.font = FONT_SUBTITLE
     st.alignment = ALIGN_LEFT
 
-    tt = ws.cell(TITLE_ROW, POS_COL, f"{group_name} | Working capital {MONTHS[0]} - {MONTHS[-1]}")
+    tt = ws.cell(TITLE_ROW, POS_COL, f"{group_name} | Working capital {PERIODS[0]} - {PERIODS[-1]}")
     tt.font = FONT_TITLE
     tt.alignment = ALIGN_LEFT
 
-    for hdr_col, hdr_txt in enumerate(["Reported", "", "NA", "L3", "L4"], start=MAP_START_COL):
-        ws.cell(HEADER_ROW, hdr_col, hdr_txt).font = FONT_HEADER
-
-    for c in range(MAP_START_COL, MAP_END_COL + 1):
-        ws.cell(HEADER_ROW, c).alignment = ALIGN_LEFT
-        ws.cell(HEADER_ROW, c).fill = FILL_HEADER
-        ws.cell(HEADER_ROW_7, c).fill = FILL_HEADER
+    layout = LAYOUT_NA
+    write_mapping_header_row(
+        ws,
+        layout,
+        header_row=HEADER_ROW,
+        header_row_7=HEADER_ROW_7,
+        labels=["Reported", "", "NA", "L3", "L4"],
+    )
 
     for cc in [POS_COL] + Y_COLS:
         ws.cell(HEADER_ROW_7, cc).fill = FILL_HEADER
@@ -411,26 +494,18 @@ def main() -> None:
     ws.cell(HEADER_ROW, POS_COL).alignment = ALIGN_LEFT
     ws.cell(HEADER_ROW, POS_COL).fill = FILL_HEADER
 
-    for idx, month in enumerate(MONTHS):
+    for idx, period in enumerate(PERIODS):
         cc = Y_COLS[idx]
-        h = ws.cell(HEADER_ROW, cc, month)
+        h = ws.cell(HEADER_ROW, cc, period)
         h.font = FONT_HEADER
         h.alignment = ALIGN_RIGHT
-        h.fill = FILL_PERIOD
-
-    for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
-        ws.cell(HEADER_ROW, cc).border = BOTTOM_BORDER
+        h.fill = FILL_HEADER
 
     for c in range(MAP_START_COL, MAP_END_COL + 1):
         ws.column_dimensions[col_letter(c)].width = MAP_COL_WIDTH
     ws.column_dimensions[col_letter(POS_COL)].width = POS_COL_WIDTH
     for c in Y_COLS:
         ws.column_dimensions[col_letter(c)].width = VALUE_COL_WIDTH
-
-    for c in range(MAP_START_COL, MAP_END_COL + 1):
-        ws.column_dimensions[col_letter(c)].hidden = True
-        ws.column_dimensions[col_letter(c)].outlineLevel = 1
-    ws.column_dimensions[col_letter(MAP_START_COL)].collapsed = True
 
     map_rep_col = col_letter(MAP_START_COL)
     map_na_col = col_letter(MAP_START_COL + 2)
@@ -440,77 +515,49 @@ def main() -> None:
     ws.sheet_properties.outlinePr.summaryBelow = True
     ws.sheet_properties.outlinePr.summaryRight = True
 
-    # Data rows
-    for i, r in enumerate(row_structure):
+    # WC table data rows (main table only — fy averages come after KPI block)
+    for i, r in enumerate(main_row_structure):
         excel_row = r["_excel_row"]
         ws.row_dimensions[excel_row].height = ROW_HEIGHT
         rt = r["type"]
 
-        if rt not in {"kpi_section"}:
-            ws.cell(excel_row, MAP_START_COL, "Reported").font = FONT_MAPPING
-            ws.cell(excel_row, MAP_START_COL + 1, "").font = FONT_MAPPING
-            ws.cell(excel_row, MAP_START_COL + 2, r.get("NA", "")).font = FONT_MAPPING
-            ws.cell(excel_row, MAP_START_COL + 3, r.get("L3", "")).font = FONT_MAPPING
-            ws.cell(excel_row, MAP_START_COL + 4, r.get("L4", "")).font = FONT_MAPPING
-            for c in range(MAP_START_COL, MAP_END_COL + 1):
-                ws.cell(excel_row, c).alignment = ALIGN_LEFT
+        ws.cell(excel_row, MAP_START_COL, "Reported").font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 1, "").font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 2, r.get("NA", "")).font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 3, r.get("L3", "")).font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 4, r.get("L4", "")).font = FONT_MAPPING
+        for c in range(MAP_START_COL, MAP_END_COL + 1):
+            ws.cell(excel_row, c).alignment = ALIGN_LEFT
 
         pc = ws.cell(excel_row, POS_COL, r["label"])
         pc.alignment = ALIGN_LEFT
 
         is_bold = rt in {"total_na", "total_nwc"}
-        is_kpi = rt == "kpi"
-        is_fy_avg = rt == "fy_avg"
+        pc.font = FONT_BASE_BOLD if is_bold else FONT_BASE
 
-        if rt in {"detail", "detail_single"}:
+        if rt == "detail":
             pc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
             ws.row_dimensions[excel_row].outlineLevel = 1
             ws.row_dimensions[excel_row].collapsed = True
-        elif rt == "subtotal_l3":
+        elif rt in {"detail_single", "subtotal_l3"}:
             ws.row_dimensions[excel_row].outlineLevel = 0
-        elif rt == "total_na":
-            for c in range(MAP_START_COL, Y_COLS[-1] + 1):
-                ws.cell(excel_row, c).fill = FILL_SUBTOTAL
-            pc.border = BORDER_SUBTOTAL_TOP
+        elif rt in {"total_na", "total_nwc"}:
             ws.row_dimensions[excel_row].outlineLevel = 0
-        elif rt == "total_nwc":
-            for c in range(MAP_START_COL, Y_COLS[-1] + 1):
-                ws.cell(excel_row, c).fill = FILL_SUBTOTAL
-            pc.font = FONT_BASE_BOLD
-            for cc in Y_COLS:
-                ws.cell(excel_row, cc).border = TOP_BOTTOM_BORDER
-            pc.border = TOP_BOTTOM_BORDER
-            ws.row_dimensions[excel_row].outlineLevel = 0
-        elif rt == "fy_avg":
-            pc.font = FONT_BASE
-            ws.row_dimensions[excel_row].outlineLevel = 0
-        elif rt == "kpi_section":
-            pc.font = FONT_KPI_SECTION
-            pc.fill = FILL_HEADER
-            pc.border = BORDER_KPI_SECTION
-            for cc in Y_COLS:
-                ws.cell(excel_row, cc).fill = FILL_HEADER
-                ws.cell(excel_row, cc).border = BORDER_KPI_SECTION
-        elif rt == "kpi":
-            pc.font = FONT_KPI
-            for cc in Y_COLS:
-                ws.cell(excel_row, cc).fill = FILL_KPI
-
-        pc.font = FONT_BASE_BOLD if is_bold else (FONT_KPI if is_kpi else FONT_BASE)
 
         rep_crit = f"${map_rep_col}${excel_row}"
         na_crit = f"${map_na_col}${excel_row}"
         l3_crit = f"${map_l3_col}${excel_row}"
         l4_crit = f"${map_l4_col}${excel_row}"
 
-        for m_idx, month in enumerate(MONTHS):
-            cell = ws.cell(excel_row, Y_COLS[m_idx])
+        for p_idx, period in enumerate(PERIODS):
+            cell = ws.cell(excel_row, Y_COLS[p_idx])
             cell.alignment = ALIGN_RIGHT
-            cell.number_format = NUM_FMT_KPI if is_kpi else NUM_FMT_INT
-            col_l = col_letter(Y_COLS[m_idx])
+            cell.number_format = NUM_FMT_INT
+            cell.font = FONT_BASE_BOLD if is_bold else FONT_BASE
+            col_l = col_letter(Y_COLS[p_idx])
 
             if rt in {"detail", "detail_single"}:
-                sum_rng = month_rng[month]
+                sum_rng = period_rng[period]
                 if src_rng is not None:
                     cell.value = (
                         f"=SUMIFS({sum_rng},"
@@ -528,14 +575,12 @@ def main() -> None:
                         f"{l4_rng},{l4_crit}"
                         f")/1000"
                     )
-                cell.fill = FILL_PERIOD
             elif rt == "subtotal_l3":
-                start, end = subtotal_span_for_l3(row_structure, i, r["NA"], r["label"])
+                start, end = subtotal_span_for_l3(main_row_structure, i, r["NA"], r["label"])
                 cell.value = f"=SUM({col_l}{start}:{col_l}{end})" if end >= start else 0
             elif rt == "total_na":
-                refs = bucket_l4_refs(row_structure, r["bucket"], col_l)
+                refs = bucket_l4_refs(main_row_structure, r["bucket"], col_l)
                 cell.value = f"=SUM({','.join(refs)})" if refs else 0
-                cell.border = BORDER_SUBTOTAL_TOP
             elif rt == "total_nwc":
                 twc = bucket_total_row.get("TWC")
                 owc = bucket_total_row.get("OWC")
@@ -545,106 +590,399 @@ def main() -> None:
                 if owc:
                     parts.append(f"{col_l}{owc}")
                 cell.value = f"=SUM({','.join(parts)})" if parts else 0
-                cell.border = TOP_BOTTOM_BORDER
-            elif rt == "fy_avg" and nwc_rownum:
-                if month in r.get("month_cols", []):
-                    refs = [
-                        f"{col_letter(Y_COLS[MONTHS.index(mc)])}{nwc_rownum}"
-                        for mc in r["month_cols"]
-                    ]
-                    cell.value = f"=AVERAGE({','.join(refs)})"
-                else:
-                    cell.value = ""
-            elif rt == "kpi":
-                cell.font = FONT_KPI
 
-        if rt == "subtotal_l3":
-            for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
-                ws.cell(excel_row, cc).fill = FILL_WHITE
-        elif rt in {"detail", "detail_single"}:
-            for cc in range(MAP_START_COL, MAP_END_COL + 1):
+        if rt == "total_nwc":
+            apply_subtotal_row_style(
+                ws,
+                excel_row,
+                layout=layout,
+                pos_col=POS_COL,
+                value_cols=Y_COLS,
+                fill=FILL_WHITE,
+                pos_border=TOP_BOTTOM_BORDER,
+                value_border=TOP_BOTTOM_BORDER,
+            )
+        else:
+            for cc in Y_COLS:
                 ws.cell(excel_row, cc).fill = FILL_WHITE
 
-    # PL helper rows (hidden) for KPI denominators
-    helper_start = LAST_TABLE_ROW + 2
-    cogs_row = helper_start
-    ns_row = helper_start + 1
-    for rr, label in [(cogs_row, pl_l3_cogs), (ns_row, pl_l3_ns)]:
-        ws.row_dimensions[rr].hidden = True
-        ws.row_dimensions[rr].outlineLevel = 2
+    # KPI block (after Net working capital)
+    KPI_TITLE_ROW = LAST_TABLE_ROW + 1
+    write_kpi_section_title_row(
+        ws,
+        KPI_TITLE_ROW,
+        title_cols=Y_COLS,
+        label_col=POS_COL,
+        title_text="KPIs",
+        fill_end_col=Y_COLS[-1],
+    )
+    KPI_START_ROW = LAST_TABLE_ROW + 2
+    kpi_rows_by_key: dict[str, int] = {}
+    KPI_ROWS: set[int] = set()
+
+    for i_kpi, (label, key) in enumerate(KPI_SPECS):
+        rr = KPI_START_ROW + i_kpi
+        KPI_ROWS.add(rr)
+        kpi_rows_by_key[key] = rr
+        ws.row_dimensions[rr].height = ROW_HEIGHT
+        ws.cell(rr, POS_COL, label).alignment = ALIGN_LEFT
         ws.cell(rr, POS_COL, label).font = FONT_KPI
-        ws.cell(rr, MAP_START_COL + 3, label).font = FONT_MAPPING
+        for cc in Y_COLS:
+            ws.cell(rr, cc).number_format = NUM_FMT_KPI
+            ws.cell(rr, cc).alignment = ALIGN_RIGHT
+            ws.cell(rr, cc).font = FONT_KPI
 
-    for m_idx, month in enumerate(MONTHS):
-        cc = Y_COLS[m_idx]
-        rep_cogs = f"${map_rep_col}${cogs_row}"
-        rep_ns = f"${map_rep_col}${ns_row}"
-        l3_cogs = f"${map_l3_col}${cogs_row}"
-        l3_ns = f"${map_l3_col}${ns_row}"
-        if pl_month_rng.get(month) and pl_l3_rng and pl_src_rng:
-            ws.cell(cogs_row, cc).value = (
-                f"=SUMIFS({pl_month_rng[month]},{pl_src_rng},{rep_cogs},"
+    # Yearly averages after KPI rows (KPI band formatting)
+    FY_AVG_START_ROW = KPI_START_ROW + len(KPI_SPECS)
+    FY_AVG_ROWS: set[int] = set()
+    for i_fy, r in enumerate(fy_avg_rows):
+        excel_row = FY_AVG_START_ROW + i_fy
+        FY_AVG_ROWS.add(excel_row)
+        r["_excel_row"] = excel_row
+        ws.row_dimensions[excel_row].height = ROW_HEIGHT
+        ws.row_dimensions[excel_row].outlineLevel = 0
+
+        ws.cell(excel_row, MAP_START_COL, "Reported").font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 1, "").font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 2, r.get("NA", "")).font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 3, r.get("L3", "")).font = FONT_MAPPING
+        ws.cell(excel_row, MAP_START_COL + 4, r.get("L4", "")).font = FONT_MAPPING
+        for c in range(MAP_START_COL, MAP_END_COL + 1):
+            ws.cell(excel_row, c).alignment = ALIGN_LEFT
+
+        pc = ws.cell(excel_row, POS_COL, r["label"])
+        pc.alignment = ALIGN_LEFT
+        pc.font = FONT_KPI
+
+        for p_idx, period in enumerate(PERIODS):
+            cell = ws.cell(excel_row, Y_COLS[p_idx])
+            cell.alignment = ALIGN_RIGHT
+            cell.number_format = NUM_FMT_KPI
+            cell.font = FONT_KPI
+            month_cols_fy = r.get("month_cols", [])
+            if period not in month_cols_fy or not nwc_rownum:
+                cell.value = ""
+                continue
+            refs = [
+                f"{col_letter(Y_COLS[period_index[mc]])}{nwc_rownum}"
+                for mc in month_cols_fy
+                if mc in period_index
+            ]
+            cell.value = f"=AVERAGE({','.join(refs)})" if refs else ""
+
+        ws.cell(excel_row, POS_COL).fill = FILL_KPI
+        for cc in Y_COLS:
+            ws.cell(excel_row, cc).fill = FILL_KPI
+
+    GAP_ROW = FY_AVG_START_ROW + len(fy_avg_rows)
+    COGS_HELPER_ROW = GAP_ROW + 2
+    NS_HELPER_ROW = COGS_HELPER_ROW + 1
+
+    for rr in (COGS_HELPER_ROW, NS_HELPER_ROW):
+        ws.row_dimensions[rr].outlineLevel = 2
+        ws.row_dimensions[rr].hidden = True
+
+    for rr, label in [(COGS_HELPER_ROW, pl_l3_cogs), (NS_HELPER_ROW, pl_l3_ns)]:
+        ws.cell(rr, MAP_START_COL, "Reported").font = FONT_MAPPING
+        ws.cell(rr, MAP_START_COL + 1, "").font = FONT_MAPPING
+        ws.cell(rr, MAP_START_COL + 3, label).font = FONT_MAPPING
+        ws.cell(rr, POS_COL, label).font = FONT_KPI
+        ws.cell(rr, POS_COL).alignment = ALIGN_LEFT
+        for cc in range(MAP_START_COL, Y_COLS[-1] + 1):
+            ws.cell(rr, cc).fill = FILL_WHITE
+        for cc in Y_COLS:
+            ws.cell(rr, cc).number_format = NUM_FMT_INT
+            ws.cell(rr, cc).alignment = ALIGN_RIGHT
+            ws.cell(rr, cc).font = FONT_KPI
+
+    rep_cogs = f"${map_rep_col}${COGS_HELPER_ROW}"
+    rep_ns = f"${map_rep_col}${NS_HELPER_ROW}"
+    l3_cogs = f"${map_l3_col}${COGS_HELPER_ROW}"
+    l3_ns = f"${map_l3_col}${NS_HELPER_ROW}"
+
+    for p_idx, period in enumerate(PERIODS):
+        cc = Y_COLS[p_idx]
+        if pl_period_rng.get(period) and pl_l3_rng and pl_src_rng:
+            ws.cell(COGS_HELPER_ROW, cc).value = (
+                f"=SUMIFS({pl_period_rng[period]},{pl_src_rng},{rep_cogs},"
                 f"{pl_l3_rng},{l3_cogs})/1000"
             )
-            ws.cell(ns_row, cc).value = (
-                f"=SUMIFS({pl_month_rng[month]},{pl_src_rng},{rep_ns},"
+            ws.cell(NS_HELPER_ROW, cc).value = (
+                f"=SUMIFS({pl_period_rng[period]},{pl_src_rng},{rep_ns},"
                 f"{pl_l3_rng},{l3_ns})/1000"
             )
         else:
-            ws.cell(cogs_row, cc).value = 0
-            ws.cell(ns_row, cc).value = 0
+            ws.cell(COGS_HELPER_ROW, cc).value = 0
+            ws.cell(NS_HELPER_ROW, cc).value = 0
 
-    row_inventory = find_row_by_label_contains(ws, POS_COL, "inventories")
-    row_recv = find_row_by_label_contains(ws, POS_COL, "trade receivables")
-    row_pay = find_row_by_label_contains(ws, POS_COL, "trade payables")
+    row_inventory = kpi_numerator_rows.get("dio")
+    row_recv = kpi_numerator_rows.get("dso")
+    row_pay = kpi_numerator_rows.get("dpo")
 
-    kpi_rows_by_key: dict[str, int] = {}
-    for r in row_structure:
-        if r["type"] == "kpi":
-            kpi_rows_by_key[r.get("kpi_key", "")] = r["_excel_row"]
+    for p_idx, period in enumerate(PERIODS):
+        cc = Y_COLS[p_idx]
+        col_l = col_letter(cc)
+        days = days_in_month_formula(period, fy_end_month)
+        cogs_cell = f"{col_l}{COGS_HELPER_ROW}"
+        ns_cell = f"{col_l}{NS_HELPER_ROW}"
+        inv_cell = f"{col_l}{row_inventory}" if row_inventory else None
+        recv_cell = f"{col_l}{row_recv}" if row_recv else None
+        pay_cell = f"{col_l}{row_pay}" if row_pay else None
 
-    for r in row_structure:
-        if r["type"] != "kpi":
-            continue
-        rr = r["_excel_row"]
-        key = r.get("kpi_key", "")
-        for m_idx, month in enumerate(MONTHS):
-            cc = Y_COLS[m_idx]
-            col_l = col_letter(cc)
-            days = days_in_month_formula(month)
-            cogs_cell = f"{col_l}{cogs_row}"
-            ns_cell = f"{col_l}{ns_row}"
-            inv_cell = f"{col_l}{row_inventory}" if row_inventory else None
-            recv_cell = f"{col_l}{row_recv}" if row_recv else None
-            pay_cell = f"{col_l}{row_pay}" if row_pay else None
+        if inv_cell:
+            ws.cell(kpi_rows_by_key["dio"], cc).value = (
+                f'=IFERROR(-{inv_cell}/{cogs_cell}*{days},"n/a")'
+            )
+        if recv_cell:
+            ws.cell(kpi_rows_by_key["dso"], cc).value = (
+                f'=IFERROR({recv_cell}/{ns_cell}*{days},"n/a")'
+            )
+        if pay_cell:
+            ws.cell(kpi_rows_by_key["dpo"], cc).value = (
+                f'=IFERROR({pay_cell}/{cogs_cell}*{days},"n/a")'
+            )
 
-            if key == "dio" and inv_cell:
-                ws.cell(rr, cc).value = f'=IFERROR({inv_cell}/{cogs_cell}*{days},"n/a")'
-            elif key == "dso" and recv_cell:
-                ws.cell(rr, cc).value = f'=IFERROR({recv_cell}/{ns_cell}*{days},"n/a")'
-            elif key == "dpo" and pay_cell:
-                ws.cell(rr, cc).value = f'=IFERROR({pay_cell}/{cogs_cell}*{days},"n/a")'
-            elif key == "ccc":
-                dio_r = kpi_rows_by_key.get("dio")
-                dso_r = kpi_rows_by_key.get("dso")
-                dpo_r = kpi_rows_by_key.get("dpo")
-                if dio_r and dso_r and dpo_r:
-                    ws.cell(rr, cc).value = (
-                        f'=IFERROR({col_l}{dso_r}+{col_l}{dio_r}-{col_l}{dpo_r},"n/a")'
+        dio_r = kpi_rows_by_key.get("dio")
+        dso_r = kpi_rows_by_key.get("dso")
+        dpo_r = kpi_rows_by_key.get("dpo")
+        if dio_r and dso_r and dpo_r:
+            ws.cell(kpi_rows_by_key["ccc"], cc).value = (
+                f'=IFERROR({col_l}{dso_r}+{col_l}{dio_r}-{col_l}{dpo_r},"n/a")'
+            )
+
+    check_base_row = NS_HELPER_ROW + 2
+    (
+        bs_bucket_src_row,
+        bs_bucket_sum_row,
+        bs_bucket_check_row,
+        master_src_row,
+        master_sum_row,
+        master_check_row,
+    ) = check_row_groups_after_table(check_base_row, [3, 3])
+    check_rows_to_collapse = [
+        bs_bucket_src_row,
+        bs_bucket_sum_row,
+        bs_bucket_check_row,
+        master_src_row,
+        master_sum_row,
+        master_check_row,
+    ]
+    master_periods = ordered_reporting_columns_from_df(df_bs)
+    display_periods = display_bs_period_labels(master_periods, fy_end_month)
+    master_to_display = {
+        master_periods[i]: display_periods[i] for i in range(len(master_periods))
+    }
+
+    from openpyxl.formatting.rule import CellIsRule
+
+    def _style_check_row(cell, *, red: bool = False) -> None:
+        cell.number_format = NUM_FMT_INT
+        cell.alignment = ALIGN_RIGHT
+        cell.font = FONT_CHECK_RED if red else FONT_BASE
+
+    def _style_check_delta(cell) -> None:
+        _style_check_row(cell, red=True)
+        ws.conditional_formatting.add(
+            cell.coordinate,
+            CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+        )
+
+    if SHEET_BS_BUCKET in wb.sheetnames and nwc_rownum is not None:
+        ws_bs = wb[SHEET_BS_BUCKET]
+        period_bucket_cols = detect_period_bucket_cols(ws_bs, PERIODS)
+        bs_assets_row = _find_row_in_col_any(ws_bs, POS_COL, ["Total assets"])
+        bs_el_row = _find_row_in_col_any(
+            ws_bs, POS_COL, ["Total equity & liabilities", "Total equity & liabilities "]
+        )
+        owc_total_row = bucket_total_row.get("OWC")
+        twc_total_row = bucket_total_row.get("TWC")
+        if (
+            not period_bucket_cols
+            or bs_assets_row is None
+            or bs_el_row is None
+            or owc_total_row is None
+            or twc_total_row is None
+        ):
+            print("Warnung: BS_Bucket Bucket-Checks übersprungen (Perioden/Total-Zeilen).")
+        else:
+            ws.cell(bs_bucket_src_row, POS_COL, "Source - BS_Bucket").font = FONT_BASE
+            ws.cell(bs_bucket_src_row, POS_COL).alignment = ALIGN_LEFT
+            ws.cell(bs_bucket_sum_row, POS_COL, "Sum WC").font = FONT_BASE
+            ws.cell(bs_bucket_sum_row, POS_COL).alignment = ALIGN_LEFT
+            ws.cell(bs_bucket_check_row, POS_COL, "Check").font = FONT_CHECK_RED
+            ws.cell(bs_bucket_check_row, POS_COL).alignment = ALIGN_LEFT
+            bs_yellow_cols: list[int] = []
+            for _fy_end_year, month_cols in fy_groups.items():
+                if len(month_cols) < 2:
+                    continue
+                penultimate_period = month_cols[-2]
+                last_period = month_cols[-1]
+                if penultimate_period not in period_index or last_period not in period_index:
+                    continue
+                pen_display = master_to_display.get(penultimate_period, penultimate_period)
+                last_display = master_to_display.get(last_period, last_period)
+                bucket_map_pen = period_bucket_cols.get(pen_display)
+                bucket_map_last = period_bucket_cols.get(last_display)
+                if bucket_map_pen is None or bucket_map_last is None:
+                    continue
+                owc_cc = Y_COLS[period_index[penultimate_period]]
+                twc_cc = Y_COLS[period_index[last_period]]
+                for bucket, cc, bucket_map, total_row in (
+                    ("OWC", owc_cc, bucket_map_pen, owc_total_row),
+                    ("TWC", twc_cc, bucket_map_last, twc_total_row),
+                ):
+                    src_cell = ws.cell(bs_bucket_src_row, cc)
+                    src_cell.value = _bs_bucket_bucket_source_formula(
+                        SHEET_BS_BUCKET, bucket_map, bucket, bs_assets_row, bs_el_row
                     )
+                    src_cell.fill = FILL_YELLOW
+                    _style_check_row(src_cell)
+                    bs_yellow_cols.append(cc)
+                    sum_refs = [
+                        f"{col_letter(Y_COLS[period_index[mc]])}{total_row}"
+                        for mc in month_cols
+                        if mc in period_index
+                    ]
+                    sum_cell = ws.cell(bs_bucket_sum_row, cc)
+                    sum_cell.value = f"=SUM({','.join(sum_refs)})" if sum_refs else ""
+                    _style_check_row(sum_cell)
+                    delta_cell = ws.cell(bs_bucket_check_row, cc)
+                    delta_cell.value = f"={sum_cell.coordinate}-{src_cell.coordinate}"
+                    _style_check_delta(delta_cell)
+            if bs_yellow_cols:
+                paint_check_source_yellow(ws, bs_bucket_src_row, [POS_COL, *bs_yellow_cols])
+    else:
+        print(f"Hinweis: Sheet '{SHEET_BS_BUCKET}' fehlt oder NWC-Zeile nicht gefunden — BS_Bucket-Check übersprungen.")
 
-    apply_zero_row_conditional_formatting(
-        ws,
-        first_row=DATA_START_ROW,
-        last_row=LAST_TABLE_ROW,
-        year_col_indices=Y_COLS,
-        style_start_col=POS_COL,
-        style_end_col=Y_COLS[-1],
+    if nwc_rownum is not None:
+        ws.cell(master_src_row, POS_COL, "Source - Master_BS").font = FONT_BASE
+        ws.cell(master_src_row, POS_COL).alignment = ALIGN_LEFT
+        ws.cell(master_sum_row, POS_COL, "Sum WC").font = FONT_BASE
+        ws.cell(master_sum_row, POS_COL).alignment = ALIGN_LEFT
+        ws.cell(master_check_row, POS_COL, "Check").font = FONT_CHECK_RED
+        ws.cell(master_check_row, POS_COL).alignment = ALIGN_LEFT
+        master_yellow_cols: list[int] = []
+        rep_crit = f'"{REPORTED_FILTER_VALUE}"' if src_rng else None
+        for _fy_end_year, month_cols in fy_groups.items():
+            if not month_cols:
+                continue
+            fy_master_label = yearly_average_period_label(
+                _fy_end_year, month_cols, PERIODS, fy_end_month
+            )
+            target_period = month_cols[-1]
+            if target_period not in period_index:
+                continue
+            target_cc = Y_COLS[period_index[target_period]]
+            nwc_refs = _wc_nwc_month_refs(nwc_rownum, month_cols, period_index, Y_COLS)
+            if not nwc_refs:
+                continue
+            if fy_master_label in df_bs.columns:
+                sum_rng = master_bs_range(fy_master_label)
+                if rep_crit and src_rng:
+                    src_formula = (
+                        f"=(SUMIFS({sum_rng},{na_rng},\"TWC\",{src_rng},{rep_crit})"
+                        f"+SUMIFS({sum_rng},{na_rng},\"OWC\",{src_rng},{rep_crit}))/1000"
+                    )
+                else:
+                    src_formula = (
+                        f"=(SUMIFS({sum_rng},{na_rng},\"TWC\")"
+                        f"+SUMIFS({sum_rng},{na_rng},\"OWC\"))/1000"
+                    )
+            else:
+                month_parts: list[str] = []
+                for mc in month_cols:
+                    if mc not in period_rng:
+                        continue
+                    pr = period_rng[mc]
+                    if rep_crit and src_rng:
+                        month_parts.append(
+                            f"SUMIFS({pr},{na_rng},\"TWC\",{src_rng},{rep_crit})"
+                            f"+SUMIFS({pr},{na_rng},\"OWC\",{src_rng},{rep_crit})"
+                        )
+                    else:
+                        month_parts.append(
+                            f"SUMIFS({pr},{na_rng},\"TWC\")+SUMIFS({pr},{na_rng},\"OWC\")"
+                        )
+                src_formula = (
+                    f"=({'+'.join(month_parts)})/1000" if month_parts else ""
+                )
+            if not src_formula:
+                continue
+            src_cell = ws.cell(master_src_row, target_cc)
+            src_cell.value = src_formula
+            src_cell.fill = FILL_YELLOW
+            _style_check_row(src_cell)
+            master_yellow_cols.append(target_cc)
+            sum_cell = ws.cell(master_sum_row, target_cc)
+            sum_cell.value = f"=SUM({','.join(nwc_refs)})"
+            _style_check_row(sum_cell)
+            delta_cell = ws.cell(master_check_row, target_cc)
+            delta_cell.value = f"={sum_cell.coordinate}-{src_cell.coordinate}"
+            _style_check_delta(delta_cell)
+        if master_yellow_cols:
+            paint_check_source_yellow(ws, master_src_row, [POS_COL, *master_yellow_cols])
+
+    if check_rows_to_collapse:
+        collapse_check_portfolio(ws, check_rows_to_collapse)
+
+    current_row = max(
+        NS_HELPER_ROW,
+        master_check_row if nwc_rownum else NS_HELPER_ROW,
+        bs_bucket_check_row if nwc_rownum else NS_HELPER_ROW,
     )
+
+    ws.sheet_view.showOutlineSymbols = True
+
+    FILL_END_ROW = max(LAST_TABLE_ROW, current_row, FY_AVG_START_ROW + len(fy_avg_rows)) + 100
+    FILL_END_COL = Y_COLS[-1] + 40
+
+    for rr in range(1, FILL_END_ROW + 1):
+        if rr != PROJECT_TITLE_ROW:
+            ws.row_dimensions[rr].height = ROW_HEIGHT
+
+    paint_grey_white_canvas(ws, layout, last_row=FILL_END_ROW, last_col=Y_COLS[-1])
+
+    for rr in range(1, FILL_END_ROW + 1):
+        for cc in range(POS_COL, FILL_END_COL + 1):
+            if rr in (KPI_ROWS | FY_AVG_ROWS | {KPI_TITLE_ROW}) and cc in ([POS_COL] + Y_COLS):
+                continue
+            if rr in (HEADER_ROW_7, HEADER_ROW) and cc in ([POS_COL] + Y_COLS):
+                continue
+            if ws.cell(rr, cc).fill.fill_type is None:
+                ws.cell(rr, cc).fill = FILL_WHITE
+
+    paint_header_band(
+        ws,
+        layout,
+        header_rows=[HEADER_ROW_7, HEADER_ROW],
+        period_cols=Y_COLS,
+    )
+
+    for rr in KPI_ROWS | FY_AVG_ROWS | {KPI_TITLE_ROW}:
+        ws.cell(rr, POS_COL).fill = FILL_KPI
+        for cc in Y_COLS:
+            ws.cell(rr, cc).fill = FILL_KPI
+
+    for r in main_row_structure:
+        if r["type"] != "total_nwc":
+            continue
+        excel_row = r["_excel_row"]
+        apply_subtotal_row_style(
+            ws,
+            excel_row,
+            pos_col=POS_COL,
+            value_cols=Y_COLS,
+            fill=FILL_WHITE,
+            pos_border=TOP_BOTTOM_BORDER,
+            value_border=TOP_BOTTOM_BORDER,
+        )
+
+    hide_helper_column_group(ws, layout)
 
     wb.calculation.fullCalcOnLoad = True
     wb.save(input_file)
     print(f"Saved sheet '{SHEET_OUT}' to {input_file}")
+    print(f"Monatsspalten: {len(PERIODS)} ({PERIODS[0]} … {PERIODS[-1]})")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ from databook_periods import (  # noqa: E402
 )
 from urllib.parse import quote
 
-from config import FASTAPI_BASE_URL, FILTER_OPERATORS, MONTH_NAMES
+from config import FASTAPI_BASE_URL, FILTER_OPERATORS, MONTH_NAMES, UPLOAD_BASE_DIR
 
 # Must exceed backend subprocess timeout (fdd_bot._run_script); GST with formulas often >2 min
 FDD_SCRIPT_RUN_TIMEOUT_SEC = 900
@@ -145,11 +145,32 @@ def _resolve_output_download_file(result: dict, tracker: Tracker | None = None) 
                 folders.append(expanded_slot)
 
     if session_id:
+        from databook_paths import master_workbook_filename
+
+        project_master = master_workbook_filename(
+            str(result.get("project_name") or (tracker.get_slot("project_name") if tracker else "") or "Project")
+        )
         for folder in folders:
-            for name in (f"{session_id}_SuSa_Master.xlsx", f"{session_id}_Output.xlsx"):
+            for name in (
+                project_master,
+                f"{session_id}_SuSa_Master.xlsx",
+                f"{session_id}_Output.xlsx",
+            ):
                 path = os.path.join(folder, name)
                 if os.path.isfile(path):
                     candidates.append(os.path.abspath(path))
+            try:
+                from pathlib import Path
+
+                for pattern in ("*_Master.xlsx", "*_Workbook.xlsx"):
+                    for p in sorted(
+                        Path(folder).glob(pattern),
+                        key=lambda item: item.stat().st_mtime,
+                        reverse=True,
+                    ):
+                        candidates.append(str(p.resolve()))
+            except OSError:
+                pass
 
     if not candidates:
         return None
@@ -215,6 +236,7 @@ def _start_async_revenue_script(
     """Start a revenue script asynchronously; frontend polls and shows download."""
     result = _fdd_post(f"/api/v1/fdd/run/{script_key}/async", body, timeout=30)
     if result.get("run_id"):
+        dispatcher.utter_message(text=f"Starting {script_label}…")
         dispatcher.utter_message(
             json_message={
                 "type": "adaptive_card",
@@ -445,6 +467,282 @@ _SESSION_CHURN_FLOW: dict[str, dict[str, Any]] = {}
 _SESSION_DB_LAYOUT: dict[str, str] = {}
 _SESSION_DB_ENTITY_YEAR_FILES: dict[str, list[dict[str, Any]]] = {}
 _SESSION_DB_ENTITY_NAMES: dict[str, list[str]] = {}
+_SESSION_OPOS_STATE: dict[str, dict[str, Any]] = {}
+_SESSION_FA_STATE: dict[str, dict[str, Any]] = {}
+_SESSION_FTE_STATE: dict[str, dict[str, Any]] = {}
+
+
+def _bot_flow_state_path(session_key: str) -> "Path":
+    from pathlib import Path
+
+    return Path(UPLOAD_BASE_DIR) / session_key / "fdd_bot_flow_state.json"
+
+
+def _load_bot_flow_state_file(session_key: str) -> dict[str, Any]:
+    if not session_key:
+        return {}
+    path = _bot_flow_state_path(session_key)
+    if not path.is_file():
+        return {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _persist_bot_flow_state(session_key: str, data: dict[str, Any]) -> None:
+    if not session_key:
+        return
+    path = _bot_flow_state_path(session_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _sync_flow_state_to_disk(tracker: Tracker) -> None:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return
+    data = _load_bot_flow_state_file(key)
+    if key in _SESSION_OPOS_STATE:
+        prev = data.get("opos") if isinstance(data.get("opos"), dict) else {}
+        merged = {**prev, **_SESSION_OPOS_STATE[key]}
+        _SESSION_OPOS_STATE[key] = merged
+        data["opos"] = merged
+    if key in _SESSION_FA_STATE:
+        prev = data.get("fa") if isinstance(data.get("fa"), dict) else {}
+        merged = {**prev, **_SESSION_FA_STATE[key]}
+        _SESSION_FA_STATE[key] = merged
+        data["fa"] = merged
+    if key in _SESSION_FTE_STATE:
+        prev = data.get("fte") if isinstance(data.get("fte"), dict) else {}
+        merged = {**prev, **_SESSION_FTE_STATE[key]}
+        _SESSION_FTE_STATE[key] = merged
+        data["fte"] = merged
+    _persist_bot_flow_state(key, data)
+
+
+def _opos_state(tracker: Tracker) -> dict[str, Any]:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return {}
+    if key not in _SESSION_OPOS_STATE:
+        cached = _load_bot_flow_state_file(key).get("opos")
+        _SESSION_OPOS_STATE[key] = dict(cached) if isinstance(cached, dict) else {}
+    return _SESSION_OPOS_STATE.setdefault(key, {})
+
+
+def _fa_state(tracker: Tracker) -> dict[str, Any]:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return {}
+    if key not in _SESSION_FA_STATE:
+        cached = _load_bot_flow_state_file(key).get("fa")
+        _SESSION_FA_STATE[key] = dict(cached) if isinstance(cached, dict) else {}
+    return _SESSION_FA_STATE.setdefault(key, {})
+
+
+def _fte_state(tracker: Tracker) -> dict[str, Any]:
+    key = _sender_cache_key(tracker)
+    if not key:
+        return {}
+    if key not in _SESSION_FTE_STATE:
+        cached = _load_bot_flow_state_file(key).get("fte")
+        _SESSION_FTE_STATE[key] = dict(cached) if isinstance(cached, dict) else {}
+    return _SESSION_FTE_STATE.setdefault(key, {})
+
+
+def _opos_is_dual_snapshot_format(raw: list) -> bool:
+    return bool(raw) and isinstance(raw[0], dict) and "debitor" in raw[0] and "kreditor" in raw[0]
+
+
+def _opos_side_snapshots_from_stored(raw: list, side: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        as_of = str(item.get("as_of") or "").strip()
+        if not as_of:
+            continue
+        if _opos_is_dual_snapshot_format(raw):
+            block = item.get(side) if isinstance(item.get(side), dict) else {}
+            out.append(
+                {
+                    "as_of": as_of,
+                    "file_id": str(block.get("file_id") or "").strip(),
+                    "file_path": str(block.get("file_path") or "").strip(),
+                    "sheet_name": str(block.get("sheet_name") or "").strip(),
+                }
+            )
+        else:
+            out.append(
+                {
+                    "as_of": as_of,
+                    "file_id": str(item.get("file_id") or "").strip(),
+                    "file_path": str(item.get("file_path") or "").strip(),
+                    "sheet_name": str(item.get("sheet_name") or "").strip(),
+                }
+            )
+    return out
+
+
+def _opos_snapshots_from_sources(tracker: Tracker) -> list[dict[str, Any]]:
+    cached = _opos_state(tracker).get("snapshots")
+    if isinstance(cached, list) and cached:
+        return [r for r in cached if isinstance(r, dict)]
+    raw = tracker.get_slot("opos_snapshots_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [r for r in parsed if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _fa_periods_from_sources(tracker: Tracker) -> list[dict[str, Any]]:
+    cached = _fa_state(tracker).get("periods")
+    if isinstance(cached, list) and cached:
+        return [r for r in cached if isinstance(r, dict)]
+    raw = tracker.get_slot("fa_periods_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [r for r in parsed if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _fte_periods_from_sources(tracker: Tracker) -> list[dict[str, Any]]:
+    cached = _fte_state(tracker).get("periods")
+    if isinstance(cached, list) and cached:
+        return [r for r in cached if isinstance(r, dict)]
+    raw = tracker.get_slot("fte_periods_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [r for r in parsed if isinstance(r, dict)]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def _opos_columns_from_sources(tracker: Tracker, payload: dict | None = None) -> dict[str, str]:
+    st = _opos_state(tracker)
+    out: dict[str, str] = {}
+    cached = st.get("columns")
+    if isinstance(cached, dict):
+        for k, v in cached.items():
+            text = str(v or "").strip()
+            if text:
+                out[str(k)] = text
+    p = payload or {}
+    for key, slot in (
+        ("partner_id", "opos_partner_id_col"),
+        ("partner_name", "opos_partner_name_col"),
+        ("amount", "opos_amount_col"),
+        ("due_date", "opos_due_date_col"),
+    ):
+        raw = p.get(slot)
+        if raw in (None, ""):
+            raw = tracker.get_slot(slot)
+        text = str(raw or "").strip()
+        if text:
+            out[key] = text
+    pid = str(p.get("opos_partner_col") or p.get("opos_partner_id_col") or tracker.get_slot("opos_partner_id_col") or "").strip()
+    if pid and "partner_id" not in out:
+        out["partner_id"] = pid
+    if pid and "partner_name" not in out:
+        out["partner_name"] = str(p.get("opos_partner_name_col") or tracker.get_slot("opos_partner_name_col") or pid).strip() or pid
+    return out
+
+
+def _fa_dep_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    st = _fa_state(tracker)
+    cached = st.get("depreciation_cols")
+    if isinstance(cached, list) and cached:
+        return [str(c).strip() for c in cached if str(c).strip()]
+    p = payload or {}
+    raw_dep = p.get("fa_depreciation_cols_json", st.get("depreciation_cols_json") or tracker.get_slot("fa_depreciation_cols_json") or "[]")
+    if isinstance(raw_dep, list):
+        return [str(c).strip() for c in raw_dep if str(c).strip()]
+    try:
+        parsed = json.loads(str(raw_dep or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        parsed = []
+    return [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+
+
+def _fa_columns_from_sources(tracker: Tracker, payload: dict | None = None) -> dict[str, Any]:
+    st = _fa_state(tracker)
+    out: dict[str, Any] = {}
+    cached = st.get("columns")
+    if isinstance(cached, dict):
+        out.update(cached)
+    p = payload or {}
+    for slot, key in (
+        ("fa_opening_col", "opening"),
+        ("fa_additions_col", "additions"),
+        ("fa_disposals_col", "disposals"),
+    ):
+        raw = p.get(slot)
+        if raw in (None, ""):
+            raw = tracker.get_slot(slot)
+        text = str(raw or "").strip()
+        if text:
+            out[key] = text
+    dep_cols = _fa_dep_cols_from_sources(tracker, p)
+    if dep_cols:
+        out["depreciation_cols"] = dep_cols
+    return out
+
+
+def _fte_payroll_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    st = _fte_state(tracker)
+    cached = st.get("columns")
+    if isinstance(cached, dict):
+        pay = cached.get("payroll_cols")
+        if isinstance(pay, list) and pay:
+            return [str(c).strip() for c in pay if str(c).strip()]
+    p = payload or {}
+    raw = p.get("fte_payroll_cols_json", tracker.get_slot("fte_payroll_cols_json") or "[]")
+    if isinstance(raw, list):
+        return [str(c).strip() for c in raw if str(c).strip()]
+    try:
+        parsed = json.loads(str(raw or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        parsed = []
+    return [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+
+
+def _fte_columns_from_sources(tracker: Tracker, payload: dict | None = None) -> dict[str, Any]:
+    st = _fte_state(tracker)
+    out: dict[str, Any] = {}
+    cached = st.get("columns")
+    if isinstance(cached, dict):
+        out.update(cached)
+    p = payload or {}
+    for slot, key in (
+        ("fte_employment_col", "employment"),
+        ("fte_months_col", "months_sum"),
+    ):
+        raw = p.get(slot)
+        if raw in (None, ""):
+            raw = tracker.get_slot(slot)
+        text = str(raw or "").strip()
+        if text:
+            out[key] = text
+    pay_cols = _fte_payroll_cols_from_sources(tracker, p)
+    if pay_cols:
+        out["payroll_cols"] = pay_cols
+    return out
 
 
 def _remember_databook_layout(tracker: Tracker, layout: Any) -> None:
@@ -537,17 +835,121 @@ def _headers_from_sources(tracker: Tracker, payload: dict | None = None) -> list
         sheet_name = str(payload.get("sheet_name") or "").strip()
     if not file_id:
         return []
+    return _headers_for_period_file(tracker, file_id, sheet_name)
+
+
+def _headers_for_period_file(
+    tracker: Tracker,
+    file_id: str,
+    sheet_name: str = "",
+) -> list[str]:
+    """Fetch column headers for a specific uploaded file (not session cache)."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return []
     session_id = str(_fdd_session_id(tracker) or "").strip()
-    if isinstance(payload, dict) and payload.get("session_id"):
-        session_id = str(payload.get("session_id") or "").strip()
     params: dict[str, str] = {"session_id": session_id}
     if sheet_name:
         params["sheet_name"] = sheet_name
-    result = _fdd_get(f"/api/v1/fdd/headers/{file_id}", params)
-    headers = _normalize_header_list(result.get("headers"))
-    if headers:
-        _remember_session_headers(tracker, headers)
-    return headers
+    result = _fdd_get(f"/api/v1/fdd/headers/{fid}", params)
+    return _normalize_header_list(result.get("headers"))
+
+
+def _normalize_header_key(name: str) -> str:
+    import re
+
+    s = str(name).replace("\u00a0", " ").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _headers_intersection_for_periods(
+    tracker: Tracker,
+    periods: list[dict[str, Any]],
+) -> list[str]:
+    """Column headers present in every period file (preserving order from first file)."""
+    if not periods:
+        return []
+    per_file: list[list[str]] = []
+    for period in periods:
+        fid = str(period.get("file_id") or "").strip()
+        if not fid:
+            continue
+        sheet = str(period.get("sheet_name") or "").strip()
+        headers = _headers_for_period_file(tracker, fid, sheet)
+        if headers:
+            per_file.append(headers)
+    if not per_file:
+        return []
+    common = {_normalize_header_key(h) for h in per_file[0]}
+    for hdrs in per_file[1:]:
+        common &= {_normalize_header_key(h) for h in hdrs}
+    return [h for h in per_file[0] if _normalize_header_key(h) in common]
+
+
+def _headers_union_for_periods(
+    tracker: Tracker,
+    periods: list[dict[str, Any]],
+) -> list[str]:
+    """All column headers across period files (first-seen order)."""
+    if not periods:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for period in periods:
+        fid = str(period.get("file_id") or "").strip()
+        if not fid:
+            continue
+        sheet = str(period.get("sheet_name") or "").strip()
+        for header in _headers_for_period_file(tracker, fid, sheet):
+            key = _normalize_header_key(header)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(header)
+    return out
+
+
+def _resolve_header_names(headers: list[str], names: list[str]) -> list[str] | None:
+    """Map config labels to header strings (nbsp/case tolerant, like resolve_column_names_to_df)."""
+    col_map = {
+        _normalize_header_key(str(h)): str(h).replace("\u00a0", " ").strip() for h in headers
+    }
+    resolved: list[str] = []
+    for raw in names:
+        key = _normalize_header_key(str(raw).replace("\u00a0", " "))
+        if key not in col_map:
+            return None
+        resolved.append(col_map[key])
+    return resolved
+
+
+def _validate_group_cols_in_periods(
+    tracker: Tracker,
+    periods: list[dict[str, Any]],
+    group_cols: list[str],
+) -> str | None:
+    """Return an error message if any grouping column is missing from a period file."""
+    if not group_cols:
+        return None
+    for period in periods:
+        fid = str(period.get("file_id") or "").strip()
+        sheet = str(period.get("sheet_name") or "").strip()
+        label = str(period.get("label") or fid or "period").strip()
+        if not fid:
+            continue
+        headers = _headers_for_period_file(tracker, fid, sheet)
+        if _resolve_header_names(headers, group_cols) is None:
+            missing = [
+                col
+                for col in group_cols
+                if _resolve_header_names(headers, [col]) is None
+            ]
+            col_label = missing[0] if missing else group_cols[0]
+            return (
+                f"Column '{col_label}' was not found in the register file for {label}. "
+                "Please choose grouping columns that exist in all uploaded period files."
+            )
+    return None
 
 
 def _slot_int_first_hit(tracker: Tracker, keys: tuple[str, ...], default: int = 2020) -> int:
@@ -809,9 +1211,16 @@ def _resolve_filter_context(tracker: Tracker) -> str:
     chain (Rasa tracker persistence); `desired_output` stays set — use it as fallback.
     """
     raw = tracker.get_slot("active_filter_context")
-    if raw in ("gst", "pvm", "top", "bs", "churn", "fa", "opos"):
+    if raw in ("gst", "pvm", "top", "bs", "churn", "opos", "fa", "fte"):
         return str(raw)
     desired = str(tracker.get_slot("desired_output") or "").strip()
+    output_type = str(tracker.get_slot("output_type") or "").strip()
+    if output_type == "creditor_debitor_aging":
+        return "opos"
+    if output_type == "fixed_assets_rollforward":
+        return "fa"
+    if output_type == "fte_development":
+        return "fte"
     return {
         "general_sales_table": "gst",
         "pvm_analysis": "pvm",
@@ -819,6 +1228,7 @@ def _resolve_filter_context(tracker: Tracker) -> str:
         "bubble_scatter": "bs",
         "churn": "churn",
         "fixed_assets_rollforward": "fa",
+        "fte_development": "fte",
     }.get(desired, "gst")
 
 
@@ -876,6 +1286,44 @@ def _parse_payload(tracker: Tracker) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except (json.JSONDecodeError, TypeError):
         return {}
+
+
+def _inline_action(action: Action, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list[Any]:
+    """Run an action in-process — avoids FollowupAction when the model lacks that action."""
+    return action.run(dispatcher, tracker, domain)
+
+
+def _inline_run_after_filter(
+    tracker: Tracker,
+    dispatcher: CollectingDispatcher,
+    domain: dict,
+    *,
+    run_action: Action,
+    pending_slot: str,
+) -> list[Any]:
+    events: list[Any] = []
+    if str(tracker.get_slot(pending_slot) or "").strip().lower() == "filters":
+        events.append(SlotSet(pending_slot, ""))
+    events.extend(run_action.run(dispatcher, tracker, domain))
+    return events
+
+
+def _enter_strand_run_target(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+    script_key: str,
+    *,
+    pending_slot: str | None = None,
+) -> list[Any]:
+    """Show master vs separate workbook card immediately before a strand script run."""
+    key = str(script_key or "").strip().lower()
+    if key not in STRAND_RUN_META:
+        key = "opos"
+    events: list[Any] = [SlotSet("strand_run_script", key)]
+    if pending_slot and str(tracker.get_slot(pending_slot) or "").strip().lower() == "filters":
+        events.append(SlotSet(pending_slot, ""))
+    dispatcher.utter_message(json_message=_strand_run_target_card(tracker, key))
+    return events
 
 
 def _get_headers_card(headers: list[str], slots_to_fill: list[dict]) -> dict:
@@ -1692,6 +2140,10 @@ def _fdd_post(path: str, body: dict, timeout: int = FDD_SCRIPT_RUN_TIMEOUT_SEC) 
                     detail_msg = json.dumps(detail, ensure_ascii=False)[:500]
                 elif isinstance(detail, dict):
                     detail_msg = detail.get("message") or json.dumps(detail, ensure_ascii=False)[:500]
+                    out: dict[str, Any] = {"success": False, "message": f"{exc} — {detail_msg}"}
+                    if detail.get("errors"):
+                        out["errors"] = detail["errors"]
+                    return out
                 elif isinstance(detail, str):
                     detail_msg = detail
             except (ValueError, TypeError):
@@ -1931,15 +2383,25 @@ class ActionDispatchCard(Action):
             "opos_snapshots": ActionProcessOposSnapshots(),
             "opos_columns": ActionProcessOposColumns(),
             "opos_missing_due_date": ActionProcessOposMissingDueDate(),
+            "opos_display_buckets": ActionProcessOposDisplayBuckets(),
             "opos_sort": ActionProcessOposSort(),
             "opos_buckets": ActionProcessOposBuckets(),
+            "opos_top_bucket": ActionProcessOposBuckets(),
             "opos_filter_checkpoint": ActionProcessOposFilterCheckpoint(),
+            "opos_post_output": ActionProcessOposPostOutput(),
+            "strand_post_output": ActionProcessStrandPostOutput(),
             "opos_proceed": ActionRunOpos(),
             # Fixed assets rollforward
             "fa_rollf_files": ActionProcessFaRollfFiles(),
             "fa_rollf_columns": ActionProcessFaRollfColumns(),
             "fa_rollf_grouping": ActionProcessFaRollfGrouping(),
             "fa_filter_checkpoint": ActionProcessFaFilterCheckpoint(),
+            # FTE
+            "fte_files": ActionProcessFteFiles(),
+            "fte_columns": ActionProcessFteColumns(),
+            "fte_grouping": ActionProcessFteGrouping(),
+            "fte_filter_checkpoint": ActionProcessFteFilterCheckpoint(),
+            "strand_run_target": ActionProcessStrandRunTarget(),
             # Filters
             "filter_start": ActionStartFilter(),
             "filter_rule": ActionProcessFilterRule(),
@@ -1950,6 +2412,7 @@ class ActionDispatchCard(Action):
             "coming_soon": ActionProcessComingSoon(),
             # Databook
             "databook_susa_format": ActionProcessDatabookSusaFormat(),
+            "databook_master_upload": ActionProcessDatabookMasterUpload(),
             "databook_entity_count": ActionProcessDatabookEntityCount(),
             "databook_entities": ActionProcessDatabookEntities(),
             "databook_susa_options": ActionProcessDatabookSusaInterpretation(),
@@ -1961,10 +2424,14 @@ class ActionDispatchCard(Action):
             "databook_adjustments": ActionProcessDatabookAdjustments(),
             "databook_adjustments_upload": ActionProcessDatabookAdjustmentsUpload(),
             "databook_l4_sort": ActionProcessDatabookL4Sort(),
+            "databook_fs_extract_choice": ActionProcessDatabookFsExtractChoice(),
+            "databook_fs_extract_placeholder": ActionProcessDatabookFsExtractPlaceholder(),
             "databook_fs_upload": ActionProcessDatabookFsUpload(),
             "databook_fs_review_upload": ActionProcessDatabookFsReviewUpload(),
             "databook_recon_order": ActionProcessDatabookReconOrder(),
             "databook_recon_labels": ActionProcessDatabookReconLabels(),
+            "databook_extended_tables": ActionProcessDatabookExtendedTables(),
+            "databook_master_next_action": ActionProcessDatabookMasterNextAction(),
             "databook_sort": ActionProcessDatabookSort(),
             "databook_proceed": ActionRunDatabookFinal(),
         }
@@ -2099,6 +2566,11 @@ def _undo_redo_handlers() -> dict[str, Any]:
         "action_reshow_opos_columns": ActionReshowOposColumns(),
         "action_enter_opos_filter_checkpoint": ActionEnterOposFilterCheckpoint(),
         "action_show_opos_review": ActionShowOposReview(),
+        "action_show_fte_files": ActionShowFteFiles(),
+        "action_reshow_fte_columns": ActionReshowFteColumns(),
+        "action_show_fte_grouping": ActionShowFteGrouping(),
+        "action_enter_fte_filter_checkpoint": ActionEnterFteFilterCheckpoint(),
+        "action_enter_strand_run_target": ActionEnterStrandRunTarget(),
     }
     return _UNDO_REDO_HANDLERS
 
@@ -2318,16 +2790,8 @@ class ActionProcessBuildDatabook(Action):
             dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
             return [SlotSet("output_type", "fixed_assets_rollforward")]
         elif output_type == "fte_development":
-            dispatcher.utter_message(
-                json_message={
-                    "type": "adaptive_card",
-                    "card": "coming_soon",
-                    "title": "FTE Development",
-                    "subtitle": "This output type is coming soon. Please check back later.",
-                    "inputs": [],
-                    "submit_label": "Back",
-                }
-            )
+            dispatcher.utter_message(text="Great! Let's configure FTE Development.")
+            dispatcher.utter_message(json_message=_fte_files_card(tracker))
             return [SlotSet("output_type", "fte_development")]
         else:
             dispatcher.utter_message(text=f"Unknown output type '{output_type}'. Please try again.")
@@ -2601,7 +3065,6 @@ class ActionProcessFxCard(Action):
                                 {"label": "General Sales Table", "value": "general_sales_table"},
                                 {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
-                                {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
                             ],
                         }
                     ],
@@ -2660,10 +3123,6 @@ class ActionProcessDesiredOutput(Action):
                     },
                 )
             )
-        elif desired == "fixed_assets_rollforward":
-            dispatcher.utter_message(text="Great! Let's configure the Fixed Assets Rollforward.")
-            dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
-            events.append(SlotSet("output_type", "fixed_assets_rollforward"))
 
         return events
 
@@ -3824,12 +4283,52 @@ def _parse_list(val: Any, fallback: list) -> list:
         return fallback
     if isinstance(val, list):
         return val
+    s = str(val).strip()
+    if not s:
+        return fallback
     try:
         import ast
-        parsed = ast.literal_eval(str(val))
-        return parsed if isinstance(parsed, list) else fallback
+
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, list):
+            return parsed
     except Exception:
-        return fallback
+        pass
+    if "," in s:
+        out: list[Any] = []
+        for part in s.split(","):
+            part = part.strip().strip("[]")
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except ValueError:
+                try:
+                    out.append(float(part))
+                except ValueError:
+                    out.append(part)
+        if out:
+            return out
+    if ";" in s:
+        out = []
+        for part in s.split(";"):
+            part = part.strip().strip("[]")
+            if not part:
+                continue
+            try:
+                out.append(int(part))
+            except ValueError:
+                try:
+                    out.append(float(part))
+                except ValueError:
+                    out.append(part)
+        if out:
+            return out
+    try:
+        return [int(s)]
+    except ValueError:
+        pass
+    return fallback
 
 
 def _top_filters_payload(rules_json: str | None) -> dict:
@@ -5610,6 +6109,15 @@ def _fa_periods_from_grid(groups: dict[str, list[str]], tracker: Tracker) -> lis
 
 def _fa_mapped_column_names(tracker: Tracker) -> set[str]:
     names: set[str] = set()
+    cols = _fa_columns_from_sources(tracker)
+    for key in ("opening", "additions", "disposals"):
+        v = str(cols.get(key) or "").strip()
+        if v:
+            names.add(v)
+    for c in cols.get("depreciation_cols") or []:
+        s = str(c).strip()
+        if s:
+            names.add(s)
     for slot in ("fa_opening_col", "fa_additions_col", "fa_disposals_col"):
         v = str(tracker.get_slot(slot) or "").strip()
         if v:
@@ -5630,13 +6138,18 @@ def _fa_mapped_column_names(tracker: Tracker) -> set[str]:
     return names
 
 
-def _emit_fa_rollf_columns_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
-    periods = json.loads(tracker.get_slot("fa_periods_json") or "[]")
+def _emit_fa_rollf_columns_card(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+    periods: list[dict[str, Any]] | None = None,
+) -> None:
+    if periods is None:
+        periods = _fa_periods_from_sources(tracker)
     preview_id = ""
     preview_sheet = ""
     if periods:
         preview_id = str(periods[0].get("file_id") or tracker.get_slot("file_id") or "")
-        preview_sheet = str(periods[0].get("sheet_name") or tracker.get_slot("sheet_name") or "")
+        preview_sheet = str(periods[0].get("sheet_name") or "").strip()
     dispatcher.utter_message(
         json_message={
             "type": "adaptive_card",
@@ -5660,7 +6173,10 @@ def _emit_fa_rollf_columns_card(dispatcher: CollectingDispatcher, tracker: Track
 
 
 def _emit_fa_rollf_grouping_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
-    headers = _headers_from_sources(tracker)
+    periods = _fa_periods_from_sources(tracker)
+    headers = _headers_union_for_periods(tracker, periods) if periods else []
+    if not headers:
+        headers = _headers_from_sources(tracker)
     mapped = _fa_mapped_column_names(tracker)
     dim_opts = [{"label": "None", "value": ""}] + [{"label": h, "value": h} for h in headers if h and h not in mapped]
     inputs: list[dict[str, Any]] = [
@@ -5677,6 +6193,7 @@ def _emit_fa_rollf_grouping_card(dispatcher: CollectingDispatcher, tracker: Trac
             "label": "Grouping — level 2 (optional, e.g. Anlagenklasse)",
             "options": dim_opts,
             "default": str(tracker.get_slot("fa_group_col_2") or ""),
+            "required": False,
         },
     ]
     dispatcher.utter_message(
@@ -5692,6 +6209,10 @@ def _emit_fa_rollf_grouping_card(dispatcher: CollectingDispatcher, tracker: Trac
 
 
 def _fa_group_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    st = _fa_state(tracker)
+    cached = st.get("group_cols")
+    if isinstance(cached, list) and cached:
+        return [str(c).strip() for c in cached if str(c).strip()]
     p = payload or {}
     cols: list[str] = []
     for i in range(1, FA_MAX_GROUP_LEVELS + 1):
@@ -5725,8 +6246,14 @@ class ActionProcessFaRollfFiles(Action):
             dispatcher.utter_message(text="Please upload at least one period file in the grid.")
             dispatcher.utter_message(json_message=_fa_rollf_files_card(tracker))
             return []
-        events = [SlotSet("fa_periods_json", json.dumps(periods, ensure_ascii=False))]
-        _emit_fa_rollf_columns_card(dispatcher, tracker)
+        first_id = periods[0]["file_id"]
+        _fa_state(tracker)["periods"] = periods
+        _sync_flow_state_to_disk(tracker)
+        events: list[Any] = [
+            SlotSet("fa_periods_json", json.dumps(periods, ensure_ascii=False)),
+            SlotSet("file_id", first_id),
+        ]
+        _emit_fa_rollf_columns_card(dispatcher, tracker, periods)
         return events
 
 
@@ -5770,6 +6297,13 @@ class ActionProcessFaRollfColumns(Action):
             return []
 
         events.append(SlotSet("fa_depreciation_cols_json", json.dumps(dep_cols, ensure_ascii=False)))
+        _fa_state(tracker)["columns"] = {
+            "opening": str(payload.get("fa_opening_col") or "").strip(),
+            "additions": str(payload.get("fa_additions_col") or "").strip(),
+            "disposals": str(payload.get("fa_disposals_col") or "").strip(),
+            "depreciation_cols": dep_cols,
+        }
+        _sync_flow_state_to_disk(tracker)
         _emit_fa_rollf_grouping_card(dispatcher, tracker)
         return events
 
@@ -5799,7 +6333,10 @@ class ActionProcessFaRollfGrouping(Action):
             dispatcher.utter_message(text="Level 1 and level 2 must be different columns.")
             _emit_fa_rollf_grouping_card(dispatcher, tracker)
             return events
-        return events + [FollowupAction("action_enter_fa_filter_checkpoint")]
+        _fa_state(tracker)["group_cols"] = group_cols
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_fa_filter_checkpoint_card(tracker))
+        return events
 
 
 def _fa_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
@@ -5850,13 +6387,437 @@ class ActionProcessFaFilterCheckpoint(Action):
         if choice == "add_rule":
             return [SlotSet("active_filter_context", "fa"), FollowupAction("action_start_filter")]
         if choice == "keep":
-            return [FollowupAction("action_run_fa_rollf")]
+            return _enter_strand_run_target(
+                dispatcher, tracker, "fa", pending_slot="fa_pending_rerun"
+            )
         return [FollowupAction("action_enter_fa_filter_checkpoint")]
 
 
 class ActionRunFaRollf(Action):
     def name(self) -> str:
         return "action_run_fa_rollf"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+
+        periods = _fa_periods_from_sources(tracker)
+        if not periods:
+            dispatcher.utter_message(text="Fixed assets period files missing — please upload register files first.")
+            return _inline_action(ActionShowFaRollfFiles(), dispatcher, tracker, domain)
+
+        cols = _fa_columns_from_sources(tracker, payload)
+        dep_cols = cols.get("depreciation_cols") or _fa_dep_cols_from_sources(tracker, payload)
+        if not dep_cols:
+            dispatcher.utter_message(text="Depreciation columns missing — please map columns first.")
+            return _inline_action(ActionReshowFaRollfColumns(), dispatcher, tracker, domain)
+
+        group_cols = _fa_group_cols_from_sources(tracker, payload)
+        col_err = _validate_group_cols_in_periods(tracker, periods, group_cols)
+        if col_err:
+            dispatcher.utter_message(text=col_err)
+            _emit_fa_rollf_grouping_card(dispatcher, tracker)
+            return []
+
+        fy_m, fy_d = _fy_end_month_day_from_tracker({}, tracker)
+        workbook_fields = _strand_workbook_fields(tracker, suffix="FA_Rollf")
+        fa_cfg: dict[str, Any] = {
+            "title": tracker.get_slot("project_name") or payload.get("project_name") or "",
+            "company": tracker.get_slot("group_name") or payload.get("group_name") or "",
+            "first_fy": _tracker_first_fy_int(tracker),
+            "fy_end_month": fy_m,
+            "fy_end_day": fy_d,
+            "periods": periods,
+            "header_row": 0,
+            "columns": {
+                "opening": cols.get("opening") or "",
+                "additions": cols.get("additions") or "",
+                "disposals": cols.get("disposals") or "",
+                "depreciation_cols": dep_cols,
+            },
+            "group_cols": group_cols,
+            "filters": _fdd_filters_payload(
+                tracker.get_slot("fa_filter_rules_json") or _fa_state(tracker).get("filter_rules_json") or "[]"
+            ),
+            "unit_label": "kEUR",
+            "amount_scale": 1000,
+            "output_file_path": tracker.get_slot("output_folder") or "",
+            **workbook_fields,
+        }
+        if not workbook_fields.get("use_separate_workbook"):
+            master = (
+                tracker.get_slot("db_master_workbook_path")
+                or _session_output_workbook_path(tracker)
+                or ""
+            )
+            if master:
+                fa_cfg["output_workbook_path"] = master
+                fa_cfg["db_master_workbook_path"] = master
+                fa_cfg["master_workbook_path"] = master
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "file_id": periods[0].get("file_id") or tracker.get_slot("file_id"),
+            "config": fa_cfg,
+        }
+        _start_async_revenue_script(dispatcher, body, "fixed_assets_rollf", "Fixed Assets Rollforward")
+        return [SlotSet("output_type", "fixed_assets_rollforward")]
+
+
+# ─── FTE & Payroll flow ───────────────────────────────────────────────────────
+
+FTE_MAX_GROUP_LEVELS = 2
+
+
+def _fte_files_card(tracker: Tracker) -> dict[str, Any]:
+    grid_options = _databook_grid_options(tracker)
+    has_ytd = any(is_ytd_grid_label(y) for y in _compute_databook_period_labels(tracker))
+    note = "One personnel table (.xlsx) per fiscal year."
+    if has_ytd:
+        note += " YTD column is optional."
+    return {
+        "type": "adaptive_card",
+        "card": "fte_files",
+        "title": "FTE Development — Personnel files",
+        "subtitle": "Upload your personnel / payroll table for each period.",
+        "inputs": [
+            {
+                "id": "susa_files",
+                "type": "susa_grid",
+                "label": "Personnel files",
+                "options": grid_options,
+                "entity_count": 1,
+                "grid_mode": "single_file",
+                "fixed_entity_name": "FTE",
+            }
+        ],
+        "susa_grid_note": note,
+        "submit_label": "Continue",
+    }
+
+
+def _fte_periods_from_grid(groups: dict[str, list[str]], tracker: Tracker) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for key, ids in groups.items():
+        if not ids:
+            continue
+        parts = str(key).split("_")
+        if len(parts) < 3 or parts[0] != "entity":
+            continue
+        fy_label = "_".join(parts[2:])
+        rows.append({"label": fy_label, "file_id": str(ids[0])})
+    order = {label: i for i, label in enumerate(_compute_databook_period_labels(tracker))}
+    rows.sort(key=lambda r: order.get(r["label"], 999))
+    return rows
+
+
+def _fte_mapped_column_names(tracker: Tracker) -> set[str]:
+    names: set[str] = set()
+    cols = _fte_columns_from_sources(tracker)
+    for key in ("employment", "months_sum"):
+        v = str(cols.get(key) or "").strip()
+        if v:
+            names.add(v)
+    for c in cols.get("payroll_cols") or []:
+        s = str(c).strip()
+        if s:
+            names.add(s)
+    for slot in ("fte_employment_col", "fte_months_col"):
+        v = str(tracker.get_slot(slot) or "").strip()
+        if v:
+            names.add(v)
+    raw = tracker.get_slot("fte_payroll_cols_json") or "[]"
+    try:
+        pay_cols = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pay_cols = []
+    if isinstance(pay_cols, list):
+        for c in pay_cols:
+            s = str(c).strip()
+            if s:
+                names.add(s)
+    return names
+
+
+def _emit_fte_columns_card(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+    periods: list[dict[str, Any]] | None = None,
+) -> None:
+    if periods is None:
+        try:
+            periods = json.loads(tracker.get_slot("fte_periods_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            periods = []
+    preview_id = ""
+    preview_sheet = ""
+    if periods:
+        preview_id = str(periods[0].get("file_id") or tracker.get_slot("file_id") or "")
+        preview_sheet = str(periods[0].get("sheet_name") or "").strip()
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "fte_columns",
+            "wide": True,
+            "title": "Map personnel columns",
+            "subtitle": (
+                "Click a column for employment rate and annual working time (months). "
+                "Then click every payroll column to include in the total and confirm."
+            ),
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": preview_id,
+                "sheet_name": preview_sheet,
+                "header_row": 0,
+                "fte_periods_json": tracker.get_slot("fte_periods_json") or "[]",
+            },
+            "inputs": [],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _emit_fte_grouping_card(dispatcher: CollectingDispatcher, tracker: Tracker) -> None:
+    periods = _fte_periods_from_sources(tracker)
+    headers = _headers_union_for_periods(tracker, periods) if periods else []
+    if not headers:
+        headers = _headers_from_sources(tracker)
+    mapped = _fte_mapped_column_names(tracker)
+    dim_opts = [{"label": "None", "value": ""}] + [
+        {"label": h, "value": h} for h in headers if h and h not in mapped
+    ]
+    inputs: list[dict[str, Any]] = [
+        {
+            "id": "fte_group_col_1",
+            "type": "dropdown",
+            "label": "Grouping — level 1 (required)",
+            "options": dim_opts,
+            "default": str(tracker.get_slot("fte_group_col_1") or ""),
+        },
+        {
+            "id": "fte_group_col_2",
+            "type": "dropdown",
+            "label": "Grouping — level 2 (optional)",
+            "options": dim_opts,
+            "default": str(tracker.get_slot("fte_group_col_2") or ""),
+            "required": False,
+        },
+    ]
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "fte_grouping",
+            "title": "FTE Development — Grouping",
+            "subtitle": "Choose one or two hierarchy levels for rows in each block.",
+            "inputs": inputs,
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _fte_group_cols_from_sources(tracker: Tracker, payload: dict | None = None) -> list[str]:
+    st = _fte_state(tracker)
+    cached = st.get("group_cols")
+    if isinstance(cached, list) and cached:
+        return [str(c).strip() for c in cached if str(c).strip()]
+    p = payload or {}
+    cols: list[str] = []
+    for i in range(1, FTE_MAX_GROUP_LEVELS + 1):
+        raw = p.get(f"fte_group_col_{i}")
+        if raw is None or raw == "":
+            raw = tracker.get_slot(f"fte_group_col_{i}")
+        name = str(raw or "").strip()
+        if name and name.lower() != "none":
+            cols.append(name)
+    return cols[:FTE_MAX_GROUP_LEVELS]
+
+
+class ActionShowFteFiles(Action):
+    def name(self) -> str:
+        return "action_show_fte_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_fte_files_card(tracker))
+        return []
+
+
+class ActionProcessFteFiles(Action):
+    def name(self) -> str:
+        return "action_process_fte_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        groups = _parse_susa_grid_file_groups(payload)
+        periods = _fte_periods_from_grid(groups, tracker)
+        if not periods:
+            dispatcher.utter_message(text="Please upload at least one personnel file in the grid.")
+            dispatcher.utter_message(json_message=_fte_files_card(tracker))
+            return []
+
+        first_id = periods[0]["file_id"]
+        _fte_state(tracker)["periods"] = periods
+        _sync_flow_state_to_disk(tracker)
+        union_headers = _headers_union_for_periods(tracker, periods)
+        if union_headers:
+            _remember_session_headers(tracker, union_headers)
+        events: list[Any] = [
+            SlotSet("fte_periods_json", json.dumps(periods)),
+            SlotSet("file_id", first_id),
+        ]
+        if union_headers:
+            events.append(SlotSet("headers", union_headers))
+        _emit_fte_columns_card(dispatcher, tracker, periods)
+        return events
+
+
+class ActionReshowFteColumns(Action):
+    def name(self) -> str:
+        return "action_reshow_fte_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_fte_columns_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessFteColumns(Action):
+    def name(self) -> str:
+        return "action_process_fte_columns"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        events: list[Any] = []
+        for slot in ("fte_employment_col", "fte_months_col"):
+            val = str(payload.get(slot) or "").strip()
+            if not val:
+                dispatcher.utter_message(
+                    text="Please map employment rate and annual working time before continuing."
+                )
+                _emit_fte_columns_card(dispatcher, tracker)
+                return []
+            events.append(SlotSet(slot, val))
+
+        raw_pay = payload.get("fte_payroll_cols_json", tracker.get_slot("fte_payroll_cols_json") or "[]")
+        if isinstance(raw_pay, list):
+            pay_cols = [str(c).strip() for c in raw_pay if str(c).strip()]
+        else:
+            try:
+                parsed = json.loads(str(raw_pay or "[]"))
+            except (json.JSONDecodeError, TypeError):
+                parsed = []
+            pay_cols = [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+
+        if not pay_cols:
+            dispatcher.utter_message(text="Please select at least one payroll column to sum.")
+            _emit_fte_columns_card(dispatcher, tracker)
+            return []
+
+        events.append(SlotSet("fte_payroll_cols_json", json.dumps(pay_cols)))
+        _fte_state(tracker)["columns"] = {
+            "employment": str(payload.get("fte_employment_col") or "").strip(),
+            "months_sum": str(payload.get("fte_months_col") or "").strip(),
+            "payroll_cols": pay_cols,
+        }
+        _sync_flow_state_to_disk(tracker)
+        _emit_fte_grouping_card(dispatcher, tracker)
+        return events
+
+
+class ActionShowFteGrouping(Action):
+    def name(self) -> str:
+        return "action_show_fte_grouping"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _emit_fte_grouping_card(dispatcher, tracker)
+        return []
+
+
+class ActionProcessFteGrouping(Action):
+    def name(self) -> str:
+        return "action_process_fte_grouping"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        events: list[Any] = []
+        for i in range(1, FTE_MAX_GROUP_LEVELS + 1):
+            slot = f"fte_group_col_{i}"
+            if slot in payload:
+                events.append(SlotSet(slot, str(payload.get(slot) or "").strip()))
+        group_cols = _fte_group_cols_from_sources(tracker, payload)
+        if not group_cols:
+            dispatcher.utter_message(text="Please choose at least one grouping column.")
+            _emit_fte_grouping_card(dispatcher, tracker)
+            return events
+        if len(group_cols) >= 2 and group_cols[0] == group_cols[1]:
+            dispatcher.utter_message(text="Level 1 and level 2 must be different columns.")
+            _emit_fte_grouping_card(dispatcher, tracker)
+            return events
+        periods = _fte_periods_from_sources(tracker)
+        col_err = _validate_group_cols_in_periods(tracker, periods, group_cols)
+        if col_err:
+            dispatcher.utter_message(text=col_err)
+            _emit_fte_grouping_card(dispatcher, tracker)
+            return events
+        _fte_state(tracker)["group_cols"] = group_cols
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_fte_filter_checkpoint_card(tracker))
+        return events
+
+
+def _fte_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
+    disp = (tracker.get_slot("fte_filter_rules_display") or "").strip() or "No active filter rules."
+    return {
+        "type": "adaptive_card",
+        "card": "fte_filter_checkpoint",
+        "title": "FTE Development — Filter rules",
+        "review_text": disp,
+        "inputs": [
+            {
+                "id": "fte_filter_manage_choice",
+                "type": "radio",
+                "label": "What would you like to do?",
+                "options": [
+                    {"label": "1. Delete current rules", "value": "delete_all"},
+                    {"label": "2. Add a rule", "value": "add_rule"},
+                    {"label": "3. Keep rules as they are", "value": "keep"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+class ActionEnterFteFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_enter_fte_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_fte_filter_checkpoint_card(tracker))
+        return []
+
+
+class ActionProcessFteFilterCheckpoint(Action):
+    def name(self) -> str:
+        return "action_process_fte_filter_checkpoint"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("fte_filter_manage_choice", "")).lower()
+        if choice == "delete_all":
+            return [
+                SlotSet("fte_filter_rules_json", "[]"),
+                SlotSet("fte_filter_rules_display", ""),
+                FollowupAction("action_enter_fte_filter_checkpoint"),
+            ]
+        if choice == "add_rule":
+            return [SlotSet("active_filter_context", "fte"), FollowupAction("action_start_filter")]
+        if choice == "keep":
+            return _enter_strand_run_target(
+                dispatcher, tracker, "fte", pending_slot="fte_pending_rerun"
+            )
+        return [FollowupAction("action_enter_fte_filter_checkpoint")]
+
+
+class ActionRunFtePayroll(Action):
+    def name(self) -> str:
+        return "action_run_fte_payroll"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         s = tracker.slots
@@ -5868,7 +6829,7 @@ class ActionRunFaRollf(Action):
                 v = s.get(key)
             return default if v in (None, "") else v
 
-        periods_raw = pick("fa_periods_json", s.get("fa_periods_json") or "[]")
+        periods_raw = pick("fte_periods_json", s.get("fte_periods_json") or "[]")
         if isinstance(periods_raw, str):
             try:
                 periods = json.loads(periods_raw)
@@ -5877,63 +6838,286 @@ class ActionRunFaRollf(Action):
         else:
             periods = list(periods_raw or [])
         if not periods:
-            dispatcher.utter_message(text="Fixed assets period files missing — please upload register files first.")
-            return [FollowupAction("action_show_fa_rollf_files")]
+            periods = _fte_periods_from_sources(tracker)
+        if not periods:
+            dispatcher.utter_message(text="Personnel period files missing — please upload files first.")
+            return _inline_action(ActionShowFteFiles(), dispatcher, tracker, domain)
 
-        raw_dep = pick("fa_depreciation_cols_json", s.get("fa_depreciation_cols_json") or "[]")
-        if isinstance(raw_dep, list):
-            dep_cols = [str(c).strip() for c in raw_dep if str(c).strip()]
+        raw_pay = pick("fte_payroll_cols_json", s.get("fte_payroll_cols_json") or "[]")
+        cols_from_state = _fte_columns_from_sources(tracker, payload)
+        if isinstance(raw_pay, list):
+            pay_cols = [str(c).strip() for c in raw_pay if str(c).strip()]
         else:
             try:
-                parsed = json.loads(str(raw_dep or "[]"))
+                parsed = json.loads(str(raw_pay or "[]"))
             except (json.JSONDecodeError, TypeError):
                 parsed = []
-            dep_cols = [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
-        if not dep_cols:
-            dispatcher.utter_message(text="Depreciation columns missing — please map columns first.")
-            return [FollowupAction("action_reshow_fa_rollf_columns")]
+            pay_cols = [str(c).strip() for c in parsed if str(c).strip()] if isinstance(parsed, list) else []
+        if not pay_cols:
+            pay_cols = cols_from_state.get("payroll_cols") or []
+        if not pay_cols:
+            dispatcher.utter_message(text="Payroll columns missing — please map columns first.")
+            return _inline_action(ActionReshowFteColumns(), dispatcher, tracker, domain)
 
         columns = {
-            "opening": pick("fa_opening_col", s.get("fa_opening_col")),
-            "additions": pick("fa_additions_col", s.get("fa_additions_col")),
-            "disposals": pick("fa_disposals_col", s.get("fa_disposals_col")),
-            "depreciation_cols": dep_cols,
+            "employment": cols_from_state.get("employment") or pick("fte_employment_col", s.get("fte_employment_col")),
+            "months_sum": cols_from_state.get("months_sum") or pick("fte_months_col", s.get("fte_months_col")),
+            "payroll_cols": pay_cols,
         }
-
+        group_cols = _fte_group_cols_from_sources(tracker, payload)
+        if not group_cols:
+            dispatcher.utter_message(text="Grouping columns missing — please choose grouping first.")
+            return _inline_action(ActionShowFteGrouping(), dispatcher, tracker, domain)
         fy_m, fy_d = _fy_end_month_day_from_tracker({}, tracker)
+        workbook_fields = _strand_workbook_fields(tracker, suffix="FTE")
+        fte_cfg: dict[str, Any] = {
+            "title": pick("project_name", s.get("project_name")),
+            "project_name": pick("project_name", s.get("project_name")),
+            "company": pick("group_name", s.get("group_name")),
+            "first_fy": _tracker_first_fy_int(tracker),
+            "fy_end_month": fy_m,
+            "fy_end_day": fy_d,
+            "periods": periods,
+            "header_row": 0,
+            "columns": columns,
+            "group_cols": group_cols,
+            "filters": _fdd_filters_payload(pick("fte_filter_rules_json", s.get("fte_filter_rules_json"))),
+            "unit_label": "kEUR",
+            "amount_scale": 1000,
+            "output_file_path": s.get("output_folder", ""),
+            "sheet_name": "FTE Development",
+            **workbook_fields,
+        }
+        if not workbook_fields.get("use_separate_workbook"):
+            master = (
+                s.get("db_master_workbook_path")
+                or _session_output_workbook_path(tracker)
+                or ""
+            )
+            if master:
+                fte_cfg["output_workbook_path"] = master
+                fte_cfg["db_master_workbook_path"] = master
+                fte_cfg["master_workbook_path"] = master
+                fte_cfg["master_pl_path"] = master
         body = {
             "session_id": _fdd_session_id(tracker),
             "file_id": periods[0].get("file_id") or tracker.get_slot("file_id"),
-            "config": {
-                "title": pick("project_name", s.get("project_name")),
-                "company": pick("group_name", s.get("group_name")),
-                "first_fy": _tracker_first_fy_int(tracker),
-                "fy_end_month": fy_m,
-                "fy_end_day": fy_d,
-                "periods": periods,
-                "header_row": 0,
-                "columns": columns,
-                "group_cols": _fa_group_cols_from_sources(tracker, payload),
-                "filters": _fdd_filters_payload(pick("fa_filter_rules_json", s.get("fa_filter_rules_json"))),
-                "unit_label": "kEUR",
-                "amount_scale": 1000,
-                "output_file_path": s.get("output_folder", ""),
-            },
+            "config": fte_cfg,
         }
-        _start_async_revenue_script(dispatcher, body, "fixed_assets_rollf", "Fixed Assets Rollforward")
-        return [SlotSet("output_type", "fixed_assets_rollforward")]
-
+        _start_async_revenue_script(dispatcher, body, "fte_payroll", "FTE Development")
+        return [SlotSet("output_type", "fte_development")]
 
 # ─── OPOS (Creditor / Debitor Aging) ───────────────────────────────────────────
 
 OPOS_SORT_BUCKETS: list[tuple[str, str]] = [
     ("not_yet_due", "Not yet due"),
-    ("overdue_1_30", "Overdue 1–30"),
-    ("overdue_31_60", "Overdue 31–60"),
-    ("overdue_61_90", "Overdue 61–90"),
-    ("overdue_91_180", "Overdue 91–180"),
-    ("overdue_over_180", "Overdue >180"),
+    ("overdue_1_30", "1-30 days"),
+    ("overdue_31_60", "31-60 days"),
+    ("overdue_61_90", "61-90 days"),
+    ("overdue_91_180", "91-180 days"),
+    ("overdue_over_180", ">180 days"),
 ]
+
+
+def _session_output_workbook_path(tracker: Tracker) -> str:
+    """Prefer databook master workbook so strand outputs append to the same file."""
+    return _abs_master_path_from_tracker(tracker) or ""
+
+
+def _strand_separate_workbook_enabled(raw: Any, *, default: bool = False) -> bool:
+    if raw in (None, ""):
+        return default
+    if isinstance(raw, bool):
+        return raw
+    token = str(raw).strip().lower()
+    if token in ("on", "yes", "true", "1"):
+        return True
+    if token in ("off", "no", "false", "0"):
+        return False
+    return default
+
+
+def _strand_workbook_fields(tracker: Tracker, *, suffix: str) -> dict[str, Any]:
+    separate = _strand_separate_workbook_enabled(tracker.get_slot("strand_separate_workbook"))
+    base = {
+        "case_id": _fdd_session_id(tracker),
+        "title": str(tracker.get_slot("project_name") or "").strip(),
+        "project_name": str(tracker.get_slot("project_name") or "").strip(),
+    }
+    if separate:
+        return {
+            **base,
+            "use_separate_workbook": True,
+            "separate_workbook_suffix": suffix,
+        }
+    master = _session_output_workbook_path(tracker)
+    fields: dict[str, Any] = {**base, "use_separate_workbook": False}
+    if master:
+        fields["output_workbook_path"] = master
+        fields["db_master_workbook_path"] = master
+        fields["master_workbook_path"] = master
+    return fields
+
+
+def _opos_top_bucket_enabled(raw: Any, *, default: bool = True) -> bool:
+    if raw in (None, ""):
+        return default
+    if isinstance(raw, bool):
+        return raw
+    token = str(raw).strip().lower()
+    if token in ("on", "yes", "true", "1"):
+        return True
+    if token in ("off", "no", "false", "0"):
+        return False
+    return default
+
+
+def _default_opos_display_bucket_keys() -> list[str]:
+    return [k for k, _ in OPOS_SORT_BUCKETS]
+
+
+def _default_opos_sort_keys() -> list[str]:
+    return [k for k, _ in OPOS_SORT_BUCKETS if k != "not_yet_due"]
+
+
+def _opos_display_buckets_card(tracker: Tracker) -> dict[str, Any]:
+    snapshots = _opos_snapshots_from_sources(tracker)
+    multiple = len(snapshots) > 1
+    defaults_raw = tracker.get_slot("opos_display_bucket_keys_json") or json.dumps(
+        _default_opos_display_bucket_keys()
+    )
+    defaults = _parse_list(defaults_raw, _default_opos_display_bucket_keys())
+    return {
+        "type": "adaptive_card",
+        "card": "opos_display_buckets",
+        "title": "Choose buckets to display",
+        "subtitle": (
+            "Select which aging buckets appear in the report. "
+            "Deselected buckets are omitted from the output entirely."
+        ),
+        "bucket_options": [{"label": lbl, "value": key} for key, lbl in OPOS_SORT_BUCKETS],
+        "bucket_defaults": defaults,
+        "multiple_snapshots": multiple,
+        "sort_basis_default": tracker.get_slot("opos_sort_basis") or "most_recent",
+        "submit_label": "Continue",
+    }
+
+
+def _opos_sort_card(tracker: Tracker) -> dict[str, Any]:
+    defaults = tracker.get_slot("opos_sort_bucket_keys_json") or json.dumps(_default_opos_sort_keys())
+    sort_metric = tracker.get_slot("opos_sort_metric") or "total"
+    return {
+        "type": "adaptive_card",
+        "card": "opos_sort",
+        "title": "Sort partners by period buckets",
+        "subtitle": (
+            "Choose which overdue buckets count toward partner ranking. "
+            "Select Total to rank by the full open balance across all buckets."
+        ),
+        "inputs": [
+            {
+                "id": "opos_sort_basis",
+                "type": "radio",
+                "label": "Ranking period basis",
+                "default": tracker.get_slot("opos_sort_basis") or "most_recent",
+                "options": [
+                    {"label": "Most recent snapshot only", "value": "most_recent"},
+                    {"label": "All snapshots combined", "value": "all_dates"},
+                ],
+            },
+            {
+                "id": "opos_sort_metric",
+                "type": "radio",
+                "label": "Ranking metric",
+                "default": sort_metric,
+                "options": [
+                    {"label": "Total (all buckets)", "value": "total"},
+                    {"label": "Selected buckets only", "value": "buckets"},
+                ],
+            },
+            {
+                "id": "opos_sort_bucket_keys",
+                "type": "multi_select",
+                "label": "Buckets included in sort total",
+                "default": _parse_list(defaults, _default_opos_sort_keys()),
+                "options": [{"label": lbl, "value": key} for key, lbl in OPOS_SORT_BUCKETS],
+                "showWhen": {"field": "opos_sort_metric", "value": "buckets"},
+            },
+        ],
+        "submit_label": "Continue",
+    }
+
+
+def _opos_other_bucket_choice(tracker: Tracker, payload: dict | None = None) -> str:
+    """Return 'include' or 'disable' for the OPOS Other bucket (card + run)."""
+    if payload is not None:
+        raw = payload.get("opos_top_other_bucket")
+        if isinstance(raw, list):
+            if "include" in [str(x).strip().lower() for x in raw]:
+                return "include"
+            if "disable" in [str(x).strip().lower() for x in raw]:
+                return "disable"
+        if raw in ("include", "disable"):
+            return str(raw)
+    st = _opos_state(tracker)
+    if st.get("top_other_bucket") is True:
+        return "include"
+    if st.get("top_other_bucket") is False:
+        return "disable"
+    raw_slot = tracker.get_slot("opos_top_other_bucket")
+    if raw_slot in ("include", "disable"):
+        return str(raw_slot)
+    if str(raw_slot or "").strip().lower() == "include":
+        return "include"
+    top_on = _opos_top_bucket_enabled(tracker.get_slot("opos_top_bucket_enabled"), default=True)
+    return "include" if top_on else "disable"
+
+
+def _opos_top_other_default(tracker: Tracker) -> str:
+    return _opos_other_bucket_choice(tracker)
+
+
+def _opos_top_bucket_card(tracker: Tracker) -> dict[str, Any]:
+    return {
+        "type": "adaptive_card",
+        "card": "opos_top_bucket",
+        "title": "Top bucket sorting",
+        "subtitle": (
+            "Group partners into Top-N buckets (default 10, 20, 50). "
+            "You can enter any list of bucket sizes, e.g. [10, 25, 100]."
+        ),
+        "inputs": [
+            {
+                "id": "opos_top_bucket_enabled",
+                "type": "radio",
+                "label": "Enable top buckets",
+                "default": tracker.get_slot("opos_top_bucket_enabled") or "on",
+                "options": [
+                    {"label": "Yes", "value": "on"},
+                    {"label": "No", "value": "off"},
+                ],
+            },
+            {
+                "id": "opos_top_bucket_numbers",
+                "type": "text",
+                "label": "Partners per bucket — e.g. [10, 20, 50]",
+                "default": tracker.get_slot("opos_top_bucket_numbers") or "[10, 20, 50]",
+                "showWhen": {"field": "opos_top_bucket_enabled", "value": "on"},
+            },
+            {
+                "id": "opos_top_other_bucket",
+                "type": "radio",
+                "label": "'Other' bucket",
+                "default": _opos_top_other_default(tracker),
+                "options": [
+                    {"label": "Include", "value": "include"},
+                    {"label": "Disable", "value": "disable"},
+                ],
+                "showWhen": {"field": "opos_top_bucket_enabled", "value": "on"},
+            },
+        ],
+        "submit_label": "Continue",
+    }
 
 
 def _opos_snapshots_card(tracker: Tracker) -> dict[str, Any]:
@@ -5941,7 +7125,10 @@ def _opos_snapshots_card(tracker: Tracker) -> dict[str, Any]:
         "type": "adaptive_card",
         "card": "opos_snapshots",
         "title": "OPOS snapshots",
-        "subtitle": "Add one row per snapshot date and upload the corresponding open-items file(s).",
+        "subtitle": (
+            "Each row is one snapshot date with a Debitor file and a Kreditor file. "
+            "Use Add another date for additional snapshot dates."
+        ),
         "inputs": [],
         "submit_label": "Continue",
     }
@@ -5960,11 +7147,42 @@ def _parse_opos_snapshots_payload(payload: dict) -> list[dict[str, Any]]:
         if not isinstance(it, dict):
             continue
         as_of = str(it.get("as_of") or "").strip()
-        file_id = str(it.get("file_id") or "").strip()
-        file_path = str(it.get("file_path") or "").strip()
-        if not as_of or not file_id:
+        if not as_of:
+            raise ValueError("Each snapshot needs as_of")
+        deb = it.get("debitor")
+        kred = it.get("kreditor")
+        if isinstance(deb, dict) and isinstance(kred, dict):
+            deb_id = str(deb.get("file_id") or "").strip()
+            kred_id = str(kred.get("file_id") or "").strip()
+            if not deb_id or not kred_id:
+                raise ValueError("Each snapshot needs debitor and kreditor file_id")
+            out.append(
+                {
+                    "as_of": as_of,
+                    "debitor": {
+                        "file_id": deb_id,
+                        "file_path": str(deb.get("file_path") or "").strip(),
+                        "sheet_name": str(deb.get("sheet_name") or "").strip(),
+                    },
+                    "kreditor": {
+                        "file_id": kred_id,
+                        "file_path": str(kred.get("file_path") or "").strip(),
+                        "sheet_name": str(kred.get("sheet_name") or "").strip(),
+                    },
+                }
+            )
             continue
-        out.append({"as_of": as_of, "file_id": file_id, "file_path": file_path})
+        file_id = str(it.get("file_id") or "").strip()
+        if not file_id:
+            raise ValueError("Each snapshot needs debitor/kreditor or legacy file_id")
+        out.append(
+            {
+                "as_of": as_of,
+                "file_id": file_id,
+                "file_path": str(it.get("file_path") or "").strip(),
+                "sheet_name": str(it.get("sheet_name") or "").strip(),
+            }
+        )
     if not out:
         raise ValueError("No valid OPOS snapshots in payload")
     return out
@@ -5975,29 +7193,121 @@ def _emit_opos_columns_card(
 ) -> None:
     snaps = snapshots
     if snaps is None:
-        try:
-            snaps = json.loads(tracker.get_slot("opos_snapshots_json") or "[]")
-        except Exception:
-            snaps = []
-    preview_id = str(snaps[0].get("file_id") or tracker.get_slot("file_id") or "") if snaps else ""
-    preview_sheet = str(snaps[0].get("sheet_name") or tracker.get_slot("sheet_name") or "") if snaps else ""
+        snaps = _opos_snapshots_from_sources(tracker)
+    preview_id = ""
+    preview_sheet = ""
+    if snaps:
+        first = snaps[0]
+        if isinstance(first.get("debitor"), dict):
+            preview_id = str(first["debitor"].get("file_id") or "")
+            preview_sheet = str(first["debitor"].get("sheet_name") or "")
+        else:
+            preview_id = str(first.get("file_id") or tracker.get_slot("file_id") or "")
+            preview_sheet = str(first.get("sheet_name") or tracker.get_slot("sheet_name") or "")
     dispatcher.utter_message(
         json_message={
             "type": "adaptive_card",
             "card": "opos_columns",
             "wide": True,
             "title": "Map OPOS columns",
-            "subtitle": "Click a column header to assign each role.",
+            "subtitle": (
+                "Map columns on the debitor file (partner, amount, due date). "
+                "The same column positions are applied to kreditor files with their own header names."
+            ),
             "mapper_meta": {
                 "session_id": _fdd_session_id(tracker),
                 "preview_file_id": preview_id,
                 "sheet_name": preview_sheet,
                 "header_row": 0,
+                "snapshots_json": json.dumps(snaps or [], ensure_ascii=False),
             },
             "inputs": [],
             "submit_label": "Continue",
         }
     )
+
+
+STRAND_RUN_META: dict[str, tuple[str, str, str]] = {
+    "opos": ("Creditor / Debitor Aging", "Aging", "action_run_opos"),
+    "fa": ("Fixed Assets Rollforward", "FA_Rollf", "action_run_fa_rollf"),
+    "fte": ("FTE Development", "FTE", "action_run_fte_payroll"),
+}
+
+
+def _strand_run_target_card(tracker: Tracker, script_key: str | None = None) -> dict[str, Any]:
+    key = str(script_key or tracker.get_slot("strand_run_script") or "").strip().lower()
+    if key not in STRAND_RUN_META:
+        key = "opos"
+    title_label, _, _ = STRAND_RUN_META[key]
+    separate_default = _strand_separate_workbook_enabled(
+        tracker.get_slot("strand_separate_workbook"), default=False
+    )
+    return {
+        "type": "adaptive_card",
+        "card": "strand_run_target",
+        "title": f"{title_label} — Output destination",
+        "subtitle": (
+            "Output will be written to the session master workbook by default "
+            "(for reconciliation checks)."
+        ),
+        "inputs": [
+            {
+                "id": "strand_separate_workbook",
+                "type": "checkbox",
+                "label": "Write to a separate file instead",
+                "default": "on" if separate_default else "off",
+                "required": False,
+            },
+            {
+                "id": "strand_run_script",
+                "type": "text",
+                "hidden": True,
+                "default": key,
+            },
+        ],
+        "submit_label": "Run",
+    }
+
+
+class ActionEnterStrandRunTarget(Action):
+    def name(self) -> str:
+        return "action_enter_strand_run_target"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        dispatcher.utter_message(json_message=_strand_run_target_card(tracker))
+        return []
+
+
+class ActionProcessStrandRunTarget(Action):
+    def name(self) -> str:
+        return "action_process_strand_run_target"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        script_key = str(
+            payload.get("strand_run_script") or tracker.get_slot("strand_run_script") or ""
+        ).strip().lower()
+        separate = _strand_separate_workbook_enabled(payload.get("strand_separate_workbook"))
+        meta = STRAND_RUN_META.get(script_key)
+        if not meta:
+            dispatcher.utter_message(text="Unknown output type — please try again.")
+            return _enter_strand_run_target(dispatcher, tracker, "opos")
+        _, _, run_action_name = meta
+        run_map = {
+            "action_run_opos": ActionRunOpos(),
+            "action_run_fa_rollf": ActionRunFaRollf(),
+            "action_run_fte_payroll": ActionRunFtePayroll(),
+        }
+        run_action = run_map.get(run_action_name)
+        if run_action is None:
+            dispatcher.utter_message(text="Run action missing — please try again.")
+            return []
+        events: list[Any] = [
+            SlotSet("strand_run_script", script_key),
+            SlotSet("strand_separate_workbook", "on" if separate else "off"),
+        ]
+        events.extend(_inline_action(run_action, dispatcher, tracker, domain))
+        return events
 
 
 def _opos_filter_checkpoint_card(tracker: Tracker) -> dict[str, Any]:
@@ -6044,8 +7354,22 @@ class ActionProcessOposSnapshots(Action):
             dispatcher.utter_message(text=str(exc))
             _emit_opos_snapshots_card(dispatcher, tracker)
             return []
+        _opos_state(tracker)["snapshots"] = snapshots
+        _sync_flow_state_to_disk(tracker)
         _emit_opos_columns_card(dispatcher, tracker, snapshots)
-        return [SlotSet("opos_snapshots_json", json.dumps(snapshots, ensure_ascii=False))]
+        first = snapshots[0]
+        if isinstance(first.get("debitor"), dict):
+            file_id = first["debitor"].get("file_id")
+            sheet_name = str(first["debitor"].get("sheet_name") or "").strip()
+        else:
+            file_id = first.get("file_id")
+            sheet_name = str(first.get("sheet_name") or "").strip()
+        events: list[Any] = [SlotSet("opos_snapshots_json", json.dumps(snapshots, ensure_ascii=False))]
+        if file_id:
+            events.append(SlotSet("file_id", file_id))
+        if sheet_name:
+            events.append(SlotSet("sheet_name", sheet_name))
+        return events
 
 
 class ActionReshowOposColumns(Action):
@@ -6063,24 +7387,71 @@ class ActionProcessOposColumns(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
-        required = ("opos_partner_id_col", "opos_partner_name_col", "opos_amount_col", "opos_due_date_col")
-        events: list[Any] = []
-        for slot in required:
-            val = str(payload.get(slot) or "").strip()
-            if not val:
-                dispatcher.utter_message(text="Please map all four required columns before continuing.")
-                _emit_opos_columns_card(dispatcher, tracker)
-                return []
-            events.append(SlotSet(slot, val))
-        # Defaults that match finssentials behavior
-        events.append(SlotSet("opos_side", str(payload.get("opos_side") or tracker.get_slot("opos_side") or "debitor")))
+        snapshots = _opos_snapshots_from_sources(tracker)
+        if not snapshots:
+            dispatcher.utter_message(
+                text="OPOS snapshot file(s) missing — please add a snapshot date and upload the file(s) first."
+            )
+            _emit_opos_snapshots_card(dispatcher, tracker)
+            return []
+        pid = str(
+            payload.get("opos_partner_col")
+            or payload.get("opos_partner_id_col")
+            or ""
+        ).strip()
+        pname = str(payload.get("opos_partner_name_col") or "").strip() or pid
+        amount = str(payload.get("opos_amount_col") or "").strip()
+        due = str(payload.get("opos_due_date_col") or "").strip()
+        letters_raw = payload.get("opos_column_letters_json")
+        if isinstance(letters_raw, str) and letters_raw.strip():
+            try:
+                column_letters = json.loads(letters_raw)
+            except json.JSONDecodeError:
+                column_letters = {}
+        elif isinstance(letters_raw, dict):
+            column_letters = letters_raw
+        else:
+            column_letters = {}
+        if not all([pid, amount, due]) or not column_letters:
+            dispatcher.utter_message(text="Please map partner, amount, and due date columns.")
+            _emit_opos_columns_card(dispatcher, tracker)
+            return []
+        events: list[Any] = [
+            SlotSet("opos_partner_id_col", pid),
+            SlotSet("opos_partner_name_col", pname),
+            SlotSet("opos_amount_col", amount),
+            SlotSet("opos_due_date_col", due),
+            SlotSet("opos_column_letters_json", json.dumps(column_letters)),
+        ]
         events.append(SlotSet("opos_sort_basis", "most_recent"))
-        events.append(SlotSet("opos_sort_metric", "total"))
-        events.append(SlotSet("opos_sort_bucket_keys_json", json.dumps([k for k, _ in OPOS_SORT_BUCKETS if k != "not_yet_due"])))
+        events.append(SlotSet("opos_sort_metric", "buckets"))
+        events.append(
+            SlotSet(
+                "opos_display_bucket_keys_json",
+                json.dumps(_default_opos_display_bucket_keys()),
+            )
+        )
+        events.append(
+            SlotSet(
+                "opos_sort_bucket_keys_json",
+                json.dumps(_default_opos_display_bucket_keys()),
+            )
+        )
         events.append(SlotSet("opos_top_bucket_enabled", "on"))
         events.append(SlotSet("opos_top_bucket_numbers", "[10, 20, 50]"))
         events.append(SlotSet("opos_top_other_bucket", "include"))
-        return events + [FollowupAction("action_enter_opos_filter_checkpoint")]
+        _opos_state(tracker)["columns"] = {
+            "partner_id": pid,
+            "partner_name": pname,
+            "amount": amount,
+            "due_date": due,
+        }
+        _opos_state(tracker)["column_letters"] = column_letters
+        if not _opos_state(tracker).get("snapshots"):
+            _opos_state(tracker)["snapshots"] = snapshots
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_opos_display_buckets_card(tracker))
+        return events
 
 
 class ActionProcessOposMissingDueDate(Action):
@@ -6088,7 +7459,57 @@ class ActionProcessOposMissingDueDate(Action):
         return "action_process_opos_missing_due_date"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        return [FollowupAction("action_process_opos_sort")]
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("opos_missing_due_choice") or "continue").strip().lower()
+        if choice == "reupload":
+            return ActionShowOposSnapshots().run(dispatcher, tracker, domain)
+        dispatcher.utter_message(json_message=_opos_display_buckets_card(tracker))
+        return []
+
+
+class ActionProcessOposDisplayBuckets(Action):
+    def name(self) -> str:
+        return "action_process_opos_display_buckets"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        raw_keys = payload.get("opos_display_bucket_keys")
+        if isinstance(raw_keys, list):
+            keys = [str(k).strip() for k in raw_keys if str(k).strip()]
+        else:
+            keys = _parse_list(str(raw_keys or "[]"), _default_opos_display_bucket_keys())
+        valid = {k for k, _ in OPOS_SORT_BUCKETS}
+        keys = [k for k in keys if k in valid]
+        if not keys:
+            dispatcher.utter_message(text="Please select at least one bucket to display.")
+            dispatcher.utter_message(json_message=_opos_display_buckets_card(tracker))
+            return []
+
+        basis = str(payload.get("opos_sort_basis") or tracker.get_slot("opos_sort_basis") or "most_recent").strip().lower()
+        if basis in ("latest_fy", "most_recent"):
+            basis = "most_recent"
+        elif basis in ("all_fys", "all_dates"):
+            basis = "all_dates"
+        else:
+            basis = "most_recent"
+
+        events: list[Any] = [
+            SlotSet("opos_display_bucket_keys_json", json.dumps(keys)),
+            SlotSet("opos_sort_basis", basis),
+            SlotSet("opos_sort_metric", "buckets"),
+            SlotSet("opos_sort_bucket_keys_json", json.dumps(keys)),
+        ]
+        _opos_state(tracker)["display_bucket_keys"] = keys
+        _sync_flow_state_to_disk(tracker)
+
+        pending = str(tracker.get_slot("opos_pending_rerun") or "").strip().lower()
+        if pending == "buckets":
+            events.append(SlotSet("opos_pending_rerun", ""))
+            events.extend(_enter_strand_run_target(dispatcher, tracker, "opos"))
+            return events
+
+        dispatcher.utter_message(json_message=_opos_top_bucket_card(tracker))
+        return events
 
 
 class ActionProcessOposSort(Action):
@@ -6096,7 +7517,26 @@ class ActionProcessOposSort(Action):
         return "action_process_opos_sort"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        return [FollowupAction("action_process_opos_buckets")]
+        payload = _parse_payload(tracker)
+        basis = str(payload.get("opos_sort_basis") or "most_recent").strip().lower()
+        if basis in ("latest_fy", "most_recent"):
+            basis = "most_recent"
+        elif basis in ("all_fys", "all_dates"):
+            basis = "all_dates"
+        else:
+            basis = "most_recent"
+        keys = payload.get("opos_sort_bucket_keys")
+        if not isinstance(keys, list):
+            keys = _parse_list(str(keys or "[]"), _default_opos_sort_keys())
+        sort_metric = str(payload.get("opos_sort_metric") or "total").strip().lower()
+        if sort_metric not in ("total", "buckets"):
+            sort_metric = "total"
+        dispatcher.utter_message(json_message=_opos_top_bucket_card(tracker))
+        return [
+            SlotSet("opos_sort_basis", basis),
+            SlotSet("opos_sort_metric", sort_metric),
+            SlotSet("opos_sort_bucket_keys_json", json.dumps(keys)),
+        ]
 
 
 class ActionProcessOposBuckets(Action):
@@ -6104,7 +7544,21 @@ class ActionProcessOposBuckets(Action):
         return "action_process_opos_buckets"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        return [FollowupAction("action_enter_opos_filter_checkpoint")]
+        payload = _parse_payload(tracker)
+        enabled = str(payload.get("opos_top_bucket_enabled", "on")).lower() == "on"
+        numbers = _parse_list(payload.get("opos_top_bucket_numbers"), [10, 20, 50])
+        other_choice = _opos_other_bucket_choice(tracker, payload)
+        other_on = other_choice == "include"
+        dispatcher.utter_message(json_message=_opos_filter_checkpoint_card(tracker))
+        _opos_state(tracker)["top_bucket_numbers"] = numbers
+        _opos_state(tracker)["top_bucket_enabled"] = enabled
+        _opos_state(tracker)["top_other_bucket"] = other_on
+        _sync_flow_state_to_disk(tracker)
+        return [
+            SlotSet("opos_top_bucket_enabled", "on" if enabled else "off"),
+            SlotSet("opos_top_bucket_numbers", json.dumps(numbers)),
+            SlotSet("opos_top_other_bucket", "include" if other_on else "disable"),
+        ]
 
 
 class ActionEnterOposFilterCheckpoint(Action):
@@ -6132,7 +7586,9 @@ class ActionProcessOposFilterCheckpoint(Action):
         if choice == "add_rule":
             return [SlotSet("active_filter_context", "opos"), FollowupAction("action_start_filter")]
         if choice == "keep":
-            return [FollowupAction("action_show_opos_review")]
+            return _enter_strand_run_target(
+                dispatcher, tracker, "opos", pending_slot="opos_pending_rerun"
+            )
         return [FollowupAction("action_enter_opos_filter_checkpoint")]
 
 
@@ -6160,50 +7616,197 @@ class ActionRunOpos(Action):
         return "action_run_opos"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        s = tracker.slots
         payload = _parse_payload(tracker)
+        s = tracker.slots
 
         def pick(key: str, default=None):
             v = payload.get(key, None)
             return default if v is None or v == "" else v
 
-        raw_snaps = pick("opos_snapshots", None)
-        if raw_snaps is None:
-            raw_snaps = s.get("opos_snapshots_json")
-        if isinstance(raw_snaps, str):
-            try:
-                snapshots = json.loads(raw_snaps)
-            except json.JSONDecodeError:
-                snapshots = []
-        elif isinstance(raw_snaps, list):
-            snapshots = raw_snaps
-        else:
-            snapshots = []
+        snapshots = _opos_snapshots_from_sources(tracker)
         if not snapshots:
             dispatcher.utter_message(text="OPOS snapshots missing — please add a snapshot date and file(s) first.")
-            return [FollowupAction("action_show_opos_snapshots")]
+            return _inline_action(ActionShowOposSnapshots(), dispatcher, tracker, domain)
 
-        body = {
-            "session_id": _fdd_session_id(tracker),
-            "file_id": (snapshots[0] or {}).get("file_id") or tracker.get_slot("file_id"),
-            "config": {
-                "title": tracker.get_slot("project_name") or "",
-                "company": tracker.get_slot("group_name") or "",
-                "snapshots": snapshots,
-                "columns": {
-                    "partner_id": tracker.get_slot("opos_partner_id_col") or "",
-                    "partner_name": tracker.get_slot("opos_partner_name_col") or "",
-                    "amount": tracker.get_slot("opos_amount_col") or "",
-                    "due_date": tracker.get_slot("opos_due_date_col") or "",
-                },
-                "side": tracker.get_slot("opos_side") or "debitor",
-                "output_file_path": tracker.get_slot("output_folder") or "",
-                "filters": _fdd_filters_payload(tracker.get_slot("opos_filter_rules_json") or "[]"),
+        cols = _opos_columns_from_sources(tracker, payload)
+        letters_raw = pick("opos_column_letters_json", s.get("opos_column_letters_json"))
+        if isinstance(letters_raw, str):
+            try:
+                column_letters = json.loads(letters_raw)
+            except json.JSONDecodeError:
+                column_letters = {}
+        elif isinstance(letters_raw, dict):
+            column_letters = letters_raw
+        else:
+            column_letters = dict(_opos_state(tracker).get("column_letters") or {})
+
+        cached_display = _opos_state(tracker).get("display_bucket_keys")
+        if isinstance(cached_display, list) and cached_display:
+            display_keys = [str(k).strip() for k in cached_display if str(k).strip()]
+        else:
+            display_raw = pick("opos_display_bucket_keys_json", s.get("opos_display_bucket_keys_json"))
+            if isinstance(display_raw, list):
+                display_keys = [str(k).strip() for k in display_raw if str(k).strip()]
+            else:
+                display_keys = _parse_list(str(display_raw or "[]"), _default_opos_display_bucket_keys())
+        valid = {k for k, _ in OPOS_SORT_BUCKETS}
+        display_keys = [k for k in display_keys if k in valid]
+        if not display_keys:
+            display_keys = _default_opos_display_bucket_keys()
+
+        sort_metric = "buckets"
+        sort_keys_list = list(display_keys)
+        top_enabled = _opos_top_bucket_enabled(
+            pick(
+                "opos_top_bucket_enabled",
+                _opos_state(tracker).get("top_bucket_enabled")
+                if _opos_state(tracker).get("top_bucket_enabled") is not None
+                else s.get("opos_top_bucket_enabled"),
+            ),
+            default=True,
+        )
+        top_numbers = _parse_list(
+            pick(
+                "opos_top_bucket_numbers",
+                _opos_state(tracker).get("top_bucket_numbers") or s.get("opos_top_bucket_numbers"),
+            ),
+            [10, 20, 50],
+        )
+        top_other = _opos_other_bucket_choice(tracker, payload) == "include"
+        sort_basis = str(pick("opos_sort_basis", s.get("opos_sort_basis") or "most_recent")).lower()
+        if sort_basis in ("latest_fy", "most_recent"):
+            sort_basis = "most_recent"
+        elif sort_basis in ("all_fys", "all_dates"):
+            sort_basis = "all_dates"
+        else:
+            sort_basis = "most_recent"
+
+        shared_cfg = {
+            "title": tracker.get_slot("project_name") or "",
+            "project_name": tracker.get_slot("project_name") or "",
+            "company": tracker.get_slot("group_name") or "",
+            "column_letters": column_letters,
+            "columns": {
+                "partner_id": cols.get("partner_id") or "",
+                "partner_name": cols.get("partner_name") or "",
+                "amount": cols.get("amount") or "",
+                "due_date": cols.get("due_date") or "",
             },
+            "sort": {
+                "basis": sort_basis,
+                "metric": sort_metric,
+                "bucket_keys": sort_keys_list,
+            },
+            "display_bucket_keys": display_keys,
+            "top_bucket": {
+                "enabled": top_enabled,
+                "numbers": top_numbers,
+                "create_other_bucket": top_other,
+                "other_bucket_label": "Other",
+            },
+            "formula_mode": True,
+            "sheet_name": tracker.get_slot("sheet_name") or "",
+            "output_file_path": tracker.get_slot("output_folder") or "",
+            "filters": _fdd_filters_payload(tracker.get_slot("opos_filter_rules_json") or "[]"),
+            **_strand_workbook_fields(tracker, suffix="Aging"),
         }
+
+        if _opos_is_dual_snapshot_format(snapshots):
+            body = {
+                "session_id": _fdd_session_id(tracker),
+                "file_id": snapshots[0]["debitor"].get("file_id") or tracker.get_slot("file_id"),
+                "config": {
+                    **shared_cfg,
+                    "sides": {
+                        "debitor": {"snapshots": _opos_side_snapshots_from_stored(snapshots, "debitor")},
+                        "kreditor": {"snapshots": _opos_side_snapshots_from_stored(snapshots, "kreditor")},
+                    },
+                },
+            }
+        else:
+            body = {
+                "session_id": _fdd_session_id(tracker),
+                "file_id": (snapshots[0] or {}).get("file_id") or tracker.get_slot("file_id"),
+                "config": {
+                    **shared_cfg,
+                    "side": _opos_state(tracker).get("side") or tracker.get_slot("opos_side") or "debitor",
+                    "snapshots": snapshots,
+                },
+            }
 
         _start_async_revenue_script(dispatcher, body, "opos", "Creditor / Debitor Aging")
         return [SlotSet("output_type", "creditor_debitor_aging")]
+
+
+class ActionProcessOposPostOutput(Action):
+    def name(self) -> str:
+        return "action_process_opos_post_output"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("opos_post_output_choice") or "").strip().lower()
+
+        if choice == "another_output":
+            dispatcher.utter_message(json_message=_build_databook_select_card())
+            return []
+
+        if choice == "change_periods":
+            dispatcher.utter_message(json_message=_opos_display_buckets_card(tracker))
+            return [SlotSet("opos_pending_rerun", "buckets")]
+
+        if choice == "change_filters":
+            dispatcher.utter_message(json_message=_opos_filter_checkpoint_card(tracker))
+            return [SlotSet("opos_pending_rerun", "filters")]
+
+        return []
+
+
+def _build_databook_select_card() -> dict[str, Any]:
+    return {
+        "type": "adaptive_card",
+        "card": "build_databook",
+        "title": "Select Output",
+        "subtitle": "What would you like to build?",
+        "inputs": [
+            {
+                "id": "output_type",
+                "type": "radio",
+                "label": "Choose output",
+                "options": [
+                    {"label": "Databook", "value": "databook"},
+                    {"label": "Revenue Databook", "value": "revenue_databook"},
+                    {"label": "Creditor / Debitor Aging", "value": "creditor_debitor_aging"},
+                    {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
+                    {"label": "FTE Development", "value": "fte_development"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+class ActionProcessStrandPostOutput(Action):
+    def name(self) -> str:
+        return "action_process_strand_post_output"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("strand_post_output_choice") or "").strip().lower()
+        script_key = str(payload.get("script_key") or tracker.get_slot("output_type") or "").strip().lower()
+
+        if choice == "another_output":
+            dispatcher.utter_message(json_message=_build_databook_select_card())
+            return []
+
+        if choice == "change_filters":
+            if script_key in ("fixed_assets_rollforward", "fixed_assets_rollf"):
+                dispatcher.utter_message(json_message=_fa_filter_checkpoint_card(tracker))
+                return [SlotSet("fa_pending_rerun", "filters")]
+            if script_key in ("fte_development", "fte_payroll"):
+                dispatcher.utter_message(json_message=_fte_filter_checkpoint_card(tracker))
+                return [SlotSet("fte_pending_rerun", "filters")]
+
+        return []
 
 
 # ─── Apply Filters ────────────────────────────────────────────────────────────
@@ -6342,6 +7945,8 @@ class ActionFinishFilters(Action):
             "bs": "action_enter_bs_filter_checkpoint",
             "churn": "action_enter_churn_filter_checkpoint",
             "fa": "action_enter_fa_filter_checkpoint",
+            "opos": "action_enter_opos_filter_checkpoint",
+            "fte": "action_enter_fte_filter_checkpoint",
         }
         next_action = follow_map.get(context, "utter_default")
         return [FollowupAction(next_action)]
@@ -6381,7 +7986,6 @@ class ActionProcessNextAction(Action):
                                 {"label": "General Sales Table", "value": "general_sales_table"},
                                 {"label": "Churn / ARR Bridge", "value": "churn"},
                                 {"label": "Bubble Scatter Plot", "value": "bubble_scatter"},
-                                {"label": "Fixed Assets Rollforward", "value": "fixed_assets_rollforward"},
                             ],
                         }
                     ],
@@ -6496,6 +8100,66 @@ def _compute_fy_years(tracker: Tracker) -> list[str]:
     return _compute_databook_fy_labels(tracker)
 
 
+def _utter_databook_susa_format_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_susa_format",
+            "title": "Databook — Trial balance file layout",
+            "inputs": [
+                {
+                    "id": "db_susa_layout_format",
+                    "type": "radio",
+                    "label": "How are monthly trial balances provided?",
+                    "options": [
+                        {
+                            "label": "12 separate Excel files per fiscal year (one workbook per month)",
+                            "value": "monthly_workbooks",
+                        },
+                        {
+                            "label": "One Excel per fiscal year — one sheet per month (12 sheets)",
+                            "value": "monthly_sheets",
+                        },
+                        {
+                            "label": "One Excel per fiscal year — all months on a single sheet",
+                            "value": "single_sheet",
+                        },
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
+            "secondary_submit_label": (
+                "I already have a finished SuSa_Master in the correct format"
+            ),
+            "secondary_submit_id": "db_use_existing_master",
+            "secondary_submit_variant": "link",
+        }
+    )
+
+
+def _utter_databook_master_upload_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_master_upload",
+            "title": "Databook — Upload SuSa_Master",
+            "subtitle": (
+                "Upload your finished SuSa_Master workbook (Master_BS and Master_PL). "
+                "Trial balance upload, consolidation and adjustments will be skipped."
+            ),
+            "inputs": [
+                {
+                    "id": "master_workbook_file",
+                    "type": "file_drop",
+                    "label": "SuSa_Master (.xlsx)",
+                    "accept": ".xlsx",
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
 class ActionRunDatabook(Action):
     def name(self) -> str:
         return "action_run_databook"
@@ -6507,35 +8171,7 @@ class ActionRunDatabook(Action):
                 "are organised in Excel."
             )
         )
-        dispatcher.utter_message(
-            json_message={
-                "type": "adaptive_card",
-                "card": "databook_susa_format",
-                "title": "Databook — Trial balance file layout",
-                "inputs": [
-                    {
-                        "id": "db_susa_layout_format",
-                        "type": "radio",
-                        "label": "How are monthly trial balances provided?",
-                        "options": [
-                            {
-                                "label": "12 separate Excel files per fiscal year (one workbook per month)",
-                                "value": "monthly_workbooks",
-                            },
-                            {
-                                "label": "One Excel per fiscal year — one sheet per month (12 sheets)",
-                                "value": "monthly_sheets",
-                            },
-                            {
-                                "label": "One Excel per fiscal year — all months on a single sheet",
-                                "value": "single_sheet",
-                            },
-                        ],
-                    }
-                ],
-                "submit_label": "Continue",
-            }
-        )
+        _utter_databook_susa_format_card(dispatcher)
         return []
 
 
@@ -6623,43 +8259,82 @@ class ActionProcessDatabookSusaFormat(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
+        if payload.get("db_use_existing_master"):
+            _utter_databook_master_upload_card(dispatcher)
+            return [SlotSet("db_master_imported", False)]
+
         layout = str(payload.get("db_susa_layout_format") or "").strip()
         if layout not in ("monthly_workbooks", "monthly_sheets", "single_sheet"):
             dispatcher.utter_message(text="Please choose one of the trial balance layout options.")
-            dispatcher.utter_message(
-                json_message={
-                    "type": "adaptive_card",
-                    "card": "databook_susa_format",
-                    "title": "Databook — Trial balance file layout",
-                    "inputs": [
-                        {
-                            "id": "db_susa_layout_format",
-                            "type": "radio",
-                            "label": "How are monthly trial balances provided?",
-                            "options": [
-                                {
-                                    "label": "12 separate Excel files per fiscal year (one workbook per month)",
-                                    "value": "monthly_workbooks",
-                                },
-                                {
-                                    "label": "One Excel per fiscal year — one sheet per month (12 sheets)",
-                                    "value": "monthly_sheets",
-                                },
-                                {
-                                    "label": "One Excel per fiscal year — all months on a single sheet",
-                                    "value": "single_sheet",
-                                },
-                            ],
-                        }
-                    ],
-                    "submit_label": "Continue",
-                }
-            )
+            _utter_databook_susa_format_card(dispatcher)
             return []
 
         _remember_databook_layout(tracker, layout)
         _utter_databook_entity_count_card(dispatcher, tracker)
         return [SlotSet("db_susa_layout_format", layout)]
+
+
+class ActionShowDatabookMasterUpload(Action):
+    """Re-display the finished SuSa_Master upload card (redo/undo)."""
+
+    def name(self) -> str:
+        return "action_show_databook_master_upload"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_master_upload_card(dispatcher)
+        return []
+
+
+class ActionProcessDatabookMasterUpload(Action):
+    def name(self) -> str:
+        return "action_process_databook_master_upload"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        file_id = (
+            payload.get("master_workbook_file_file_id")
+            or payload.get("master_workbook_file_id")
+            or payload.get("file_id")
+            or payload.get("master_workbook_file")
+        )
+        if not file_id:
+            dispatcher.utter_message(text="Please upload a SuSa_Master workbook (.xlsx).")
+            _utter_databook_master_upload_card(dispatcher)
+            return []
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "master_file_id": str(file_id),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "project_name": tracker.get_slot("project_name") or "Project",
+        }
+        result = _fdd_post("/api/v1/fdd/run/databook/import-master", body)
+        events: list = []
+        if result.get("success"):
+            if not _utter_output_file_attachment(
+                dispatcher,
+                result,
+                title="Master workbook (BS & PL)",
+                tracker=tracker,
+            ):
+                dispatcher.utter_message(text="SuSa_Master imported successfully.")
+            master_path = _master_path_from_result(result, tracker)
+            if master_path:
+                events.append(SlotSet("db_master_workbook_path", master_path))
+            entities = result.get("entities") or []
+            if entities:
+                events.append(SlotSet("db_entity_names", list(entities)))
+            events.extend([
+                SlotSet("db_susa_mapping_confirmed", True),
+                SlotSet("db_master_imported", True),
+            ])
+            _utter_databook_l4_sort_card(dispatcher, tracker)
+        else:
+            dispatcher.utter_message(
+                text=f"Import failed: {result.get('message', 'Unknown error')}"
+            )
+            _utter_databook_master_upload_card(dispatcher)
+        return events
 
 
 class ActionProcessDatabookEntityCount(Action):
@@ -6956,27 +8631,33 @@ def _utter_databook_consolidation_level_card(dispatcher: CollectingDispatcher) -
 
 
 def _abs_master_path_from_tracker(tracker: Tracker) -> str:
+    from databook_paths import master_workbook_filename, resolve_existing_master_path
+
     raw = str(tracker.get_slot("db_master_workbook_path") or "").strip()
-    if not raw:
-        expanded_folder = _expand_output_folder(str(tracker.get_slot("output_folder") or ""))
-        if expanded_folder:
-            sid = _fdd_session_id(tracker)
-            candidate = os.path.join(expanded_folder, f"{sid}_SuSa_Master.xlsx")
-            if os.path.isfile(candidate):
-                return os.path.abspath(candidate)
-        return ""
-    if os.path.isabs(raw) and os.path.isfile(raw):
+    if raw and os.path.isabs(raw) and os.path.isfile(raw):
         return os.path.abspath(raw)
-    candidate = os.path.abspath(raw)
-    if os.path.isfile(candidate):
-        return candidate
+    if raw:
+        candidate = os.path.abspath(raw)
+        if os.path.isfile(candidate):
+            return candidate
+
     expanded_folder = _expand_output_folder(str(tracker.get_slot("output_folder") or ""))
+    sid = _fdd_session_id(tracker)
+    project_name = str(tracker.get_slot("project_name") or "Project")
     if expanded_folder:
-        sid = _fdd_session_id(tracker)
-        fallback = os.path.join(expanded_folder, f"{sid}_SuSa_Master.xlsx")
-        if os.path.isfile(fallback):
-            return os.path.abspath(fallback)
-    return raw
+        resolved = resolve_existing_master_path(
+            expanded_folder,
+            session_id=sid,
+            project_name=project_name,
+        )
+        if resolved:
+            return str(resolved)
+
+    if raw:
+        return raw
+    if expanded_folder:
+        return os.path.join(expanded_folder, master_workbook_filename(project_name))
+    return ""
 
 
 def _consolidation_template_download_qs(tracker: Tracker) -> str:
@@ -7132,6 +8813,64 @@ def _utter_databook_adjustments_card(dispatcher: CollectingDispatcher) -> None:
     )
 
 
+def _utter_databook_recon_order_from_tracker(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+) -> None:
+    entity_names = list(
+        tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker)
+    )
+    if not entity_names:
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "master_path": tracker.get_slot("db_master_workbook_path") or "",
+            "project_name": tracker.get_slot("project_name") or "Project",
+        }
+        result = _fdd_post("/api/v1/fdd/run/databook/extract-entities", body)
+        if result.get("success"):
+            entity_names = list(result.get("entities") or [])
+    _utter_databook_recon_order_card(dispatcher, entity_names)
+
+
+def _utter_databook_fs_extract_choice_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_fs_extract_choice",
+            "title": "Financial statements",
+            "subtitle": "Would you like to extract financial statements at this step?",
+            "inputs": [
+                {
+                    "id": "db_extract_financial_statements",
+                    "type": "radio",
+                    "label": "Extract financial statements now?",
+                    "options": [
+                        {"label": "Yes", "value": "yes"},
+                        {"label": "No", "value": "no"},
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _utter_databook_fs_extract_placeholder_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_fs_extract_placeholder",
+            "title": "Financial statements — extraction",
+            "subtitle": (
+                "Automatic financial statement extraction is not yet available here "
+                "(placeholder)."
+            ),
+            "submit_label": "Continue",
+        }
+    )
+
+
 def _utter_databook_fs_upload_card(dispatcher: CollectingDispatcher) -> None:
     dispatcher.utter_message(
         json_message={
@@ -7181,7 +8920,7 @@ def _utter_databook_recon_order_card(
             "type": "adaptive_card",
             "card": "databook_recon_order",
             "title": "Reconciliation entity order",
-            "subtitle": "Drag entities to set the order for the PL reconciliation table.",
+            "subtitle": "Drag entities to set the order for PL and BS reconciliation tables.",
             "inputs": [
                 {
                     "id": "db_recon_entity_order",
@@ -7215,6 +8954,60 @@ def _utter_databook_recon_labels_card(dispatcher: CollectingDispatcher) -> None:
                 {"id": "recon_title_ic", "type": "text", "label": "IC eliminations", "default": "IC eliminations"},
             ],
             "submit_label": "Build reconciliation",
+        }
+    )
+
+
+def _utter_databook_extended_tables_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_extended_tables",
+            "title": "Extended tables",
+            "subtitle": (
+                "Do you also want to create BS_Bucket, Lead_IS, Lead_BS, "
+                "Working capital and Cashflow?"
+            ),
+            "inputs": [
+                {
+                    "id": "db_create_extended_tables",
+                    "type": "radio",
+                    "label": "Create extended tables?",
+                    "options": [
+                        {"label": "Yes", "value": "yes"},
+                        {"label": "No", "value": "no"},
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
+        }
+    )
+
+
+def _utter_databook_master_next_action_card(dispatcher: CollectingDispatcher) -> None:
+    dispatcher.utter_message(
+        json_message={
+            "type": "adaptive_card",
+            "card": "databook_master_next_action",
+            "title": "What would you like to do now?",
+            "inputs": [
+                {
+                    "id": "db_master_next_action",
+                    "type": "radio",
+                    "label": "Next step",
+                    "options": [
+                        {
+                            "label": "Extract financial statements",
+                            "value": "fs_extract",
+                        },
+                        {
+                            "label": "Create another output",
+                            "value": "another_output",
+                        },
+                    ],
+                }
+            ],
+            "submit_label": "Continue",
         }
     )
 
@@ -7495,6 +9288,7 @@ class ActionProcessDatabookColumnMapping(Action):
             "fiscal_start_month": fiscal_start_month,
             "ltm_month": ltm_month,
             "first_fy": _tracker_first_fy_int(tracker),
+            "project_name": tracker.get_slot("project_name") or "Project",
         }
         result = _fdd_post("/api/v1/fdd/run/databook/susa", body)
         events = [
@@ -7537,6 +9331,7 @@ class ActionProcessDatabookConsolidationLevel(Action):
                 "session_id": _fdd_session_id(tracker),
                 "output_folder": tracker.get_slot("output_folder") or "",
                 "master_path": _abs_master_path_from_tracker(tracker),
+                "project_name": tracker.get_slot("project_name") or "Project",
                 "period_level": period,
                 "first_fy": _tracker_first_fy_int(tracker),
                 "ltm_month": ltm,
@@ -7585,6 +9380,7 @@ class ActionProcessDatabookConsolidationUpload(Action):
             "consolidation_file_id": str(file_id),
             "output_folder": tracker.get_slot("output_folder") or "",
             "master_path": tracker.get_slot("db_master_workbook_path") or "",
+            "project_name": tracker.get_slot("project_name") or "Project",
             "fy_end_month": fy_end_m,
             "fy_end_day": fy_end_d,
             "fiscal_start_month": fiscal_start_month,
@@ -7629,6 +9425,7 @@ class ActionProcessDatabookAdjustments(Action):
                 "session_id": _fdd_session_id(tracker),
                 "output_folder": tracker.get_slot("output_folder") or "",
                 "master_path": _abs_master_path_from_tracker(tracker),
+                "project_name": tracker.get_slot("project_name") or "Project",
                 "first_fy": _tracker_first_fy_int(tracker),
                 "ltm_month": ltm,
                 "fy_end_month": fy_end_m,
@@ -7669,6 +9466,7 @@ class ActionProcessDatabookAdjustmentsUpload(Action):
             "adjustments_file_id": str(file_id),
             "output_folder": tracker.get_slot("output_folder") or "",
             "master_path": _abs_master_path_from_tracker(tracker),
+            "project_name": tracker.get_slot("project_name") or "Project",
         }
         result = _fdd_post("/api/v1/fdd/run/databook/adjustments", body)
         events: list = []
@@ -7714,8 +9512,55 @@ class ActionProcessDatabookL4Sort(Action):
                 _utter_databook_l4_sort_card(dispatcher, tracker)
                 return []
 
-        _utter_databook_fs_upload_card(dispatcher)
+        _utter_databook_fs_extract_choice_card(dispatcher)
         return [SlotSet("db_l4_sort_basis", basis)]
+
+
+class ActionShowDatabookFsExtractChoice(Action):
+    def name(self) -> str:
+        return "action_show_databook_fs_extract_choice"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_fs_extract_choice_card(dispatcher)
+        return []
+
+
+class ActionProcessDatabookFsExtractChoice(Action):
+    def name(self) -> str:
+        return "action_process_databook_fs_extract_choice"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("db_extract_financial_statements") or "").strip().lower()
+        if choice not in ("yes", "no"):
+            dispatcher.utter_message(text="Please choose Yes or No.")
+            _utter_databook_fs_extract_choice_card(dispatcher)
+            return []
+
+        events = [SlotSet("db_extract_financial_statements", choice)]
+        if choice == "no":
+            _utter_databook_recon_order_from_tracker(dispatcher, tracker)
+        else:
+            _utter_databook_fs_extract_placeholder_card(dispatcher)
+        return events
+
+
+class ActionShowDatabookFsExtractPlaceholder(Action):
+    def name(self) -> str:
+        return "action_show_databook_fs_extract_placeholder"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_fs_extract_placeholder_card(dispatcher)
+        return []
+
+
+class ActionProcessDatabookFsExtractPlaceholder(Action):
+    def name(self) -> str:
+        return "action_process_databook_fs_extract_placeholder"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_recon_order_from_tracker(dispatcher, tracker)
+        return []
 
 
 class ActionProcessDatabookFsUpload(Action):
@@ -7787,12 +9632,126 @@ class ActionProcessDatabookReconOrder(Action):
         if isinstance(entity_order, str):
             entity_order = [entity_order]
         if not entity_order:
-            entity_names = list(tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker))
+            entity_names = list(
+                tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker)
+            )
             _utter_databook_recon_order_card(dispatcher, entity_names)
             return []
 
-        _utter_databook_recon_labels_card(dispatcher)
-        return [SlotSet("db_recon_entity_order", list(entity_order))]
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "master_path": tracker.get_slot("db_master_workbook_path") or "",
+            "project_name": tracker.get_slot("project_name") or "Project",
+            "company_name": tracker.get_slot("group_name") or "Group",
+            "entity_order": list(entity_order),
+            "l4_sort_basis": tracker.get_slot("db_l4_sort_basis") or "latest_fy",
+        }
+        result = _fdd_post("/api/v1/fdd/run/databook/recon-core", body, timeout=900)
+        events = [SlotSet("db_recon_entity_order", list(entity_order))]
+        if result.get("success"):
+            if not _utter_output_file_attachment(
+                dispatcher,
+                result,
+                title="Master databook (PL & BS reconciliation)",
+                tracker=tracker,
+            ):
+                dispatcher.utter_message(
+                    text="PL and BS reconciliation tables added to the master databook."
+                )
+            _utter_databook_extended_tables_card(dispatcher)
+        else:
+            dispatcher.utter_message(
+                text=f"Reconciliation error: {result.get('message', 'Unknown error')}"
+            )
+            _utter_databook_recon_order_card(
+                dispatcher,
+                list(
+                    tracker.get_slot("db_entity_names") or _db_entity_names_from_tracker(tracker)
+                ),
+            )
+        return events
+
+
+class ActionProcessDatabookExtendedTables(Action):
+    def name(self) -> str:
+        return "action_process_databook_extended_tables"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("db_create_extended_tables") or "").strip().lower()
+        if choice not in ("yes", "no"):
+            dispatcher.utter_message(text="Please choose Yes or No.")
+            _utter_databook_extended_tables_card(dispatcher)
+            return []
+
+        if choice == "no":
+            dispatcher.utter_message(json_message=_build_output_type_card())
+            return [SlotSet("db_create_extended_tables", choice)]
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "master_path": tracker.get_slot("db_master_workbook_path") or "",
+            "project_name": tracker.get_slot("project_name") or "Project",
+            "company_name": tracker.get_slot("group_name") or "Group",
+            "entity_order": tracker.get_slot("db_recon_entity_order") or [],
+            "l4_sort_basis": tracker.get_slot("db_l4_sort_basis") or "latest_fy",
+        }
+        result = _fdd_post("/api/v1/fdd/run/databook/extended-tables", body, timeout=1200)
+        events = [SlotSet("db_create_extended_tables", choice)]
+        if result.get("success"):
+            if not _utter_output_file_attachment(
+                dispatcher,
+                result,
+                title="Master databook (extended tables)",
+                tracker=tracker,
+            ):
+                dispatcher.utter_message(text="Extended tables added to the master databook.")
+            _utter_databook_master_next_action_card(dispatcher)
+        else:
+            dispatcher.utter_message(
+                text=f"Extended tables error: {result.get('message', 'Unknown error')}"
+            )
+            _utter_databook_extended_tables_card(dispatcher)
+        return events
+
+
+class ActionShowDatabookExtendedTables(Action):
+    def name(self) -> str:
+        return "action_show_databook_extended_tables"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_extended_tables_card(dispatcher)
+        return []
+
+
+class ActionProcessDatabookMasterNextAction(Action):
+    def name(self) -> str:
+        return "action_process_databook_master_next_action"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("db_master_next_action") or "").strip().lower()
+        if choice == "fs_extract":
+            _utter_databook_fs_extract_placeholder_card(dispatcher)
+            return [SlotSet("db_master_next_action", choice)]
+        if choice == "another_output":
+            dispatcher.utter_message(json_message=_build_output_type_card())
+            return [SlotSet("db_master_next_action", choice)]
+
+        dispatcher.utter_message(text="Please choose a next step.")
+        _utter_databook_master_next_action_card(dispatcher)
+        return []
+
+
+class ActionShowDatabookMasterNextAction(Action):
+    def name(self) -> str:
+        return "action_show_databook_master_next_action"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        _utter_databook_master_next_action_card(dispatcher)
+        return []
 
 
 class ActionProcessDatabookReconLabels(Action):

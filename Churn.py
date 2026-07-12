@@ -1569,8 +1569,8 @@ def format_churn_workbook(output_path_churn_universal: str, tables: dict, cfg: d
     fmt_money = "#,##0;(#,##0)"
     fmt_pct   = "0.0%"
 
-    base_font = Font(name="GT Walsheim LC Light", size=8)
-    bold_font = Font(name="GT Walsheim LC Light", bold=True, size=8)
+    base_font = Font(name="Inter", size=8)
+    bold_font = Font(name="Inter", bold=True, size=8)
 
     header_fill = PatternFill(fill_type="solid", fgColor="FFF2F2F2")
     white_fill  = PatternFill(fill_type="solid", fgColor="FFFFFFFF")
@@ -1608,11 +1608,11 @@ def format_churn_workbook(output_path_churn_universal: str, tables: dict, cfg: d
     # Titel etc.
     titel_cell = ws.cell(row=1, column=1 + COL_OFFSET)
     titel_cell.value = cfg.get("title", "")
-    titel_cell.font = Font(name="GT Walsheim LC Light", size=24, color="FF4F2D7F")
+    titel_cell.font = Font(name="Inter", size=24, color="FF4F2D7F")
 
     table_cell = ws.cell(row=2, column=1 + COL_OFFSET)
     table_cell.value = cfg.get("table", "")
-    table_cell.font = Font(name="GT Walsheim LC Light", size=12, color="FF4F2D7F")
+    table_cell.font = Font(name="Inter", size=12, color="FF4F2D7F")
 
     # For: alles was pro Tabelle formatiert wird
     for label, start_row, nrows, ncols in starts:
@@ -1634,7 +1634,7 @@ def format_churn_workbook(output_path_churn_universal: str, tables: dict, cfg: d
 
         # Label formatieren
         ws.cell(row=label_row, column=TABLE_LEFT_COL).font = Font(
-            name="GT Walsheim LC Light", size=9, color="FF4F2D7F", bold=True
+            name="Inter", size=9, color="FF4F2D7F", bold=True
         )
 
         # Datenbereich weiß + Zeilenhöhe

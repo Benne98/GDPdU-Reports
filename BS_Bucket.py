@@ -17,10 +17,34 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from gst_excel_theme import THEME, apply_zero_row_conditional_formatting  # noqa: E402
-from databook_periods import ordered_reporting_columns_from_df, split_fy_and_ytd  # noqa: E402
+from gst_excel_theme import THEME, apply_recon_portfolio_layout  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    LAYOUT_BS,
+    apply_bs_hierarchy_borders,
+    check_row_groups_after_table,
+    collapse_check_outline_rows,
+    hide_helper_column_group,
+    paint_check_source_yellow,
+    paint_grey_white_canvas,
+    paint_header_band,
+    prune_zero_value_rows,
+    recon_check_yellow_columns,
+    write_bs_ale_check_section,
+    write_entity_block_titles,
+)
+from databook_periods import (  # noqa: E402
+    display_bs_period_labels,
+    display_reporting_columns_from_df,
+    is_fy_period_column,
+    is_ytd_period_column,
+    ordered_reporting_columns_from_df,
+    split_fy_and_ytd,
+)
 from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
-from databook_workbook import MASTER_WORKBOOK_STR  # noqa: E402
+from databook_workbook import BS_RECON_MAPPING_FILE, MASTER_WORKBOOK_STR  # noqa: E402
+from databook_runtime import load_argv_config, path_value  # noqa: E402
+
+_argv_cfg = load_argv_config()
 
 # ================================================
 # CONFIG (Desktop work defaults)
@@ -31,8 +55,8 @@ PROJECT_NAME = "Desktop Test"
 GROUP_NAME = "Group"
 UNIT_LABEL = "kEUR"
 
-INPUT_FILE = MASTER_WORKBOOK_STR
-MAPPING_FILE_BS = str(DESKTOP_DIR / "BS_recon_Mapping.xlsx")
+INPUT_FILE = path_value(_argv_cfg, "input_file", MASTER_WORKBOOK_STR)
+MAPPING_FILE_BS = BS_RECON_MAPPING_FILE
 SHEET_MASTER = "Master_BS"
 REPORT_SHEET = "BS_Bucket"
 
@@ -58,14 +82,22 @@ BS_TOTALS_CONFIG = [
 
 SHOW_BS_CHECKS = True
 
+FY_END_MONTH = int(_argv_cfg.get("fy_end_month") or 12)
+LTM_MONTH = _argv_cfg.get("ltm_month") or "2023-7"
+if "show_bs_checks" in _argv_cfg:
+    SHOW_BS_CHECKS = bool(_argv_cfg["show_bs_checks"])
+
 NA_BUCKETS = ["FA", "TWC", "OWC", "Other", "ND", "Equity"]
 
 # ================================================
 # LAYOUT
 # ================================================
-MAP_START_COL = 5
-POS_COL = 10
-FIRST_ENTITY_COL = 11
+# LAYOUT — A free | B..F helpers | G spacer | H POS
+_COL_LAYOUT = LAYOUT_BS
+MAP_START_COL = _COL_LAYOUT.map_start_col
+TECH_SPACER_COL = _COL_LAYOUT.spacer_col
+POS_COL = _COL_LAYOUT.pos_col
+FIRST_ENTITY_COL = _COL_LAYOUT.first_value_col
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
@@ -76,7 +108,7 @@ BLOCK_TITLE_ROW = 7
 DATA_START_ROW = 9
 
 BS_MAP_START_COL = MAP_START_COL
-BS_MAP_END_COL = MAP_START_COL + 4
+BS_MAP_END_COL = _COL_LAYOUT.map_end_col
 BS_L2_COL = MAP_START_COL + 2
 BS_L3_COL = MAP_START_COL + 3
 BS_L4_COL = MAP_START_COL + 4
@@ -117,7 +149,6 @@ FILL_GREY = THEME.fill_tech
 FILL_WHITE = THEME.fill_white
 FILL_HEADER = THEME.fill_header
 FILL_SUBTOTAL = THEME.fill_subtotal
-FILL_YELLOW = PatternFill("solid", fgColor="FFFF99")
 
 ALIGN_LEFT = Alignment(horizontal="left", vertical="center")
 ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
@@ -126,6 +157,10 @@ ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
 THIN_SIDE = Side(style="thin", color=THEME.border_color)
 TOP_BORDER = THEME.border_subtotal_top
 BOTTOM_BORDER = THEME.border_header_bottom
+TOP_BOTTOM_BORDER = Border(
+    top=THEME.border_subtotal_top.top,
+    bottom=THEME.border_subtotal_top.top,
+)
 
 NUM_FMT_INT = '#,##0;(#,##0);"-"'
 
@@ -145,7 +180,7 @@ def is_blank_entity(x):
 
 
 def detect_reporting_period_columns(df_: pd.DataFrame) -> list[str]:
-    periods = ordered_reporting_columns_from_df(df_)
+    periods = display_reporting_columns_from_df(df_)
     if not periods:
         raise ValueError("Keine FY/YTD-Spalten im Master_BS gefunden.")
     return periods
@@ -270,7 +305,6 @@ df_bs = pd.read_excel(INPUT_FILE, sheet_name=SHEET_MASTER, engine="openpyxl")
 
 PERIODS = detect_reporting_period_columns(df_bs)
 FY_COLS, YTD_COLS = split_fy_and_ytd(PERIODS)
-NA_PERIODS = [{"label": y, "year_col": y} for y in PERIODS]
 BS_PERIOD_FROM = PERIODS[0]
 BS_PERIOD_TO = PERIODS[-1]
 
@@ -314,7 +348,7 @@ bs_row_structure = build_bs_row_structure(
     df_bs,
     bs_l2_l3_order,
     {"l4_sort_basis": L4_SORT_BASIS},
-    source_col=l5_col,
+    source_col=source_col or l5_col,
 )
 
 # ================================================
@@ -336,6 +370,17 @@ for t in BS_TOTALS_CONFIG:
     total_row = {"type": "total", "label": t["label"], "components": comps, "L2": "", "L3": "", "L4": ""}
     if not insert_after_anchor(bs_row_structure, t["insert_after"], total_row):
         raise RuntimeError(f"Anchor '{t['insert_after']}' für Total '{t['label']}' nicht gefunden.")
+
+bs_row_structure = prune_zero_value_rows(
+    bs_row_structure,
+    df_bs,
+    PERIODS,
+    source_col=source_col or SOURCE_COL_CANDIDATES[0],
+)
+
+DISPLAY_PERIODS = display_bs_period_labels(PERIODS, FY_END_MONTH, LTM_MONTH)
+FY_PERIOD_INDICES = [i for i, p in enumerate(PERIODS) if is_fy_period_column(p)]
+NA_PERIODS = [{"label": DISPLAY_PERIODS[i], "year_col": p} for i, p in enumerate(PERIODS)]
 
 # ================================================
 # ENTITY LIST
@@ -442,7 +487,7 @@ for b in blocks:
         end_column=b["year_endcol"],
     )
     t = ws.cell(BLOCK_TITLE_ROW, b["startcol"], b["title"])
-    t.font = FONT_BASE_BOLD
+    t.font = FONT_HEADER
     t.alignment = ALIGN_CENTER
 
     ws.merge_cells(
@@ -456,9 +501,9 @@ for b in blocks:
     ec.alignment = ALIGN_CENTER
 
     for y_idx, year in enumerate(PERIODS):
-        h = ws.cell(HEADER_ROW, b["year_startcol"] + y_idx, year)
+        h = ws.cell(HEADER_ROW, b["year_startcol"] + y_idx, DISPLAY_PERIODS[y_idx])
         h.font = FONT_HEADER
-        h.alignment = ALIGN_CENTER
+        h.alignment = ALIGN_RIGHT
 
     ws.column_dimensions[col_letter(b["spacer_col"])].width = SPACER_WIDTH
 
@@ -477,6 +522,7 @@ except StopIteration:
     con_block = blocks[-1]
 
 LAST_USED_COL = max(b["spacer_col"] for b in blocks)
+main_spacer_cols = {b["spacer_col"] for b in blocks}
 
 # ================================================
 # WRITE MAIN TABLE ROWS
@@ -574,7 +620,7 @@ for b in blocks:
                     k = idx - 1
                     while (
                         k >= 0
-                        and bs_row_structure[k]["type"] == "detail"
+                        and bs_row_structure[k]["type"] in {"detail", "detail_single"}
                         and bs_row_structure[k]["L3"] == r["L3"]
                         and bs_row_structure[k]["L2"] == r["L2"]
                     ):
@@ -617,22 +663,30 @@ for b in blocks:
                 ic_ref = f"{col_letter(icb['year_startcol'] + y_idx)}{excel_row}"
                 cell.value = f"={agg_ref}+{ic_ref}"
 
-# TOP BORDER main Totals
-for rr in bs_row_structure:
-    if rr["type"] != "total":
-        continue
-    tr = rr["_excel_row"]
-    ws.cell(tr, POS_COL).border = TOP_BORDER
-    for bb in blocks:
-        for y_idx in range(len(PERIODS)):
-            ws.cell(tr, bb["year_startcol"] + y_idx).border = TOP_BORDER
+# Borders + row fills for subtotals/totals
+layout = LAYOUT_BS
+apply_bs_hierarchy_borders(
+    ws,
+    bs_row_structure,
+    layout=layout,
+    last_used_col=LAST_USED_COL,
+    skip_cols=main_spacer_cols,
+)
 
-# Row fills for subtotals/totals
 for r in bs_row_structure:
     excel_row = r["_excel_row"]
     fill = FILL_SUBTOTAL if r["type"] in {"subtotal_l2", "total"} else FILL_WHITE
-    for c in range(MAP_START_COL, LAST_USED_COL + 1):
-        ws.cell(excel_row, c).fill = fill
+    if r["type"] in {"subtotal_l2", "total"}:
+        ws.cell(excel_row, POS_COL).fill = fill
+        for c in range(POS_COL + 1, LAST_USED_COL + 1):
+            if BS_MAP_START_COL <= c <= BS_MAP_END_COL:
+                continue
+            if c not in main_spacer_cols:
+                ws.cell(excel_row, c).fill = fill
+    else:
+        for c in range(POS_COL, LAST_USED_COL + 1):
+            if c not in main_spacer_cols:
+                ws.cell(excel_row, c).fill = fill
 
 # ================================================
 # CHECKS (FS + BS_Reconciliation)
@@ -641,32 +695,48 @@ CHECK_FS_ROW = None
 CHECK_DELTA_ROW = None
 CHECK_BSREC_ROW = None
 CHECK_BSREC_DELTA_ROW = None
+CHECK_ALE_ROW = None
 CHECK_BAL_ROW = None
 total_assets_row = None
 total_el_row = None
 
 if SHOW_BS_CHECKS:
-    CHECK_FS_ROW = LAST_TABLE_ROW + 4
-    CHECK_DELTA_ROW = LAST_TABLE_ROW + 5
-    CHECK_BSREC_ROW = LAST_TABLE_ROW + 6
-    CHECK_BSREC_DELTA_ROW = LAST_TABLE_ROW + 7
-    CHECK_BAL_ROW = LAST_TABLE_ROW + 8
+    _check_rows = check_row_groups_after_table(LAST_TABLE_ROW, [1, 2, 2])
+    (
+        CHECK_ALE_ROW,
+        CHECK_FS_ROW,
+        CHECK_DELTA_ROW,
+        CHECK_BSREC_ROW,
+        CHECK_BSREC_DELTA_ROW,
+    ) = _check_rows
+    CHECK_BAL_ROW = CHECK_BSREC_DELTA_ROW + 2
 
     total_row_map = {r["label"]: r["_excel_row"] for r in bs_row_structure if r["type"] == "total"}
     total_assets_row = total_row_map["Total assets"]
     total_el_row = total_row_map["Total equity & liabilities"]
 
+    write_bs_ale_check_section(
+        ws,
+        blocks=blocks,
+        years=[PERIODS[i] for i in FY_PERIOD_INDICES],
+        check_row=CHECK_ALE_ROW,
+        total_assets_row=total_assets_row,
+        total_el_row=total_el_row,
+        pos_col=POS_COL,
+        block_kinds=frozenset({"entity", "ic", "aggregated", "consolidation"}),
+        num_fmt=NUM_FMT_INT,
+        hide_outline=False,
+    )
+
     ws.cell(CHECK_FS_ROW, POS_COL, "Source - Financial statements").alignment = ALIGN_LEFT
-    ws.cell(CHECK_DELTA_ROW, POS_COL, "Check").alignment = ALIGN_LEFT
+    ws.cell(CHECK_DELTA_ROW, POS_COL, "Difference to trial balances").alignment = ALIGN_LEFT
     ws.cell(CHECK_BSREC_ROW, POS_COL, "Source - BS Reconciliation").alignment = ALIGN_LEFT
-    ws.cell(CHECK_BSREC_DELTA_ROW, POS_COL, "Check").alignment = ALIGN_LEFT
-    ws.cell(CHECK_BAL_ROW, POS_COL, "A = E + L").alignment = ALIGN_LEFT
+    ws.cell(CHECK_BSREC_DELTA_ROW, POS_COL, "Difference to trial balances").alignment = ALIGN_LEFT
 
     ws.cell(CHECK_FS_ROW, POS_COL).font = FONT_BASE
     ws.cell(CHECK_DELTA_ROW, POS_COL).font = FONT_BASE
     ws.cell(CHECK_BSREC_ROW, POS_COL).font = FONT_BASE
     ws.cell(CHECK_BSREC_DELTA_ROW, POS_COL).font = FONT_BASE
-    ws.cell(CHECK_BAL_ROW, POS_COL).font = FONT_CHECK_RED
 
     def setup_value_cell(c, red=False):
         c.number_format = NUM_FMT_INT
@@ -679,7 +749,7 @@ if SHOW_BS_CHECKS:
         if b["kind"] not in check_kinds:
             continue
 
-        for y_idx in range(len(PERIODS)):
+        for y_idx in FY_PERIOD_INDICES:
             c_fs = ws.cell(CHECK_FS_ROW, b["year_startcol"] + y_idx)
             setup_value_cell(c_fs, red=False)
 
@@ -697,11 +767,6 @@ if SHOW_BS_CHECKS:
                 ),
             )
 
-            el_cell = ws.cell(total_el_row, b["year_startcol"] + y_idx)
-            bal_cell = ws.cell(CHECK_BAL_ROW, b["year_startcol"] + y_idx)
-            bal_cell.value = f"={assets_cell.coordinate}+{el_cell.coordinate}"
-            setup_value_cell(bal_cell, red=True)
-
     if "BS_Reconciliation" not in wb.sheetnames:
         raise RuntimeError("Sheet 'BS_Reconciliation' wurde nicht gefunden (für Source - BS Reconciliation).")
 
@@ -714,7 +779,9 @@ if SHOW_BS_CHECKS:
             rec_total_assets_row = rr
             break
     if rec_total_assets_row is None:
-        raise RuntimeError("Konnte 'Total assets' in BS_Reconciliation (Spalte J) nicht finden.")
+        raise RuntimeError(
+            f"Konnte 'Total assets' in BS_Reconciliation (Spalte {col_letter(POS_COL)}) nicht finden."
+        )
 
     rec_title_to_startcol = {}
     for cc in range(1, ws_rec.max_column + 1):
@@ -735,7 +802,7 @@ if SHOW_BS_CHECKS:
 
         rec_start = rec_startcol_for(b["title"])
 
-        for y_idx in range(len(PERIODS)):
+        for y_idx in FY_PERIOD_INDICES:
             rec_col = rec_start + y_idx
             src_cell = ws.cell(CHECK_BSREC_ROW, b["year_startcol"] + y_idx)
             src_cell.value = f"=BS_Reconciliation!{col_letter(rec_col)}{rec_total_assets_row}"
@@ -815,7 +882,7 @@ for nb in na_blocks:
     for k, col in nb["cat_cols"].items():
         h = ws.cell(HEADER_ROW, col, k)
         h.font = FONT_HEADER
-        h.alignment = ALIGN_CENTER
+        h.alignment = ALIGN_RIGHT
 
 for r in bs_row_structure:
     excel_row = r["_excel_row"]
@@ -866,7 +933,7 @@ for r in bs_row_structure:
                 k = idx - 1
                 while (
                     k >= 0
-                    and bs_row_structure[k]["type"] == "detail"
+                    and bs_row_structure[k]["type"] in {"detail", "detail_single"}
                     and bs_row_structure[k]["L3"] == r["L3"]
                     and bs_row_structure[k]["L2"] == r["L2"]
                 ):
@@ -896,13 +963,14 @@ for r in bs_row_structure:
                 c.value = f"=SUM({','.join(refs)})" if refs else 0
 
 for rr in bs_row_structure:
-    if rr["type"] != "total":
+    if rr["type"] not in {"subtotal_l2", "total"}:
         continue
     tr = rr["_excel_row"]
+    border = TOP_BOTTOM_BORDER if rr["type"] == "total" else TOP_BORDER
     for nb in na_blocks:
-        ws.cell(tr, nb["pos_col"]).border = TOP_BORDER
+        ws.cell(tr, nb["pos_col"]).border = border
         for col in nb["cat_cols"].values():
-            ws.cell(tr, col).border = TOP_BORDER
+            ws.cell(tr, col).border = border
 
 # Extend subtotal fills into NA area
 for r in bs_row_structure:
@@ -953,46 +1021,54 @@ for rr in range(1, FILL_END_ROW + 1):
         continue
     ws.row_dimensions[rr].height = ROW_HEIGHT
 
-FILL_END_COL = LAST_USED_COL + 40
-for rr in range(1, FILL_END_ROW + 1):
-    for cc in range(1, POS_COL):
-        ws.cell(rr, cc).fill = FILL_GREY
-for rr in range(1, FILL_END_ROW + 1):
-    for cc in range(POS_COL, FILL_END_COL + 1):
-        ws.cell(rr, cc).fill = FILL_WHITE
+paint_grey_white_canvas(ws, layout, last_row=FILL_END_ROW, last_col=LAST_USED_COL)
 
 spacer_cols = {b["spacer_col"] for b in blocks} | {nb["spacer_col"] for nb in na_blocks}
-for rrr in (BLOCK_TITLE_ROW, HEADER_ROW):
-    for cc in range(1, LAST_USED_COL + 1):
-        if cc in spacer_cols:
-            ws.cell(rrr, cc).fill = FILL_WHITE
-        else:
-            ws.cell(rrr, cc).fill = FILL_HEADER
+for sc in spacer_cols:
+    for rr in range(1, FILL_END_ROW + 1):
+        ws.cell(rr, sc).border = Border()
+        ws.cell(rr, sc).fill = FILL_WHITE
+main_period_cols: list[int] = []
+for b in blocks:
+    for y_idx in range(len(PERIODS)):
+        main_period_cols.append(b["year_startcol"] + y_idx)
+na_value_cols: list[int] = []
+for nb in na_blocks:
+    na_value_cols.extend(nb["cat_cols"].values())
 
-for cc in range(1, LAST_USED_COL + 1):
-    if cc in spacer_cols:
-        continue
-    ws.cell(HEADER_ROW, cc).border = BOTTOM_BORDER
+paint_header_band(
+    ws,
+    layout,
+    header_rows=[BLOCK_TITLE_ROW, HEADER_ROW],
+    period_cols=main_period_cols + na_value_cols,
+    spacer_cols=spacer_cols,
+)
+write_entity_block_titles(ws, blocks, block_title_row=BLOCK_TITLE_ROW)
 
-for cc in range(1, 10):
-    col = col_letter(cc)
-    ws.column_dimensions[col].outlineLevel = 2
-    ws.column_dimensions[col].hidden = True
-ws.column_dimensions[col_letter(POS_COL)].outlineLevel = 0
-ws.column_dimensions[col_letter(POS_COL)].hidden = False
+hide_helper_column_group(ws, layout)
 
 if SHOW_BS_CHECKS:
-    CONS_LAST = con_block["year_endcol"]
+    yellow_cols = recon_check_yellow_columns(
+        blocks,
+        pos_col=POS_COL,
+        block_kinds=frozenset({"entity", "ic", "aggregated", "consolidation"}),
+        spacer_cols=spacer_cols,
+        period_indices=FY_PERIOD_INDICES,
+    )
     for rr in (CHECK_FS_ROW, CHECK_BSREC_ROW):
-        for cc in range(POS_COL, CONS_LAST + 1):
-            if cc in spacer_cols:
-                ws.cell(rr, cc).fill = FILL_WHITE
-            else:
-                ws.cell(rr, cc).fill = FILL_YELLOW
+        paint_check_source_yellow(ws, rr, yellow_cols)
 
-    for rr in (CHECK_FS_ROW, CHECK_DELTA_ROW, CHECK_BSREC_ROW, CHECK_BSREC_DELTA_ROW, CHECK_BAL_ROW):
-        ws.row_dimensions[rr].outlineLevel = 2
-        ws.row_dimensions[rr].hidden = True
+    collapse_check_outline_rows(
+        ws,
+        [
+            CHECK_ALE_ROW,
+            CHECK_FS_ROW,
+            CHECK_DELTA_ROW,
+            CHECK_BSREC_ROW,
+            CHECK_BSREC_DELTA_ROW,
+            CHECK_BAL_ROW,
+        ],
+    )
 
 for b in blocks:
     c_first = b["startcol"]
@@ -1022,24 +1098,6 @@ for nb in na_blocks:
         cL = col_letter(c)
         ws.column_dimensions[cL].outlineLevel = 0
         ws.column_dimensions[cL].hidden = False
-
-# Zero-row conditional formatting
-bucket_cf_cols = []
-for b in blocks:
-    for y_idx in range(len(PERIODS)):
-        bucket_cf_cols.append(b["year_startcol"] + y_idx)
-for nb in na_blocks:
-    bucket_cf_cols.extend(nb["cat_cols"].values())
-
-apply_zero_row_conditional_formatting(
-    ws,
-    first_row=DATA_START_ROW,
-    last_row=LAST_TABLE_ROW,
-    year_col_indices=bucket_cf_cols,
-    style_start_col=POS_COL,
-    style_end_col=LAST_USED_COL,
-    exclude_cols=spacer_cols,
-)
 
 # ================================================
 # SAVE

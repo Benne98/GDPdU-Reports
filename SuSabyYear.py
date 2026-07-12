@@ -1622,7 +1622,21 @@ def main(config: dict) -> None:
     if not output_path:
         out_dir = str(config.get("output_file_path") or ".")
         case_id = str(config.get("case_id") or "output")
-        output_path = str(Path(out_dir) / f"{case_id}_SuSa_Master.xlsx")
+        project_name = str(config.get("title") or config.get("project_name") or "Project")
+        try:
+            from databook_paths import resolve_existing_master_path
+
+            resolved = resolve_existing_master_path(
+                out_dir,
+                session_id=case_id,
+                project_name=project_name,
+            )
+            if resolved is not None:
+                output_path = str(resolved)
+        except OSError:
+            pass
+        if not output_path:
+            output_path = str(Path(out_dir) / f"{case_id}_SuSa_Master.xlsx")
 
     write_output(master_bs, master_pl, str(output_path), config)
     print("Finished:", output_path)

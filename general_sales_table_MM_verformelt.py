@@ -2118,8 +2118,8 @@ def split_key_to_n_parts(key: str, n: int) -> list[str | None]:
 
 # Befüllt die Hilfsspalten 1..n (n = len(group_cols)) für SUMIFS und setzt Header.
 def write_formula_key_columns(ws, cfg: dict, ctx: dict):
-    red_font = Font(name="GT Walsheim LC Light", size=8, color="FFFF5149")
-    red_bold_font = Font(name="GT Walsheim LC Light", size=8, color="FFFF5149", bold=True)
+    red_font = Font(name="Inter", size=8, color="FFFF5149")
+    red_bold_font = Font(name="Inter", size=8, color="FFFF5149", bold=True)
 
     header_row_1 = ctx["HEADER_ROW_1"]
     header_row_2 = ctx["HEADER_ROW_2"]
@@ -2263,7 +2263,7 @@ def ensure_gst_period_bounds(
     ctx: dict,
 ) -> None:
     """Write period start/end (or year) into each period column — same column as SUMIFS bounds."""
-    red_font = Font(name="GT Walsheim LC Light", size=8, color="FFFF5149")
+    red_font = Font(name="Inter", size=8, color="FFFF5149")
     period_map = period_defs.get("period_map") or {}
     col_map = _gst_period_column_map(export_columns, ctx["TABLE_LEFT_COL"])
 
@@ -2278,7 +2278,7 @@ def ensure_gst_period_bounds(
 
 
 def write_period_helper_rows(ws, cfg: dict, period_defs: dict, export_headers: dict, LABEL_COL: int, VISIBLE_RIGHT_COL: int, NEG_COLOR: str, year_row=None, start_row=None, end_row=None):
-    red_font = Font(name="GT Walsheim LC Light", size=8, color=NEG_COLOR)
+    red_font = Font(name="Inter", size=8, color=NEG_COLOR)
     ctx = {
         "PERIOD_YEAR_ROW": year_row,
         "PERIOD_START_ROW": start_row,

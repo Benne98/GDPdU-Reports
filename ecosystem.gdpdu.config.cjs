@@ -33,7 +33,10 @@ const apps = [
     script: rasaPy,
     args: ['-m', 'rasa', 'run', 'actions', '--port', '5055'],
     cwd: path.join(root, 'rasa'),
-    env: { FASTAPI_BASE_URL: 'http://127.0.0.1:8010' },
+    env: {
+      FASTAPI_BASE_URL: 'http://127.0.0.1:8010',
+      UPLOAD_BASE_DIR: '/Users/mathi/finssentials-wt-mathis/uploads',
+    },
     autorestart: true,
     max_restarts: 20,
     min_uptime: '5s',

@@ -3,8 +3,8 @@
  * Used inside FddChatPanel (slide-over).
  */
 
-import { useEffect, useRef, useState } from 'react'
-import { Send } from 'lucide-react'
+import { useEffect, useRef, useState, type DragEvent } from 'react'
+import { Upload } from 'lucide-react'
 import type { ChatMessage as ChatMessageType, FddBotApi } from './useFddBot'
 import ChatMessage from './ChatMessage'
 import AdaptiveCard from './AdaptiveCard'
@@ -18,7 +18,6 @@ export interface BotConversationProps {
   preloadedFile?: File | null
   /** Line under the composer */
   footerNote?: string
-  inputPlaceholder?: string
   /** Use full width centered content column */
   wide?: boolean
 }
@@ -29,7 +28,6 @@ export default function BotConversation({
   autoHello = true,
   preloadedFile,
   footerNote,
-  inputPlaceholder = 'Type a message or use the cards above…',
   wide = false,
 }: BotConversationProps) {
   const {
@@ -43,7 +41,7 @@ export default function BotConversation({
     markCardSubmitted,
     sessionEpoch,
   } = bot
-  const [freeText, setFreeText] = useState('')
+  const [fileDragDepth, setFileDragDepth] = useState(0)
   const bottomRef = useRef<HTMLDivElement>(null)
   const hasInitiated = useRef(false)
   const hasPreloadedFile = useRef(false)
@@ -115,18 +113,46 @@ export default function BotConversation({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- match legacy panel: run when active/file changes
   }, [active, preloadedFile])
 
-  const handleFreeText = async () => {
-    const text = freeText.trim()
-    if (!text) return
-    setFreeText('')
-    await send(text)
+  const chatDragActive = fileDragDepth > 0
+
+  const onChatDragEnter = (e: DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return
+    e.preventDefault()
+    e.stopPropagation()
+    setFileDragDepth(d => d + 1)
+  }
+
+  const onChatDragLeave = (e: DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setFileDragDepth(d => Math.max(0, d - 1))
+  }
+
+  const onChatDragOver = (e: DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'copy'
+  }
+
+  const onChatDrop = async (e: DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setFileDragDepth(0)
+    const file = e.dataTransfer.files?.[0]
+    if (!file || !/\.xlsx?$/i.test(file.name)) return
+    await uploadFile(file)
   }
 
   return (
-    <div className="flex flex-col flex-1 min-h-0">
+    <div className="flex flex-col flex-1 min-h-0 relative">
       <div
         className={`flex-1 overflow-y-auto py-4 ${wide ? 'px-6' : 'px-4'}`}
         style={{ overscrollBehavior: 'contain' }}
+        onDragEnter={onChatDragEnter}
+        onDragLeave={onChatDragLeave}
+        onDragOver={onChatDragOver}
+        onDrop={e => { void onChatDrop(e) }}
       >
         <div className={wide ? 'max-w-4xl mx-auto w-full' : 'w-full'}>
         {messages.length === 0 && !loading && !scriptJobLoading && (
@@ -183,50 +209,35 @@ export default function BotConversation({
         </div>
       </div>
 
-      <div
-        className={`shrink-0 ${wide ? 'px-6' : 'px-4'} py-3`}
-        style={{ borderTop: '1px solid #E2E8F0', background: '#FFFFFF' }}
-      >
-        <div className={wide ? 'max-w-4xl mx-auto w-full' : 'w-full'}>
+      {chatDragActive && (
         <div
-          className="flex items-center gap-2 rounded-xl px-3 py-2"
-          style={{ border: '1px solid #E2E8F0', background: '#F8FAFC' }}
+          className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none"
+          style={{ background: 'rgba(30,58,95,0.08)', border: '2px dashed #1E3A5F' }}
         >
-          <input
-            type="text"
-            value={freeText}
-            placeholder={inputPlaceholder}
-            onChange={(e) => setFreeText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                void handleFreeText()
-              }
-            }}
-            className="flex-1 text-sm bg-transparent outline-none"
-            style={{ color: '#1E293B' }}
-          />
-          <button
-            type="button"
-            onClick={() => void handleFreeText()}
-            disabled={!freeText.trim() || loading || scriptJobLoading}
-            className="rounded-lg p-1.5 transition-colors"
-            style={{
-              background: freeText.trim() && !loading && !scriptJobLoading ? '#1E3A5F' : '#E2E8F0',
-              color:      freeText.trim() && !loading && !scriptJobLoading ? '#fff' : '#94A3B8',
-            }}
-            aria-label="Send message"
+          <div
+            className="flex flex-col items-center gap-2 px-6 py-4 rounded-xl"
+            style={{ background: 'rgba(255,255,255,0.95)' }}
           >
-            <Send size={13} />
-          </button>
+            <Upload size={28} style={{ color: '#1E3A5F' }} />
+            <p className="text-sm font-medium" style={{ color: '#1E3A5F' }}>
+              XLSX hier ablegen zum Hochladen
+            </p>
+          </div>
         </div>
-        {footerNote ? (
-          <p className="text-xs text-center mt-2" style={{ color: '#94A3B8' }}>
-            {footerNote}
-          </p>
-        ) : null}
+      )}
+
+      {footerNote ? (
+        <div
+          className={`shrink-0 ${wide ? 'px-6' : 'px-4'} py-2`}
+          style={{ borderTop: '1px solid #E2E8F0', background: '#FFFFFF' }}
+        >
+          <div className={wide ? 'max-w-4xl mx-auto w-full' : 'w-full'}>
+            <p className="text-xs text-center" style={{ color: '#94A3B8' }}>
+              {footerNote}
+            </p>
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   )
 }

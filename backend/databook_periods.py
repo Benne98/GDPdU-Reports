@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import calendar
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -12,6 +13,10 @@ _FY_COL_RE = re.compile(r"^FY\d{2}A$", re.IGNORECASE)
 _YTD_COL_RE = re.compile(r"^YTD\d{2}A$", re.IGNORECASE)
 _YTD_GRID_RE = re.compile(r"^YTD(19|20)\d{2}$", re.IGNORECASE)
 _MONTH_COL_RE = re.compile(r"^[A-Za-z]{3}-\d{4}$")
+_COMPACT_MONTH_COL_RE = re.compile(
+    r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{2})A$",
+    re.IGNORECASE,
+)
 
 
 def make_period_str(year: int, month: int) -> str:
@@ -38,6 +43,24 @@ def is_month_period_column(header: str) -> bool:
     return abbr in EN_MONTH_ABBR
 
 
+def is_compact_month_period_column(header: str) -> bool:
+    s = str(header or "").strip()
+    m = _COMPACT_MONTH_COL_RE.match(s)
+    if not m:
+        return False
+    return m.group(1).capitalize() in EN_MONTH_ABBR or m.group(1) in EN_MONTH_ABBR
+
+
+def is_master_amount_period_column(header: str) -> bool:
+    s = str(header or "").strip()
+    return (
+        is_fy_period_column(s)
+        or is_ytd_period_column(s)
+        or is_month_period_column(s)
+        or is_compact_month_period_column(s)
+    )
+
+
 def filter_master_period_columns(headers: list, period_level: str) -> list[str]:
     """Keep FY or month columns in master header order."""
     level = str(period_level or "yearly").strip().lower()
@@ -48,9 +71,25 @@ def filter_master_period_columns(headers: list, period_level: str) -> list[str]:
             continue
         if level == "yearly" and (is_fy_period_column(s) or is_ytd_period_column(s)):
             out.append(s)
-        elif level == "monthly" and is_month_period_column(s):
+        elif level == "monthly" and (
+            is_month_period_column(s) or is_compact_month_period_column(s)
+        ):
             out.append(s)
     return out
+
+
+def ordered_master_period_columns_from_headers(headers: list) -> list[str]:
+    """All amount period columns (FY, YTD, months) in master header order."""
+    out: list[str] = []
+    for h in headers:
+        s = str(h or "").strip()
+        if is_master_amount_period_column(s):
+            out.append(s)
+    return out
+
+
+def ordered_master_period_columns_from_df(df) -> list[str]:
+    return ordered_master_period_columns_from_headers(list(df.columns))
 
 
 def reporting_fy_from_period(calendar_year: int, month_num: int, fy_end_month: int) -> int:
@@ -164,13 +203,78 @@ def ordered_reporting_columns_from_df(df) -> list[str]:
     return ordered_reporting_columns_from_headers(list(df.columns))
 
 
+def display_reporting_columns_from_headers(headers: list) -> list[str]:
+    """FY + latest YTD for databook output sheets (prior-year YTD stays master-only)."""
+    fy_cols, ytd_cols = split_fy_and_ytd(ordered_reporting_columns_from_headers(headers))
+    out = list(fy_cols)
+    if ytd_cols:
+        out.append(ytd_cols[-1])
+    return out
+
+
+def display_reporting_columns_from_df(df) -> list[str]:
+    return display_reporting_columns_from_headers(list(df.columns))
+
+
 def ordered_month_columns_from_headers(headers: list) -> list[str]:
-    """Month columns (Jan-2024) in master header order."""
-    return filter_master_period_columns(headers, "monthly")
+    """Month columns (Jan-2024 or Jan22A) in master header order."""
+    out: list[str] = []
+    for h in headers:
+        s = str(h or "").strip()
+        if is_month_period_column(s) or is_compact_month_period_column(s):
+            out.append(s)
+    return out
 
 
 def ordered_month_columns_from_df(df) -> list[str]:
     return ordered_month_columns_from_headers(list(df.columns))
+
+
+def _reporting_fy_from_yy_suffix(yy: int) -> int:
+    return 2000 + yy if yy < 70 else 1900 + yy
+
+
+def calendar_year_from_reporting_fy_month(
+    reporting_fy: int, month_num: int, fy_end_month: int
+) -> int:
+    if month_num <= fy_end_month:
+        return reporting_fy
+    return reporting_fy - 1
+
+
+def parse_period_column_info(header: str, fy_end_month: int = 12) -> dict:
+    """Classify a master period column (FY / YTD / month)."""
+    s = str(header or "").strip()
+    if is_fy_period_column(s):
+        yy = int(re.search(r"(\d{2})", s, re.IGNORECASE).group(1))
+        rfy = _reporting_fy_from_yy_suffix(yy)
+        return {"kind": "fy", "reporting_fy": rfy, "month_num": None, "calendar_year": None}
+    if is_ytd_period_column(s):
+        yy = int(re.search(r"(\d{2})", s, re.IGNORECASE).group(1))
+        rfy = _reporting_fy_from_yy_suffix(yy)
+        return {"kind": "ytd", "reporting_fy": rfy, "month_num": None, "calendar_year": None}
+    if is_month_period_column(s):
+        cal_y, cal_m = parse_month_period_column(s)
+        rfy = reporting_fy_from_period(cal_y, cal_m, fy_end_month)
+        return {
+            "kind": "month",
+            "reporting_fy": rfy,
+            "month_num": cal_m,
+            "calendar_year": cal_y,
+        }
+    m = _COMPACT_MONTH_COL_RE.match(s)
+    if m:
+        abbr = m.group(1).capitalize()
+        month_num = EN_MONTH_ABBR.index(abbr) + 1
+        rfy = _reporting_fy_from_yy_suffix(int(m.group(2)))
+        cal_y = calendar_year_from_reporting_fy_month(rfy, month_num, fy_end_month)
+        return {
+            "kind": "month",
+            "reporting_fy": rfy,
+            "month_num": month_num,
+            "calendar_year": cal_y,
+        }
+    raise ValueError(f"Not a master period column: {header!r}")
 
 
 def parse_month_period_column(header: str) -> tuple[int, int]:
@@ -184,15 +288,16 @@ def parse_month_period_column(header: str) -> tuple[int, int]:
 
 
 def group_month_columns_by_reporting_fy(
-    month_cols: list[str],
+    period_cols: list[str],
     fy_end_month: int,
 ) -> dict[int, list[str]]:
-    """Map reporting FY-end year -> month column labels in input order."""
+    """Map reporting FY-end year -> month column labels (skips FY/YTD cols)."""
     groups: dict[int, list[str]] = {}
-    for col in month_cols:
-        cal_y, cal_m = parse_month_period_column(col)
-        fy = reporting_fy_from_period(cal_y, cal_m, fy_end_month)
-        groups.setdefault(fy, []).append(col)
+    for col in period_cols:
+        info = parse_period_column_info(col, fy_end_month)
+        if info["kind"] != "month":
+            continue
+        groups.setdefault(int(info["reporting_fy"]), []).append(col)
     return dict(sorted(groups.items()))
 
 
@@ -200,16 +305,210 @@ def master_fy_label(reporting_fy_end_year: int) -> str:
     return f"FY{str(int(reporting_fy_end_year))[-2:]}A"
 
 
-def days_in_month_formula(month_header: str) -> str:
+def is_open_ytd_fy_group(
+    fy_end_year: int,
+    month_cols: list[str],
+    all_periods: list[str],
+    fy_end_month: int,
+) -> bool:
+    """True when the FY month group is the open YTD interval (not a completed fiscal year)."""
+    if not month_cols or not all_periods:
+        return False
+    last_global = all_periods[-1]
+    last_in_group = month_cols[-1]
+    if last_in_group != last_global:
+        return False
+    info = parse_period_column_info(last_global, fy_end_month)
+    if int(info["reporting_fy"]) != int(fy_end_year):
+        return False
+    month_num = info.get("month_num")
+    if month_num is None:
+        return False
+    return int(month_num) != int(fy_end_month)
+
+
+def yearly_average_period_label(
+    fy_end_year: int,
+    month_cols: list[str],
+    all_periods: list[str],
+    fy_end_month: int,
+) -> str:
+    if is_open_ytd_fy_group(fy_end_year, month_cols, all_periods, fy_end_month):
+        return master_ytd_label(fy_end_year)
+    return master_fy_label(fy_end_year)
+
+
+_DEC_SNAPSHOT_RE = re.compile(r"^[A-Z][a-z]{2}\d{2}A$")
+
+
+def display_bs_snapshot_label(fy_header: str, fy_end_month: int = 12) -> str:
+    """Map master FY column (FY23A) to balance-sheet snapshot label (Dec23A, Mar23A, …)."""
+    s = str(fy_header or "").strip()
+    if not is_fy_period_column(s):
+        return s
+    yy = s[2:4]
+    month = min(max(int(fy_end_month or 12), 1), 12)
+    abbr = EN_MONTH_ABBR[month - 1]
+    return f"{abbr}{yy}A"
+
+
+def display_bs_ytd_snapshot_label(
+    ytd_header: str,
+    ltm_month: str | None = None,
+    fy_end_month: int = 12,
+) -> str:
+    """YTD master column -> month snapshot from date settings (YTD23A + Jul -> Jul23A)."""
+    s = str(ytd_header or "").strip()
+    if not is_ytd_period_column(s):
+        return s
+    yy = int(re.search(r"(\d{2})", s, re.IGNORECASE).group(1))
+    ltm = _parse_ltm_month(ltm_month)
+    if ltm:
+        abbr = EN_MONTH_ABBR[ltm[1] - 1]
+    else:
+        abbr = EN_MONTH_ABBR[min(max(int(fy_end_month or 12), 1), 12) - 1]
+    return f"{abbr}{yy:02d}A"
+
+
+def display_bs_period_labels(
+    headers: list[str],
+    fy_end_month: int = 12,
+    ltm_month: str | None = None,
+) -> list[str]:
+    out: list[str] = []
+    for h in headers:
+        if is_fy_period_column(h):
+            out.append(display_bs_snapshot_label(h, fy_end_month))
+        elif is_ytd_period_column(h):
+            out.append(display_bs_ytd_snapshot_label(h, ltm_month, fy_end_month))
+        else:
+            out.append(str(h))
+    return out
+
+
+def days_in_month_formula(month_header: str, fy_end_month: int = 12) -> str:
     """Excel formula for calendar days in a month column header."""
-    cal_y, cal_m = parse_month_period_column(month_header)
+    info = parse_period_column_info(month_header, fy_end_month)
+    if info["kind"] != "month":
+        return "365"
+    cal_y, cal_m = info["calendar_year"], info["month_num"]
     return f"DAY(EOMONTH(DATE({cal_y},{cal_m},1),0))"
+
+
+def days_in_period_formula(period_header: str, fy_end_month: int = 12) -> str:
+    """Days multiplier for KPI formulas: actual month length or 365 for FY/YTD."""
+    return days_in_month_formula(period_header, fy_end_month)
 
 
 def split_fy_and_ytd(columns: list[str]) -> tuple[list[str], list[str]]:
     fy = [c for c in columns if is_fy_period_column(c)]
     ytd = [c for c in columns if is_ytd_period_column(c)]
     return fy, ytd
+
+
+def cashflow_display_periods(periods: list[str]) -> tuple[list[str], list[str]]:
+    """Cashflow shows FY/YTD from the second period onward; return display cols and priors."""
+    if len(periods) < 2:
+        return [], []
+    display = periods[1:]
+    priors = [periods[i] for i in range(len(display))]
+    return display, priors
+
+
+def prior_year_month_column(month_col: str) -> str:
+    """Shift a master month column one calendar year back (Jan25A -> Jan24A)."""
+    s = str(month_col or "").strip()
+    m = _COMPACT_MONTH_COL_RE.match(s)
+    if m:
+        abbr = m.group(1).capitalize()
+        yy = int(m.group(2))
+        return f"{abbr}{(yy - 1) % 100:02d}A"
+    if is_month_period_column(s):
+        cal_y, cal_m = parse_month_period_column(s)
+        return make_period_str(cal_y - 1, cal_m)
+    raise ValueError(f"Not a month period column: {month_col!r}")
+
+
+def prior_year_month_columns(month_cols: list[str], all_columns: list[str]) -> list[str]:
+    """Same-month prior-year columns that exist in the master."""
+    col_set = {str(c).strip() for c in all_columns}
+    out: list[str] = []
+    for mc in month_cols:
+        try:
+            prior = prior_year_month_column(mc)
+        except ValueError:
+            continue
+        if prior in col_set:
+            out.append(prior)
+    return out
+
+
+def ytd_month_columns_for_period(
+    ytd_label: str,
+    all_columns: list[str],
+    fy_end_month: int = 12,
+) -> list[str]:
+    """Month columns in the YTD reporting FY up to the last available month."""
+    if not is_ytd_period_column(ytd_label):
+        return []
+    yy = int(re.search(r"(\d{2})", ytd_label, re.IGNORECASE).group(1))
+    rfy = _reporting_fy_from_yy_suffix(yy)
+    month_cols = [
+        str(c).strip()
+        for c in all_columns
+        if is_compact_month_period_column(c) or is_month_period_column(c)
+    ]
+    groups = group_month_columns_by_reporting_fy(month_cols, fy_end_month)
+    return list(groups.get(rfy, []))
+
+
+def prior_ytd_column(ytd_label: str, all_columns: list[str]) -> str | None:
+    """Prior-year YTD column label (YTD25A -> YTD24A) when present in master."""
+    if not is_ytd_period_column(ytd_label):
+        return None
+    yy = int(re.search(r"(\d{2})", ytd_label, re.IGNORECASE).group(1))
+    prior = f"YTD{(yy - 1) % 100:02d}A"
+    col_set = {str(c).strip() for c in all_columns}
+    return prior if prior in col_set else None
+
+
+@dataclass(frozen=True)
+class CashflowDeltaSpec:
+    kind: str
+    curr_col: str | None = None
+    prior_col: str | None = None
+    curr_months: tuple[str, ...] = ()
+    prior_months: tuple[str, ...] = ()
+
+
+def cashflow_delta_spec(
+    display_period: str,
+    prior_period: str | None,
+    all_columns: list[str],
+    *,
+    fy_end_month: int = 12,
+) -> CashflowDeltaSpec:
+    """FY: column pair; YTD: prefer YTD curr/prior columns, else month sums."""
+    if is_ytd_period_column(display_period):
+        prior_ytd = prior_ytd_column(display_period, all_columns)
+        if prior_ytd and display_period in {str(c).strip() for c in all_columns}:
+            return CashflowDeltaSpec(
+                kind="ytd",
+                curr_col=display_period,
+                prior_col=prior_ytd,
+            )
+        curr_months = ytd_month_columns_for_period(display_period, all_columns, fy_end_month)
+        prior_months = prior_year_month_columns(curr_months, all_columns)
+        return CashflowDeltaSpec(
+            kind="ytd",
+            curr_months=tuple(curr_months),
+            prior_months=tuple(prior_months),
+        )
+    return CashflowDeltaSpec(
+        kind="fy",
+        curr_col=display_period,
+        prior_col=prior_period,
+    )
 
 
 def _parse_ltm_month(ltm_month: str | None) -> tuple[int, int] | None:

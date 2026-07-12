@@ -30,8 +30,8 @@ from databook_amounts import FMT_KEUR, scale_to_keur  # noqa: E402
 # --------------------------------------------------
 # FORMAT STANDARDS
 # --------------------------------------------------
-BASE_FONT = Font(name="GT Walsheim LC Light", size=8)
-HEADER_FONT = Font(name="GT Walsheim LC Light", size=8, bold=True)
+BASE_FONT = Font(name="Inter", size=8)
+HEADER_FONT = Font(name="Inter", size=8, bold=True)
 
 FMT_AMOUNT = FMT_KEUR
 
@@ -145,7 +145,7 @@ def fy_columns_from_df(df: pd.DataFrame) -> list[str]:
 
 def apply_header_style(ws, l6_col=None):
     """
-    Header format: #F2F2F2, bold, bottom border, GT Walsheim LC Light 8.
+    Header format: #F2F2F2, bold, bottom border, Inter 8.
     """
     limit = get_format_limit_col(ws, l6_col=l6_col)
     for c in range(1, limit + 1):

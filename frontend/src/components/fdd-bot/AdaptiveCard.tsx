@@ -2,7 +2,7 @@
  * AdaptiveCard — renders a structured bot message as an interactive form.
  *
  * Supports input types:
- *   text, dropdown, radio, multi_select, number, month_picker, day_picker,
+ *   text, dropdown, radio, multi_select, checkbox, number, month_picker, day_picker,
  *   file_drop, date_picker, susa_grid
  *
  * On submit, calls onSubmit(cardName, values) which the parent hook posts to Rasa.
@@ -13,9 +13,11 @@ import { Upload, ChevronDown, Check, FileSpreadsheet, Download } from 'lucide-re
 import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
 import SusaColumnMapper, { type SusaColumnMappingPayload } from './SusaColumnMapper'
-import FaRollfColumnMapper from './FaRollfColumnMapper'
 import OposColumnMapper from './OposColumnMapper'
+import FaRollfColumnMapper from './FaRollfColumnMapper'
+import FtePayrollColumnMapper from './FtePayrollColumnMapper'
 import OposSnapshotsCard from './OposSnapshotsCard'
+import OposDisplayBucketsCard from './OposDisplayBucketsCard'
 
 interface Props {
   payload: AdaptiveCardPayload
@@ -447,6 +449,31 @@ function RadioInput({ input, value, onChange, dense }: {
   )
 }
 
+function checkboxDefault(defaultVal: unknown): boolean {
+  if (defaultVal === true || defaultVal === 'on' || defaultVal === 'true' || defaultVal === '1') return true
+  return false
+}
+
+function CheckboxInput({ input, value, onChange }: {
+  input: AdaptiveCardInput
+  value: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <label className="flex items-center gap-2 cursor-pointer select-none">
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={e => onChange(e.target.checked)}
+        className="h-4 w-4 rounded border-slate-300 text-[#1E3A5F] focus:ring-[#1E3A5F]"
+      />
+      <span className="text-sm" style={{ color: '#334155' }}>
+        {input.label}
+      </span>
+    </label>
+  )
+}
+
 function MultiSelectInput({ input, value, onChange }: {
   input: AdaptiveCardInput
   value: string[]
@@ -760,14 +787,16 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange, d
   onEntityNameChange: (entityIdx: number, name: string) => void
   disabled?: boolean
 }) {
+  const gridUid = useId()
   const entityCount = input.entity_count ?? 5
+  const fixedName = input.fixed_entity_name?.trim()
   const yearOptions = input.options ?? []
   const years = yearOptions.map(o => o.value)
   const optionalYears = new Set(yearOptions.filter(o => o.optional).map(o => o.value))
   const gridMode = input.grid_mode ?? 'single_file'
   const fileRefs = useRef<Record<string, HTMLInputElement | null>>({})
   const [entityNames, setEntityNames] = useState<string[]>(() =>
-    Array.from({ length: entityCount }, (_, i) => `Entity ${i + 1}`),
+    Array.from({ length: entityCount }, (_, i) => fixedName || `Entity ${i + 1}`),
   )
 
   const cellKey = (entityIdx: number, year: string) => `entity_${entityIdx + 1}_${year}`
@@ -809,26 +838,44 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange, d
             {Array.from({ length: entityCount }, (_, ei) => (
               <tr key={ei} style={{ borderTop: '1px solid #F1F5F9' }}>
                 <td className="pr-3 py-2">
-                  <input
-                    type="text"
-                    value={entityNames[ei]}
-                    onChange={e => {
-                      const updated = [...entityNames]
-                      updated[ei] = e.target.value
-                      setEntityNames(updated)
-                      onEntityNameChange(ei, e.target.value)
-                    }}
-                    className="rounded px-2 py-1 text-xs outline-none"
-                    style={{ border: '1px solid #E2E8F0', background: '#F8FAFC', color: '#1E293B', width: 90 }}
-                  />
+                  {fixedName ? (
+                    <span className="text-xs font-medium" style={{ color: '#1E293B' }}>{fixedName}</span>
+                  ) : (
+                    <input
+                      type="text"
+                      value={entityNames[ei]}
+                      onChange={e => {
+                        const updated = [...entityNames]
+                        updated[ei] = e.target.value
+                        setEntityNames(updated)
+                        onEntityNameChange(ei, e.target.value)
+                      }}
+                      className="rounded px-2 py-1 text-xs outline-none"
+                      style={{ border: '1px solid #E2E8F0', background: '#F8FAFC', color: '#1E293B', width: 90 }}
+                    />
+                  )}
                 </td>
                 {years.map(yr => {
                   const key = cellKey(ei, yr)
+                  const inputId = `${gridUid}-susa-${key}`
                   const uploaded = fileStatuses[key]
+                  const openPicker = () => {
+                    if (disabled) return
+                    fileRefs.current[key]?.click()
+                  }
                   return (
                     <td key={yr} className="px-2 py-2 text-center">
-                      <label
-                        htmlFor={disabled ? undefined : `susa-${key}`}
+                      <div
+                        role="button"
+                        tabIndex={disabled ? -1 : 0}
+                        onClick={openPicker}
+                        onKeyDown={e => {
+                          if (disabled) return
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            openPicker()
+                          }
+                        }}
                         className="rounded-lg flex flex-col items-center justify-center gap-1 transition-colors"
                         style={{
                           border: `1.5px dashed ${uploaded ? '#10B981' : '#CBD5E1'}`,
@@ -859,9 +906,9 @@ function SusaGridInput({ input, onCellFiles, fileStatuses, onEntityNameChange, d
                         >
                           {uploaded ?? (gridMode === 'folder' ? 'Drop folder / click' : 'Drop / click')}
                         </span>
-                      </label>
+                      </div>
                       <input
-                        id={`susa-${key}`}
+                        id={inputId}
                         ref={el => {
                           fileRefs.current[key] = el
                           if (el && gridMode === 'folder') enableFolderPicker(el)
@@ -910,19 +957,57 @@ export default function AdaptiveCard(props: Props) {
   if (props.payload.card === 'opos_columns') {
     return <OposColumnMapperCard {...props} />
   }
+  if (props.payload.card === 'fa_rollf_columns') {
+    return <FaRollfColumnMapperCard {...props} />
+  }
+  if (props.payload.card === 'fte_columns') {
+    return <FtePayrollColumnMapperCard {...props} />
+  }
   if (props.payload.card === 'opos_snapshots') {
     return <OposSnapshotsCardWrapper {...props} />
   }
-  if (props.payload.card === 'fa_rollf_columns') {
-    return <FaRollfColumnMapperCard {...props} />
+  if (props.payload.card === 'opos_display_buckets') {
+    return <OposDisplayBucketsCardWrapper {...props} />
   }
   return <AdaptiveCardForm {...props} />
 }
 
+function OposDisplayBucketsCardWrapper({ payload, onSubmit, disabled }: Props) {
+  const bucketOptions =
+  (payload as { bucket_options?: { label: string; value: string }[] }).bucket_options ?? []
+  const defaultKeys =
+    (payload as { bucket_defaults?: string[] }).bucket_defaults ?? []
+  const multipleSnapshots = Boolean(
+    (payload as { multiple_snapshots?: boolean }).multiple_snapshots,
+  )
+  const defaultSortBasis = String(
+    (payload as { sort_basis_default?: string }).sort_basis_default ?? 'most_recent',
+  )
+
+  const handleSubmit = async (values: {
+    opos_display_bucket_keys: string[]
+    opos_sort_basis?: string
+  }) => {
+    await onSubmit(payload.card, values)
+  }
+
+  return (
+    <OposDisplayBucketsCard
+      title={payload.title}
+      subtitle={payload.subtitle}
+      submitLabel={payload.submit_label ?? 'Continue'}
+      bucketOptions={bucketOptions}
+      defaultKeys={defaultKeys}
+      multipleSnapshots={multipleSnapshots}
+      defaultSortBasis={defaultSortBasis}
+      disabled={disabled}
+      onSubmit={handleSubmit}
+    />
+  )
+}
+
 function OposSnapshotsCardWrapper({ payload, onSubmit, onFileUpload, disabled }: Props) {
-  const handleSubmit = async (
-    snapshots: { as_of: string; file_id: string; file_path: string; sheet_name?: string }[],
-  ) => {
+  const handleSubmit = async (snapshots: import('./OposSnapshotsCard').OposSnapshotPair[]) => {
     await onSubmit(payload.card, { opos_snapshots: snapshots })
   }
   return (
@@ -935,6 +1020,11 @@ function OposSnapshotsCardWrapper({ payload, onSubmit, onFileUpload, disabled }:
       onSubmit={handleSubmit}
     />
   )
+}
+
+function normalizeMapperMeta(value: unknown, fallback: string): string {
+  const trimmed = String(value ?? '').trim()
+  return trimmed || fallback
 }
 
 function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
@@ -956,7 +1046,9 @@ function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
         {payload.title}
       </h3>
-      {payload.subtitle && <p className="text-xs text-slate-500">{payload.subtitle}</p>}
+      {payload.subtitle && (
+        <p className="text-xs text-slate-500">{payload.subtitle}</p>
+      )}
       <FaRollfColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
@@ -969,7 +1061,7 @@ function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
   )
 }
 
-function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+function FtePayrollColumnMapperCard({ payload, onSubmit, disabled }: Props) {
   const meta = payload.mapper_meta ?? {}
   const sessionId = String(meta.session_id ?? '')
   const previewFileId = String(meta.preview_file_id ?? '')
@@ -988,8 +1080,10 @@ function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
         {payload.title}
       </h3>
-      {payload.subtitle && <p className="text-xs text-slate-500">{payload.subtitle}</p>}
-      <OposColumnMapper
+      {payload.subtitle && (
+        <p className="text-xs text-slate-500">{payload.subtitle}</p>
+      )}
+      <FtePayrollColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
         sheetName={sheetName}
@@ -1001,9 +1095,45 @@ function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
   )
 }
 
-function normalizeMapperMeta(value: unknown, fallback: string): string {
-  const trimmed = String(value ?? '').trim()
-  return trimmed || fallback
+function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const meta = payload.mapper_meta ?? {}
+  const sessionId = String(meta.session_id ?? '')
+  const previewFileId = String(meta.preview_file_id ?? '')
+  const sheetName = String(meta.sheet_name ?? '')
+  const headerRow = Number(meta.header_row ?? 0)
+  const snapshotsJson = String(meta.snapshots_json ?? '[]')
+
+  const handleMapping = async (mapping: Record<string, string>) => {
+    await onSubmit(payload.card, mapping)
+  }
+
+  const handleReupload = async () => {
+    await onSubmit('opos_missing_due_date', { opos_missing_due_choice: 'reupload' })
+  }
+
+  return (
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3 relative"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
+    >
+      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
+        {payload.title}
+      </h3>
+      {payload.subtitle && (
+        <p className="text-xs text-slate-500">{payload.subtitle}</p>
+      )}
+      <OposColumnMapper
+        sessionId={sessionId}
+        previewFileId={previewFileId}
+        sheetName={sheetName}
+        headerRow={headerRow}
+        snapshotsJson={snapshotsJson}
+        disabled={disabled}
+        onSubmit={handleMapping}
+        onReupload={handleReupload}
+      />
+    </div>
+  )
 }
 
 function SusaColumnMapperCard({ payload, onSubmit, disabled }: Props) {
@@ -1047,7 +1177,8 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   const [values, setValues] = useState<Record<string, unknown>>(() => {
     const init: Record<string, unknown> = {}
     for (const inp of inputs) {
-      if (inp.type === 'multi_select') init[inp.id] = []
+      if (inp.type === 'multi_select') init[inp.id] = Array.isArray(inp.default) ? inp.default : []
+      else if (inp.type === 'checkbox') init[inp.id] = checkboxDefault(inp.default)
       else if (inp.type === 'sortable_list') init[inp.id] = inp.options?.map(o => o.value) ?? []
       else init[inp.id] = inp.default ?? ''
     }
@@ -1058,6 +1189,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   const [fileResults, setFileResults] = useState<Record<string, { file_id: string; file_path: string }[]>>({})
   // display names for susa_grid cells
   const [susaFileNames, setSusaFileNames] = useState<Record<string, string | null>>({})
+  const [susaGridError, setSusaGridError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const set = (id: string, v: unknown) => setValues(prev => ({ ...prev, [id]: v }))
@@ -1065,6 +1197,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   const handleSubmit = async () => {
     if (disabled || submitting) return
     setSubmitting(true)
+    setSusaGridError(null)
 
     try {
       const visible = inputs.filter(inp => inputVisible(inp, values))
@@ -1090,6 +1223,7 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             continue
           }
           if (inp.type === 'susa_grid') continue
+          if (inp.type === 'checkbox') continue
           const raw = values[inp.id]
           if (inp.type === 'multi_select') {
             if (!Array.isArray(raw) || raw.length === 0) {
@@ -1176,7 +1310,13 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
           const years = inp.options?.map(o => o.value) ?? []
           const entityNames: string[] = []
           for (let ei = 0; ei < entityCount; ei++) {
-            entityNames.push(String(values[`${inp.id}_entity_${ei + 1}_name`] ?? `Entity ${ei + 1}`))
+            entityNames.push(
+              String(
+                values[`${inp.id}_entity_${ei + 1}_name`]
+                  ?? inp.fixed_entity_name
+                  ?? `Entity ${ei + 1}`,
+              ),
+            )
           }
           out['entity_names'] = entityNames
           const gridGroups: Record<string, string[]> = {}
@@ -1208,6 +1348,8 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             }
           }
           out['susa_file_groups'] = gridGroups
+        } else if (inp.type === 'checkbox') {
+          out[inp.id] = values[inp.id] ? 'on' : 'off'
         } else {
           const raw = values[inp.id]
           if (inp.type === 'number') {
@@ -1223,6 +1365,17 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
         return
       }
 
+      const gridGroups = out.susa_file_groups as Record<string, string[]> | undefined
+      if (
+        (payload.card === 'fa_rollf_files' ||
+          payload.card === 'fte_files' ||
+          payload.card === 'databook_susa_files')
+        && (!gridGroups || !Object.values(gridGroups).some(ids => Array.isArray(ids) && ids.length > 0))
+      ) {
+        setSusaGridError('Please upload at least one file in the grid before continuing.')
+        return
+      }
+
       await Promise.resolve(
         onSubmit(payload.card, out, { submitLabel: payload.submit_label }),
       )
@@ -1234,13 +1387,16 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
   const handleSusaCellFiles = async (_gridInputId: string, entityIdx: number, year: string, files: File[]) => {
     const cellKey = `entity_${entityIdx + 1}_${year}`
     if (!files.length) return
-    if (files.length === 1) {
-      setSusaFileNames(prev => ({ ...prev, [cellKey]: files[0].name }))
-    } else {
-      setSusaFileNames(prev => ({ ...prev, [cellKey]: `${files.length} .xlsx files` }))
-    }
+    setSusaGridError(null)
     setFileCache(prev => ({ ...prev, [cellKey]: files }))
-    if (!onFileUpload) return
+    if (!onFileUpload) {
+      if (files.length === 1) {
+        setSusaFileNames(prev => ({ ...prev, [cellKey]: files[0].name }))
+      } else {
+        setSusaFileNames(prev => ({ ...prev, [cellKey]: `${files.length} .xlsx files` }))
+      }
+      return
+    }
     const results: { file_id: string; file_path: string }[] = []
     for (const f of files) {
       const r = await onFileUpload(f)
@@ -1248,9 +1404,22 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
         results.push({ file_id: r.file_id, file_path: r.file_path })
       }
     }
-    if (results.length) {
-      setFileResults(prev => ({ ...prev, [cellKey]: results }))
+    if (!results.length) {
+      setSusaFileNames(prev => ({ ...prev, [cellKey]: null }))
+      setFileCache(prev => {
+        const next = { ...prev }
+        delete next[cellKey]
+        return next
+      })
+      setSusaGridError('File upload failed — please try again.')
+      return
     }
+    if (results.length === 1) {
+      setSusaFileNames(prev => ({ ...prev, [cellKey]: files[0].name }))
+    } else {
+      setSusaFileNames(prev => ({ ...prev, [cellKey]: `${results.length} .xlsx files` }))
+    }
+    setFileResults(prev => ({ ...prev, [cellKey]: results }))
   }
 
   const handleSusaEntityName = (inputId: string, entityIdx: number, name: string) => {
@@ -1306,6 +1475,15 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             key={inp.id}
             input={inp}
             value={(values[inp.id] as string[]) ?? []}
+            onChange={v => set(inp.id, v)}
+          />
+        )
+      case 'checkbox':
+        return (
+          <CheckboxInput
+            key={inp.id}
+            input={inp}
+            value={Boolean(values[inp.id])}
             onChange={v => set(inp.id, v)}
           />
         )
@@ -1506,6 +1684,12 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
         </p>
       )}
 
+      {susaGridError && (
+        <p className={`${compact ? 'px-3 pb-1' : 'px-4 pb-2'} text-xs`} style={{ color: '#DC2626' }}>
+          {susaGridError}
+        </p>
+      )}
+
       {/* Footer — submit / secondary */}
       {!disabled && (
         <div className={`${compact ? 'px-3 pb-2' : 'px-4 pb-4'} flex flex-col gap-2`}>
@@ -1523,24 +1707,45 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
             {submitting ? 'Processing...' : (payload.submit_label ?? 'Submit')}
           </button>
           {payload.secondary_submit_label && payload.secondary_submit_id && (
-            <button
-              type="button"
-              disabled={submitting}
-              className="w-full rounded-lg py-2 text-xs font-medium border border-slate-300"
-              style={{ color: '#475569', opacity: submitting ? 0.6 : 1 }}
-              onClick={async () => {
-                setSubmitting(true)
-                try {
-                  await Promise.resolve(
-                    onSubmit(payload.card, { [payload.secondary_submit_id!]: true }),
-                  )
-                } finally {
-                  setSubmitting(false)
-                }
-              }}
-            >
-              {payload.secondary_submit_label}
-            </button>
+            payload.secondary_submit_variant === 'link' ? (
+              <button
+                type="button"
+                disabled={submitting}
+                className="text-[11px] text-center underline-offset-2 hover:underline disabled:opacity-60"
+                style={{ color: '#94A3B8' }}
+                onClick={async () => {
+                  setSubmitting(true)
+                  try {
+                    await Promise.resolve(
+                      onSubmit(payload.card, { [payload.secondary_submit_id!]: true }),
+                    )
+                  } finally {
+                    setSubmitting(false)
+                  }
+                }}
+              >
+                {payload.secondary_submit_label}
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={submitting}
+                className="w-full rounded-lg py-2 text-xs font-medium border border-slate-300"
+                style={{ color: '#475569', opacity: submitting ? 0.6 : 1 }}
+                onClick={async () => {
+                  setSubmitting(true)
+                  try {
+                    await Promise.resolve(
+                      onSubmit(payload.card, { [payload.secondary_submit_id!]: true }),
+                    )
+                  } finally {
+                    setSubmitting(false)
+                  }
+                }}
+              >
+                {payload.secondary_submit_label}
+              </button>
+            )
           )}
         </div>
       )}

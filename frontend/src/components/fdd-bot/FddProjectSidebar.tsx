@@ -57,11 +57,11 @@ export default function FddProjectSidebar({
             {projects.map(project => {
               const isActive = project.id === activeProjectId
               return (
-                <li key={project.id} className="group relative">
+                <li key={project.id} className={`group flex items-center gap-0.5 min-w-0${isActive ? '' : ''}`}>
                   <button
                     type="button"
                     onClick={() => onSelectProject(project.id)}
-                    className="w-full text-left px-3 py-2 pr-9 rounded-lg text-sm truncate transition-colors"
+                    className="flex-1 min-w-0 text-left px-3 py-2 rounded-lg text-sm truncate transition-colors"
                     style={{
                       background: isActive ? 'rgba(30,58,95,0.08)' : 'transparent',
                       color: isActive ? '#1E3A5F' : '#334155',
@@ -71,18 +71,17 @@ export default function FddProjectSidebar({
                   >
                     {project.name}
                   </button>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onDeleteProject(project.id)
-                    }}
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                    style={{ color: '#94A3B8' }}
-                    aria-label="Projekt löschen"
-                  >
-                    <X size={14} />
-                  </button>
+                  {isActive ? (
+                    <button
+                      type="button"
+                      onClick={() => onDeleteProject(project.id)}
+                      className="shrink-0 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:text-red-600"
+                      style={{ color: '#64748B' }}
+                      aria-label="Projekt löschen"
+                    >
+                      <X size={14} />
+                    </button>
+                  ) : null}
                 </li>
               )
             })}

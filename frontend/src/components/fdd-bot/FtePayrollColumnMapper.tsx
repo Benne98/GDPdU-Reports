@@ -1,6 +1,6 @@
 /**
- * Interactive column mapper for Fixed Assets Rollforward.
- * Click column headers for opening / additions / disposals; multi-select depreciation columns.
+ * Interactive column mapper for FTE Development.
+ * Click headers for employment rate and annual working time; multi-select payroll columns via table clicks.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -19,32 +19,32 @@ interface PreviewData {
   rows: string[][]
 }
 
-export type FaRollfRole = 'opening' | 'additions' | 'disposals'
+type FteRole = 'employment' | 'months_sum'
 
-const SINGLE_ROLES: { key: FaRollfRole; label: string; slot: string }[] = [
-  { key: 'opening', label: 'Opening (FY begin)', slot: 'fa_opening_col' },
-  { key: 'additions', label: 'Additions', slot: 'fa_additions_col' },
-  { key: 'disposals', label: 'Disposals', slot: 'fa_disposals_col' },
+const SINGLE_ROLES: { key: FteRole; label: string; slot: string }[] = [
+  { key: 'employment', label: 'Employment rate', slot: 'fte_employment_col' },
+  { key: 'months_sum', label: 'Annual working time (months)', slot: 'fte_months_col' },
 ]
 
-const ROLE_COLORS: Record<FaRollfRole, string> = {
-  opening: '#2563EB',
-  additions: '#059669',
-  disposals: '#D97706',
+const ROLE_COLORS: Record<FteRole, string> = {
+  employment: '#2563EB',
+  months_sum: '#059669',
 }
 
 interface Props {
   sessionId: string
   previewFileId: string
+  periodsJson?: string
   sheetName?: string
   headerRow?: number
   disabled?: boolean
   onSubmit: (payload: Record<string, string>) => void | Promise<void>
 }
 
-export default function FaRollfColumnMapper({
+export default function FtePayrollColumnMapper({
   sessionId,
   previewFileId,
+  periodsJson = '[]',
   sheetName = '',
   headerRow = 0,
   disabled,
@@ -53,13 +53,15 @@ export default function FaRollfColumnMapper({
   const [preview, setPreview] = useState<PreviewData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [assignments, setAssignments] = useState<Partial<Record<FaRollfRole, string>>>({})
-  const [history, setHistory] = useState<Partial<Record<FaRollfRole, string>>[]>([])
+  const [assignments, setAssignments] = useState<Partial<Record<FteRole, string>>>({})
+  const [history, setHistory] = useState<Partial<Record<FteRole, string>>[]>([])
   const [stepIndex, setStepIndex] = useState(0)
-  const [depCols, setDepCols] = useState<Set<string>>(new Set())
-  const [depSelectionOrder, setDepSelectionOrder] = useState<string[]>([])
-  const [phase, setPhase] = useState<'map' | 'depreciation'>('map')
+  const [payCols, setPayCols] = useState<Set<string>>(new Set())
+  const [paySelectionOrder, setPaySelectionOrder] = useState<string[]>([])
+  const [phase, setPhase] = useState<'map' | 'payroll'>('map')
   const [submitting, setSubmitting] = useState(false)
+  const [columnWarning, setColumnWarning] = useState<number | null>(null)
+  const [pendingPayload, setPendingPayload] = useState<Record<string, string> | null>(null)
   const submittedRef = useRef(false)
 
   const currentRole = SINGLE_ROLES[stepIndex]?.key
@@ -90,7 +92,7 @@ export default function FaRollfColumnMapper({
       setError(null)
       try {
         if (!previewFileId.trim()) {
-          throw new Error('No file — please upload your register file first.')
+          throw new Error('No file — please upload your personnel file first.')
         }
         if (!sessionId.trim()) {
           throw new Error('No session — please refresh the conversation.')
@@ -103,7 +105,7 @@ export default function FaRollfColumnMapper({
           max_rows: '12',
         })
         if (sheetName.trim()) params.set('sheet_name', sheetName.trim())
-        const resp = await fetch(`${base}/api/v1/fdd/fa_rollf/preview?${params}`)
+        const resp = await fetch(`${base}/api/v1/fdd/fte_payroll/preview?${params}`)
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({}))
           const detail = (err as { detail?: string }).detail
@@ -122,14 +124,78 @@ export default function FaRollfColumnMapper({
     }
   }, [sessionId, previewFileId, sheetName, headerRow])
 
-  useEffect(() => {
-    if (singleMapped && phase === 'map') {
-      setPhase('depreciation')
+  const auditPeriods = useMemo(() => {
+    try {
+      const parsed = JSON.parse(periodsJson || '[]') as Array<{
+        file_id?: string
+        sheet_name?: string
+        label?: string
+      }>
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.map(p => ({
+          file_id: String(p.file_id || previewFileId || '').trim(),
+          sheet_name: String(p.sheet_name || sheetName || '').trim(),
+          label: String(p.label || '').trim(),
+        }))
+      }
+    } catch {
+      /* ignore */
     }
-  }, [singleMapped, phase])
+    return [{ file_id: previewFileId, sheet_name: sheetName, label: 'Preview' }]
+  }, [periodsJson, previewFileId, sheetName])
+
+  const auditInvalidColumns = useCallback(
+    async (payload: Record<string, string>): Promise<number> => {
+      if (!previewFileId.trim()) return 0
+      const base = getApiBaseUrl()
+      const resp = await fetch(`${base}/api/v1/fdd/fte_payroll/audit-columns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          periods: auditPeriods,
+          columns: {
+            employment: payload.fte_employment_col,
+            months_sum: payload.fte_months_col,
+          },
+          header_row: headerRow,
+        }),
+      })
+      if (!resp.ok) return 0
+      const data = (await resp.json()) as { total_invalid?: number }
+      return Number(data.total_invalid || 0)
+    },
+    [auditPeriods, headerRow, previewFileId, sessionId],
+  )
+
+  useEffect(() => {
+    if (!singleMapped || phase !== 'map') return
+    let cancelled = false
+    ;(async () => {
+      const payload: Record<string, string> = {}
+      for (const role of SINGLE_ROLES) {
+        const letter = assignments[role.key]
+        const header = letter ? headerByLetter.get(letter) : ''
+        if (header) payload[role.slot] = header
+      }
+      const invalid = await auditInvalidColumns(payload)
+      if (!cancelled) {
+        setColumnWarning(invalid > 0 ? invalid : null)
+        setPhase('payroll')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [singleMapped, phase, assignments, headerByLetter, auditInvalidColumns])
+
+  useEffect(() => {
+    if (phase !== 'map' || singleMapped) return
+    setColumnWarning(null)
+  }, [phase, singleMapped, assignments])
 
   const roleForLetter = useCallback(
-    (letter: string): FaRollfRole | undefined => {
+    (letter: string): FteRole | undefined => {
       for (const role of SINGLE_ROLES) {
         if (assignments[role.key] === letter) return role.key
       }
@@ -144,7 +210,7 @@ export default function FaRollfColumnMapper({
     if (!header) return
 
     setHistory(prev => [...prev, { ...assignments }])
-    const next: Partial<Record<FaRollfRole, string>> = { ...assignments }
+    const next: Partial<Record<FteRole, string>> = { ...assignments }
     for (const role of SINGLE_ROLES) {
       if (next[role.key] === letter) delete next[role.key]
     }
@@ -158,10 +224,10 @@ export default function FaRollfColumnMapper({
   const undoLast = () => {
     if (disabled) return
     submittedRef.current = false
-    if (phase === 'depreciation' && depSelectionOrder.length > 0) {
-      const last = depSelectionOrder[depSelectionOrder.length - 1]
-      setDepSelectionOrder(prev => prev.slice(0, -1))
-      setDepCols(prev => {
+    if (phase === 'payroll' && paySelectionOrder.length > 0) {
+      const last = paySelectionOrder[paySelectionOrder.length - 1]
+      setPaySelectionOrder(prev => prev.slice(0, -1))
+      setPayCols(prev => {
         const next = new Set(prev)
         next.delete(last)
         return next
@@ -170,8 +236,8 @@ export default function FaRollfColumnMapper({
     }
     if (!history.length) return
     setPhase('map')
-    setDepCols(new Set())
-    setDepSelectionOrder([])
+    setPayCols(new Set())
+    setPaySelectionOrder([])
     const prev = history[history.length - 1]
     setHistory(h => h.slice(0, -1))
     setAssignments(prev)
@@ -179,25 +245,30 @@ export default function FaRollfColumnMapper({
     setStepIndex(nextStep >= 0 ? nextStep : 0)
   }
 
-  const toggleDepCol = (header: string) => {
-    if (disabled || phase !== 'depreciation') return
+  const togglePayCol = (header: string) => {
+    if (disabled || phase !== 'payroll') return
     if (mappedSingleHeaders.has(header)) return
-    setDepCols(prev => {
+    setPayCols(prev => {
       const next = new Set(prev)
       if (next.has(header)) {
         next.delete(header)
-        setDepSelectionOrder(order => order.filter(h => h !== header))
+        setPaySelectionOrder(order => order.filter(h => h !== header))
       } else {
         next.add(header)
-        setDepSelectionOrder(order => [...order, header])
+        setPaySelectionOrder(order => [...order, header])
       }
       return next
     })
   }
 
+  const finalizeSubmit = async (payload: Record<string, string>) => {
+    setColumnWarning(null)
+    setPendingPayload(null)
+    await onSubmit(payload)
+  }
+
   const handleSubmit = useCallback(async () => {
-    if (!singleMapped || depCols.size === 0 || submitting || disabled || submittedRef.current) return
-    submittedRef.current = true
+    if (!singleMapped || payCols.size === 0 || submitting || disabled || submittedRef.current) return
     setSubmitting(true)
     try {
       const payload: Record<string, string> = {}
@@ -206,15 +277,43 @@ export default function FaRollfColumnMapper({
         const header = letter ? headerByLetter.get(letter) : ''
         if (header) payload[role.slot] = header
       }
-      payload.fa_depreciation_cols_json = JSON.stringify([...depCols])
-      await onSubmit(payload)
+      payload.fte_payroll_cols_json = JSON.stringify([...payCols])
+      const invalid = await auditInvalidColumns(payload)
+      if (invalid > 0) {
+        submittedRef.current = false
+        setColumnWarning(invalid)
+        setPendingPayload(payload)
+        return
+      }
+      submittedRef.current = true
+      await finalizeSubmit(payload)
     } finally {
       setSubmitting(false)
     }
-  }, [singleMapped, depCols, assignments, disabled, headerByLetter, onSubmit, submitting])
+  }, [
+    singleMapped,
+    payCols,
+    assignments,
+    disabled,
+    headerByLetter,
+    onSubmit,
+    submitting,
+    auditInvalidColumns,
+  ])
+
+  const handleContinueDespiteWarning = async () => {
+    if (!pendingPayload || submitting || disabled) return
+    setSubmitting(true)
+    submittedRef.current = true
+    try {
+      await finalizeSubmit(pendingPayload)
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   if (loading) {
-    return <p className="text-sm text-slate-500">Loading register preview…</p>
+    return <p className="text-sm text-slate-500">Loading personnel preview…</p>
   }
   if (error && !preview) {
     return <p className="text-sm text-red-600">{error}</p>
@@ -247,14 +346,14 @@ export default function FaRollfColumnMapper({
         </div>
       )}
 
-      {phase === 'depreciation' && (
+      {phase === 'payroll' && (
         <p className="text-xs font-semibold text-slate-700">
-          Click every depreciation column you want summed (e.g. annual AfA + disposal AfA), then
-          click Continue.
+          Click every column you want included in the payroll total (e.g. base salary only, or full
+          gross), then click Continue.
         </p>
       )}
 
-      {(phase === 'depreciation' ? depSelectionOrder.length > 0 : history.length > 0) && (
+      {(phase === 'payroll' ? paySelectionOrder.length > 0 : history.length > 0) && (
         <div className="self-start">
           <button
             type="button"
@@ -263,7 +362,7 @@ export default function FaRollfColumnMapper({
             className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
           >
             <Undo2 size={14} />
-            {phase === 'depreciation' ? 'Undo last column' : 'Undo'}
+            {phase === 'payroll' ? 'Undo last column' : 'Undo'}
           </button>
         </div>
       )}
@@ -275,27 +374,27 @@ export default function FaRollfColumnMapper({
               {preview.columns.map(col => {
                 const role = roleForLetter(col.letter)
                 const header = col.header || col.letter
-                const depSelected = phase === 'depreciation' && depCols.has(header)
+                const paySelected = phase === 'payroll' && payCols.has(header)
                 const canMap = !disabled && phase === 'map' && currentRole && !singleMapped
-                const canDep =
+                const canPay =
                   !disabled &&
-                  phase === 'depreciation' &&
+                  phase === 'payroll' &&
                   header.trim() &&
                   !mappedSingleHeaders.has(header)
                 let bg = role ? ROLE_COLORS[role] : '#E2E8F0'
-                if (depSelected) bg = '#7C3AED'
+                if (paySelected) bg = '#7C3AED'
                 return (
                   <th
                     key={col.letter}
                     className="px-2 py-1 border border-slate-200 select-none min-w-[72px] max-w-[120px]"
                     style={{
                       background: bg,
-                      color: role || depSelected ? '#fff' : '#475569',
-                      cursor: canMap || canDep ? 'pointer' : 'default',
+                      color: role || paySelected ? '#fff' : '#475569',
+                      cursor: canMap || canPay ? 'pointer' : 'default',
                     }}
                     onClick={() => {
                       if (canMap) assignColumn(col.letter)
-                      else if (canDep) toggleDepCol(header)
+                      else if (canPay) togglePayCol(header)
                     }}
                     title={[col.header, ...col.sample_values.slice(0, 3)].filter(Boolean).join(' · ')}
                   >
@@ -313,7 +412,7 @@ export default function FaRollfColumnMapper({
                   const letter = preview.columns[ci]?.letter
                   const role = letter ? roleForLetter(letter) : undefined
                   const header = preview.columns[ci]?.header || letter
-                  const depSelected = phase === 'depreciation' && header && depCols.has(header)
+                  const paySelected = phase === 'payroll' && header && payCols.has(header)
                   return (
                     <td
                       key={ci}
@@ -321,7 +420,7 @@ export default function FaRollfColumnMapper({
                       style={{
                         background: role
                           ? `${ROLE_COLORS[role]}18`
-                          : depSelected
+                          : paySelected
                             ? '#7C3AED18'
                             : undefined,
                       }}
@@ -336,10 +435,41 @@ export default function FaRollfColumnMapper({
         </table>
       </div>
 
-      {phase === 'depreciation' && (
+      {columnWarning !== null && columnWarning > 0 && (
+        <div
+          className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
+          role="alert"
+        >
+          <p className="font-medium">
+            {columnWarning.toLocaleString('en-US')} row{columnWarning === 1 ? '' : 's'} have invalid
+            employment rate or annual working time values across uploaded personnel files.
+          </p>
+          {phase === 'payroll' ? (
+            <>
+              <p className="mt-1 text-amber-900">Do you want to continue anyway?</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={disabled || submitting}
+                  onClick={() => void handleContinueDespiteWarning()}
+                  className="rounded-md bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50"
+                >
+                  Continue anyway
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="mt-1 text-amber-900">
+              Review the mapped columns or continue to payroll column selection below.
+            </p>
+          )}
+        </div>
+      )}
+
+      {phase === 'payroll' && (
         <button
           type="button"
-          disabled={disabled || depCols.size === 0 || submitting}
+          disabled={disabled || payCols.size === 0 || submitting}
           onClick={() => void handleSubmit()}
           className="self-start rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           style={{ background: '#1E40AF' }}

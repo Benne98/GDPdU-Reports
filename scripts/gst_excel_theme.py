@@ -14,8 +14,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 class GstExcelTheme:
     """ARGB hex without # prefix (openpyxl fgColor)."""
 
-    font_name: str = "GT Walsheim LC Light"
-    font_size: int = 8
+    font_name: str = "Calibri"
+    font_size: int = 9
     font_size_title: int = 24
     font_size_subtitle: int = 12
     font_size_company: int = 9
@@ -129,8 +129,8 @@ SCHEMA_ROWS = [
     ("KPI rows", "Text italic", "64748B", THEME.text_kpi),
     ("Hidden key columns", "Background", "F1F5F9", THEME.tech_col_bg),
     ("Title / subtitle", "Text", "1E3A5F", THEME.text_brand_title),
-    ("Font family", "All cells", "GT Walsheim LC Light", ""),
-    ("Font size data", "All cells", "8pt", ""),
+    ("Font family", "All cells", "Calibri", ""),
+    ("Font size data", "All cells", "9pt", ""),
     ("All-zero data row", "Background", "F1F5F9", THEME.zero_row_bg),
     ("All-zero data row", "Text", "94A3B8", THEME.delta_zero),
 ]
@@ -145,6 +145,7 @@ def apply_zero_row_conditional_formatting(
     style_start_col: int,
     style_end_col: int,
     exclude_cols: set[int] | None = None,
+    gray_font: bool = True,
 ) -> None:
     """
     Gray out rows where every year value column is exactly 0.
@@ -167,7 +168,7 @@ def apply_zero_row_conditional_formatting(
     rule = FormulaRule(
         formula=[formula],
         fill=THEME.fill_zero_row,
-        font=THEME.font_zero_row,
+        font=THEME.font_zero_row if gray_font else THEME.font_base,
     )
 
     style_cols = [c for c in range(style_start_col, style_end_col + 1) if c not in skip]
@@ -205,6 +206,7 @@ def apply_recon_portfolio_layout(
     spacer_cols: set[int],
     visible_block_kinds: frozenset[str] | None = None,
     collapsed_poscol_keys: tuple[str, ...] = ("Difference", "Financial statements"),
+    tech_layout=None,
 ) -> None:
     """
     Column grouping, header bands and entity block titles — aligned with BS_Bucket.py.
@@ -220,13 +222,18 @@ def apply_recon_portfolio_layout(
     ws.sheet_properties.outlinePr.summaryBelow = True
     ws.sheet_properties.outlinePr.applyStyles = True
 
-    left_group_end = pos_col - 1
-    for cc in range(1, left_group_end + 1):
-        col = get_column_letter(cc)
-        ws.column_dimensions[col].outlineLevel = 2
-        ws.column_dimensions[col].hidden = True
-    if left_group_end >= 1:
-        ws.column_dimensions[get_column_letter(left_group_end)].collapsed = True
+    if tech_layout is not None:
+        from databook_excel_layout import hide_helper_column_group
+
+        hide_helper_column_group(ws, tech_layout)
+    else:
+        left_group_end = pos_col - 1
+        for cc in range(1, left_group_end + 1):
+            col = get_column_letter(cc)
+            ws.column_dimensions[col].outlineLevel = 2
+            ws.column_dimensions[col].hidden = True
+        if left_group_end >= 1:
+            ws.column_dimensions[get_column_letter(left_group_end)].collapsed = True
 
     pos_letter = get_column_letter(pos_col)
     ws.column_dimensions[pos_letter].outlineLevel = 0
@@ -269,26 +276,32 @@ def apply_recon_portfolio_layout(
             ws.column_dimensions[c_l].outlineLevel = 0
             ws.column_dimensions[c_l].hidden = False
 
-    for r in (block_title_row, header_row):
-        for cc in range(1, last_used_col + 1):
-            cell = ws.cell(r, cc)
-            if cc in spacer_cols:
-                cell.fill = THEME.fill_white
-            else:
-                cell.fill = THEME.fill_header
+    from databook_excel_layout import DatabookLayout, paint_header_band, write_entity_block_titles
 
-    for cc in range(1, last_used_col + 1):
-        if cc in spacer_cols:
-            continue
-        ws.cell(header_row, cc).border = THEME.border_header_bottom
-
+    period_cols: list[int] = []
     for b in blocks:
-        if b.get("has_plpos"):
-            title_col = b["year_startcol"]
-            if b.get("poscol"):
-                ws.cell(block_title_row, b["poscol"]).fill = THEME.fill_white
-        else:
-            title_col = b["startcol"]
-        title_cell = ws.cell(block_title_row, title_col)
-        title_cell.font = THEME.font_bold
-        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        for y_idx in range(b["year_endcol"] - b["year_startcol"] + 1):
+            period_cols.append(b["year_startcol"] + y_idx)
+
+    layout = tech_layout if tech_layout is not None else DatabookLayout(pos_col=pos_col)
+    paint_header_band(
+        ws,
+        layout,
+        header_rows=[block_title_row, header_row],
+        period_cols=period_cols,
+        spacer_cols=spacer_cols,
+    )
+    write_entity_block_titles(ws, blocks, block_title_row=block_title_row)
+    for b in blocks:
+        key = str(b.get("key") or "")
+        if key not in collapsed_poscol_keys:
+            continue
+        poscol = b.get("poscol")
+        if poscol is None:
+            continue
+        for r in (block_title_row, header_row):
+            cell = ws.cell(r, poscol)
+            cell.fill = THEME.fill_header
+            if r == header_row:
+                cell.font = THEME.font_header
+                cell.border = THEME.border_header_bottom

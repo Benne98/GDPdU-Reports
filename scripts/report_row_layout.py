@@ -58,7 +58,7 @@ def period_columns_for_sort(master_df: pd.DataFrame, basis: str) -> list[str]:
     if sort_basis == "latest_fy":
         return [fy_cols[-1]] if fy_cols else []
     if sort_basis == "ytd":
-        return ytd_cols[:1] if ytd_cols else []
+        return ytd_cols[-1:] if ytd_cols else []
     return fy_cols
 
 
@@ -129,6 +129,43 @@ def l3_order_from_mapping(map_df: pd.DataFrame) -> list[str]:
     return order
 
 
+def l3_order_from_na_mapping(map_df: pd.DataFrame, bucket: str) -> list[str]:
+    """L3 display order for a NA bucket from CF_NA_L3_order.xlsx."""
+    if "NA" not in map_df.columns or "L3" not in map_df.columns:
+        return []
+    sub = map_df[map_df["NA"].astype(str).str.strip().eq(str(bucket).strip())].copy()
+    if sub.empty:
+        return []
+    if "sort_order" in sub.columns:
+        sub = sub.sort_values("sort_order", kind="stable")
+    order: list[str] = []
+    for v in sub["L3"].tolist():
+        s = str(v).strip()
+        if not s or s.lower() in BLANK_TOKENS:
+            continue
+        if s not in order:
+            order.append(s)
+    return order
+
+
+def load_na_l3_orders(map_df: pd.DataFrame, bucket_order: list[str]) -> dict[str, list[str]]:
+    return {bucket: l3_order_from_na_mapping(map_df, bucket) for bucket in bucket_order}
+
+
+def l4_order_from_pl_l3_mapping(map_df: pd.DataFrame, l3: str) -> list[str]:
+    """L4 display order under a PL L3 from Kontenmapping row sequence."""
+    if "L3" not in map_df.columns or "L4" not in map_df.columns:
+        return []
+    target = str(l3).strip().lower()
+    sub = map_df[map_df["L3"].astype(str).str.strip().str.lower().eq(target)]
+    order: list[str] = []
+    for v in sub["L4"].tolist():
+        s = str(v).strip()
+        if s and s.lower() not in BLANK_TOKENS and s not in order:
+            order.append(s)
+    return order
+
+
 def l2_l3_order_from_mapping(map_df: pd.DataFrame) -> list[tuple[str, str]]:
     if "L2" not in map_df.columns or "L3" not in map_df.columns:
         raise ValueError("BS mapping must contain columns 'L2' and 'L3'.")
@@ -157,8 +194,12 @@ def _sorted_l4_for_l3(
     period_cols: list[str],
     *,
     reported_value: str = DEFAULT_REPORTED_VALUE,
+    l4_candidates: list[str] | None = None,
 ) -> list[str]:
-    l4_labels = discover_l4_under_l3(master_df, l3, source_col, reported_value=reported_value)
+    if l4_candidates is not None:
+        l4_labels = list(l4_candidates)
+    else:
+        l4_labels = discover_l4_under_l3(master_df, l3, source_col, reported_value=reported_value)
     if not l4_labels:
         return []
     metrics = {
@@ -655,9 +696,10 @@ def build_working_capital_row_structure(
     bucket_col: str,
     normalize_bucket_fn: Callable[[Any], str],
     reported_value: str = DEFAULT_REPORTED_VALUE,
+    na_l3_order: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """TWC/OWC hierarchy: L4 detail -> L3 subtotal -> NA bucket total; then NWC."""
-    month_cols = ordered_month_columns_from_df(master_df)
+    period_cols = period_columns_for_sort(master_df, normalize_l4_sort_basis(cfg))
     pairs_by_bucket = discover_l3_l4_pairs_by_bucket(
         master_df,
         l3_order,
@@ -680,39 +722,20 @@ def build_working_capital_row_structure(
             if l4 not in l3_to_l4[l3]:
                 l3_to_l4[l3].append(l4)
 
-        l3_metrics = {
-            l3: compute_monthly_avg_sort_metric(
-                master_df,
-                month_cols,
-                source_col,
-                bucket_col,
-                bucket,
-                l3,
-                l4=None,
-                reported_value=reported_value,
-                normalize_bucket_fn=normalize_bucket_fn,
-            )
-            for l3 in l3_to_l4
-        }
-        sorted_l3s = sort_by_signed_monthly_avg(list(l3_to_l4.keys()), l3_metrics)
+        bucket_l3_order = (na_l3_order or {}).get(bucket) or list(l3_to_l4.keys())
 
-        for l3 in sorted_l3s:
+        for l3 in bucket_l3_order:
             l4_list = l3_to_l4.get(l3, [])
-            l4_metrics = {
-                l4: compute_monthly_avg_sort_metric(
-                    master_df,
-                    month_cols,
-                    source_col,
-                    bucket_col,
-                    bucket,
-                    l3,
-                    l4=l4,
-                    reported_value=reported_value,
-                    normalize_bucket_fn=normalize_bucket_fn,
-                )
-                for l4 in l4_list
-            }
-            sorted_l4s = sort_by_signed_monthly_avg(l4_list, l4_metrics)
+            if not l4_list:
+                continue
+            sorted_l4s = _sorted_l4_for_l3(
+                master_df,
+                l3,
+                source_col,
+                period_cols,
+                reported_value=reported_value,
+                l4_candidates=l4_list,
+            )
             _append_wc_l3_block(row_structure, bucket, l3, sorted_l4s)
 
         row_structure.append(
@@ -736,3 +759,107 @@ def build_working_capital_row_structure(
         }
     )
     return row_structure
+
+
+CF_BUCKET_ORDER = ["TWC", "OWC", "Other", "ND"]
+CF_BUCKET_TOTAL_LABELS = {
+    "TWC": "Δ Trade working capital",
+    "OWC": "Δ Other working capital",
+    "Other": "Δ Other",
+    "ND": "Δ Debt-like items",
+}
+
+
+def build_cf_na_bucket_row_structure(
+    master_df: pd.DataFrame,
+    l3_order: list[str],
+    cfg: dict,
+    *,
+    source_col: str,
+    bucket_col: str,
+    bucket_order: list[str],
+    bucket_total_labels: dict[str, str],
+    normalize_bucket_fn: Callable[[Any], str],
+    reported_value: str = DEFAULT_REPORTED_VALUE,
+    na_l3_order: dict[str, list[str]] | None = None,
+) -> list[dict]:
+    """Cashflow Δ-WC: L4 detail -> L3 subtotal -> NA bucket total per section."""
+    period_cols = period_columns_for_sort(master_df, normalize_l4_sort_basis(cfg))
+    pairs_by_bucket = discover_l3_l4_pairs_by_bucket(
+        master_df,
+        l3_order,
+        source_col,
+        bucket_col,
+        bucket_order=bucket_order,
+        normalize_bucket_fn=normalize_bucket_fn,
+        reported_value=reported_value,
+    )
+
+    row_structure: list[dict] = []
+    for bucket in bucket_order:
+        pairs = pairs_by_bucket.get(bucket, [])
+        l3_to_l4: dict[str, list[str]] = {}
+        for l3, l4 in pairs:
+            l3_to_l4.setdefault(l3, [])
+            if l4 not in l3_to_l4[l3]:
+                l3_to_l4[l3].append(l4)
+
+        if not pairs and bucket != "Other":
+            continue
+
+        bucket_l3_order = (na_l3_order or {}).get(bucket, [])
+
+        for l3 in bucket_l3_order:
+            l4_list = l3_to_l4.get(l3, [])
+            if not l4_list:
+                continue
+            sorted_l4s = _sorted_l4_for_l3(
+                master_df,
+                l3,
+                source_col,
+                period_cols,
+                reported_value=reported_value,
+                l4_candidates=l4_list,
+            )
+            _append_wc_l3_block(row_structure, bucket, l3, sorted_l4s)
+
+        row_structure.append(
+            {
+                "type": "total_na",
+                "label": bucket_total_labels.get(bucket, bucket),
+                "NA": bucket,
+                "L3": "",
+                "L4": "",
+                "bucket": bucket,
+            }
+        )
+
+    return row_structure
+
+
+def running_avg_month_prefix(month_cols: list[str], period: str) -> list[str]:
+    """Months from FY start through period (inclusive) for running NWC average."""
+    if period not in month_cols:
+        return []
+    return month_cols[: month_cols.index(period) + 1]
+
+
+def resolve_wc_kpi_rows(row_structure: list[dict]) -> dict[str, int | None]:
+    """Map KPI keys to excel rows: DIO=L3 Inventories subtotal, DSO/DPO=L4 detail rows."""
+    rows: dict[str, int | None] = {"dio": None, "dso": None, "dpo": None}
+    for r in row_structure:
+        rt = r.get("type")
+        row_num = r.get("_excel_row")
+        if row_num is None:
+            continue
+        label = str(r.get("label", "")).strip().lower()
+        l3 = str(r.get("L3", "")).strip().lower()
+        l4 = str(r.get("L4", "")).strip().lower()
+        if rt == "subtotal_l3" and (label == "inventories" or l3 == "inventories"):
+            rows["dio"] = int(row_num)
+        if rt in {"detail", "detail_single"}:
+            if l4 == "trade receivables" or label == "trade receivables":
+                rows["dso"] = int(row_num)
+            if l4 == "trade payables" or label == "trade payables":
+                rows["dpo"] = int(row_num)
+    return rows

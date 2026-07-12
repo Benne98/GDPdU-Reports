@@ -1,15 +1,26 @@
 /**
- * OPOS snapshot date + file upload rows (one snapshot per row).
+ * OPOS snapshot date + Debitor/Kreditor file uploads per row.
  */
 
 import { useCallback, useId, useState } from 'react'
 import { Plus, Upload } from 'lucide-react'
 
+export interface OposSideUpload {
+  file: File | null
+  fileName: string | null
+}
+
 export interface OposSnapshotRow {
   id: string
   as_of: string
-  file: File | null
-  fileName: string | null
+  debitor: OposSideUpload
+  kreditor: OposSideUpload
+}
+
+export interface OposSnapshotPair {
+  as_of: string
+  debitor: { file_id: string; file_path: string; sheet_name?: string }
+  kreditor: { file_id: string; file_path: string; sheet_name?: string }
 }
 
 interface UploadResult {
@@ -24,25 +35,29 @@ interface Props {
   submitLabel?: string
   disabled?: boolean
   onFileUpload?: (file: File) => Promise<UploadResult | null>
-  onSubmit: (snapshots: { as_of: string; file_id: string; file_path: string; sheet_name?: string }[]) => void | Promise<void>
+  onSubmit: (snapshots: OposSnapshotPair[]) => void | Promise<void>
 }
 
 function newRow(): OposSnapshotRow {
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     as_of: '',
-    file: null,
-    fileName: null,
+    debitor: { file: null, fileName: null },
+    kreditor: { file: null, fileName: null },
   }
 }
 
 function SnapshotFileDrop({
   rowId,
+  side,
+  label,
   fileName,
   disabled,
   onFile,
 }: {
   rowId: string
+  side: 'debitor' | 'kreditor'
+  label: string
   fileName: string | null
   disabled?: boolean
   onFile: (file: File) => void
@@ -66,10 +81,10 @@ function SnapshotFileDrop({
   return (
     <div className="flex flex-col gap-1 flex-1 min-w-0">
       <label className="text-xs font-medium" style={{ color: '#475569' }}>
-        Open-items file
+        {label}
       </label>
       <label
-        htmlFor={disabled ? undefined : `${inputId}-${rowId}`}
+        htmlFor={disabled ? undefined : `${inputId}-${rowId}-${side}`}
         className="rounded-lg flex flex-col items-center justify-center gap-1 py-4 px-2 transition-colors"
         style={{
           border: `1.5px dashed ${dragging ? '#1E3A5F' : '#CBD5E1'}`,
@@ -81,22 +96,22 @@ function SnapshotFileDrop({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        <Upload size={16} />
-        <span className="text-[11px] text-slate-600 text-center">
-          {fileName ? fileName : 'Drop .xlsx here or click to upload'}
-        </span>
+        <Upload size={16} style={{ color: fileName ? '#10B981' : '#94A3B8' }} />
+        <p className="text-xs text-center truncate w-full px-1" style={{ color: '#64748B' }}>
+          {fileName ?? 'Drop file or browse'}
+        </p>
+        <input
+          id={`${inputId}-${rowId}-${side}`}
+          type="file"
+          accept=".xlsx,.xls,.xlsm"
+          className="hidden"
+          disabled={disabled}
+          onChange={e => {
+            const f = e.target.files?.[0]
+            if (f) onFile(f)
+          }}
+        />
       </label>
-      <input
-        id={`${inputId}-${rowId}`}
-        type="file"
-        accept=".xlsx,.xls"
-        className="hidden"
-        disabled={disabled}
-        onChange={e => {
-          const f = e.target.files?.[0]
-          if (f) onFile(f)
-        }}
-      />
     </div>
   )
 }
@@ -109,105 +124,153 @@ export default function OposSnapshotsCard({
   onFileUpload,
   onSubmit,
 }: Props) {
-  const [rows, setRows] = useState<OposSnapshotRow[]>([newRow()])
-  const [uploads, setUploads] = useState<Record<string, UploadResult>>({})
+  const [rows, setRows] = useState<OposSnapshotRow[]>(() => [newRow()])
   const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const updateRow = useCallback((id: string, patch: Partial<OposSnapshotRow>) => {
+    setRows(prev => prev.map(r => (r.id === id ? { ...r, ...patch } : r)))
+  }, [])
+
+  const updateSide = useCallback(
+    (id: string, side: 'debitor' | 'kreditor', file: File) => {
+      setRows(prev =>
+        prev.map(r =>
+          r.id === id ? { ...r, [side]: { file, fileName: file.name } } : r,
+        ),
+      )
+    },
+    [],
+  )
 
   const addRow = () => setRows(prev => [...prev, newRow()])
 
-  const setAsOf = (rowId: string, value: string) => {
-    setRows(prev => prev.map(r => (r.id === rowId ? { ...r, as_of: value } : r)))
-  }
+  const canSubmit =
+    rows.length > 0 &&
+    rows.every(
+      r =>
+        r.as_of.trim() !== '' &&
+        r.debitor.file !== null &&
+        r.kreditor.file !== null,
+    )
 
-  const setFile = async (rowId: string, file: File) => {
-    setRows(prev => prev.map(r => (r.id === rowId ? { ...r, file, fileName: file.name } : r)))
-    if (!onFileUpload) return
-    const res = await onFileUpload(file)
-    if (!res) return
-    setUploads(prev => ({ ...prev, [rowId]: res }))
-  }
-
-  const canSubmit = rows.some(r => r.as_of && uploads[r.id]?.file_id)
-
-  const submit = useCallback(async () => {
+  const handleSubmit = async () => {
     if (!canSubmit || submitting || disabled) return
+    if (!onFileUpload) {
+      setError('File upload is not available.')
+      return
+    }
     setSubmitting(true)
+    setError(null)
     try {
-      const snapshots = rows
-        .map(r => {
-          const up = uploads[r.id]
-          if (!r.as_of || !up?.file_id) return null
-          return { as_of: r.as_of, file_id: up.file_id, file_path: up.file_path }
+      const out: OposSnapshotPair[] = []
+      for (const row of rows) {
+        if (!row.debitor.file || !row.kreditor.file) continue
+        const debUploaded = await onFileUpload(row.debitor.file)
+        if (!debUploaded) {
+          setError(`Upload failed for debitor file (${row.debitor.fileName ?? 'file'}).`)
+          setSubmitting(false)
+          return
+        }
+        const kredUploaded = await onFileUpload(row.kreditor.file)
+        if (!kredUploaded) {
+          setError(`Upload failed for kreditor file (${row.kreditor.fileName ?? 'file'}).`)
+          setSubmitting(false)
+          return
+        }
+        out.push({
+          as_of: row.as_of,
+          debitor: {
+            file_id: debUploaded.file_id,
+            file_path: debUploaded.file_path,
+            sheet_name: debUploaded.sheet_names?.[0] ?? '',
+          },
+          kreditor: {
+            file_id: kredUploaded.file_id,
+            file_path: kredUploaded.file_path,
+            sheet_name: kredUploaded.sheet_names?.[0] ?? '',
+          },
         })
-        .filter(Boolean) as { as_of: string; file_id: string; file_path: string }[]
-      await onSubmit(snapshots)
+      }
+      await onSubmit(out)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Submit failed')
     } finally {
       setSubmitting(false)
     }
-  }, [canSubmit, disabled, onSubmit, rows, submitting, uploads])
+  }
 
   return (
-    <div className="flex flex-col gap-3">
-      <div>
-        <h3 className="text-sm font-semibold" style={{ color: '#1E293B' }}>
-          {title}
-        </h3>
-        {subtitle && <p className="text-xs text-slate-500">{subtitle}</p>}
-      </div>
+    <div
+      className="rounded-xl p-4 flex flex-col gap-3"
+      style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', maxWidth: 720 }}
+    >
+      <h3 className="text-sm font-semibold" style={{ color: '#1E293B' }}>{title}</h3>
+      {subtitle && <p className="text-xs text-slate-500">{subtitle}</p>}
 
       <div className="flex flex-col gap-3">
-        {rows.map(r => (
-          <div
-            key={r.id}
-            className="rounded-xl p-3 flex flex-col gap-2"
-            style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
-          >
-            <div className="flex gap-3 flex-wrap items-end">
-              <div className="flex flex-col gap-1">
+        {rows.map((row, idx) => (
+          <div key={row.id} className="flex flex-col gap-2">
+            <div className="flex flex-col sm:flex-row gap-3 items-stretch">
+              <div className="flex flex-col gap-1 sm:w-36 shrink-0">
                 <label className="text-xs font-medium" style={{ color: '#475569' }}>
-                  Snapshot date
+                  Snapshot date{rows.length > 1 ? ` ${idx + 1}` : ''}
                 </label>
                 <input
-                  value={r.as_of}
-                  disabled={disabled}
-                  onChange={e => setAsOf(r.id, e.target.value)}
-                  className="rounded-md border border-slate-200 px-2 py-1 text-xs"
                   type="date"
+                  value={row.as_of}
+                  disabled={disabled || submitting}
+                  onChange={e => updateRow(row.id, { as_of: e.target.value })}
+                  className="rounded-lg px-3 py-2 text-sm outline-none"
+                  style={{ border: '1px solid #E2E8F0', background: '#F8FAFC' }}
                 />
               </div>
               <SnapshotFileDrop
-                rowId={r.id}
-                fileName={r.fileName}
-                disabled={disabled}
-                onFile={f => void setFile(r.id, f)}
+                rowId={row.id}
+                side="debitor"
+                label="Debitor"
+                fileName={row.debitor.fileName}
+                disabled={disabled || submitting}
+                onFile={file => updateSide(row.id, 'debitor', file)}
+              />
+              <SnapshotFileDrop
+                rowId={row.id}
+                side="kreditor"
+                label="Kreditor"
+                fileName={row.kreditor.fileName}
+                disabled={disabled || submitting}
+                onFile={file => updateSide(row.id, 'kreditor', file)}
               />
             </div>
           </div>
         ))}
       </div>
 
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={addRow}
-          className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-        >
-          <Plus size={14} />
-          Add snapshot
-        </button>
+      <button
+        type="button"
+        disabled={disabled || submitting}
+        onClick={addRow}
+        className="flex items-center gap-1.5 text-xs font-medium self-start px-2 py-1 rounded-md"
+        style={{ color: '#1E3A5F', background: '#F1F5F9' }}
+      >
+        <Plus size={14} />
+        Add another date
+      </button>
 
-        <button
-          type="button"
-          disabled={disabled || !canSubmit || submitting}
-          onClick={() => void submit()}
-          className="ml-auto inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
-          style={{ background: '#1E3A5F' }}
-        >
-          {submitLabel}
-        </button>
-      </div>
+      {error && <p className="text-xs text-red-600">{error}</p>}
+
+      <button
+        type="button"
+        disabled={!canSubmit || disabled || submitting}
+        onClick={handleSubmit}
+        className="rounded-lg py-2 text-sm font-medium text-white self-end px-6"
+        style={{
+          background: !canSubmit || disabled || submitting ? '#94A3B8' : '#1E3A5F',
+          cursor: !canSubmit || disabled || submitting ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {submitting ? 'Uploading…' : submitLabel}
+      </button>
     </div>
   )
 }
-
