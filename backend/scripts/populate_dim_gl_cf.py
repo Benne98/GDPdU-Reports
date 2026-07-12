@@ -44,9 +44,9 @@ from sqlalchemy.orm import Session as SASession
 
 from app.db import engine
 
-# SINGLE SOURCE OF TRUTH for the two UPSERTs lives in the ETL module so the rebuild
+# SINGLE SOURCE OF TRUTH for the UPSERTs lives in the ETL module so the rebuild
 # stage (etl.cf_fill.populate_dim_gl_cf) and this standalone script cannot drift.
-from etl.cf_fill import _NA_UPSERT, _PL_UPSERT
+from etl.cf_fill import _NA_UPSERT, _PL_UPSERT, _PL_UPSERT_L2
 
 # Unmatched diagnostics.
 _NA_UNMATCHED = """
@@ -59,13 +59,19 @@ WHERE lib.key_1 IS NULL
 GROUP BY 1, 2 ORDER BY n DESC;
 """
 
+# Unmatched = a P&L account whose coarse category is at NEITHER level_3 (pass 1) NOR
+# level_2 (pass 2 fallback) — i.e. genuinely uncovered by the library (some intentionally
+# excluded, e.g. 'Other taxes').  An account covered via the level_2 fallback is NOT
+# unmatched, so we exclude both matches.
 _PL_UNMATCHED = """
-SELECT a.level_3, COUNT(*) AS n
+SELECT a.level_2, a.level_3, COUNT(*) AS n
 FROM dim_gl_account a
-LEFT JOIN lib_cf_mapping lib
-  ON lib.key_kind = 'pl_level3' AND lib.key_1 = 'PL' AND lib.key_2 = a.level_3
-WHERE a.level_0 = 'PL' AND lib.key_1 IS NULL
-GROUP BY 1 ORDER BY n DESC;
+WHERE a.level_0 = 'PL'
+  AND NOT EXISTS (SELECT 1 FROM lib_cf_mapping lib
+                  WHERE lib.key_kind = 'pl_level3' AND lib.key_1 = 'PL' AND lib.key_2 = a.level_3)
+  AND NOT EXISTS (SELECT 1 FROM lib_cf_mapping lib
+                  WHERE lib.key_kind = 'pl_level3' AND lib.key_1 = 'PL' AND lib.key_2 = a.level_2)
+GROUP BY 1, 2 ORDER BY n DESC;
 """
 
 
@@ -80,13 +86,13 @@ def _report_unmatched(session: SASession) -> tuple[int, int]:
     else:
         print("[unmatched NA] none — every dim_gl_na classification is covered.")
     if pl_un:
-        print(f"[unmatched PL] {len(pl_un)} P&L level_3 value(s) with NO library row "
-              f"(some are intentionally excluded, e.g. 'Other taxes'):")
+        print(f"[unmatched PL] {len(pl_un)} P&L (level_2, level_3) pair(s) with NO library row "
+              f"at EITHER level (some are intentionally excluded, e.g. 'Other taxes'):")
         for r in pl_un:
-            print(f"    {r[0]!r}  ({r[1]} accounts)")
+            print(f"    level_2={r[0]!r} | level_3={r[1]!r}  ({r[2]} accounts)")
     else:
         print("[unmatched PL] none.")
-    return sum(int(r[2]) for r in na_un), sum(int(r[1]) for r in pl_un)
+    return sum(int(r[2]) for r in na_un), sum(int(r[2]) for r in pl_un)
 
 
 def main() -> int:
@@ -109,7 +115,8 @@ def main() -> int:
             return 0
 
         session.execute(text(_NA_UPSERT))
-        session.execute(text(_PL_UPSERT))
+        session.execute(text(_PL_UPSERT))     # P&L level_3 pass (authoritative)
+        session.execute(text(_PL_UPSERT_L2))  # P&L level_2 fallback (CoA level-shift)
         session.commit()
 
         after = session.execute(text("SELECT COUNT(*) FROM dim_gl_cf")).scalar() or 0

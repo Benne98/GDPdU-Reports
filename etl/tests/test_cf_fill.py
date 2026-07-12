@@ -54,7 +54,7 @@ _SCHEMA = [
     CREATE TABLE dim_gl_account (
         account_number_group TEXT NOT NULL,
         fiscal_year INTEGER NOT NULL,
-        level_0 TEXT, level_3 TEXT,
+        level_0 TEXT, level_2 TEXT, level_3 TEXT,
         PRIMARY KEY (account_number_group, fiscal_year)
     )
     """,
@@ -156,6 +156,97 @@ class TestPopulate:
         angs = {r[0] for r in _cf_rows(session)}
         assert "01020000" not in angs  # BS account excluded by WHERE level_0='PL'
         assert angs == {"01014000", "01048100"}
+
+
+# =========================================================================== #
+# CoA level-shift: P&L coarse category matched at level_3 (pass 1) OR level_2
+# (pass 2 fallback).  level_3 is authoritative; level_2 never double-counts.
+# =========================================================================== #
+def _seed_ebitda_lib(session):
+    """Two EBITDA coarse-category library bands ('Cost of materials', 'Net sales')."""
+    session.execute(text(
+        "INSERT INTO lib_cf_mapping (key_kind, key_1, key_2, l1, l2, l3, l4, l5, cf_mapping) "
+        "VALUES ('pl_level3', 'PL', 'Cost of materials', "
+        "'Cash flow from operating activities', 'Gross cash flow', "
+        "'Cost of materials', NULL, NULL, 'EBITDA')"
+    ))
+    session.execute(text(
+        "INSERT INTO lib_cf_mapping (key_kind, key_1, key_2, l1, l2, l3, l4, l5, cf_mapping) "
+        "VALUES ('pl_level3', 'PL', 'Net sales', "
+        "'Cash flow from operating activities', 'Gross cash flow', "
+        "'Net sales', NULL, NULL, 'EBITDA')"
+    ))
+
+
+class TestCoaLevelShift:
+    def test_level2_fallback_maps_shifted_coarse_category(self):
+        """e2e / bs_pl_master convention: coarse category shifted UP to level_2, the
+        FINE subcategory sits at level_3 (NOT a library key).  Pass 1 (level_3) misses;
+        pass 2 (level_2 fallback) maps the account to EBITDA."""
+        session = _make_session()
+        _seed_ebitda_lib(session)
+        # Coarse 'Cost of materials' at level_2; fine 'Purchased goods and materials'
+        # at level_3 — level_3 is NOT in the library, so ONLY the level_2 pass matches.
+        session.execute(text(
+            "INSERT INTO dim_gl_account (account_number_group, fiscal_year, level_0, level_2, level_3) "
+            "VALUES ('01050000', 2024, 'PL', 'Cost of materials', 'Purchased goods and materials')"
+        ))
+        session.commit()
+
+        out = populate_dim_gl_cf(session)
+        session.commit()
+
+        rows = dict(_cf_rows(session))
+        assert rows == {"01050000": "EBITDA"}  # mapped via the level_2 fallback
+        assert out["noop"] is False
+
+    def test_level3_wins_and_level2_pass_is_noop(self):
+        """Reference chart convention: coarse category at level_3, level_2 is the parent
+        grouping ('Expenses', NOT a library key).  Pass 1 maps via level_3; pass 2
+        (level_2) matches nothing → parity.  Exactly ONE row, from the level_3 mapping."""
+        session = _make_session()
+        _seed_ebitda_lib(session)
+        # Coarse 'Cost of materials' at level_3; parent 'Expenses' at level_2 (not a key).
+        session.execute(text(
+            "INSERT INTO dim_gl_account (account_number_group, fiscal_year, level_0, level_2, level_3) "
+            "VALUES ('01050000', 2024, 'PL', 'Expenses', 'Cost of materials')"
+        ))
+        session.commit()
+
+        out = populate_dim_gl_cf(session)
+        session.commit()
+
+        rows = _cf_rows(session)
+        assert len(rows) == 1  # exactly one row per account — no double-count
+        assert dict(rows) == {"01050000": "EBITDA"}
+        # The level_3 pass produced the row; the level_2 pass was a no-op (DO NOTHING).
+        assert out["noop"] is False
+
+    def test_no_account_gets_two_rows_mixed_chart(self):
+        """A mixed dataset — one account coarse-at-level_3, one coarse-at-level_2 — each
+        ends with EXACTLY ONE dim_gl_cf row (the PK + DO NOTHING guarantee)."""
+        session = _make_session()
+        _seed_ebitda_lib(session)
+        session.execute(text(
+            "INSERT INTO dim_gl_account (account_number_group, fiscal_year, level_0, level_2, level_3) "
+            "VALUES ('01050000', 2024, 'PL', 'Expenses', 'Cost of materials')"       # coarse @ L3
+        ))
+        session.execute(text(
+            "INSERT INTO dim_gl_account (account_number_group, fiscal_year, level_0, level_2, level_3) "
+            "VALUES ('01060000', 2024, 'PL', 'Net sales', 'Domestic revenue')"        # coarse @ L2
+        ))
+        session.commit()
+
+        populate_dim_gl_cf(session)
+        session.commit()
+
+        # Each account_number_group/year appears exactly once (PK enforces it too).
+        dupes = session.execute(text(
+            "SELECT account_number_group, COUNT(*) c FROM dim_gl_cf "
+            "GROUP BY account_number_group HAVING COUNT(*) > 1"
+        )).fetchall()
+        assert dupes == []
+        assert dict(_cf_rows(session)) == {"01050000": "EBITDA", "01060000": "EBITDA"}
 
 
 # =========================================================================== #

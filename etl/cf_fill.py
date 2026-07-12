@@ -14,13 +14,48 @@ Two disjoint UPSERTs, keyed ``(account_number_group, fiscal_year)``:
         ⋈ lib_cf_mapping (key_kind='na', key_1=l6_na_mapping,
                               key_2=l7_na_description)
 
-  P&L accounts (``_PL_UPSERT``):
-      dim_gl_account (level_0='PL', level_3)
-        ⋈ lib_cf_mapping (key_kind='pl_level3', key_1='PL', key_2=level_3)
+  P&L accounts — two passes, coarse category matched at whichever level it lives:
+      1. ``_PL_UPSERT``    (level_3 pass, ON CONFLICT DO UPDATE):
+           dim_gl_account (level_0='PL', level_3)
+             ⋈ lib_cf_mapping (key_kind='pl_level3', key_1='PL', key_2=level_3)
+      2. ``_PL_UPSERT_L2`` (level_2 fallback, ON CONFLICT DO NOTHING):
+           dim_gl_account (level_0='PL', level_2)
+             ⋈ lib_cf_mapping (key_kind='pl_level3', key_1='PL', key_2=level_2)
 
-Both are ``ON CONFLICT (account_number_group, fiscal_year) DO UPDATE`` → strictly
-idempotent: re-running reproduces identical rows (row COUNT unchanged), so a DB
-where ``dim_gl_cf`` was already correct (golden / live) is unchanged in effect.
+CoA LEVEL-SHIFT (why the level_2 fallback exists)
+─────────────────────────────────────────────────
+The CF library's ``key_2`` values are the COARSE P&L line categories ('Cost of
+materials', 'Personnel expenses', 'Net sales', 'Other operating income/expenses',
+'Δ Finished goods & WIP', 'Own work capitalised', 'Depreciation & amortisation',
+'Interest…', 'Taxes on income').  On the reference chart (finssentials_v5) those
+coarse categories live at ``level_3`` (the level_3 pass matches all of them).  But
+after a ``bs_pl_master`` Project-Setup round-trip the hierarchy shifts UP one level:
+the coarse categories move to ``level_2`` and ``level_3`` holds the FINE subcategory
+('Purchased goods and materials', 'Wages and salaries', …), which is NOT a library
+key.  Then only the accounts whose ``level_3`` happens to equal a coarse key (Net
+sales, D&A, Interest, Taxes) match the level_3 pass; ALL the cost/expense accounts
+(Cost of materials, Personnel, Other op) do NOT — so they never enter ``dim_gl_cf``
+and CF EBITDA excludes the operating COSTS (EBITDA ≈ revenue, ~10× too high).  The
+level_2 fallback catches the shifted coarse categories.  This is the same
+CoA-level-shift class ``realign_pl_structure`` already handles for the PL structure.
+
+RESOLUTION ORDER / NO DOUBLE-COUNT
+──────────────────────────────────
+The level_3 pass runs FIRST (DO UPDATE), the level_2 pass SECOND (DO NOTHING), so on
+the reference chart (coarse at level_3) the level_3 row is authoritative and the
+level_2 pass is a strict no-op → byte-identical to before (golden parity).  An
+account carries ONE ``level_2`` and ONE ``level_3`` value, and the two conventions
+are mutually exclusive: when the coarse category is at ``level_3`` (matches pass 1)
+its ``level_2`` is the parent grouping ('Income'/'Expenses'), which is NOT a library
+key; when the coarse category is at ``level_2`` (matches pass 2) its ``level_3`` is
+the fine subcategory, which is NOT a library key.  So an account matches AT MOST ONE
+of the two passes.  Even if both matched, the ``(account_number_group, fiscal_year)``
+PRIMARY KEY + the level_2 pass's ``DO NOTHING`` guarantee exactly ONE ``dim_gl_cf``
+row per account/year, with the level_3 mapping winning.
+
+All three P&L/NA UPSERTs are ``ON CONFLICT`` → strictly idempotent: re-running
+reproduces identical rows (row COUNT unchanged), so a DB where ``dim_gl_cf`` was
+already correct (golden / live) is unchanged in effect.
 
 NO-OP / GOLDEN PARITY
 ─────────────────────
@@ -30,8 +65,8 @@ no CF library loaded).  This mirrors the other rebuild stages' handling of absen
 source tables (``_stage_account_library_fill`` / ``statement_backfill``) so the
 golden live-vs-rebuild equivalence is preserved.
 
-``backend/scripts/populate_dim_gl_cf.py`` imports ``_NA_UPSERT`` / ``_PL_UPSERT``
-from here so the SQL lives in ONE place and cannot drift.
+``backend/scripts/populate_dim_gl_cf.py`` imports ``_NA_UPSERT`` / ``_PL_UPSERT`` /
+``_PL_UPSERT_L2`` from here so the SQL lives in ONE place and cannot drift.
 """
 from __future__ import annotations
 
@@ -58,7 +93,8 @@ ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
   l4 = EXCLUDED.l4, l5 = EXCLUDED.l5, cf_mapping = EXCLUDED.cf_mapping;
 """
 
-# Set-based UPSERT for the P&L side (level_3 keyed).
+# Set-based UPSERT for the P&L side — PASS 1: level_3 keyed (reference-chart convention).
+# Runs FIRST and DO UPDATE, so the level_3 mapping is authoritative and preferred.
 _PL_UPSERT = """
 INSERT INTO dim_gl_cf (account_number_group, fiscal_year, l1, l2, l3, l4, l5, cf_mapping)
 SELECT a.account_number_group, a.fiscal_year,
@@ -72,6 +108,26 @@ WHERE a.level_0 = 'PL'
 ON CONFLICT (account_number_group, fiscal_year) DO UPDATE SET
   l1 = EXCLUDED.l1, l2 = EXCLUDED.l2, l3 = EXCLUDED.l3,
   l4 = EXCLUDED.l4, l5 = EXCLUDED.l5, cf_mapping = EXCLUDED.cf_mapping;
+"""
+
+# Set-based UPSERT for the P&L side — PASS 2: level_2 FALLBACK (CoA-level-shift chart).
+# Runs SECOND and DO NOTHING, so an account already mapped by the level_3 pass is NEVER
+# overwritten (level_3 wins); only accounts whose coarse category shifted UP to level_2
+# (fine subcategory now at level_3, unmatched by pass 1) are picked up here.  On the
+# reference chart (coarse at level_3) this pass matches nothing → strict no-op / golden
+# parity.  DO NOTHING (not DO UPDATE) also tolerates intra-statement duplicate conflict
+# keys gracefully.
+_PL_UPSERT_L2 = """
+INSERT INTO dim_gl_cf (account_number_group, fiscal_year, l1, l2, l3, l4, l5, cf_mapping)
+SELECT a.account_number_group, a.fiscal_year,
+       lib.l1, lib.l2, lib.l3, lib.l4, lib.l5, lib.cf_mapping
+FROM dim_gl_account a
+JOIN lib_cf_mapping lib
+  ON lib.key_kind = 'pl_level3'
+ AND lib.key_1 = 'PL'
+ AND lib.key_2 = a.level_2
+WHERE a.level_0 = 'PL'
+ON CONFLICT (account_number_group, fiscal_year) DO NOTHING;
 """
 
 
@@ -93,10 +149,11 @@ def _safe_count(session: Session, table: str) -> Optional[int]:
 def populate_dim_gl_cf(session: Session, scope=None) -> dict:
     """Fill ``dim_gl_cf`` from ``lib_cf_mapping`` via the NA + P&L UPSERTs.
 
-    Deterministic, idempotent (``ON CONFLICT DO UPDATE``) and additive-in-effect:
-    on a DB whose ``dim_gl_cf`` is already correct it reproduces the same rows (row
-    count unchanged).  Runs BOTH UPSERTs (``_NA_UPSERT`` then ``_PL_UPSERT``) in the
-    caller's open transaction; the caller commits.
+    Deterministic, idempotent (``ON CONFLICT``) and additive-in-effect: on a DB whose
+    ``dim_gl_cf`` is already correct it reproduces the same rows (row count unchanged).
+    Runs the UPSERTs (``_NA_UPSERT`` then the P&L level_3 ``_PL_UPSERT`` then the
+    level_2 fallback ``_PL_UPSERT_L2``) in the caller's open transaction; the caller
+    commits.  ``pl_rows`` sums the rows touched by BOTH P&L passes.
 
     ``scope`` is accepted for signature parity with the other rebuild stages and is
     recorded only — the UPSERTs are global set-based statements (they mirror the
@@ -138,9 +195,12 @@ def populate_dim_gl_cf(session: Session, scope=None) -> dict:
         logger.warning("cf_fill: dim_gl_na absent — NA/BS side of dim_gl_cf skipped")
 
     # P&L side — requires dim_gl_account (level_0='PL' set by classification/backfill).
+    # Two passes: level_3 (DO UPDATE, authoritative) then level_2 (DO NOTHING, fallback
+    # for a CoA that shifted the coarse category up one level).  level_3 always wins.
     if _safe_count(session, "dim_gl_account") is not None:
-        res = session.execute(text(_PL_UPSERT))
-        summary["pl_rows"] = int(res.rowcount or 0)
+        res_l3 = session.execute(text(_PL_UPSERT))
+        res_l2 = session.execute(text(_PL_UPSERT_L2))
+        summary["pl_rows"] = int(res_l3.rowcount or 0) + int(res_l2.rowcount or 0)
         ran = True
     else:
         logger.warning("cf_fill: dim_gl_account absent — P&L side of dim_gl_cf skipped")
