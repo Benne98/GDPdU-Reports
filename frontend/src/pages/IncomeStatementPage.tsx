@@ -13,8 +13,9 @@ export default function IncomeStatementPage() {
 
   const subTabs: StatementSubTab[] = [
     { id: 'pl-statement', label: 'P&L statement' },
-    { id: 'profitability', label: 'Profitability' },
-    // GL + Profitability are always shown; Payroll only when its data is loaded.
+    // Profitability only when partner masters (customer + supplier) are loaded.
+    ...(availability.profitability ? [{ id: 'profitability', label: 'Profitability' }] : []),
+    // Payroll only when personnel data is loaded.
     ...(availability.payroll ? [{ id: 'payroll', label: 'Payroll' }] : []),
   ]
 

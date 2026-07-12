@@ -460,6 +460,9 @@ export default function GlGroupConfigPanel({
               subtitle="How creditor, debtor, and fixed-asset numbers are stored in this format."
             >
               <div className="space-y-3">
+                <p className="rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                  <span className="font-semibold">Recommended</span> — mapping partner columns enables the Profitability page and all partner-level revenue/COGS analyses. Without a partner key, customers and suppliers cannot be identified in the GL data.
+                </p>
                 <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 bg-white p-4 hover:bg-slate-50 transition">
                   <input
                     type="radio"

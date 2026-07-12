@@ -41,8 +41,8 @@ export const TARGET_FIELDS: TargetField[] = [
   { key: "line_note", label: "Line Note", group: "Line", required: false },
   { key: "posting_type", label: "Posting Type", group: "Line", required: false },
   // Partner
-  { key: "source_type", label: "Source Type", group: "Partner", required: false, hint: "Debtor / creditor" },
-  { key: "source_no", label: "Source No.", group: "Partner", required: false, hint: "Debtor/creditor number" },
+  { key: "source_type", label: "Source Type", group: "Partner", required: false, hint: "Recommended — partner type (debtor / creditor). Required for Profitability and partner-level analyses." },
+  { key: "source_no", label: "Source No.", group: "Partner", required: false, hint: "Recommended — debtor/creditor number. Without a partner key, revenue/COGS cannot be attributed to customers/suppliers." },
 ];
 
 /**
@@ -297,6 +297,11 @@ export default function ColumnMapper({
                 </span>
                 <div className="flex-1 border-t border-slate-200" />
               </div>
+              {group === 'Partner' && (
+                <p className="mb-2 rounded-md border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                  <span className="font-semibold">Recommended</span> — mapping partner keys enables the Profitability page and all partner-level analyses. Without them, revenue and COGS cannot be attributed to customers or suppliers.
+                </p>
+              )}
               <div className="space-y-2">
                 {fields.filter((f) => f.group === group).map((field) => (
                   <DropZone
