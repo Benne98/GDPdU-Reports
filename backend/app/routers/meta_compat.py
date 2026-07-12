@@ -172,16 +172,46 @@ def get_reporting_availability(
 ) -> dict:
     """Which optional reporting modules actually have data (FE hides empty tabs).
 
-    GL + Profitability are always shown, so they are intentionally NOT reported
-    here.  Each probe is a cheap existence check wrapped in try/except → False on
-    ANY error: a missing table / query failure must read as "not available" (the
-    FE hides the tab) rather than 500 the whole endpoint.
+    GL + the statements (IS/BS/CF/WC) + Cash & debt are always shown.  Everything
+    reported here is CONDITIONAL — the tab is hidden until its input is loaded:
+      * profitability     — needs BOTH a customer AND a supplier master (partner-
+                            level margins are meaningless without partner dims).
+      * payroll / fixed_assets — a personnel / fixed-asset snapshot exists.
+      * receivables_aging / payables_aging — OPOS debitor / kreditor rows exist
+                            (reported separately so one aging page can show while
+                            the other stays hidden — either side may be loaded on
+                            its own or both together).
+      * opos              — legacy convenience = receivables OR payables (kept so
+                            older FE builds still work).
+    Each probe is a cheap existence check wrapped in try/except → False on ANY
+    error: a missing table / query failure must read as "not available" (the FE
+    hides the tab) rather than 500 the whole endpoint.
     """
+    receivables = _has_opos_side(session, "fact_opos_debitor")
+    payables = _has_opos_side(session, "fact_opos_kreditor")
     return {
+        "profitability": _has_profitability(session),
         "payroll": _has_payroll(session),
         "fixed_assets": _has_fixed_assets(session),
-        "opos": _has_opos(session),
+        "receivables_aging": receivables,
+        "payables_aging": payables,
+        "opos": receivables or payables,
     }
+
+
+def _has_profitability(session: Session) -> bool:
+    """True iff BOTH a customer AND a supplier master have rows — partner-level
+    profitability needs both partner dimensions to attribute margins."""
+    try:
+        has_cust = session.execute(
+            text("SELECT EXISTS(SELECT 1 FROM dim_customer)")
+        ).scalar()
+        has_supp = session.execute(
+            text("SELECT EXISTS(SELECT 1 FROM dim_supplier)")
+        ).scalar()
+        return bool(has_cust) and bool(has_supp)
+    except Exception:  # noqa: BLE001 — missing table → not available
+        return False
 
 
 def _has_payroll(session: Session) -> bool:
@@ -202,20 +232,17 @@ def _has_fixed_assets(session: Session) -> bool:
         return False
 
 
-def _has_opos(session: Session) -> bool:
-    """True iff any OPOS open-item row exists (cheap EXISTS probe — the aging
-    service reads fact_opos_debitor / fact_opos_kreditor).  Does NOT run the full
-    (expensive) aging computation."""
-    for table in ("fact_opos_debitor", "fact_opos_kreditor"):
-        try:
-            row = session.execute(text(
-                f"SELECT EXISTS(SELECT 1 FROM {table} WHERE project_id = 'default')"
-            )).fetchone()
-            if row and row[0]:
-                return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
+def _has_opos_side(session: Session, table: str) -> bool:
+    """True iff the given OPOS side (fact_opos_debitor | fact_opos_kreditor) has an
+    open-item row for the default project.  Cheap EXISTS probe — does NOT run the
+    full (expensive) aging computation.  Absent table → False (tab hidden)."""
+    try:
+        row = session.execute(text(
+            f"SELECT EXISTS(SELECT 1 FROM {table} WHERE project_id = 'default')"
+        )).fetchone()
+        return bool(row and row[0])
+    except Exception:  # noqa: BLE001 — missing table → not available
+        return False
 
 
 # ---------------------------------------------------------------------------

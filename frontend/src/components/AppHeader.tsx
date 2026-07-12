@@ -56,13 +56,16 @@ const REPORTING_NAV: { to: string; label: string; Icon: typeof LayoutDashboard; 
  *  home redirect); ANOMALY_NAV still renders when already on an /anomaly-detection* route. */
 const REPORTING_PATHS: ReadonlySet<string> = new Set(REPORTING_NAV.map(n => n.to))
 
-/** Sub-pages that render only when their underlying data is loaded (Phase 7). A sub-page
- *  absent from this map is always shown (GL, Profitability, statements, Cash & debt). */
+/** Sub-pages that render only when their underlying data is loaded. A sub-page
+ *  absent from this map is always shown (GL, statements, Cash & debt). Profitability
+ *  is now conditional (needs a customer + supplier master); the two aging pages are
+ *  gated independently (either OPOS side may be loaded on its own). */
 const CONDITIONAL_SUBPAGES: Record<string, keyof Omit<ReportingAvailability, 'loaded'>> = {
+  profitability: 'profitability',
   payroll: 'payroll',
   'fixed-assets': 'fixed_assets',
-  'receivables-aging': 'opos',
-  'payables-aging': 'opos',
+  'receivables-aging': 'receivables_aging',
+  'payables-aging': 'payables_aging',
 }
 
 /** Drop conditional sub-pages whose data is not available. */

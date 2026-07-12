@@ -4049,9 +4049,19 @@ export const api = {
   entities: (): Promise<Entity[]> =>
     get('/api/v1/entities'),
 
-  /** Which optional reporting sub-pages have data loaded (conditional display, Phase 7).
-   *  GL + Profitability are always shown, so they are not reported here. */
-  reportingAvailability: (): Promise<{ payroll: boolean; fixed_assets: boolean; opos: boolean }> =>
+  /** Which optional reporting sub-pages have data loaded (conditional display).
+   *  GL + the statements + Cash & debt are always shown. Profitability needs a
+   *  customer AND supplier master; receivables/payables aging are reported
+   *  separately (either OPOS side may be loaded on its own). `opos` is the legacy
+   *  receivables-OR-payables convenience flag. */
+  reportingAvailability: (): Promise<{
+    profitability: boolean
+    payroll: boolean
+    fixed_assets: boolean
+    receivables_aging: boolean
+    payables_aging: boolean
+    opos: boolean
+  }> =>
     get('/api/v1/meta/reporting-availability'),
 
   kpiTotals: (entity?: string, dateFrom?: string, dateTo?: string): Promise<{ metric: string; grain: string; data: KpiTotals }> =>
