@@ -332,15 +332,11 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
   return (
     <div className="space-y-6">
 
-      {/* DRAFT notice */}
-      <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-        <span className="shrink-0 rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[12px] font-semibold uppercase tracking-wide text-amber-700">
-          Draft
-        </span>
-        <p className="text-sm text-amber-900">
-          Provisioning only. Roll-forward (carry AHK / NBV to the next period) and
-          depreciation schedule computation are not yet calculated in the UI.
-        </p>
+      {/* Info note */}
+      <div className="rounded-lg border border-blue-200 bg-blue-50/80 px-4 py-3 text-sm text-blue-900">
+        Upload the fixed-asset register to enable the Fixed Assets reporting page.
+        Roll-forward (carry AHK / NBV to the next period) and depreciation schedule
+        computation will be added in a future release.
       </div>
 
       {/* Entity source selector */}

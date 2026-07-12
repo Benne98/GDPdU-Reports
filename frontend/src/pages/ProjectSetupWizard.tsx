@@ -353,7 +353,7 @@ export interface WizardFteState {
 // WizardAnlagenState and WizardOposState are defined in and imported from their step components.
 // Re-export them so external consumers (e.g. tests) can import from this file as before.
 export type { WizardAnlagenUpload, WizardAnlagenState } from '../components/ingest/AnlagenStep'
-export type { WizardOposUpload, WizardOposSideState, WizardOposState } from '../components/ingest/OposStep'
+export type { WizardOposUpload, WizardOposSideState, WizardOposCombinedSidesState, WizardOposState } from '../components/ingest/OposStep'
 
 export interface WizardState {
   projectName: string
@@ -412,8 +412,10 @@ function defaultState(): WizardState {
     },
     opos: {
       provided: false,
-      debitor:  { viewMode: 'combined', uploads: [], columnMap: {} },
-      kreditor: { viewMode: 'combined', uploads: [], columnMap: {} },
+      loadMode: 'per_side' as const,
+      combinedSides: { viewMode: 'combined' as const, uploads: [], columnMap: {} },
+      debitor:  { viewMode: 'combined' as const, uploads: [], columnMap: {} },
+      kreditor: { viewMode: 'combined' as const, uploads: [], columnMap: {} },
     },
     netProfitRoll: false,
   }
@@ -620,14 +622,15 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
     case 'PATCH_ANLAGEN':
       return { ...state, anlagen: { ...state.anlagen, ...action.patch } }
     case 'PATCH_OPOS': {
-      const { debitor, kreditor, ...rest } = action.patch
+      const { debitor, kreditor, combinedSides, ...rest } = action.patch
       return {
         ...state,
         opos: {
           ...state.opos,
           ...rest,
-          ...(debitor  !== undefined ? { debitor:  { ...state.opos.debitor,  ...debitor  } } : {}),
-          ...(kreditor !== undefined ? { kreditor: { ...state.opos.kreditor, ...kreditor } } : {}),
+          ...(debitor       !== undefined ? { debitor:       { ...state.opos.debitor,       ...debitor       } } : {}),
+          ...(kreditor      !== undefined ? { kreditor:      { ...state.opos.kreditor,      ...kreditor      } } : {}),
+          ...(combinedSides !== undefined ? { combinedSides: { ...state.opos.combinedSides, ...combinedSides } } : {}),
         },
       }
     }
@@ -646,6 +649,8 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
         action.dataset === 'opos' && !action.value
           ? {
               provided: false,
+              loadMode: 'per_side' as const,
+              combinedSides: { viewMode: 'combined' as const, uploads: [], columnMap: {} },
               debitor:  { viewMode: 'combined' as const, uploads: [], columnMap: {} },
               kreditor: { viewMode: 'combined' as const, uploads: [], columnMap: {} },
             }
@@ -4071,6 +4076,12 @@ function buildInitialCommitSteps(state: WizardState): CommitStepState[] {
   if (hasPartnerData(state)) {
     steps.push({ id: 'partner', label: 'Commit partner master',       status: 'pending' })
   }
+  if (state.additionalDatasets.anlagen && state.anlagen.provided) {
+    steps.push({ id: 'anlagen', label: 'Fixed-asset register', status: 'pending' })
+  }
+  if (state.additionalDatasets.opos && state.opos.provided) {
+    steps.push({ id: 'opos', label: 'Open-items lists (OPOS)', status: 'pending' })
+  }
   if (hasFteData(state)) {
     steps.push({ id: 'fte',     label: 'Build FTE Development table', status: 'pending' })
   }
@@ -6151,6 +6162,36 @@ export default function ProjectSetupWizard() {
           (raw) => friendlyFinishError(raw, { stepLabel: `partner master (${item.side})`, entityCode: partnerEntityCode }),
         )
         if (partnerResult === null) return
+      }
+    }
+
+    // ---- Anlagen: summarise inline-committed data (no API call — committed per-slot during setup) ----
+    if (state.additionalDatasets.anlagen && state.anlagen.provided) {
+      const slotCount = state.anlagen.uploads.filter(u => !!u.file_id).length
+      patchStep('anlagen', {
+        status: 'skipped',
+        detail: slotCount > 0
+          ? `${slotCount} slot(s) uploaded and committed inline during the Additional Information step`
+          : 'No fixed-asset files staged — upload and commit in the Additional Information step',
+      })
+    }
+
+    // ---- OPOS: summarise inline-committed data (no API call — committed per-slot during setup) ----
+    if (state.additionalDatasets.opos && state.opos.provided) {
+      const loadMode = state.opos.loadMode ?? 'per_side'
+      if (loadMode === 'combined_sides') {
+        const slotCount = state.opos.combinedSides.uploads.filter(u => !!u.file_id).length
+        patchStep('opos', {
+          status: 'skipped',
+          detail: `${slotCount} combined-side file(s) staged. Commit requires backend endpoint POST /api/v1/opos/combined/commit (not yet implemented). Switch to Separate Files mode to commit.`,
+        })
+      } else {
+        const debCount  = state.opos.debitor.uploads.filter(u => !!u.file_id).length
+        const kredCount = state.opos.kreditor.uploads.filter(u => !!u.file_id).length
+        patchStep('opos', {
+          status: 'skipped',
+          detail: `Debitor: ${debCount} file(s), Kreditor: ${kredCount} file(s) committed inline during the Additional Information step`,
+        })
       }
     }
 
