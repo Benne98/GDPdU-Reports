@@ -122,6 +122,8 @@ export default function StepColumnMapper<R,>({
       return ans?.t === 'column' && ans.id !== null
     })
 
+  const isLastStep = steps.length > 0 && cursor >= steps.length - 1
+
   // ── Sync temp states when cursor moves ──────────────────────────────────────
 
   useEffect(() => {
@@ -295,11 +297,20 @@ export default function StepColumnMapper<R,>({
 
   // ── Submit ───────────────────────────────────────────────────────────────────
 
+  /** Flush the current step's temp state into answers before submitting.
+   *  Column and choice steps commit on interaction, so they are a no-op here. */
+  const flushCurrentStep = (a: Answers): Answers => {
+    if (multiStep) return { ...a, [multiStep.role]: { t: 'multiColumn', items: multiItems } }
+    if (checkStep) return { ...a, [checkStep.role]: { t: 'checklist', values: checklistValues } }
+    if (customStep) return { ...a, [customStep.role]: { t: 'custom', rows: customRows } }
+    return a
+  }
+
   const handleComplete = async () => {
     if (!allRequiredFilled || submitting || disabled) return
     setSubmitting(true)
     try {
-      await onComplete(toResult(answers))
+      await onComplete(toResult(flushCurrentStep(answers)))
     } finally {
       setSubmitting(false)
     }
@@ -317,7 +328,7 @@ export default function StepColumnMapper<R,>({
           : current.kind === 'checklist'
             ? `Select all that apply for "${current.label}", then click Continue.`
             : `Configure output columns for "${current.label}", then click Continue.`
-    : 'All steps complete — click Confirm mapping below.'
+    : 'All steps complete — click Confirm mapping.'
 
   // ── Table ────────────────────────────────────────────────────────────────────
 
@@ -480,22 +491,26 @@ export default function StepColumnMapper<R,>({
             <span className="text-xs text-slate-500">
               {multiItems.length} / {multiStep.max} selected
             </span>
-            <button
-              type="button"
-              disabled={disabled}
-              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
-              onClick={confirmMulti}
-            >
-              Continue
-            </button>
-            {multiStep.skippable && (
-              <button
-                type="button"
-                className="text-xs text-slate-500 underline"
-                onClick={skipMulti}
-              >
-                Skip
-              </button>
+            {!isLastStep && (
+              <>
+                <button
+                  type="button"
+                  disabled={disabled}
+                  className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
+                  onClick={confirmMulti}
+                >
+                  Continue
+                </button>
+                {multiStep.skippable && (
+                  <button
+                    type="button"
+                    className="text-xs text-slate-500 underline"
+                    onClick={skipMulti}
+                  >
+                    Skip
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -556,25 +571,27 @@ export default function StepColumnMapper<R,>({
               </label>
             ))}
           </div>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              disabled={disabled}
-              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
-              onClick={confirmChecklist}
-            >
-              Continue
-            </button>
-            {checkStep.skippable && (
+          {!isLastStep && (
+            <div className="flex items-center gap-3">
               <button
                 type="button"
-                className="text-xs text-slate-500 underline"
-                onClick={skipChecklist}
+                disabled={disabled}
+                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
+                onClick={confirmChecklist}
               >
-                Skip
+                Continue
               </button>
-            )}
-          </div>
+              {checkStep.skippable && (
+                <button
+                  type="button"
+                  className="text-xs text-slate-500 underline"
+                  onClick={skipChecklist}
+                >
+                  Skip
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )
     }
@@ -629,25 +646,27 @@ export default function StepColumnMapper<R,>({
               Add
             </button>
           </div>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              disabled={disabled}
-              className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
-              onClick={confirmCustom}
-            >
-              Continue
-            </button>
-            {customStep.skippable && (
+          {!isLastStep && (
+            <div className="flex items-center gap-3">
               <button
                 type="button"
-                className="text-xs text-slate-500 underline"
-                onClick={skipCustom}
+                disabled={disabled}
+                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm text-white disabled:opacity-50"
+                onClick={confirmCustom}
               >
-                Skip
+                Continue
               </button>
-            )}
-          </div>
+              {customStep.skippable && (
+                <button
+                  type="button"
+                  className="text-xs text-slate-500 underline"
+                  onClick={skipCustom}
+                >
+                  Skip
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )
     }
@@ -705,23 +724,25 @@ export default function StepColumnMapper<R,>({
         {instruction}
       </p>
 
-      {/* Always-visible column table */}
-      {tableBlock}
-
       {/* Step-specific controls */}
       {stepControls}
 
-      {/* Terminal confirm button */}
-      <button
-        type="button"
-        disabled={!allRequiredFilled || submitting || disabled}
-        className="mt-1 self-start rounded-md bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40"
-        onClick={() => {
-          void handleComplete()
-        }}
-      >
-        {submitting ? 'Submitting…' : (completeLabel ?? 'Confirm mapping')}
-      </button>
+      {/* Terminal confirm button — only on the last step, replaces per-step Continue */}
+      {isLastStep && (
+        <button
+          type="button"
+          disabled={!allRequiredFilled || submitting || disabled}
+          className="mt-1 self-start rounded-md bg-slate-900 px-4 py-2 text-sm text-white disabled:opacity-40"
+          onClick={() => {
+            void handleComplete()
+          }}
+        >
+          {submitting ? 'Submitting…' : (completeLabel ?? 'Confirm mapping')}
+        </button>
+      )}
+
+      {/* Always-visible column table */}
+      {tableBlock}
     </div>
   )
 

@@ -8,7 +8,7 @@
  * NOT computed in the UI.  This is a data-provisioning scaffold only.
  */
 
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import EntitySourceSelector, { type EntitySource } from './EntitySourceSelector'
 import PerEntityPager from './PerEntityPager'
 import PerYearPager from './PerYearPager'
@@ -17,7 +17,6 @@ import { glFiscalYearLabel } from '../../lib/fiscalYear'
 import StepColumnMapper from '../mapper/StepColumnMapper'
 import { fromNamedPreview } from '../mapper/normalizePreview'
 import { buildAnlagenSteps, toAnlagenResult } from '../mapper/anlagenSteps'
-import type { Answers } from '../mapper/stepMapperTypes'
 import FileDrop from '../budget/chat/FileDrop'
 
 // ---------------------------------------------------------------------------
@@ -135,26 +134,6 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
   const previewSample  = previewUpload?.sample  ?? []
 
   const hasUploads = anlagen.uploads.some(u => !!u.file_id)
-
-  // Build initial answers: seed from suggestColumnMap (alias auto-detect) +
-  // any previously confirmed entity column / dimensions from wizard state.
-  const mapperInitial = useMemo((): Answers => {
-    const suggested = suggestColumnMap(previewColumns, anlagen.columnMap)
-    const ans: Answers = {}
-    for (const [field, col] of Object.entries(suggested)) {
-      ans[field] = { t: 'column', id: col }
-    }
-    if (anlagen.entityColumn)
-      ans['entity_column'] = { t: 'column', id: anlagen.entityColumn }
-    if (anlagen.dimensions.segmentCol)
-      ans['segmentCol'] = { t: 'column', id: anlagen.dimensions.segmentCol }
-    if (anlagen.dimensions.assetClassCol)
-      ans['assetClassCol'] = { t: 'column', id: anlagen.dimensions.assetClassCol }
-    if (anlagen.dimensions.bilanzpositionCol)
-      ans['bilanzpositionCol'] = { t: 'column', id: anlagen.dimensions.bilanzpositionCol }
-    return ans
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewColumns.join(','), anlagen.columnMap, anlagen.entityColumn, anlagen.dimensions])
 
   // ---------------------------------------------------------------------------
   // Handlers
@@ -372,7 +351,6 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
             preview={fromNamedPreview(previewColumns, previewSample)}
             buildSteps={() => buildAnlagenSteps(viewMode)}
             toResult={toAnlagenResult}
-            initial={mapperInitial}
             onComplete={r =>
               onPatch({
                 columnMap: r.columnMap,

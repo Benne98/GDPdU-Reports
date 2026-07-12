@@ -333,15 +333,15 @@ function OposSidePanel({ side, sideState, entities, fyLabels, onPatchSide }: Opo
             <div className="h-px flex-1 bg-slate-200" />
           </div>
           <p className="text-xs text-slate-500">
-            Map source columns to OPOS target fields. Account is required; all other
-            fields are optional.
+            Map source columns to OPOS target fields. Partner number, account, amount,
+            and dates are required; all other fields are optional.
             {viewMode === 'combined' && ' Then identify the entity column.'}
             {' '}The same mapping is applied to all uploaded files on this side.
           </p>
           <StepColumnMapper
             key={previewColumns.join(',')}
             preview={fromNamedPreview(previewColumns, previewSample)}
-            buildSteps={() => buildOposSteps('per_side', viewMode)}
+            buildSteps={() => buildOposSteps('per_side', viewMode, side)}
             toResult={toOposResult}
             initial={mapperInitial}
             onComplete={r =>

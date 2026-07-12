@@ -7,15 +7,27 @@
 import type { Answers, MapperStep, NormalizedPreview } from './stepMapperTypes'
 import { getColumnId, getChoice } from './stepMapperTypes'
 
-// Keep in sync with OPOS_TARGET_FIELDS in OposStep.tsx
+/**
+ * Canonical target-field set for the OPOS open-items mapping.
+ * Kept in sync with backend _TARGET_FIELDS (app/routers/opos.py).
+ *
+ * partner_no label is OVERRIDDEN per-side in buildOposSteps — the value here
+ * is the generic fallback used when no side context is available.
+ *
+ * Fields removed vs. old set: referenz (not consumed by opos_aging.py).
+ * Fields added:  partner_no (critical — NULL partner_key drops all aging rows),
+ *                satzart, buchungskreis (display / entity resolution).
+ */
 const OPOS_TARGET_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
-  { key: 'konto',               label: 'Account',                                                                      required: true  },
-  { key: 'belegart',            label: 'Document type',                                                                required: false },
-  { key: 'beleg_no',            label: 'Document number',                                                              required: false },
-  { key: 'referenz',            label: 'Reference',                                                                    required: false },
-  { key: 'net_due_date',        label: 'Net due date',                                                                 required: false },
-  { key: 'amount_hauswaehrung', label: 'Amount in house currency (signed — positive = debit, negative = credit)',       required: false },
-  { key: 'posting_date',        label: 'Posting date',                                                                 required: false },
+  { key: 'partner_no',          label: 'Debitor / Kreditor number (partner)',                                           required: true  },
+  { key: 'konto',               label: 'G/L reconciliation account (LuL trade account)',                                required: true  },
+  { key: 'amount_hauswaehrung', label: 'Open amount in house currency (signed)',                                         required: true  },
+  { key: 'net_due_date',        label: 'Net due date',                                                                  required: true  },
+  { key: 'posting_date',        label: 'Posting date',                                                                  required: true  },
+  { key: 'belegart',            label: 'Document type (needed for correct aging buckets)',                               required: false },
+  { key: 'beleg_no',            label: 'Document number',                                                               required: false },
+  { key: 'satzart',             label: 'Record type',                                                                   required: false },
+  { key: 'buchungskreis',       label: 'Company code (Buchungskreis) — identifies the entity per row',             required: false },
 ]
 
 export interface OposResult {
@@ -41,20 +53,36 @@ function distinctSampleValues(
  * Builds the ordered list of mapping steps for the OPOS open-items list.
  *
  * Step order:
- *   1. One `column` step per OPOS_TARGET_FIELDS entry (konto required, rest skippable).
+ *   1. One `column` step per OPOS_TARGET_FIELDS entry.
+ *      Required: partner_no, konto, amount_hauswaehrung, net_due_date, posting_date.
+ *      Skippable: belegart, beleg_no, satzart, buchungskreis.
  *   2. IF viewMode === 'combined': a skippable `column` step for the entity column.
  *   3. IF loadMode === 'combined_sides':
  *        – required `column` step for the side discriminator column.
  *        – `choice` step for the Debitor value (options from sample).
  *        – `choice` step for the Kreditor value (options from sample).
  *
- * Total steps:
- *   per_side + per_entity      :  7
- *   per_side + combined        :  8
- *   combined_sides + per_entity: 10
- *   combined_sides + combined  : 11
+ * @param side - When provided, the partner_no step label is made side-aware:
+ *   'debitor'  → "Debitor number (customer)"
+ *   'kreditor' → "Kreditor number (supplier)"
+ *   undefined  → "Debitor / Kreditor number (partner)"  (combined-sides / unknown)
+ *
+ * Total steps (9 target fields):
+ *   per_side + per_entity      :  9
+ *   per_side + combined        : 10
+ *   combined_sides + per_entity: 12
+ *   combined_sides + combined  : 13
  */
-export function buildOposSteps(loadMode: string, viewMode: string): MapperStep[] {
+export function buildOposSteps(
+  loadMode: string,
+  viewMode: string,
+  side?: 'debitor' | 'kreditor',
+): MapperStep[] {
+  const partnerLabel =
+    side === 'debitor'  ? 'Debitor number (customer)'          :
+    side === 'kreditor' ? 'Kreditor number (supplier)'         :
+                          'Debitor / Kreditor number (partner)'
+
   const steps: MapperStep[] = []
 
   // Target-field steps
@@ -62,7 +90,7 @@ export function buildOposSteps(loadMode: string, viewMode: string): MapperStep[]
     steps.push({
       kind: 'column',
       role: field.key,
-      label: field.label,
+      label: field.key === 'partner_no' ? partnerLabel : field.label,
       required: field.required,
       skippable: !field.required,
     })
