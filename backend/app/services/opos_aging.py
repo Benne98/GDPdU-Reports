@@ -84,6 +84,11 @@ _MAX_FLOW_DAYS = 3650.0
 AR_LUL_KONTOS: tuple[str, ...] = ("23500", "23502", "24000", "24905")
 AP_LUL_KONTOS: tuple[str, ...] = ("35500", "36000", "36905")
 
+# FIFO invoice-type belegart set (SAP RV / DATEV RG).  The canonical default; the
+# read path may override it per-project via the ``opos_invoice_doctypes`` config
+# key (see :func:`_resolve_invoice_doctypes`).
+_DEFAULT_INVOICE_DOCTYPES: tuple[str, ...] = ("RV", "RG")
+
 _SIDE: dict[str, dict[str, str]] = {
     "AR": {"table": "fact_opos_debitor", "dim": "dim_customer", "id": "customer_id"},
     "AP": {"table": "fact_opos_kreditor", "dim": "dim_supplier", "id": "supplier_id"},
@@ -174,7 +179,10 @@ def _band_of(due: date, as_of: date) -> str:
     return "overdue_over_180"
 
 
-def compute_opos_aging(rows: list[dict], as_of: date, side: str = "AR") -> dict[str, dict]:
+def compute_opos_aging(
+    rows: list[dict], as_of: date, side: str = "AR",
+    invoice_doctypes: Iterable[str] = ("RV", "RG"),
+) -> dict[str, dict]:
     """FIFO as-of aging per partner (F3/F4) — the Phase-2 acceptance gate.
 
     See module docstring / docs financial-logic F1-F3.  Returns, per
@@ -183,9 +191,16 @@ def compute_opos_aging(rows: list[dict], as_of: date, side: str = "AR") -> dict[
         {total_open, overdue_open, overdue_pct, credit_balance, in_scatter, buckets}
 
     all figures in the SAME currency units as ``betrag`` (EUR, Hauswaehrung).
+
+    ``invoice_doctypes`` is the belegart set that seeds the FIFO invoice pool
+    (SAP/DATEV-agnostic).  It DEFAULTS to ``("RV","RG")`` so the pinned golden
+    contract (which calls this positionally, without the arg) is byte-identical;
+    the DB read path resolves it from project config (see
+    :func:`_resolve_invoice_doctypes`).
     """
     sign = 1.0 if side == "AR" else -1.0
     terms = _TERMS[side]
+    doctypes = frozenset(invoice_doctypes)
 
     groups: dict[str, float] = {}
     for r in rows:
@@ -207,7 +222,7 @@ def compute_opos_aging(rows: list[dict], as_of: date, side: str = "AR") -> dict[
 
         invs = [
             r for r in rows
-            if r["partner_key"] == partner and r["belegart"] in ("RV", "RG")
+            if r["partner_key"] == partner and r["belegart"] in doctypes
             and r["fy_label"] == as_of.year and r["buchungsdatum"] <= as_of
         ]
         invs.sort(key=lambda r: _due_date(r, terms))
@@ -257,12 +272,46 @@ def _month_end(year: int, month: int) -> date:
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
-def _entity_name(bukrs: Any, prefix: Any) -> Optional[str]:
-    """Full entity name from buchungskreis (preferred) or entity_prefix.
+def _entity_names_by_prefix(session: Session) -> dict[str, str]:
+    """Data-driven ``{entity_prefix(zfill2): entity_name}`` from dim_legal_entity.
 
-    NEVER returns a bare prefix like "02" — falls back to None so callers can
-    decide, keeping the "never show the prefix" rule.
+    Lets the OPOS labels track ANY loaded dataset's entity names instead of the
+    hardcoded five.  Returns an EMPTY dict on any error / missing table so callers
+    fall back to the static ``ENTITY_BUKRS`` / ``ENTITY_PREFIX`` maps (fail safe to
+    today's labels).  On v5 the dim rows equal ENTITY_PREFIX name-for-name, so the
+    resolved labels are byte-identical.
     """
+    try:
+        raw = session.execute(
+            text("SELECT entity_prefix, entity_name FROM dim_legal_entity")
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — missing dim / DB error → static fallback
+        _safe_rollback(session)
+        return {}
+    out: dict[str, str] = {}
+    for r in raw:
+        m = r._mapping
+        p, nm = m["entity_prefix"], m["entity_name"]
+        if p is not None and nm is not None and str(nm).strip():
+            out[str(p).strip().zfill(2)] = str(nm)
+    return out
+
+
+def _entity_name(bukrs: Any, prefix: Any, names: Optional[dict[str, str]] = None) -> Optional[str]:
+    """Full entity name from the data-driven dim map (preferred), else buchungskreis,
+    else the static entity_prefix fallback.
+
+    ``names`` is the per-DB ``{entity_prefix(zfill2): entity_name}`` map resolved
+    once from dim_legal_entity (see :func:`_entity_names_by_prefix`).  Preferring it
+    makes the label data-driven for arbitrary datasets; on v5 it equals
+    ``ENTITY_PREFIX`` so the label is byte-identical.  NEVER returns a bare prefix
+    like "02" — falls back to None so callers can decide, keeping the "never show
+    the prefix" rule.
+    """
+    if names and prefix is not None:
+        nm = names.get(str(prefix).strip().zfill(2))
+        if nm:
+            return nm
     try:
         if bukrs is not None and str(bukrs).strip() != "":
             return ENTITY_BUKRS.get(int(bukrs))
@@ -277,6 +326,58 @@ def _contact(name1: Any, name2: Any, postal: Any, city: Any) -> Optional[str]:
     """One display string: name_line_1 + name_line_2 + postal_code + city."""
     parts = [str(x).strip() for x in (name1, name2, postal, city) if x and str(x).strip()]
     return " · ".join(parts) if parts else None
+
+
+def _resolve_konto_scope(
+    session: Session, side: str, project_id: str = "default",
+) -> Optional[list[str]]:
+    """Resolve the LuL trade-account ``konto`` filter for a side — DATA-DRIVEN.
+
+    Probes ``fact_opos_{debitor|kreditor}`` for ANY row whose ``konto`` is in the
+    curated AR/AP LuL set:
+      * hit   → return the curated hardcoded list (v5 / DATEV — byte-identical).
+      * none  → return ``None`` = DISABLE the konto filter.  On a dataset that does
+                not use the German LuL Sammelkonto codes, every ``fact_opos`` row is
+                an open item by construction, so no konto narrow is applied.
+      * error → return the curated list (FAIL SAFE to today's behaviour).
+    """
+    curated = list(AR_LUL_KONTOS if side == "AR" else AP_LUL_KONTOS)
+    try:
+        cfg = _SIDE[side]
+        hit = session.execute(
+            text(
+                f"SELECT 1 FROM {cfg['table']} "
+                "WHERE project_id = :pid AND konto = ANY(:kontos) LIMIT 1"
+            ),
+            {"pid": project_id, "kontos": curated},
+        ).scalar()
+        return curated if hit is not None else None
+    except Exception:  # noqa: BLE001 — probe failed → fail safe to curated list
+        _safe_rollback(session)
+        return curated
+
+
+def _resolve_invoice_doctypes(
+    session: Session, project_id: str = "default",
+) -> tuple[str, ...]:
+    """Project-config FIFO invoice document types (SAP/DATEV-agnostic).
+
+    Reads ``opos_invoice_doctypes`` from the project config; falls back to the
+    canonical ``("RV","RG")`` on any miss / empty / error (FAIL SAFE to today's
+    behaviour — on v5 the key is unset, so the default holds → byte-identical).
+    """
+    try:
+        from etl.project_config import read_project_config
+
+        cfg = read_project_config(session, project_id).get("config") or {}
+        raw = cfg.get("opos_invoice_doctypes")
+        if raw:
+            vals = tuple(str(v).strip() for v in raw if str(v).strip())
+            if vals:
+                return vals
+    except Exception:  # noqa: BLE001 — config unavailable → canonical default
+        _safe_rollback(session)
+    return _DEFAULT_INVOICE_DOCTYPES
 
 
 def fetch_opos_rows(
@@ -301,7 +402,14 @@ def fetch_opos_rows(
     fails closed (no rows, no cross-entity leak).
     """
     cfg = _SIDE[side]
-    kontos = list(AR_LUL_KONTOS if side == "AR" else AP_LUL_KONTOS)
+    # DATA-DRIVEN konto scope: the curated LuL set when the dataset uses it
+    # (v5 / DATEV — byte-identical), else ``None`` = disable the konto filter so
+    # arbitrary datasets whose every fact_opos row is already an open item are not
+    # dropped by a German-specific account narrow.
+    konto_scope = _resolve_konto_scope(session, side)
+    # Per-DB entity-name map (dim_legal_entity), resolved ONCE; empty on error so
+    # _entity_name falls back to the static ENTITY_BUKRS / ENTITY_PREFIX labels.
+    entity_names = _entity_names_by_prefix(session)
     as_of = _month_end(year, month)
 
     # ``entity`` may be a single legal_entity_code OR a comma-separated list
@@ -310,7 +418,13 @@ def fetch_opos_rows(
     # many prefixes for a comma-list.
     eps = [str(e)[:2] for e in resolve_entity_prefixes(session, entity)]
     ent_frag = ""
-    params: dict[str, Any] = {"fy": str(year), "kontos": kontos}
+    params: dict[str, Any] = {"fy": str(year)}
+    # Conditional konto narrow — bound ONLY when a scope resolved (v5 keeps the
+    # curated list; a non-LuL dataset gets no konto filter).
+    konto_frag = ""
+    if konto_scope is not None:
+        konto_frag = "AND o.konto = ANY(:kontos)"
+        params["kontos"] = konto_scope
     if allowed is not None:
         # Visibility-scoped read: restrict to the allowed entity_prefix set,
         # intersected with any entity narrow already resolved from ``entity``.
@@ -344,7 +458,7 @@ def fetch_opos_rows(
         LEFT JOIN {cfg['dim']} d ON d.{cfg['id']} = o.partner_key
         WHERE o.project_id = 'default'
           AND o.fy_label::text = :fy
-          AND o.konto = ANY(:kontos)
+          {konto_frag}
           {ent_frag}
           {asof_frag}
     """)
@@ -386,7 +500,7 @@ def fetch_opos_rows(
         rows.append({
             "partner_key": pk,
             "entity_prefix": m["entity_prefix"],
-            "entity": _entity_name(m["buchungskreis"], m["entity_prefix"]),
+            "entity": _entity_name(m["buchungskreis"], m["entity_prefix"], entity_names),
             "konto": m["konto"],
             "satzart": m["satzart"],
             "belegart": m["belegart"],
@@ -405,7 +519,7 @@ def fetch_opos_rows(
                 "region_code": (str(m["region_code"]).strip() or None) if m["region_code"] else None,
                 "city": (str(m["city"]).strip() or None) if m["city"] else None,
                 "postal_code": (str(m["postal_code"]).strip() or None) if m["postal_code"] else None,
-                "entity": _entity_name(m["buchungskreis"], m["entity_prefix"]),
+                "entity": _entity_name(m["buchungskreis"], m["entity_prefix"], entity_names),
                 "entity_prefix": m["entity_prefix"],
             }
     return rows, meta
@@ -473,7 +587,9 @@ def _partner_view_uncached(
     """
     rows, meta = fetch_opos_rows(session, side, year, month, entity, allowed)
     as_of = _month_end(year, month)
-    aging = compute_opos_aging(rows, as_of, side)
+    # Project-configurable FIFO invoice belegart set (default ("RV","RG")).
+    doctypes = _resolve_invoice_doctypes(session)
+    aging = compute_opos_aging(rows, as_of, side, invoice_doctypes=doctypes)
 
     signed_total_eur = sum(float(r["betrag"]) for r in rows)  # Method-A F5 total
     # Per-partner distinct open invoice documents (RV/RG with a beleg_no).  The
@@ -481,7 +597,7 @@ def _partner_view_uncached(
     # drill-down expand arrow (frontend gates expand on open_documents > 0).
     docs_by_partner: dict[str, set] = {}
     for r in rows:
-        if r["belegart"] in ("RV", "RG") and r["beleg_no"]:
+        if r["belegart"] in doctypes and r["beleg_no"]:
             docs_by_partner.setdefault(r["partner_key"], set()).add(r["beleg_no"])
     open_docs = len({b for s in docs_by_partner.values() for b in s})
 

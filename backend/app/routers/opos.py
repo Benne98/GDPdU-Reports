@@ -80,6 +80,21 @@ def _table(side: str) -> str:
     return tbl
 
 
+def _prefix_from_bukrs(bukrs, bukrs_map: dict | None = None) -> str | None:
+    """Resolve an entity_prefix from a Buchungskreis.
+
+    Prefers an optional per-project ``bukrs_map`` (future wizard buchungskreis
+    field), else the canonical ``entities.BUKRS_TO_PREFIX``.  Byte-identical no-op
+    when ``bukrs_map`` is None — the only caller for now.  The two orderings differ,
+    so this is the ONLY sanctioned bridge (never derive the prefix arithmetically).
+    """
+    if bukrs_map:
+        got = bukrs_map.get(bukrs)
+        if got:
+            return got
+    return BUKRS_TO_PREFIX.get(bukrs)
+
+
 def _inject_partner_id(out: dict, prefix) -> None:
     # Canonical identity: when Buchungskreis is mapped, the entity_prefix is
     # resolved from it via entities.BUKRS_TO_PREFIX (the two orderings differ;
@@ -91,7 +106,7 @@ def _inject_partner_id(out: dict, prefix) -> None:
         out[f] = int(round(v)) if v is not None else None
     bukrs = out.get("buchungskreis")
     if bukrs is not None:
-        resolved = BUKRS_TO_PREFIX.get(bukrs)
+        resolved = _prefix_from_bukrs(bukrs, bukrs_map=None)
         if resolved:
             out["entity_prefix"] = resolved
             prefix = resolved

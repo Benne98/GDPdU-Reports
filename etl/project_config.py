@@ -55,6 +55,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "partner_master_source": "files",  # 'files' | 'gdpdu'
     "sales_label": "Sales",
     "cost_label": "Cost of materials",
+    # OPOS FIFO invoice-type belegart set (SAP RV / DATEV RG).  Seeds the aging
+    # FIFO invoice pool; the read path (opos_aging._resolve_invoice_doctypes) falls
+    # back to this default when unset, so v5 stays byte-identical.
+    "opos_invoice_doctypes": ["RV", "RG"],
     # OPTIONAL retained-earnings roll (year-end close).  OFF by default → the
     # rebuild stage is a strict no-op (golden parity).  When enabled:
     #   accounts: {entity_prefix: account_number_group}  per-entity Gewinnvortrag

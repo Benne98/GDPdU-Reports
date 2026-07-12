@@ -5,29 +5,66 @@
  */
 
 import type { Answers, MapperStep, NormalizedPreview } from './stepMapperTypes'
-import { getColumnId, getChoice } from './stepMapperTypes'
+import { getColumnId, getChoice, getChecklist } from './stepMapperTypes'
 
 /**
  * Canonical target-field set for the OPOS open-items mapping.
- * Kept in sync with backend _TARGET_FIELDS (app/routers/opos.py).
+ * Kept in sync with backend _TARGET_FIELDS (app/routers/opos.py) and the fields
+ * consumed by opos_aging.py.
  *
- * partner_no label is OVERRIDDEN per-side in buildOposSteps — the value here
- * is the generic fallback used when no side context is available.
+ * Ordered by IMPORTANCE with generic, source-system-neutral labels + hints so the
+ * mapper reads on arbitrary DATEV / SAP exports (not just the reference dataset):
+ *   ESSENTIAL (required): partner_no, konto, amount_hauswaehrung, net_due_date,
+ *                         posting_date, belegart
+ *   OPTIONAL  (end)     : beleg_no
  *
- * Fields removed vs. old set: referenz (not consumed by opos_aging.py).
- * Fields added:  partner_no (critical — NULL partner_key drops all aging rows),
- *                satzart, buchungskreis (display / entity resolution).
+ * partner_no label is OVERRIDDEN per-side in buildOposSteps — the value here is
+ * the generic fallback used when no side context is available.
+ *
+ * Dropped vs. old set: satzart, buchungskreis (not needed for the aging read),
+ * referenz (not consumed by opos_aging.py).  belegart is now REQUIRED — it seeds
+ * the FIFO invoice pool, so a missing document type mis-buckets the aging.
  */
-const OPOS_TARGET_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
-  { key: 'partner_no',          label: 'Debitor / Kreditor number (partner)',                                           required: true  },
-  { key: 'konto',               label: 'G/L reconciliation account (LuL trade account)',                                required: true  },
-  { key: 'amount_hauswaehrung', label: 'Open amount in house currency (signed)',                                         required: true  },
-  { key: 'net_due_date',        label: 'Net due date',                                                                  required: true  },
-  { key: 'posting_date',        label: 'Posting date',                                                                  required: true  },
-  { key: 'belegart',            label: 'Document type (needed for correct aging buckets)',                               required: false },
-  { key: 'beleg_no',            label: 'Document number',                                                               required: false },
-  { key: 'satzart',             label: 'Record type',                                                                   required: false },
-  { key: 'buchungskreis',       label: 'Company code (Buchungskreis) — identifies the entity per row',             required: false },
+const OPOS_TARGET_FIELDS: Array<{ key: string; label: string; hint?: string; required: boolean }> = [
+  {
+    key: 'partner_no',
+    label: 'Customer/Supplier account (partner ID)',
+    hint: 'The debtor/creditor the open item belongs to — aging groups by partner.',
+    required: true,
+  },
+  {
+    key: 'konto',
+    label: 'Reconciliation / control account',
+    hint: 'The AR/AP control account (SAP HKONT, DATEV Sammelkonto).',
+    required: true,
+  },
+  {
+    key: 'amount_hauswaehrung',
+    label: 'Open amount (local currency, signed)',
+    required: true,
+  },
+  {
+    key: 'net_due_date',
+    label: 'Net due date',
+    hint: 'Drives the aging buckets.',
+    required: true,
+  },
+  {
+    key: 'posting_date',
+    label: 'Posting date',
+    required: true,
+  },
+  {
+    key: 'belegart',
+    label: 'Document type',
+    hint: 'Invoice vs payment/carry-forward — needed for correct buckets.',
+    required: true,
+  },
+  {
+    key: 'beleg_no',
+    label: 'Document number',
+    required: false,
+  },
 ]
 
 export interface OposResult {
@@ -36,6 +73,8 @@ export interface OposResult {
   sideColumn?: string
   debitorValue?: string
   kreditorValue?: string
+  /** Belegart sample values the user marked as "invoice" (FIFO pool seed). */
+  invoiceDoctypes?: string[]
 }
 
 /** Extracts up to 20 distinct non-empty sample values for a column from the preview. */
@@ -54,24 +93,27 @@ function distinctSampleValues(
  *
  * Step order:
  *   1. One `column` step per OPOS_TARGET_FIELDS entry.
- *      Required: partner_no, konto, amount_hauswaehrung, net_due_date, posting_date.
- *      Skippable: belegart, beleg_no, satzart, buchungskreis.
- *   2. IF viewMode === 'combined': a skippable `column` step for the entity column.
- *   3. IF loadMode === 'combined_sides':
+ *      Required: partner_no, konto, amount_hauswaehrung, net_due_date,
+ *                posting_date, belegart.  Skippable: beleg_no.
+ *   2. A skippable `checklist` step letting the user mark which mapped belegart
+ *      sample values mean "invoice" (FIFO pool seed).  Options come from the
+ *      mapped belegart column; skipping keeps the backend default ("RV","RG").
+ *   3. IF viewMode === 'combined': a skippable `column` step for the entity column.
+ *   4. IF loadMode === 'combined_sides':
  *        – required `column` step for the side discriminator column.
  *        – `choice` step for the Debitor value (options from sample).
  *        – `choice` step for the Kreditor value (options from sample).
  *
  * @param side - When provided, the partner_no step label is made side-aware:
- *   'debitor'  → "Debitor number (customer)"
- *   'kreditor' → "Kreditor number (supplier)"
- *   undefined  → "Debitor / Kreditor number (partner)"  (combined-sides / unknown)
+ *   'debitor'  → "Customer account (partner ID)"
+ *   'kreditor' → "Supplier account (partner ID)"
+ *   undefined  → "Customer/Supplier account (partner ID)"  (combined-sides / unknown)
  *
- * Total steps (9 target fields):
- *   per_side + per_entity      :  9
- *   per_side + combined        : 10
- *   combined_sides + per_entity: 12
- *   combined_sides + combined  : 13
+ * Total steps (7 target fields + invoice_doctypes):
+ *   per_side + per_entity      :  8
+ *   per_side + combined        :  9
+ *   combined_sides + per_entity: 11
+ *   combined_sides + combined  : 12
  */
 export function buildOposSteps(
   loadMode: string,
@@ -79,9 +121,9 @@ export function buildOposSteps(
   side?: 'debitor' | 'kreditor',
 ): MapperStep[] {
   const partnerLabel =
-    side === 'debitor'  ? 'Debitor number (customer)'          :
-    side === 'kreditor' ? 'Kreditor number (supplier)'         :
-                          'Debitor / Kreditor number (partner)'
+    side === 'debitor'  ? 'Customer account (partner ID)'          :
+    side === 'kreditor' ? 'Supplier account (partner ID)'          :
+                          'Customer/Supplier account (partner ID)'
 
   const steps: MapperStep[] = []
 
@@ -91,10 +133,26 @@ export function buildOposSteps(
       kind: 'column',
       role: field.key,
       label: field.key === 'partner_no' ? partnerLabel : field.label,
+      hint: field.hint,
       required: field.required,
       skippable: !field.required,
     })
   }
+
+  // Optional invoice-doctype picker: which belegart values seed the FIFO pool.
+  // Options derive from the mapped belegart column; skip keeps default ("RV","RG").
+  steps.push({
+    kind: 'checklist',
+    role: 'invoice_doctypes',
+    label: 'Which document types are invoices?',
+    hint: 'Seeds the FIFO invoice pool. Leave empty to keep the default (RV, RG).',
+    skippable: true,
+    options: (answers: Answers, preview: NormalizedPreview) => {
+      const belegartColId = getColumnId(answers, 'belegart')
+      if (!belegartColId) return []
+      return distinctSampleValues(belegartColId, preview)
+    },
+  })
 
   // Entity column (combined entity mode only)
   if (viewMode === 'combined') {
@@ -147,11 +205,13 @@ export function buildOposSteps(
  * Converts mapper Answers into the payload consumed by commitOpos /
  * commitOposCombined / stored in WizardOposSideState or
  * WizardOposCombinedSidesState:
- *   columnMap    — { target_field: source_column } (nulls/skipped excluded)
- *   entityColumn — source column for entity identification (combined entity mode)
- *   sideColumn   — discriminator column (combined_sides only)
- *   debitorValue — value meaning Debitor/AR in sideColumn (distinct from kreditorValue)
- *   kreditorValue — value meaning Kreditor/AP in sideColumn (distinct from debitorValue)
+ *   columnMap      — { target_field: source_column } (nulls/skipped excluded)
+ *   entityColumn   — source column for entity identification (combined entity mode)
+ *   sideColumn     — discriminator column (combined_sides only)
+ *   debitorValue   — value meaning Debitor/AR in sideColumn (distinct from kreditorValue)
+ *   kreditorValue  — value meaning Kreditor/AP in sideColumn (distinct from debitorValue)
+ *   invoiceDoctypes — belegart values marked as "invoice" (undefined when none picked;
+ *                     the backend then keeps its default ("RV","RG"))
  *
  * If debitorValue === kreditorValue, both are returned as undefined so the commit
  * gate (canCommit) stays false.
@@ -178,11 +238,14 @@ export function toOposResult(answers: Answers): OposResult {
     rawKreditor !== undefined &&
     rawDebitor !== rawKreditor
 
+  const doctypes = getChecklist(answers, 'invoice_doctypes')
+
   return {
     columnMap,
     entityColumn,
     sideColumn,
     debitorValue:  distinct ? rawDebitor  : undefined,
     kreditorValue: distinct ? rawKreditor : undefined,
+    invoiceDoctypes: doctypes.length > 0 ? doctypes : undefined,
   }
 }

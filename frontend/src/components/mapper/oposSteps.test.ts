@@ -2,12 +2,14 @@
  * Payload-parity guard for oposSteps.ts.
  *
  * Proves that toOposResult reproduces the exact columnMap / entityColumn /
- * sideColumn / debitorValue / kreditorValue payloads that commitOpos and
- * commitOposCombined consume, and that the new field set is correct:
+ * sideColumn / debitorValue / kreditorValue / invoiceDoctypes payloads that
+ * commitOpos and commitOposCombined consume, and that the restructured field set
+ * is correct:
  *
- *   REQUIRED : partner_no, konto, amount_hauswaehrung, net_due_date, posting_date
- *   SKIPPABLE: belegart, beleg_no, satzart, buchungskreis
- *   REMOVED  : referenz (not consumed by opos_aging.py)
+ *   REQUIRED : partner_no, konto, amount_hauswaehrung, net_due_date,
+ *              posting_date, belegart
+ *   SKIPPABLE: beleg_no
+ *   REMOVED  : satzart, buchungskreis, referenz (not needed by opos_aging.py)
  */
 
 import { describe, it, expect } from 'vitest'
@@ -19,24 +21,25 @@ import type { Answers } from './stepMapperTypes'
 const col  = (id: string): { t: 'column'; id: string }  => ({ t: 'column', id })
 const skip = ():            { t: 'column'; id: null }    => ({ t: 'column', id: null })
 const pick = (v: string):  { t: 'choice'; value: string } => ({ t: 'choice', value: v })
+const check = (vs: string[]): { t: 'checklist'; values: string[] } => ({ t: 'checklist', values: vs })
 
 // ── buildOposSteps — step counts ─────────────────────────────────────────────
 
-describe('buildOposSteps — step counts (9 target fields)', () => {
-  it('per_side + per_entity: 9 steps', () => {
-    expect(buildOposSteps('per_side', 'per_entity')).toHaveLength(9)
+describe('buildOposSteps — step counts (7 target fields + invoice_doctypes)', () => {
+  it('per_side + per_entity: 8 steps (7 fields + invoice_doctypes)', () => {
+    expect(buildOposSteps('per_side', 'per_entity')).toHaveLength(8)
   })
 
-  it('per_side + combined: 10 steps (9 fields + entity_column)', () => {
-    expect(buildOposSteps('per_side', 'combined')).toHaveLength(10)
+  it('per_side + combined: 9 steps (+ entity_column)', () => {
+    expect(buildOposSteps('per_side', 'combined')).toHaveLength(9)
   })
 
-  it('combined_sides + per_entity: 12 steps (9 fields + side + 2 choices)', () => {
-    expect(buildOposSteps('combined_sides', 'per_entity')).toHaveLength(12)
+  it('combined_sides + per_entity: 11 steps (+ side + 2 choices)', () => {
+    expect(buildOposSteps('combined_sides', 'per_entity')).toHaveLength(11)
   })
 
-  it('combined_sides + combined: 13 steps (9 fields + entity + side + 2 choices)', () => {
-    expect(buildOposSteps('combined_sides', 'combined')).toHaveLength(13)
+  it('combined_sides + combined: 12 steps (+ entity + side + 2 choices)', () => {
+    expect(buildOposSteps('combined_sides', 'combined')).toHaveLength(12)
   })
 })
 
@@ -45,8 +48,8 @@ describe('buildOposSteps — step counts (9 target fields)', () => {
 describe('buildOposSteps — required flags', () => {
   const steps = buildOposSteps('per_side', 'per_entity', 'debitor')
 
-  const REQUIRED  = ['partner_no', 'konto', 'amount_hauswaehrung', 'net_due_date', 'posting_date']
-  const SKIPPABLE = ['belegart', 'beleg_no', 'satzart', 'buchungskreis']
+  const REQUIRED  = ['partner_no', 'konto', 'amount_hauswaehrung', 'net_due_date', 'posting_date', 'belegart']
+  const SKIPPABLE = ['beleg_no']
 
   for (const key of REQUIRED) {
     it(`${key} is required and not skippable`, () => {
@@ -70,7 +73,18 @@ describe('buildOposSteps — required flags', () => {
     })
   }
 
-  it('referenz step is absent (field removed from wizard)', () => {
+  it('belegart is now REQUIRED (seeds the FIFO invoice pool)', () => {
+    const s = steps.find(s => s.role === 'belegart')
+    expect(s?.kind).toBe('column')
+    if (s?.kind === 'column') {
+      expect(s.required).toBe(true)
+      expect(s.skippable).toBe(false)
+    }
+  })
+
+  it('dropped fields are absent (satzart, buchungskreis, referenz)', () => {
+    expect(steps.find(s => s.role === 'satzart')).toBeUndefined()
+    expect(steps.find(s => s.role === 'buchungskreis')).toBeUndefined()
     expect(steps.find(s => s.role === 'referenz')).toBeUndefined()
   })
 
@@ -92,6 +106,27 @@ describe('buildOposSteps — required flags', () => {
       expect(entStep.required).toBeFalsy()
       expect(entStep.skippable).toBe(true)
     }
+  })
+})
+
+// ── buildOposSteps — invoice_doctypes picker ─────────────────────────────────
+
+describe('buildOposSteps — invoice_doctypes checklist', () => {
+  it('present as a skippable checklist in every mode', () => {
+    for (const mode of ['per_side', 'combined_sides'] as const) {
+      const steps = buildOposSteps(mode, 'per_entity')
+      const s = steps.find(s => s.role === 'invoice_doctypes')
+      expect(s?.kind).toBe('checklist')
+      if (s?.kind === 'checklist') expect(s.skippable).toBe(true)
+    }
+  })
+
+  it('appears after the belegart target field', () => {
+    const steps = buildOposSteps('per_side', 'per_entity', 'debitor')
+    const belIdx = steps.findIndex(s => s.role === 'belegart')
+    const invIdx = steps.findIndex(s => s.role === 'invoice_doctypes')
+    expect(belIdx).toBeGreaterThanOrEqual(0)
+    expect(invIdx).toBeGreaterThan(belIdx)
   })
 })
 
@@ -130,19 +165,19 @@ describe('buildOposSteps — structure', () => {
 // ── buildOposSteps — side-aware partner_no label ─────────────────────────────
 
 describe('buildOposSteps — side-aware partner_no label', () => {
-  it('debitor side → "Debitor number (customer)"', () => {
+  it('debitor side → "Customer account (partner ID)"', () => {
     const steps = buildOposSteps('per_side', 'per_entity', 'debitor')
-    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Debitor number (customer)')
+    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Customer account (partner ID)')
   })
 
-  it('kreditor side → "Kreditor number (supplier)"', () => {
+  it('kreditor side → "Supplier account (partner ID)"', () => {
     const steps = buildOposSteps('per_side', 'per_entity', 'kreditor')
-    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Kreditor number (supplier)')
+    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Supplier account (partner ID)')
   })
 
-  it('no side (combined_sides) → "Debitor / Kreditor number (partner)"', () => {
+  it('no side (combined_sides) → "Customer/Supplier account (partner ID)"', () => {
     const steps = buildOposSteps('combined_sides', 'per_entity')
-    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Debitor / Kreditor number (partner)')
+    expect(steps.find(s => s.role === 'partner_no')?.label).toBe('Customer/Supplier account (partner ID)')
   })
 
   it('other fields are unaffected by side parameter', () => {
@@ -151,14 +186,14 @@ describe('buildOposSteps — side-aware partner_no label', () => {
     const kontoLabelDeb  = debSteps.find(s => s.role === 'konto')?.label
     const kontoLabelKred = kredSteps.find(s => s.role === 'konto')?.label
     expect(kontoLabelDeb).toBe(kontoLabelKred)
-    expect(kontoLabelDeb).toContain('G/L reconciliation account')
+    expect(kontoLabelDeb).toContain('Reconciliation / control account')
   })
 })
 
 // ── toOposResult — per-side payload ──────────────────────────────────────────
 
 describe('toOposResult — per-side payload', () => {
-  it('includes partner_no and excludes referenz; maps all provided columns', () => {
+  it('maps all provided columns; drops satzart/buchungskreis/referenz', () => {
     const answers: Answers = {
       partner_no:          col('Debitor_Nr'),
       konto:               col('Sachkonto'),
@@ -167,10 +202,9 @@ describe('toOposResult — per-side payload', () => {
       posting_date:        col('Buchungsdatum'),
       belegart:            col('BelArt'),
       beleg_no:            skip(),   // explicitly skipped
-      satzart:             skip(),
-      buchungskreis:       col('BuKr_Col'),
+      satzart:             col('Satzart_Col'),   // stale — no longer a field
+      buchungskreis:       col('BuKr_Col'),      // stale — no longer a field
       entity_column:       col('BuKr'),
-      // referenz intentionally absent — field no longer in wizard
     }
     const result = toOposResult(answers)
     expect(result.columnMap).toEqual({
@@ -180,29 +214,16 @@ describe('toOposResult — per-side payload', () => {
       net_due_date:        'Faelligkeit',
       posting_date:        'Buchungsdatum',
       belegart:            'BelArt',
-      buchungskreis:       'BuKr_Col',
     })
     expect('referenz' in result.columnMap).toBe(false)
     expect('beleg_no' in result.columnMap).toBe(false)
     expect('satzart' in result.columnMap).toBe(false)
+    expect('buchungskreis' in result.columnMap).toBe(false)
     expect(result.entityColumn).toBe('BuKr')
     expect(result.sideColumn).toBeUndefined()
     expect(result.debitorValue).toBeUndefined()
     expect(result.kreditorValue).toBeUndefined()
-  })
-
-  it('referenz in answers is silently ignored (not in OPOS_TARGET_FIELDS)', () => {
-    const answers: Answers = {
-      referenz:            col('Referenz_Col'),  // stale / legacy answer key
-      partner_no:          col('KdNr'),
-      konto:               col('Konto'),
-      amount_hauswaehrung: col('Betrag'),
-      net_due_date:        col('Faellig'),
-      posting_date:        col('BuchDat'),
-    }
-    const result = toOposResult(answers)
-    expect('referenz' in result.columnMap).toBe(false)
-    expect(result.columnMap['partner_no']).toBe('KdNr')
+    expect(result.invoiceDoctypes).toBeUndefined()
   })
 
   it('skipped nulls are excluded from columnMap', () => {
@@ -225,22 +246,42 @@ describe('toOposResult — per-side payload', () => {
     }
     expect(toOposResult(answers).entityColumn).toBeUndefined()
   })
+
+  it('invoiceDoctypes surfaced from the checklist answer', () => {
+    const answers: Answers = {
+      partner_no:          col('KdNr'),
+      konto:               col('Konto'),
+      amount_hauswaehrung: col('Betrag'),
+      net_due_date:        col('Faellig'),
+      posting_date:        col('BuchDat'),
+      belegart:            col('BelArt'),
+      invoice_doctypes:    check(['RV', 'RG', 'RN']),
+    }
+    expect(toOposResult(answers).invoiceDoctypes).toEqual(['RV', 'RG', 'RN'])
+  })
+
+  it('invoiceDoctypes undefined when the checklist is empty/skipped (keeps backend default)', () => {
+    const answers: Answers = {
+      partner_no:       col('KdNr'),
+      konto:            col('Konto'),
+      invoice_doctypes: check([]),
+    }
+    expect(toOposResult(answers).invoiceDoctypes).toBeUndefined()
+  })
 })
 
 // ── toOposResult — combined-sides payload ─────────────────────────────────────
 
 describe('toOposResult — combined-sides payload', () => {
-  it('includes partner_no, excludes referenz, returns side-discriminator fields', () => {
+  it('maps fields and returns side-discriminator fields', () => {
     const answers: Answers = {
       partner_no:          col('PartnerNr'),
       konto:               col('Konto'),
       amount_hauswaehrung: col('Betrag HW'),
       net_due_date:        col('Faellig'),
       posting_date:        col('BuchDat'),
-      belegart:            skip(),
+      belegart:            col('BelArt'),
       beleg_no:            skip(),
-      satzart:             skip(),
-      buchungskreis:       skip(),
       side_column:         col('Deb./Kred.'),
       debitor_value:       pick('D'),
       kreditor_value:      pick('K'),
@@ -252,8 +293,8 @@ describe('toOposResult — combined-sides payload', () => {
       amount_hauswaehrung: 'Betrag HW',
       net_due_date:        'Faellig',
       posting_date:        'BuchDat',
+      belegart:            'BelArt',
     })
-    expect('referenz' in result.columnMap).toBe(false)
     expect(result.sideColumn).toBe('Deb./Kred.')
     expect(result.debitorValue).toBe('D')
     expect(result.kreditorValue).toBe('K')
@@ -267,6 +308,7 @@ describe('toOposResult — combined-sides payload', () => {
       amount_hauswaehrung: col('Betrag'),
       net_due_date:        col('Faellig'),
       posting_date:        col('BuchDat'),
+      belegart:            col('BelArt'),
       side_column:         col('Seite'),
       debitor_value:       pick('Deb'),
       kreditor_value:      pick('Kred'),
