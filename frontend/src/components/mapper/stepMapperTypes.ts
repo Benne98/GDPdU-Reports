@@ -22,8 +22,8 @@ export type MapperOption = {
 }
 
 export type MapperStep =
-  | { kind: 'column'; role: string; label: string; required?: boolean; skippable?: boolean }
-  | { kind: 'multiColumn'; role: string; label: string; max: number; withLabels?: boolean; skippable?: boolean }
+  | { kind: 'column'; role: string; label: string; hint?: string; required?: boolean; skippable?: boolean }
+  | { kind: 'multiColumn'; role: string; label: string; hint?: string; max: number; withLabels?: boolean; skippable?: boolean }
   | {
       kind: 'choice'
       role: string
@@ -32,7 +32,14 @@ export type MapperStep =
       /** When true, the step-builder may gate subsequent steps on this answer. */
       gating?: boolean
     }
-  | { kind: 'checklist'; role: string; label: string; options: MapperOption[]; skippable?: boolean }
+  | {
+      kind: 'checklist'
+      role: string
+      label: string
+      hint?: string
+      options: MapperOption[] | ((answers: Answers, p: NormalizedPreview) => MapperOption[])
+      skippable?: boolean
+    }
   | { kind: 'custom'; role: string; label: string; component: 'customOutputColumns'; skippable?: boolean }
 
 export type Answer =

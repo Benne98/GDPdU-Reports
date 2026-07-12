@@ -44,8 +44,12 @@ export interface WizardAnlagenState {
   previewFileId?: string
   /** target_field -> source_column mapping applied to all committed files. */
   columnMap: Record<string, string>
-  /** Optional dimension / breakdown column assignments. */
-  dimensions: {
+  /**
+   * @deprecated Vestigial — never sent to commit, read nowhere backend-side.
+   * Retained only so existing wizard-state initializers keep type-checking;
+   * breakdown dimensions are now optional entries inside `columnMap`.
+   */
+  dimensions?: {
     segmentCol?: string
     assetClassCol?: string
     bilanzpositionCol?: string
@@ -68,19 +72,19 @@ interface AnlagenStepProps {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// German source-header aliases kept only for best-effort auto-detection; the
+// mapper itself now uses generic, system-agnostic English labels.
 const ANLAGEN_HEADER_ALIASES: Record<string, string> = {
   anlage: 'asset_id',
   anlagenbezeichnung: 'asset_label',
   bezeichnung: 'asset_label',
-  unternummer: 'asset_sub_no',
   bilanzposition: 'bilanzposition',
   geschäftsbereich: 'segment',
   geschaftsbereich: 'segment',
-  anlagenklasse: 'asset_class',
   zugang: 'additions_zugang',
   abgang: 'disposals_abgang',
-  umbuchung: 'transfers_umbuchung',
   'afa des jahres': 'depreciation',
+  'buchwert gj-beg': 'opening_nbv',
   'lfd buchwert': 'nbv',
 }
 
@@ -340,11 +344,11 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
             <div className="h-px flex-1 bg-slate-200" />
           </div>
           <p className="text-xs text-slate-500">
-            Map source columns to fixed-asset register target fields. Asset ID is required; all
-            other fields are optional.
+            Map source columns to the rollforward inputs — asset number (required), opening and
+            closing net book value, additions, disposals, and depreciation.
             {viewMode === 'combined' && ' Then identify the entity column.'}
-            {' '}Segment, asset-class, and balance-sheet line columns can be assigned as
-            drill-down dimensions. The same mapping is applied to all uploaded files.
+            {' '}Asset description, business segment, and balance-sheet line are optional
+            breakdown columns. The same mapping is applied to all uploaded files.
           </p>
           <StepColumnMapper
             key={previewColumns.join(',')}
@@ -355,7 +359,6 @@ export default function AnlagenStep({ anlagen, entities, glYears, fyEndMonth, on
               onPatch({
                 columnMap: r.columnMap,
                 entityColumn: r.entityColumn,
-                dimensions: r.dimensions,
                 provided: true,
               })
             }

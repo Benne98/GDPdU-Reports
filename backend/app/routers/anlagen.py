@@ -18,6 +18,7 @@ traversal (UPLOAD_DIR + UUID), admin-gated + entity-scoped writes.
 from __future__ import annotations
 
 import logging
+import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.auth import User, current_user, require_admin
 from app.db import get_session
 from app.services import draft_ingest as di
+from app.services.fixed_asset_ingest import as_of_date_for_year
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ router = APIRouter(prefix="/api/v1/anlagen", tags=["anlagen"])
 # Target field -> kind. Identity/text fields are pass-through strings; the rest are
 # coerced for their DB column type. NO derived/closing/accum-depreciation field.
 _NUMBER_FIELDS = {
-    "opening_cost_ahk", "additions_zugang", "disposals_abgang",
+    "opening_cost_ahk", "opening_nbv", "additions_zugang", "disposals_abgang",
     "transfers_umbuchung", "depreciation", "nbv",
 }
 _DATE_FIELDS = {"capitalization_date"}
@@ -44,12 +46,31 @@ _TARGET_FIELDS = _NUMBER_FIELDS | _DATE_FIELDS | _TEXT_FIELDS
 
 _INSERT_COLUMNS = [
     "project_id", "dataset_version_id", "source_file_id", "row_no",
-    "entity_prefix", "fy_label",
+    "as_of_date", "entity_prefix", "fy_label",
     "asset_id", "asset_sub_no", "asset_class", "asset_label", "segment", "bilanzposition",
     "capitalization_date",
-    "opening_cost_ahk", "additions_zugang", "disposals_abgang",
+    "opening_cost_ahk", "opening_nbv", "additions_zugang", "disposals_abgang",
     "transfers_umbuchung", "depreciation", "nbv",
 ]
+
+
+def _fy_end_year(fy_label: str) -> int:
+    """Derive the ending 4-digit calendar year from a FY label.
+
+    The stored fiscal year is always the calendar ENDING year, so:
+      'FY2024' -> 2024; 'FY23/24' -> 2024; 'FY24A' -> 2024.
+    The last numeric group in the label is the ending year (2-digit -> 2000+).
+    """
+    groups = re.findall(r"\d+", fy_label or "")
+    if not groups:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot derive fiscal year from fy_label {fy_label!r}",
+        )
+    year = int(groups[-1])
+    if year < 100:
+        year += 2000
+    return year
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +158,11 @@ def commit(
             detail=f"column_map must map at least one of: {sorted(_TARGET_FIELDS)}",
         )
 
+    # Snapshot date the rollforward report filters on (as_of_date = Dec-31 of the
+    # fiscal-year ENDING year). build_mapped_rows has no source row in its
+    # extra_per_row hook, so inject the request-derived date on every row.
+    as_of = as_of_date_for_year(_fy_end_year(body.fy_label))
+
     df = di.load_staged(body.file_id, body.sheet)
     rows, prefixes = di.build_mapped_rows(
         df,
@@ -148,6 +174,7 @@ def commit(
         entity_prefix=body.entity_prefix,
         fy_label=body.fy_label,
         file_id=body.file_id,
+        extra_per_row=lambda out, _prefix: out.__setitem__("as_of_date", as_of),
     )
 
     di.assert_prefixes_visible(session, admin, prefixes)

@@ -27,7 +27,8 @@ _ADMIN = User(user_id=1, email="admin@test", display_name="Admin", is_admin=True
 # fail-closed) set, i.e. a RESTRICTED scope (not the admin "see-all" None).
 _RESTRICTED = User(user_id=2, email="user@test", display_name="User", is_admin=False)
 
-# SQLite-equivalent of migration 0022's fact_fixed_asset (no derived columns).
+# SQLite-equivalent of fact_fixed_asset incl. migration 0027 (as_of_date +
+# opening_nbv snapshot columns the rollforward report filters/reads on).
 _DDL = """
 CREATE TABLE fact_fixed_asset (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,15 +37,18 @@ CREATE TABLE fact_fixed_asset (
     source_file_id      TEXT,
     row_no              INTEGER,
     created_at          TEXT,
+    as_of_date          DATE,
     entity_prefix       TEXT,
     fy_label            TEXT,
     asset_id            TEXT,
     asset_sub_no        TEXT,
     asset_class         TEXT,
+    asset_label         TEXT,
     segment             TEXT,
     bilanzposition      TEXT,
     capitalization_date TEXT,
     opening_cost_ahk    NUMERIC,
+    opening_nbv         NUMERIC,
     additions_zugang    NUMERIC,
     disposals_abgang    NUMERIC,
     transfers_umbuchung NUMERIC,
@@ -109,14 +113,16 @@ _REGISTER_ROWS = [
         "Buchungskreis": "1", "AnlNr": "A-100", "UnterNr": "0",
         "AnlKlasse": "Maschinen", "Segment": "Prod", "Bilanzposition": "Tech. Anlagen",
         "AktivDatum": "15.03.2021",
-        "AHK_Anfang": "10.000,00", "Zugang": "2.500,00", "Abgang": "0,00",
+        "AHK_Anfang": "10.000,00", "BW_Anfang": "10.000,00",
+        "Zugang": "2.500,00", "Abgang": "0,00",
         "Umbuchung": "0,00", "Abschreibung": "1.250,00", "Restbuchwert": "11.250,00",
     },
     {
         "Buchungskreis": "1", "AnlNr": "A-101", "UnterNr": "1",
         "AnlKlasse": "Fuhrpark", "Segment": "Logistik", "Bilanzposition": "Fuhrpark",
         "AktivDatum": "01.07.2022",
-        "AHK_Anfang": "30.000,00", "Zugang": "0,00", "Abgang": "5.000,00",
+        "AHK_Anfang": "30.000,00", "BW_Anfang": "25.000,00",
+        "Zugang": "0,00", "Abgang": "5.000,00",
         "Umbuchung": "0,00", "Abschreibung": "6.000,00", "Restbuchwert": "19.000,00",
     },
 ]
@@ -129,6 +135,7 @@ _COLUMN_MAP = {
     "bilanzposition": "Bilanzposition",
     "capitalization_date": "AktivDatum",
     "opening_cost_ahk": "AHK_Anfang",
+    "opening_nbv": "BW_Anfang",
     "additions_zugang": "Zugang",
     "disposals_abgang": "Abgang",
     "transfers_umbuchung": "Umbuchung",
@@ -173,14 +180,19 @@ def test_upload_preview_commit_roundtrip(client, sqlite_session):
     assert body["entity_prefixes"] == ["01"]
 
     rows = sqlite_session.execute(
-        text("SELECT asset_id, entity_prefix, fy_label, opening_cost_ahk, "
-             "additions_zugang, depreciation FROM fact_fixed_asset ORDER BY asset_id")
+        text("SELECT asset_id, entity_prefix, fy_label, as_of_date, opening_nbv, "
+             "opening_cost_ahk, additions_zugang, depreciation "
+             "FROM fact_fixed_asset ORDER BY asset_id")
     ).fetchall()
     assert len(rows) == 2
     # Pass-through values normalized from German number format, NOT computed.
-    assert rows[0] == ("A-100", "01", "2023", 10000.0, 2500.0, 1250.0)
+    # as_of_date is derived from fy_label ('2023' -> Dec-31 of ending year) so the
+    # rollforward report (filters as_of_date, reads opening_nbv) sees the snapshot.
+    assert rows[0] == ("A-100", "01", "2023", "2023-12-31", 10000.0, 10000.0, 2500.0, 1250.0)
     assert rows[1][0] == "A-101"
     assert rows[1][1] == "01"
+    assert rows[1][3] == "2023-12-31"
+    assert rows[1][4] == 25000.0
 
 
 def test_combined_mode_resolves_prefix_from_column(client, sqlite_session):

@@ -111,6 +111,13 @@ export default function StepColumnMapper<R,>({
       : choiceStep.options
     : []
 
+  // Resolve checklist options (function or array) — same seam as choiceOptions.
+  const checkOptions = checkStep
+    ? typeof checkStep.options === 'function'
+      ? checkStep.options(answers, preview)
+      : checkStep.options
+    : []
+
   // Complete button gate: every required column step must have a non-null answer
   const allRequiredFilled = steps
     .filter(
@@ -553,7 +560,7 @@ export default function StepColumnMapper<R,>({
       return (
         <div className="flex flex-col gap-2">
           <div className="flex flex-col gap-1">
-            {checkStep.options.map(opt => (
+            {checkOptions.map(opt => (
               <label
                 key={opt.value}
                 className="flex cursor-pointer items-center gap-2 text-sm text-slate-700"
@@ -723,6 +730,13 @@ export default function StepColumnMapper<R,>({
       <p className={`text-sm font-medium text-slate-700 ${expanded ? 'pl-10' : 'pl-9'}`}>
         {instruction}
       </p>
+
+      {/* Optional per-step explanation (generic, system-agnostic guidance) */}
+      {current && (current.kind === 'column' || current.kind === 'multiColumn') && current.hint && (
+        <p className={`-mt-1 text-xs text-slate-500 ${expanded ? 'pl-10' : 'pl-9'}`}>
+          {current.hint}
+        </p>
+      )}
 
       {/* Step-specific controls */}
       {stepControls}
