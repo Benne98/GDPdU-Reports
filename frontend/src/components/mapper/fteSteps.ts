@@ -100,7 +100,45 @@ export function buildFteSteps(answers: Answers, uploadMode: string): MapperStep[
     steps.push({ kind: 'column', role: 'social',  label: 'Social security cost',   skippable: true })
   }
 
-  // 7. Breakdown dimensions — optional, max 3
+  // 7. Named dimension columns — optional, DB-ingest (fact_personnel_employee).
+  //    Each maps to a fixed schema column the Payroll page reads/groups on.
+  steps.push({
+    kind: 'column',
+    role: 'bereich',
+    label: 'Division column',
+    hint: 'Grouping dimension for the Payroll page (bereich).',
+    skippable: true,
+  })
+  steps.push({
+    kind: 'column',
+    role: 'kst_name',
+    label: 'Cost center column',
+    hint: 'Cost-center name for the Payroll page (kst_name).',
+    skippable: true,
+  })
+  steps.push({
+    kind: 'column',
+    role: 'bereichuntergruppe',
+    label: 'Org unit column',
+    hint: 'Sub-division / org unit for the Payroll page (bereichuntergruppe).',
+    skippable: true,
+  })
+  steps.push({
+    kind: 'column',
+    role: 'gew_ang',
+    label: 'Employee type column',
+    hint: 'Blue-/white-collar or employment type (gew_ang).',
+    skippable: true,
+  })
+  steps.push({
+    kind: 'column',
+    role: 'personalnummer',
+    label: 'Personnel number column',
+    hint: 'Employee identifier; auto-synthesised when omitted.',
+    skippable: true,
+  })
+
+  // 8. Breakdown dimensions — optional, max 3 (workbook-only, free-form)
   steps.push({
     kind: 'multiColumn',
     role: 'dimensions',
@@ -152,6 +190,15 @@ export interface FteStepResult {
   presetMetrics: string[]
   /** Custom output column pairs. */
   customMetrics: Array<{ source_col: string; output_label: string }>
+  /**
+   * Named dimension source headers for the DB ingest (fact_personnel_employee).
+   * Each is the resolved column header (name), omitted when the step was skipped.
+   */
+  bereich_col?: string
+  kst_name_col?: string
+  bereichuntergruppe_col?: string
+  gew_ang_col?: string
+  personalnummer_col?: string
 }
 
 // ── Internal helper ────────────────────────────────────────────────────────────
@@ -276,7 +323,9 @@ export function toFteResult(answers: Answers, preview: NormalizedPreview): FteSt
     output_label: r.output_label,
   }))
 
-  return {
+  // ── Named dimension columns (DB ingest) ─────────────────────────────────────
+  // Emit *_col header names only for steps the user answered (skipped -> omitted).
+  const result: FteStepResult = {
     fteMapping,
     payrollMapping,
     tenureMode,
@@ -285,4 +334,17 @@ export function toFteResult(answers: Answers, preview: NormalizedPreview): FteSt
     presetMetrics,
     customMetrics,
   }
+  const NAMED_DIM_ROLES: Array<[string, keyof FteStepResult]> = [
+    ['bereich',            'bereich_col'],
+    ['kst_name',           'kst_name_col'],
+    ['bereichuntergruppe', 'bereichuntergruppe_col'],
+    ['gew_ang',            'gew_ang_col'],
+    ['personalnummer',     'personalnummer_col'],
+  ]
+  for (const [role, field] of NAMED_DIM_ROLES) {
+    const header = headerById(preview, getColumnId(answers, role))
+    if (header) (result[field] as string) = header
+  }
+
+  return result
 }

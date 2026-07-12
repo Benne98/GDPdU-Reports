@@ -1,12 +1,17 @@
 """Column mapping and row normalisation for personaltable / personnel subledger loads."""
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any, Optional
 
 import pandas as pd
 
-from app.services.draft_ingest import to_number
+# Leading YYYY-MM-DD / YYYY/MM/DD -> ISO (year-first); anything else is treated as
+# day-first (German DD.MM.YYYY), matching the rest of the ingest.
+_ISO_DATE_RE = re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+
+from app.services.draft_ingest import build_mapped_rows, to_number
 from app.services.entities import ENTITY_PREFIX
 
 # Entity display name (personaltable ``Entity`` column) -> entity_prefix
@@ -157,3 +162,169 @@ def map_personnel_rows(
     if unresolved:
         print(f"    WARNING: {unresolved} rows had unmapped Entity name")
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Generic wizard commit — map arbitrary FTE/payroll columns to the fixed schema
+# --------------------------------------------------------------------------- #
+# Target fields coerced through ``to_number`` by ``build_mapped_rows``.
+_COMMIT_NUMBER_FIELDS = {
+    "beschaeftigungsgrad", "months_active", "gesamtsumme", "sozialversicherung",
+}
+
+
+def _as_pydate(value: Any) -> Optional[date]:
+    """Lenient single-value date parse, else None.
+
+    ISO ``YYYY-MM-DD`` values parse year-first; everything else (German dotted
+    ``DD.MM.YYYY``) parses day-first, consistent with ``draft_ingest.to_date``.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    dayfirst = not _ISO_DATE_RE.match(s)
+    ts = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+def _months_overlap(entry: Any, exit_: Any, year: int) -> float:
+    """Inclusive whole-month overlap of [entry, exit] within FY ``year`` (0..12).
+
+    Missing entry -> Jan 1; missing exit -> Dec 31 (still employed at year end).
+    Both endpoints are clamped into [Jan 1, Dec 31] of ``year``; a non-overlapping
+    range yields 0.  Inclusive month count: Jan..Dec = 12, Mar..Dec = 10.
+    """
+    fy_start = date(year, 1, 1)
+    fy_end = date(year, 12, 31)
+    start = _as_pydate(entry) or fy_start
+    end = _as_pydate(exit_) or fy_end
+    if start < fy_start:
+        start = fy_start
+    if end > fy_end:
+        end = fy_end
+    if end < start:
+        return 0.0
+    months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+    return float(min(12, max(0, months)))
+
+
+def build_personnel_rows(
+    df: pd.DataFrame,
+    *,
+    year: int,
+    fy_label: str,
+    file_id: str,
+    tenure_mode: str,
+    payroll_mode: str,
+    entity_mode: str = "per_entity",
+    entity_prefix: Optional[str] = None,
+    entity_column: Optional[str] = None,
+    employment_pct_col: Optional[str] = None,
+    months_col: Optional[str] = None,
+    entry_col: Optional[str] = None,
+    exit_col: Optional[str] = None,
+    total_col: Optional[str] = None,
+    monthly_col: Optional[str] = None,
+    component_cols: Optional[list[str]] = None,
+    social_col: Optional[str] = None,
+    personalnummer_col: Optional[str] = None,
+    bereich_col: Optional[str] = None,
+    bereichuntergruppe_col: Optional[str] = None,
+    kst_name_col: Optional[str] = None,
+    gew_ang_col: Optional[str] = None,
+    name_by_prefix: Optional[dict[str, str]] = None,
+) -> tuple[list[dict[str, Any]], set[str], dict[str, str]]:
+    """Map a wizard FTE/payroll frame onto ``fact_personnel_employee`` insert dicts.
+
+    Reuses the generic ``draft_ingest.build_mapped_rows`` 1:1 (same as the Anlagen
+    commit): the caller-selected source headers are mapped onto the fixed target
+    fields, and synthetic ``__payroll__`` / ``__months__`` columns are pre-computed
+    on ``df`` so the mapping stays a pure column pass-through.
+
+    PRESERVES the source sign — payroll cost is stored positive as supplied (the
+    Payroll page's aggregate applies its own sign), matching the offline loader.
+
+    Returns ``(rows, distinct_prefixes, column_map)``.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    # NaN -> None so number/text coercion behaves like the string-typed GL loader.
+    df = df.where(pd.notna(df), None)
+
+    column_map: dict[str, str] = {}
+    if employment_pct_col:
+        column_map["beschaeftigungsgrad"] = employment_pct_col
+    if social_col:
+        column_map["sozialversicherung"] = social_col
+    if bereich_col:
+        column_map["bereich"] = bereich_col
+    if bereichuntergruppe_col:
+        column_map["bereichuntergruppe"] = bereichuntergruppe_col
+    if kst_name_col:
+        column_map["kst_name"] = kst_name_col
+    if gew_ang_col:
+        column_map["gew_ang"] = gew_ang_col
+    if personalnummer_col:
+        column_map["personalnummer"] = personalnummer_col
+
+    # ----- Payroll basis -> synthetic gesamtsumme (build_mapped_rows is 1:1) -----
+    if payroll_mode == "sum_components" and component_cols:
+        acc = None
+        for c in component_cols:
+            if c not in df.columns:
+                raise ValueError(f"component column {c!r} not found in file")
+            s = df[c].map(lambda v: to_number(v) or 0.0)
+            acc = s if acc is None else acc + s
+        df["__payroll__"] = acc if acc is not None else 0.0
+        column_map["gesamtsumme"] = "__payroll__"
+    elif payroll_mode == "total_col" and total_col:
+        column_map["gesamtsumme"] = total_col
+    elif payroll_mode == "monthly_col" and monthly_col:
+        def _annualize(v: Any) -> Optional[float]:
+            n = to_number(v)
+            return None if n is None else n * 12.0
+        df["__payroll__"] = df[monthly_col].map(_annualize)
+        column_map["gesamtsumme"] = "__payroll__"
+
+    # ----- Tenure basis -> synthetic months_active ------------------------------
+    if tenure_mode == "months_col" and months_col:
+        column_map["months_active"] = months_col
+    elif tenure_mode == "entry_exit_dates":
+        records = df.to_dict(orient="records")
+        df["__months__"] = [
+            _months_overlap(
+                r.get(entry_col) if entry_col else None,
+                r.get(exit_col) if exit_col else None,
+                year,
+            )
+            for r in records
+        ]
+        column_map["months_active"] = "__months__"
+
+    names = name_by_prefix or {}
+    as_of = as_of_date_for_year(year)
+
+    def _inject(out: dict[str, Any], prefix: Optional[str]) -> None:
+        out["as_of_date"] = as_of
+        out["entity_name"] = names.get(prefix or "") or ENTITY_PREFIX.get(prefix or "")
+        # personalnummer is NOT NULL: synthesise from row_no when unmapped or blank.
+        if not out.get("personalnummer"):
+            out["personalnummer"] = str(out.get("row_no"))
+
+    rows, prefixes = build_mapped_rows(
+        df,
+        column_map=column_map,
+        number_fields=_COMMIT_NUMBER_FIELDS,
+        date_fields=set(),
+        entity_mode=entity_mode,
+        entity_column=entity_column,
+        entity_prefix=entity_prefix,
+        fy_label=fy_label,
+        file_id=file_id,
+        extra_per_row=_inject,
+    )
+    return rows, prefixes, column_map

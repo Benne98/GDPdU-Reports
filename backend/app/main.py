@@ -28,6 +28,7 @@ from app.routers import meta_compat as meta_compat_router
 from app.routers import metrics_compat as metrics_compat_router
 from app.routers import opos as opos_router
 from app.routers import personnel as personnel_router
+from app.routers import personnel_ingest_api as personnel_ingest_router
 from app.routers import fixed_assets as fixed_assets_router
 from app.routers import plan as plan_router
 from app.routers import projects as projects_router
@@ -76,6 +77,8 @@ app.include_router(masters_router.router)
 app.include_router(anlagen_router.router)
 app.include_router(opos_router.router)
 app.include_router(personnel_router.router)
+# Project-Setup FTE/Payroll DB ingest -> fact_personnel_employee (drives Payroll page)
+app.include_router(personnel_ingest_router.router)
 app.include_router(fixed_assets_router.router)
 # DF5 plan / forecast
 app.include_router(plan_router.router)

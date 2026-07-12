@@ -77,6 +77,7 @@ import {
   resetProjectData,
   uploadFddFile,
   runFteDevelopment,
+  commitPersonnel,
   glUnmappedDetail,
   applyLibraryMapping,
   fetchCandidatePositions,
@@ -345,6 +346,13 @@ export interface WizardFteState {
   presetMetrics: string[]
   /** Custom output columns (source_col → output_label) */
   customMetrics: Array<{ source_col: string; output_label: string }>
+  /** Named dimension source headers for the DB ingest (fact_personnel_employee).
+   *  Each maps 1:1 onto a fixed schema column the Payroll page reads/groups on. */
+  bereichCol?: string
+  kstNameCol?: string
+  bereichuntergruppeCol?: string
+  gewAngCol?: string
+  personalnummerCol?: string
   /** PEX view mode: 'consolidated' | 'per_entity' */
   pexViewMode: 'consolidated' | 'per_entity'
   /** Flat cell values: key = "entity{idx+1}_FY{yyyy}", value = EURk */
@@ -3761,6 +3769,11 @@ function StepAdditionalInformation({
                       dimensions:    r.dimensions,
                       presetMetrics: r.presetMetrics,
                       customMetrics: r.customMetrics,
+                      bereichCol:            r.bereich_col,
+                      kstNameCol:            r.kst_name_col,
+                      bereichuntergruppeCol: r.bereichuntergruppe_col,
+                      gewAngCol:             r.gew_ang_col,
+                      personalnummerCol:     r.personalnummer_col,
                       provided:      true,
                     })}
                   />
@@ -6053,6 +6066,60 @@ export default function ProjectSetupWizard() {
         fy_end_month:    fyEndMonth,
         fy_end_day:      31,
         formula_mode:    true,
+      }
+
+      // ---- Step 6a: FTE DB ingest -> fact_personnel_employee (drives Payroll page) ----
+      // Runs BEFORE the workbook build and is NON-BLOCKING (a DB-ingest failure must
+      // not abort the workbook or the Finish sequence). First cut: per-entity path
+      // only — 'consolidated' / single_combined_file (no resolvable per-row entity)
+      // is a noted follow-up and skips the DB write.
+      if (fte.viewMode === 'per_entity') {
+        const perEntityList = wizardEntities.filter(e => e.code.trim())
+        const fm = fte.fteMapping as Record<string, unknown>
+        const pm = fte.payrollMapping as Record<string, unknown>
+        const asStr = (v: unknown): string | undefined =>
+          typeof v === 'string' && v ? v : undefined
+        const asStrArr = (v: unknown): string[] | undefined =>
+          Array.isArray(v) && v.length ? (v as string[]) : undefined
+        for (const slot of fte.uploads) {
+          if (slot.file_ids.length === 0) continue
+          const prefix = perEntityList[slot.entity_index]?.prefix?.trim()
+          const yearMatch = slot.fy_label.match(/(19|20)\d{2}/)
+          const year = yearMatch ? Number(yearMatch[0]) : NaN
+          if (!prefix || !Number.isFinite(year)) continue
+          try {
+            await commitPersonnel({
+              session_id:         fte.sessionId,
+              file_ids:           slot.file_ids,
+              entity_mode:        'per_entity',
+              entity_prefix:      prefix,
+              year,
+              fy_label:           slot.fy_label,
+              project_id:         PROJECT_ID,
+              tenure_mode:        fte.tenureMode,
+              payroll_mode:       fte.payrollMode,
+              employment_pct_col: asStr(fm.employment_pct_col),
+              months_col:         asStr(fm.months_col),
+              entry_col:          asStr(fm.entry_col),
+              exit_col:           asStr(fm.exit_col),
+              total_col:          asStr(pm.total_col),
+              monthly_col:        asStr(pm.monthly_col),
+              component_cols:     asStrArr(pm.component_cols),
+              social_col:         asStr(pm.social_col),
+              personalnummer_col: fte.personalnummerCol,
+              bereich_col:            fte.bereichCol,
+              bereichuntergruppe_col: fte.bereichuntergruppeCol,
+              kst_name_col:           fte.kstNameCol,
+              gew_ang_col:            fte.gewAngCol,
+            })
+          } catch (err) {
+            const rawMsg = err instanceof Error ? err.message : String(err)
+            console.warn(
+              `[wizard] personnel DB ingest failed for entity ${slot.entity_index} ${slot.fy_label}:`,
+              rawMsg,
+            )
+          }
+        }
       }
 
       patchStep('fte', { status: 'running' })

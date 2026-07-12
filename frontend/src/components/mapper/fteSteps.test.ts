@@ -108,6 +108,36 @@ describe('toFteResult — months_col + total_col', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Scenario 1b: named dimension columns emit *_col header names (DB ingest)
+// ---------------------------------------------------------------------------
+
+describe('toFteResult — named dimension columns', () => {
+  it('emits mapped *_col headers and omits skipped ones', () => {
+    const answers: Answers = {
+      tenure_basis:   { t: 'choice', value: 'months_col' },
+      employment_pct: { t: 'column', id: 'B' },
+      months:         { t: 'column', id: 'C' },
+      payroll_basis:  { t: 'choice', value: 'total_col' },
+      total:          { t: 'column', id: 'F' },
+      social:         { t: 'column', id: null },
+      // named dims: Department -> bereich_col; personnel number -> A; rest skipped
+      bereich:        { t: 'column', id: 'K' },
+      kst_name:       { t: 'column', id: null },
+      personalnummer: { t: 'column', id: 'A' },
+      dimensions:     { t: 'multiColumn', items: [] },
+      preset_metrics: { t: 'checklist', values: [] },
+      custom_columns: { t: 'custom', rows: [] },
+    }
+    const result = toFteResult(answers, PREVIEW)
+    expect(result.bereich_col).toBe('Department')
+    expect(result.personalnummer_col).toBe('PersonID')
+    expect(result).not.toHaveProperty('kst_name_col')
+    expect(result).not.toHaveProperty('gew_ang_col')
+    expect(result).not.toHaveProperty('bereichuntergruppe_col')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Scenario 2: entry_exit_dates + sum_components (tests all other code paths)
 // ---------------------------------------------------------------------------
 

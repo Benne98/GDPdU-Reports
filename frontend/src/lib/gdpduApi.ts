@@ -2537,6 +2537,64 @@ export async function commitAnlagen(
 }
 
 // ---------------------------------------------------------------------------
+// Personnel / Payroll (Project-Setup FTE) — DB ingest into fact_personnel_employee
+// ---------------------------------------------------------------------------
+
+/** Request body for POST /api/v1/personnel/commit.
+ *  Files live in the FDD session store (uploaded via uploadFddFile), so the
+ *  backend resolves them by (session_id, file_id) — not the draft-ingest store. */
+export interface PersonnelCommitRequest {
+  session_id: string;
+  file_ids: string[];
+  entity_mode: "per_entity" | "combined";
+  entity_prefix?: string | null;
+  entity_column?: string | null;
+  year: number;
+  fy_label: string;
+  project_id?: string;
+  tenure_mode: string;
+  payroll_mode: string;
+  employment_pct_col?: string;
+  months_col?: string;
+  entry_col?: string;
+  exit_col?: string;
+  total_col?: string;
+  monthly_col?: string;
+  component_cols?: string[];
+  social_col?: string;
+  personalnummer_col?: string;
+  bereich_col?: string;
+  bereichuntergruppe_col?: string;
+  kst_name_col?: string;
+  gew_ang_col?: string;
+}
+
+/** Response from POST /api/v1/personnel/commit */
+export interface PersonnelCommitResponse {
+  inserted: number;
+  as_of_date: string;
+  entity_prefix: string | null;
+  project_id: string;
+}
+
+/**
+ * POST /api/v1/personnel/commit — write wizard FTE/payroll rows into
+ * fact_personnel_employee (the table the Payroll page reads). Admin-only,
+ * idempotent replace per (project_id, as_of_date, entity_prefix).
+ */
+export async function commitPersonnel(
+  payload: PersonnelCommitRequest
+): Promise<PersonnelCommitResponse> {
+  const res = await apiFetch("/api/v1/personnel/commit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<PersonnelCommitResponse>;
+}
+
+// ---------------------------------------------------------------------------
 // OPOS — open-items lists (D4) — DRAFT upload / preview / commit
 // ---------------------------------------------------------------------------
 
