@@ -6183,7 +6183,7 @@ export default function ProjectSetupWizard() {
         const slotCount = state.opos.combinedSides.uploads.filter(u => !!u.file_id).length
         patchStep('opos', {
           status: 'skipped',
-          detail: `${slotCount} combined-side file(s) staged. Commit requires backend endpoint POST /api/v1/opos/combined/commit (not yet implemented). Switch to Separate Files mode to commit.`,
+          detail: `Combined-sides: ${slotCount} file(s) committed inline (split into Debitor + Kreditor) during the Additional Information step`,
         })
       } else {
         const debCount  = state.opos.debitor.uploads.filter(u => !!u.file_id).length

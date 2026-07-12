@@ -4,8 +4,8 @@
  * Two loading modes:
  *   per_side      — separate uploads for Debitor (AR) and Kreditor (AP) (default, fully functional)
  *   combined_sides — one file containing rows for both sides, filtered by a discriminator column
- *                   NOTE: combined_sides mode requires backend endpoint
- *                   POST /api/v1/opos/combined/commit which is not yet implemented.
+ *                   Commits via POST /api/v1/opos/combined/commit, which splits the file on the
+ *                   side column and writes fact_opos_debitor + fact_opos_kreditor in one step.
  *
  * Flow (per_side): entity source selection -> upload (per FY / per entity x FY) ->
  *   preview -> column mapping -> per-slot commit.
@@ -18,7 +18,7 @@ import { useMemo, useState } from 'react'
 import EntitySourceSelector, { type EntitySource } from './EntitySourceSelector'
 import PerEntityPager from './PerEntityPager'
 import PerYearPager from './PerYearPager'
-import { uploadOposFile, commitOpos, type OposSide } from '../../lib/gdpduApi'
+import { uploadOposFile, commitOpos, commitOposCombined, type OposSide } from '../../lib/gdpduApi'
 import { glFiscalYearLabel } from '../../lib/fiscalYear'
 
 // ---------------------------------------------------------------------------
@@ -66,9 +66,8 @@ export interface WizardOposState {
   provided: boolean
   /**
    * 'per_side' (default) — separate upload for each side (Debitor / Kreditor).
-   * 'combined_sides' — one file containing rows for both sides.
-   *   NOTE: combined_sides commit requires POST /api/v1/opos/combined/commit
-   *   which is not yet implemented on the backend.
+   * 'combined_sides' — one file containing rows for both sides, committed via
+   *   POST /api/v1/opos/combined/commit (splits on the side-discriminator column).
    */
   loadMode: 'per_side' | 'combined_sides'
   /** State for combined-sides upload mode. */
@@ -478,6 +477,9 @@ function OposCombinedSidesPanel({
   const validEntities = entities.filter(e => e.code.trim())
   const [uploading, setUploading]     = useState<Record<string, boolean>>({})
   const [uploadError, setUploadError] = useState<Record<string, string>>({})
+  const [committing, setCommitting]   = useState<Record<string, boolean>>({})
+  const [commitMsg, setCommitMsg]     = useState<Record<string, string>>({})
+  const [commitErr, setCommitErr]     = useState<Record<string, string>>({})
 
   const previewUpload =
     combinedSides.uploads.find(u => u.file_id === combinedSides.previewFileId) ??
@@ -485,6 +487,16 @@ function OposCombinedSidesPanel({
   const previewColumns = previewUpload?.columns ?? []
   const previewSample  = previewUpload?.sample  ?? []
   const hasUploads     = combinedSides.uploads.some(u => !!u.file_id)
+
+  // Commit prerequisites: at least one target field mapped, a side column, and a
+  // distinct debitor/kreditor value for the split.
+  const hasMap         = Object.keys(combinedSides.columnMap).length > 0
+  const hasSideConfig  =
+    !!combinedSides.sideColumn &&
+    !!combinedSides.debitorValue &&
+    !!combinedSides.kreditorValue &&
+    combinedSides.debitorValue !== combinedSides.kreditorValue
+  const canCommit      = hasMap && hasSideConfig
 
   // Unique values from the selected sideColumn in the sample rows (for picker UX)
   const sideColumnSampleValues = useMemo(() => {
@@ -541,11 +553,59 @@ function OposCombinedSidesPanel({
     }
   }
 
-  function renderUploadZone(entityIndex: number, entityName: string, fyLabel: string) {
+  async function handleCommit(entityIndex: number, entityPrefix: string, fyLabel: string) {
+    const upload = getUpload(entityIndex, fyLabel)
+    if (!upload?.file_id) return
+    const slotKey = `${entityIndex}__${fyLabel}`
+    setCommitting(prev => ({ ...prev, [slotKey]: true }))
+    setCommitMsg(prev => ({ ...prev, [slotKey]: '' }))
+    setCommitErr(prev => ({ ...prev, [slotKey]: '' }))
+    try {
+      const result = await commitOposCombined({
+        file_id: upload.file_id,
+        fy_label: fyLabel,
+        entity_mode: combinedSides.viewMode === 'per_entity' ? 'per_entity' : 'combined',
+        ...(combinedSides.viewMode === 'per_entity' && entityPrefix ? { entity_prefix: entityPrefix } : {}),
+        ...(combinedSides.viewMode === 'combined' && combinedSides.entityColumn
+          ? { entity_column: combinedSides.entityColumn }
+          : {}),
+        column_map: combinedSides.columnMap,
+        side_column: combinedSides.sideColumn!,
+        debitor_value: combinedSides.debitorValue!,
+        kreditor_value: combinedSides.kreditorValue!,
+      })
+      const skippedNote = result.skipped_unmatched
+        ? `, ${result.skipped_unmatched} unmatched skipped`
+        : ''
+      setCommitMsg(prev => ({
+        ...prev,
+        [slotKey]:
+          `${result.debitor_inserted} debitor + ${result.kreditor_inserted} kreditor ` +
+          `rows committed${skippedNote} for ${fyLabel}`,
+      }))
+    } catch (e) {
+      setCommitErr(prev => ({
+        ...prev,
+        [slotKey]: e instanceof Error ? e.message : 'Commit failed',
+      }))
+    } finally {
+      setCommitting(prev => ({ ...prev, [slotKey]: false }))
+    }
+  }
+
+  function renderUploadZone(
+    entityIndex: number,
+    entityName: string,
+    fyLabel: string,
+    entityPrefix = '',
+  ) {
     const slotKey  = `${entityIndex}__${fyLabel}`
     const existing = getUpload(entityIndex, fyLabel)
     const isUp     = uploading[slotKey] ?? false
     const upErr    = uploadError[slotKey] ?? ''
+    const isCom    = committing[slotKey] ?? false
+    const comMsg   = commitMsg[slotKey] ?? ''
+    const comErr   = commitErr[slotKey] ?? ''
     const staged   = !!existing?.file_id
 
     return (
@@ -584,6 +644,26 @@ function OposCombinedSidesPanel({
           )}
         </label>
         {upErr && <p className="text-xs text-red-600">{upErr}</p>}
+
+        {staged && (
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={isCom || !canCommit}
+              onClick={() => void handleCommit(entityIndex, entityPrefix, fyLabel)}
+              className="rounded-md border border-blue-300 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 disabled:opacity-40 transition"
+              title={
+                !canCommit
+                  ? 'Map at least one target field and set the side column with distinct debitor / kreditor values before committing'
+                  : undefined
+              }
+            >
+              {isCom ? 'Committing…' : `Commit ${fyLabel}`}
+            </button>
+            {comMsg && <span className="text-xs text-emerald-600">{comMsg}</span>}
+            {comErr && <span className="text-xs text-red-600">{comErr}</span>}
+          </div>
+        )}
       </div>
     )
   }
@@ -656,7 +736,7 @@ function OposCombinedSidesPanel({
                 fyLabels={fyLabels}
                 stagedCount={fyLabels.filter(fy => !!getUpload(idx, fy)?.file_id).length}
                 renderYear={fyLabel =>
-                  renderUploadZone(idx, entity.name || entity.code, fyLabel)
+                  renderUploadZone(idx, entity.name || entity.code, fyLabel, entity.prefix || entity.code)
                 }
               />
             )}
@@ -794,18 +874,18 @@ function OposCombinedSidesPanel({
             </div>
           </div>
 
-          {/* Backend gap notice — commit is not yet available */}
-          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-4 space-y-2">
-            <p className="text-sm font-semibold text-slate-700">
-              Commit not yet available for combined-sides mode
-            </p>
+          {/* Commit hint — split runs server-side on the side column */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
             <p className="text-xs text-slate-600">
-              The backend endpoint for splitting and committing a combined Debitor + Kreditor
-              file does not exist yet. To load OPOS data now, switch to{' '}
-              <strong>Separate files per side</strong> and upload and commit each side individually.
-            </p>
-            <p className="font-mono text-[11px] text-slate-400">
-              Missing backend endpoint: POST /api/v1/opos/combined/commit
+              Committing splits each file on the side column and writes Debitor (AR) and
+              Kreditor (AP) rows to their respective tables in one step. Rows whose side
+              value matches neither the Debitor nor the Kreditor value are skipped.
+              {!canCommit && (
+                <>
+                  {' '}Map at least one target field and set the side column with distinct
+                  Debitor / Kreditor values to enable committing.
+                </>
+              )}
             </p>
           </div>
 

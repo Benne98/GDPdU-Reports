@@ -2582,6 +2582,34 @@ export interface OposCommitResponse {
   project_id?: string;
 }
 
+/** Request body for POST /api/v1/opos/combined/commit */
+export interface OposCombinedCommitRequest {
+  file_id: string;
+  sheet?: string;
+  fy_label: string;
+  entity_mode: "per_entity" | "combined";
+  entity_prefix?: string;
+  entity_column?: string;
+  project_id?: string;
+  column_map: Record<string, string>;
+  /** Source column identifying whether each row is debitor or kreditor. */
+  side_column: string;
+  /** Value in side_column meaning Debitor (AR). */
+  debitor_value: string;
+  /** Value in side_column meaning Kreditor (AP). */
+  kreditor_value: string;
+}
+
+/** Response from POST /api/v1/opos/combined/commit */
+export interface OposCombinedCommitResponse {
+  debitor_inserted: number;
+  kreditor_inserted: number;
+  skipped_unmatched: number;
+  fy_label: string;
+  entity_prefixes: string[];
+  project_id?: string;
+}
+
 /**
  * POST /api/v1/opos/{side}/upload — upload an OPOS file for debitor or kreditor.
  */
@@ -2632,6 +2660,23 @@ export async function commitOpos(
   });
   if (!res.ok) await throwApiError(res);
   return res.json() as Promise<OposCommitResponse>;
+}
+
+/**
+ * POST /api/v1/opos/combined/commit — split ONE combined file on a
+ * side-discriminator column and write both fact_opos_debitor and
+ * fact_opos_kreditor in a single transaction. Admin-only.
+ */
+export async function commitOposCombined(
+  payload: OposCombinedCommitRequest
+): Promise<OposCombinedCommitResponse> {
+  const res = await apiFetch(`/api/v1/opos/combined/commit`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: INGEST_LONG_TIMEOUT_MS,
+  });
+  if (!res.ok) await throwApiError(res);
+  return res.json() as Promise<OposCombinedCommitResponse>;
 }
 
 // ---------------------------------------------------------------------------

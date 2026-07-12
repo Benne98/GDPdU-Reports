@@ -267,6 +267,115 @@ def test_combined_null_entity_allowed_for_unrestricted_admin(client, sqlite_sess
 
 
 # --------------------------------------------------------------------------- #
+# combined/commit: ONE file, both sides, split on a discriminator column.
+# --------------------------------------------------------------------------- #
+_OPOS_ROWS_COMBINED = [
+    # side=D -> debitor
+    {"Side": "D", "Konto": "10000", "Belegart": "RV", "BelegNr": "1900001",
+     "Referenz": "INV-1", "Nettofaelligkeit": "30.04.2023",
+     "Betrag": "1.190,00", "Buchungsdatum": "31.03.2023"},
+    # side=" K " (whitespace-padded) -> kreditor (robust trimmed compare)
+    {"Side": " K ", "Konto": "70000", "Belegart": "KR", "BelegNr": "1900002",
+     "Referenz": "INV-2", "Nettofaelligkeit": "30.05.2023",
+     "Betrag": "-500,00", "Buchungsdatum": "30.04.2023"},
+    # side=X -> matches neither -> skipped, NOT committed
+    {"Side": "X", "Konto": "99999", "Belegart": "SA", "BelegNr": "1900003",
+     "Referenz": "INV-3", "Nettofaelligkeit": "30.06.2023",
+     "Betrag": "10,00", "Buchungsdatum": "31.05.2023"},
+]
+
+
+def _upload_combined(client) -> str:
+    resp = client.post(
+        "/api/v1/opos/debitor/upload",
+        files={"file": ("opos.xlsx", _xlsx_bytes(_OPOS_ROWS_COMBINED),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["file_id"]
+
+
+def test_combined_commit_splits_rows_to_correct_tables_and_skips_unmatched(client, sqlite_session):
+    file_id = _upload_combined(client)
+    resp = client.post(
+        "/api/v1/opos/combined/commit",
+        json={
+            "file_id": file_id,
+            "fy_label": "2023",
+            "entity_mode": "per_entity",
+            "entity_prefix": "01",
+            "column_map": _COLUMN_MAP,
+            "side_column": "Side",
+            "debitor_value": "D",
+            "kreditor_value": "K",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["debitor_inserted"] == 1
+    assert body["kreditor_inserted"] == 1
+    assert body["skipped_unmatched"] == 1
+    assert body["entity_prefixes"] == ["01"]
+
+    deb = sqlite_session.execute(
+        text("SELECT konto, amount_hauswaehrung FROM fact_opos_debitor")
+    ).fetchall()
+    kre = sqlite_session.execute(
+        text("SELECT konto, amount_hauswaehrung FROM fact_opos_kreditor")
+    ).fetchall()
+    assert [(r[0], r[1]) for r in deb] == [("10000", 1190.0)]
+    assert [(r[0], r[1]) for r in kre] == [("70000", -500.0)]
+    # The unmatched (Side=X) row landed in NEITHER table.
+    assert not any(r[0] == "99999" for r in deb + kre)
+
+
+def test_combined_commit_rejects_equal_side_values(client):
+    file_id = _upload_combined(client)
+    resp = client.post(
+        "/api/v1/opos/combined/commit",
+        json={
+            "file_id": file_id, "fy_label": "2023",
+            "entity_mode": "per_entity", "entity_prefix": "01",
+            "column_map": _COLUMN_MAP,
+            "side_column": "Side", "debitor_value": "D", "kreditor_value": "D",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_combined_commit_unknown_side_column_is_422(client):
+    file_id = _upload_combined(client)
+    resp = client.post(
+        "/api/v1/opos/combined/commit",
+        json={
+            "file_id": file_id, "fy_label": "2023",
+            "entity_mode": "per_entity", "entity_prefix": "01",
+            "column_map": _COLUMN_MAP,
+            "side_column": "Nope", "debitor_value": "D", "kreditor_value": "K",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_combined_commit_no_matches_is_422(client, sqlite_session):
+    file_id = _upload_combined(client)
+    resp = client.post(
+        "/api/v1/opos/combined/commit",
+        json={
+            "file_id": file_id, "fy_label": "2023",
+            "entity_mode": "per_entity", "entity_prefix": "01",
+            "column_map": _COLUMN_MAP,
+            "side_column": "Side", "debitor_value": "AAA", "kreditor_value": "BBB",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    sqlite_session.rollback()
+    n_deb = sqlite_session.execute(text("SELECT COUNT(*) FROM fact_opos_debitor")).scalar()
+    n_kre = sqlite_session.execute(text("SELECT COUNT(*) FROM fact_opos_kreditor")).scalar()
+    assert n_deb == 0 and n_kre == 0
+
+
+# --------------------------------------------------------------------------- #
 # 0024: canonical Buchungskreis -> entity_prefix / partner_key resolution.
 # Locks in the architect-resolved map (3000 -> "02" -> Meridian, NOT Calypto).
 # --------------------------------------------------------------------------- #

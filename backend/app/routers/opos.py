@@ -80,6 +80,89 @@ def _table(side: str) -> str:
     return tbl
 
 
+def _inject_partner_id(out: dict, prefix) -> None:
+    # Canonical identity: when Buchungskreis is mapped, the entity_prefix is
+    # resolved from it via entities.BUKRS_TO_PREFIX (the two orderings differ;
+    # never derive one arithmetically). Otherwise fall back to the prefix the
+    # generic builder resolved (per_entity / entity_column) so the existing
+    # pass-through API is unchanged.
+    for f in _INT_FIELDS:
+        v = out.get(f)
+        out[f] = int(round(v)) if v is not None else None
+    bukrs = out.get("buchungskreis")
+    if bukrs is not None:
+        resolved = BUKRS_TO_PREFIX.get(bukrs)
+        if resolved:
+            out["entity_prefix"] = resolved
+            prefix = resolved
+    # partner_no (Debitor/Kreditor); partner_key = entity_prefix(2) || partner_no
+    partner_no = out.get("partner_no")
+    out["partner_key"] = f"{prefix}{partner_no}" if (prefix and partner_no) else None
+    # partner_id = entity_prefix(2) || konto — legacy join-key shape (unchanged).
+    konto = out.get("konto")
+    out["partner_id"] = f"{prefix}{konto}" if (prefix and konto) else None
+    out["is_open"] = None       # F3: settlement matching NOT implemented
+    out["aging_band"] = None    # F4: bucketing NOT implemented (reuse AR_BANDS)
+
+
+def _commit_side_rows(
+    session: Session,
+    admin: User,
+    *,
+    table: str,
+    df,
+    column_map: dict[str, str],
+    entity_mode: str,
+    entity_column: str | None,
+    entity_prefix: str | None,
+    fy_label: str,
+    file_id: str,
+    project_id: str,
+) -> tuple[int, set[str]]:
+    """Map ``df`` -> ``table`` rows and INSERT them (single source of truth).
+
+    Shared by ``/{side}/commit`` and ``/combined/commit``. Runs the mapped-row
+    build, the per-row Buchungskreis/partner-id injection, and the fail-closed
+    visibility asserts, then executes the INSERT on the session. Does NOT commit
+    or roll back — the caller owns the transaction boundary so multiple sides can
+    be committed atomically. Returns ``(inserted, distinct_entity_prefixes)``.
+    """
+    rows, _prefixes = di.build_mapped_rows(
+        df,
+        column_map=column_map,
+        number_fields=_NUMBER_FIELDS,
+        date_fields=_DATE_FIELDS,
+        entity_mode=entity_mode,
+        entity_column=entity_column,
+        entity_prefix=entity_prefix,
+        fy_label=fy_label,
+        file_id=file_id,
+        extra_per_row=_inject_partner_id,
+    )
+
+    # The per-row hook may have overridden entity_prefix from Buchungskreis, so
+    # recompute the distinct-prefix set from the final rows before visibility checks.
+    prefixes = {str(r.get("entity_prefix")) for r in rows if r.get("entity_prefix")}
+
+    di.assert_prefixes_visible(session, admin, prefixes)
+    di.assert_entities_resolved(session, admin, rows, entity_column=entity_column)
+
+    if not rows:
+        return 0, prefixes
+
+    cols = list(_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{c}" for c in cols)
+    insert_sql = text(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})")
+    params = []
+    for r in rows:
+        rec = {c: r.get(c) for c in cols}
+        rec["project_id"] = project_id
+        params.append(rec)
+
+    session.execute(insert_sql, params)
+    return len(rows), prefixes
+
+
 # --------------------------------------------------------------------------- #
 # Pydantic models
 # --------------------------------------------------------------------------- #
@@ -126,6 +209,32 @@ class OposCommitResponse(BaseModel):
     project_id: str
 
 
+class OposCombinedCommitRequest(BaseModel):
+    file_id: str
+    sheet: str | None = None
+    fy_label: str = Field(..., max_length=20)
+    entity_mode: str = "per_entity"
+    entity_prefix: str | None = Field(None, max_length=2)
+    entity_column: str | None = None  # Buchungskreis (combined entity mode)
+    project_id: str = Field("default", max_length=64)
+    # Same target-field -> source-column mapping applied to BOTH sides.
+    column_map: dict[str, str] = Field(default_factory=dict)
+    # Side discriminator: which source column identifies debitor vs kreditor rows,
+    # and the value in that column meaning each side.
+    side_column: str = Field(..., min_length=1)
+    debitor_value: str = Field(..., min_length=1)
+    kreditor_value: str = Field(..., min_length=1)
+
+
+class OposCombinedCommitResponse(BaseModel):
+    debitor_inserted: int
+    kreditor_inserted: int
+    skipped_unmatched: int
+    fy_label: str
+    entity_prefixes: list[str]
+    project_id: str
+
+
 # --------------------------------------------------------------------------- #
 # POST /{side}/upload
 # --------------------------------------------------------------------------- #
@@ -155,6 +264,110 @@ def preview(
 
 
 # --------------------------------------------------------------------------- #
+# POST /combined/commit  — ONE file, both sides, split on a discriminator column
+# NOTE: registered BEFORE /{side}/commit so the literal "combined" path is not
+# swallowed by the {side} path parameter (Starlette matches in declaration order).
+# --------------------------------------------------------------------------- #
+@router.post("/combined/commit", response_model=OposCombinedCommitResponse)
+def commit_combined(
+    body: OposCombinedCommitRequest,
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> OposCombinedCommitResponse:
+    """Ingest ONE combined OPOS file: split rows on ``side_column`` into debitor
+    (AR) and kreditor (AP), then INSERT each into its fact table in a SINGLE
+    transaction. Rows whose ``side_column`` matches NEITHER value are dropped and
+    counted as ``skipped_unmatched``. Pass-through only (is_open/aging_band NULL).
+    """
+    column_map = {k: v for k, v in body.column_map.items() if k in _TARGET_FIELDS}
+    if not column_map:
+        raise HTTPException(
+            status_code=422,
+            detail=f"column_map must map at least one of: {sorted(_TARGET_FIELDS)}",
+        )
+
+    deb_val = body.debitor_value.strip()
+    kre_val = body.kreditor_value.strip()
+    if deb_val == kre_val:
+        raise HTTPException(
+            status_code=422,
+            detail="debitor_value and kreditor_value must differ.",
+        )
+
+    df = di.load_staged(body.file_id, body.sheet)
+    if body.side_column not in df.columns:
+        raise HTTPException(
+            status_code=422,
+            detail=f"side_column {body.side_column!r} not found in file columns.",
+        )
+
+    # Robust trimmed string compare (source cells are string-typed; None -> "").
+    side_norm = df[body.side_column].map(
+        lambda v: "" if v is None else str(v).strip()
+    )
+    is_deb = side_norm == deb_val
+    is_kre = side_norm == kre_val
+    df_deb = df[is_deb]
+    df_kre = df[is_kre]
+    skipped_unmatched = int((~(is_deb | is_kre)).sum())
+
+    if df_deb.empty and df_kre.empty:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No rows in column {body.side_column!r} matched debitor_value "
+                f"{deb_val!r} or kreditor_value {kre_val!r}."
+            ),
+        )
+
+    try:
+        deb_inserted, deb_prefixes = _commit_side_rows(
+            session, admin,
+            table=_SIDE_TABLE["debitor"],
+            df=df_deb,
+            column_map=column_map,
+            entity_mode=body.entity_mode,
+            entity_column=body.entity_column,
+            entity_prefix=body.entity_prefix,
+            fy_label=body.fy_label,
+            file_id=body.file_id,
+            project_id=body.project_id,
+        )
+        kre_inserted, kre_prefixes = _commit_side_rows(
+            session, admin,
+            table=_SIDE_TABLE["kreditor"],
+            df=df_kre,
+            column_map=column_map,
+            entity_mode=body.entity_mode,
+            entity_column=body.entity_column,
+            entity_prefix=body.entity_prefix,
+            fy_label=body.fy_label,
+            file_id=body.file_id,
+            project_id=body.project_id,
+        )
+        session.commit()
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        logger.exception("opos combined commit failed (file_id=%s)", body.file_id)
+        raise HTTPException(
+            status_code=500, detail="OPOS combined commit failed; check server logs."
+        ) from exc
+
+    prefixes = deb_prefixes | kre_prefixes
+    return OposCombinedCommitResponse(
+        debitor_inserted=deb_inserted,
+        kreditor_inserted=kre_inserted,
+        skipped_unmatched=skipped_unmatched,
+        fy_label=body.fy_label,
+        entity_prefixes=sorted(p for p in prefixes if p),
+        project_id=body.project_id,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # POST /{side}/commit
 # --------------------------------------------------------------------------- #
 @router.post("/{side}/commit", response_model=OposCommitResponse)
@@ -175,68 +388,22 @@ def commit(
 
     df = di.load_staged(body.file_id, body.sheet)
 
-    def _inject_partner_id(out: dict, prefix) -> None:
-        # Canonical identity: when Buchungskreis is mapped, the entity_prefix is
-        # resolved from it via entities.BUKRS_TO_PREFIX (the two orderings differ;
-        # never derive one arithmetically). Otherwise fall back to the prefix the
-        # generic builder resolved (per_entity / entity_column) so the existing
-        # pass-through API is unchanged.
-        for f in _INT_FIELDS:
-            v = out.get(f)
-            out[f] = int(round(v)) if v is not None else None
-        bukrs = out.get("buchungskreis")
-        if bukrs is not None:
-            resolved = BUKRS_TO_PREFIX.get(bukrs)
-            if resolved:
-                out["entity_prefix"] = resolved
-                prefix = resolved
-        # partner_no (Debitor/Kreditor); partner_key = entity_prefix(2) || partner_no
-        partner_no = out.get("partner_no")
-        out["partner_key"] = f"{prefix}{partner_no}" if (prefix and partner_no) else None
-        # partner_id = entity_prefix(2) || konto — legacy join-key shape (unchanged).
-        konto = out.get("konto")
-        out["partner_id"] = f"{prefix}{konto}" if (prefix and konto) else None
-        out["is_open"] = None       # F3: settlement matching NOT implemented
-        out["aging_band"] = None    # F4: bucketing NOT implemented (reuse AR_BANDS)
-
-    rows, prefixes = di.build_mapped_rows(
-        df,
-        column_map=column_map,
-        number_fields=_NUMBER_FIELDS,
-        date_fields=_DATE_FIELDS,
-        entity_mode=body.entity_mode,
-        entity_column=body.entity_column,
-        entity_prefix=body.entity_prefix,
-        fy_label=body.fy_label,
-        file_id=body.file_id,
-        extra_per_row=_inject_partner_id,
-    )
-
-    # The per-row hook may have overridden entity_prefix from Buchungskreis, so
-    # recompute the distinct-prefix set from the final rows before visibility checks.
-    prefixes = {str(r.get("entity_prefix")) for r in rows if r.get("entity_prefix")}
-
-    di.assert_prefixes_visible(session, admin, prefixes)
-    di.assert_entities_resolved(session, admin, rows, entity_column=body.entity_column)
-
-    if not rows:
-        return OposCommitResponse(
-            side=side, inserted=0, fy_label=body.fy_label,
-            entity_prefixes=sorted(p for p in prefixes if p), project_id=body.project_id,
-        )
-
-    cols = list(_INSERT_COLUMNS)
-    placeholders = ", ".join(f":{c}" for c in cols)
-    insert_sql = text(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})")
-    params = []
-    for r in rows:
-        rec = {c: r.get(c) for c in cols}
-        rec["project_id"] = body.project_id
-        params.append(rec)
-
     try:
-        session.execute(insert_sql, params)
+        inserted, prefixes = _commit_side_rows(
+            session, admin,
+            table=table,
+            df=df,
+            column_map=column_map,
+            entity_mode=body.entity_mode,
+            entity_column=body.entity_column,
+            entity_prefix=body.entity_prefix,
+            fy_label=body.fy_label,
+            file_id=body.file_id,
+            project_id=body.project_id,
+        )
         session.commit()
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         session.rollback()
         logger.exception("opos commit failed (side=%s file_id=%s)", side, body.file_id)
@@ -246,7 +413,7 @@ def commit(
 
     return OposCommitResponse(
         side=side,
-        inserted=len(rows),
+        inserted=inserted,
         fy_label=body.fy_label,
         entity_prefixes=sorted(p for p in prefixes if p),
         project_id=body.project_id,
