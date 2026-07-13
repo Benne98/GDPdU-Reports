@@ -90,7 +90,7 @@ export function makeAggregateVsPyColumn(
   return {
     id: `agg_vs_py:${sorted.join('|')}`,
     kind: 'agg_vs_py',
-    labelLine1: `∆ ${label} − ${pyLabel}`,
+    labelLine1: `Δ ${label} − ${pyLabel}`,
     periodKeys: sorted,
   }
 }
@@ -104,7 +104,7 @@ export function makeAggregateVsPlanColumn(
   return {
     id: `agg_vs_plan:${sorted.join('|')}`,
     kind: 'agg_vs_plan',
-    labelLine1: `∆ ${label} − Plan`,
+    labelLine1: `Δ ${label} − Plan`,
     periodKeys: sorted,
   }
 }

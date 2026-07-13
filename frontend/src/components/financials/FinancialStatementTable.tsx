@@ -230,9 +230,9 @@ export default function FinancialStatementTable({
   }, [data])
 
   const lbl = data?.col_labels
-  const hdrMom = lbl ? `∆ ${lbl.cm} - ${lbl.pm}` : '∆ MoM'
-  const hdrYoy = lbl ? `∆ ${lbl.cm} - ${lbl.py_cm}` : '∆ YoY'
-  const hdrYtd = lbl ? `∆ ${lbl.ytd} - ${lbl.ytd_py}` : '∆ YTD'
+  const hdrMom = lbl ? `Δ ${lbl.cm} − ${lbl.pm}` : 'Δ MoM'
+  const hdrYoy = lbl ? `Δ ${lbl.cm} − ${lbl.py_cm}` : 'Δ YoY'
+  const hdrYtd = lbl ? `Δ ${lbl.ytd} − ${lbl.ytd_py}` : 'Δ YTD'
 
   function toggle(id: string) {
     setUserToggles(prev => {

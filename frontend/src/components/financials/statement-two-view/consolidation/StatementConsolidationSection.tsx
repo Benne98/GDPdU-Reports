@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from 'react'
+import { Pin } from 'lucide-react'
+import { useOptionalActionNotesContext } from '../../../action-notes/ActionNotesContext'
+import { captureConsolidationSnapshot } from '../../../action-notes/captureConsolidationTable'
+import { STATEMENT_TOOLBAR_ICON_BTN, STATEMENT_TOOLBAR_BTN_STYLE } from '../statementToolbarButton'
 import type {
   ConsolidationResponse,
   FinancialStatementResponse,
@@ -338,6 +342,24 @@ export default function StatementConsolidationSection({
 
   const sectionTitle = `${cfg.cardTitle} — entity breakdown`
   const consolidationCheckOpenRef = useRef<((id: string) => boolean) | null>(null)
+  const notesCtx = useOptionalActionNotesContext()
+
+  // ─── Pin registration ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const pinId = `${statement}-consolidation`
+    if (!notesCtx || !consol?.rows?.length) {
+      notesCtx?.unregisterTableCandidate(pinId)
+      return
+    }
+    notesCtx.registerTableCandidate({
+      id: pinId,
+      label: `${cfg.cardTitle} — entity breakdown`,
+      description: 'All entities, IC eliminations, and consolidation',
+      capture: () => captureConsolidationSnapshot(consol, 'StatementConsolidationSection'),
+      viewState: { view_mode: viewMode, tab: statement },
+    })
+    return () => notesCtx.unregisterTableCandidate(pinId)
+  }, [notesCtx, consol, viewMode, statement, cfg.cardTitle])
 
   const entityPlanMap = useMemo(() => buildPlanMapFromStatement(entityStmt), [entityStmt])
 
@@ -525,6 +547,22 @@ export default function StatementConsolidationSection({
                 statement={statement}
               />
             ) : null}
+            {notesCtx && (
+              <button
+                type="button"
+                title="Pin current table to Action Notes"
+                className={STATEMENT_TOOLBAR_ICON_BTN}
+                style={STATEMENT_TOOLBAR_BTN_STYLE}
+                onClick={() => {
+                  const pinId = `${statement}-consolidation`
+                  const snap = notesCtx.pinTableById(pinId)
+                  if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                  else notesCtx.setToast('No table data to pin')
+                }}
+              >
+                <Pin size={14} strokeWidth={1.75} />
+              </button>
+            )}
             <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!consol || loading} />
           </div>
         </div>

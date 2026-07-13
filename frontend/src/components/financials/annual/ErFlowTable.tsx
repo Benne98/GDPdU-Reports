@@ -451,7 +451,7 @@ export default function ErFlowTable({
     const amountKeys = exportColumns.filter(c => c.kind === 'amount').map(c => c.amountKey!).filter(Boolean)
     const deltaKeys = exportColumns.filter(c => c.kind === 'delta').map(c => c.deltaKey!).filter(Boolean)
     const rows = flattenTree(data.rows, amountKeys, deltaKeys, { isRowOpen: checkOpen })
-    const headers = ['EURk', ...exportColumns.map(c => c.kind === 'delta' && c.labelLine2 ? `∆ ${c.labelLine1} vs ${c.labelLine2}` : c.labelLine1)]
+    const headers = ['EURk', ...exportColumns.map(c => c.kind === 'delta' && c.labelLine2 ? `${c.labelLine1} ${c.labelLine2}` : c.labelLine1)]
     const columnKinds = [''].concat(exportColumns.map(c => (c.kind === 'delta' ? 'delta' : c.id.includes('ytd') ? 'ytd' : '')))
     const base = `ER_${tableTitle.replace(/ /g, '_')}_${todayStr()}`
     if (kind === 'pptx') {
@@ -489,8 +489,8 @@ export default function ErFlowTable({
   function TwoLineHdr({ top, bottom, color = '#475569' }: { top: string; bottom: string; color?: string }) {
     return (
       <div className="flex flex-col items-end justify-end gap-0" style={{ lineHeight: 1.25 }}>
-        <span style={{ color, opacity: 0.75 }}>∆ {top}</span>
-        <span style={{ color, opacity: 0.75 }}>vs {bottom}</span>
+        <span style={{ color, opacity: 0.75 }}>{top}</span>
+        <span style={{ color, opacity: 0.75 }}>{bottom}</span>
       </div>
     )
   }
@@ -585,7 +585,7 @@ export default function ErFlowTable({
                     <li key={c.id} className="flex items-center gap-1 rounded-lg border px-2 py-1.5 bg-white border-slate-200">
                       <div className="flex-1 min-w-0">
                         <p className="text-xs font-medium text-slate-800 truncate">{c.labelLine1}</p>
-                        {c.labelLine2 && <p className="text-[0.65rem] text-slate-500 truncate">vs {c.labelLine2}</p>}
+                        {c.labelLine2 && <p className="text-[0.65rem] text-slate-500 truncate">{c.labelLine2}</p>}
                       </div>
                       <div className="flex shrink-0">
                         <button

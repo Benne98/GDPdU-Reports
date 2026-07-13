@@ -564,9 +564,9 @@ export default function EbitTable({
     const entityRows = rows.filter(r => r.entity_code !== '__total__')
     const totalRow   = rows.find(r => r.entity_code === '__total__')!
     const colsWithPlan = cols as typeof cols & { plan_cm?: string; delta_cm_pm?: string }
-    const deltaPmLabel = colsWithPlan.delta_cm_pm ?? `∆ ${cols.cm} - ${cols.pm}`
+    const deltaPmLabel = colsWithPlan.delta_cm_pm ?? `Δ ${cols.cm} − ${cols.pm}`
     const planLabel = colsWithPlan.plan_cm ?? `Plan ${cols.cm}`
-    const deltaPlanLabel = `∆ ${cols.cm} - Plan`
+    const deltaPlanLabel = `Δ ${cols.cm} − Plan`
     const headers = ['Entity', cols.pm, cols.cm, deltaPmLabel, planLabel, deltaPlanLabel, cols.ytd]
 
     const mkRow = (row: EbitTableRow, section: Section, isTotal: boolean): XlsxRow => {

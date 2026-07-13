@@ -751,6 +751,12 @@ export default function StatementsPage({
                     : undefined
                 }
                 onDrill={openDrill('statement')}
+                pinId={`${tab}-annual-group`}
+                pinLabel={
+                  tab === 'bs'
+                    ? `Balance Sheet Annual — FY${String(anchor.year).slice(-2)}`
+                    : `Working Capital Annual — FY${String(anchor.year).slice(-2)}`
+                }
               />
             )}
             {/* 2 — Statement drill */}

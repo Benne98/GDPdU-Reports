@@ -4,12 +4,15 @@
  * Columns: Dec{yr-2} | Dec{yr-1} | ∆FY | {month}{yr-1} | {month}{yr} | ∆CM
  */
 import { useMemo, useState, useEffect } from 'react'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, Pin } from 'lucide-react'
 import { ErSnapshotResponse, ErStatementRow, ErSnapshotColLabels } from '../../../lib/api'
 import { fmtKpi, fmtPct, fmtDays } from '../../../lib/fmt'
 import { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlExportMenu, { type PlExportKind } from '../pl-two-view/PlExportMenu'
 import PlViewToggleButton, { type PlViewMode } from '../pl-two-view/PlViewToggleButton'
+import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesContext'
+import { captureErSnapshotSnapshot } from '../../action-notes/captureExitReadiness'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
 import { exportFlatTablePptx } from '../../../lib/finssentialsExport/exportFlatTablePptx'
 import { exportToXlsx, flattenTree, todayStr } from '../../../lib/exportXlsx'
 import { getStatementConfig } from '../statement-two-view/statementConfig'
@@ -129,12 +132,14 @@ interface ErSnapshotTableProps {
   periodSelection?: PeriodSelection
   entityDisplayName?: string
   onDrill: (d: FinancialsDrillOpen) => void
+  pinId?: string
+  pinLabel?: string
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function ErSnapshotTable({
-  data, loading, error, year, month, entity, periodSelection, entityDisplayName, onDrill,
+  data, loading, error, year, month, entity, periodSelection, entityDisplayName, onDrill, pinId, pinLabel,
 }: ErSnapshotTableProps) {
   const statementKey = data?.statement === 'wc' ? 'wc' : 'bs'
   const stmtCfg = getStatementConfig(statementKey)
@@ -148,6 +153,24 @@ export default function ErSnapshotTable({
   useEffect(() => {
     saveStatementViewMode(statementKey, viewMode)
   }, [statementKey, viewMode])
+
+  const notesCtx = useOptionalActionNotesContext()
+
+  useEffect(() => {
+    if (!notesCtx || !pinId) return
+    if (!data) {
+      notesCtx.unregisterTableCandidate(pinId)
+      return
+    }
+    notesCtx.registerTableCandidate({
+      id: pinId,
+      label: pinLabel ?? 'Annual statement',
+      description: viewMode === 'report' ? 'Report view' : 'Table view',
+      capture: () => captureErSnapshotSnapshot(data, 'ErSnapshotTable'),
+      viewState: { tab: data.statement, view_mode: viewMode },
+    })
+    return () => notesCtx.unregisterTableCandidate(pinId)
+  }, [notesCtx, data, pinId, pinLabel, viewMode])
 
   const autoExpandedIds = useMemo(
     () => computeAutoExpandedIds(data?.rows, data?.statement),
@@ -352,10 +375,10 @@ export default function ErSnapshotTable({
       lbl?.dec_py2 ?? 'Dec-3',
       lbl?.fy_py ?? 'Dec-2',
       lbl?.fy ?? 'Dec-1',
-      lbl ? `∆ ${lbl.fy_py}–${lbl.fy}` : '∆ FY',
+      lbl ? `Δ ${lbl.fy_py} − ${lbl.fy}` : 'Δ FY',
       lbl?.cm_py ?? 'CM PY',
       lbl?.cm ?? 'CM',
-      lbl ? `∆ ${lbl.cm_py}–${lbl.cm}` : '∆ CM',
+      lbl ? `Δ ${lbl.cm_py} − ${lbl.cm}` : 'Δ CM',
     ]
     const columnKinds = ['', '', '', '', 'delta', '', 'cm', 'delta']
     const base = `ER_${stmtName.replace(/ /g, '_')}_${todayStr()}`
@@ -392,8 +415,8 @@ export default function ErSnapshotTable({
   )
 
   const tableTitle = stmtCfg.cardTitle || (STATEMENT_TITLES[data.statement] ?? 'Statement')
-  const hdrDeltaFy = lbl ? `∆ ${lbl.fy_py}–${lbl.fy}` : '∆'
-  const hdrDeltaCm = lbl ? `∆ ${lbl.cm_py}–${lbl.cm}` : '∆'
+  const hdrDeltaFy = lbl ? `Δ ${lbl.fy_py} − ${lbl.fy}` : 'Δ'
+  const hdrDeltaCm = lbl ? `Δ ${lbl.cm_py} − ${lbl.cm}` : 'Δ'
   const periodBadge = lbl?.cm ?? ''
 
   return (
@@ -417,6 +440,21 @@ export default function ErSnapshotTable({
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <PlViewToggleButton mode={viewMode} onChange={setViewMode} disabled={loading} />
+          {notesCtx && pinId && (
+            <button
+              type="button"
+              title="Pin current table to Action Notes"
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+              onClick={() => {
+                const snap = notesCtx.pinTableById(pinId)
+                if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                else notesCtx.setToast('No table data to pin')
+              }}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
           <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
         </div>
       </div>

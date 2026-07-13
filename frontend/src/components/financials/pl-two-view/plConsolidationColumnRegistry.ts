@@ -35,7 +35,7 @@ function periodLabelFromKey(key: string, periods?: MonthlyPeriod[]): string {
   return hit?.label ?? periodLabel(parseInt(key.slice(0, 4), 10), parseInt(key.slice(5), 10))
 }
 
-/** Catalog with month-only labels and ∆ Jul25 − Jun25 style deltas (no "Prior month" subtitles). */
+/** Catalog with month-only labels and Δ Jul25 − Jun25 style deltas (no "Prior month" subtitles). */
 export function buildConsolidationColumnCatalog(
   lbl: FinancialStatementColLabels,
   periods: MonthlyPeriod[],
@@ -49,26 +49,26 @@ export function buildConsolidationColumnCatalog(
     { id: 'py_cm', kind: 'py_cm', labelLine1: py },
     { id: 'pm', kind: 'pm', labelLine1: pm },
     { id: 'cm', kind: 'cm', labelLine1: cm },
-    { id: 'mom', kind: 'mom', labelLine1: `∆ ${cm} − ${pm}` },
-    { id: 'yoy', kind: 'yoy', labelLine1: `∆ ${cm} − ${py}` },
+    { id: 'mom', kind: 'mom', labelLine1: `Δ ${cm} − ${pm}` },
+    { id: 'yoy', kind: 'yoy', labelLine1: `Δ ${cm} − ${py}` },
     { id: 'ytd', kind: 'ytd', labelLine1: lbl.ytd ?? 'YTD' },
     { id: 'ytd_py', kind: 'ytd_py', labelLine1: lbl.ytd_py ?? 'YTD PY' },
     {
       id: 'ytd_delta',
       kind: 'ytd_delta',
-      labelLine1: lbl.ytd && lbl.ytd_py ? `∆ ${lbl.ytd} − ${lbl.ytd_py}` : '∆ YTD',
+      labelLine1: lbl.ytd && lbl.ytd_py ? `Δ ${lbl.ytd} − ${lbl.ytd_py}` : 'Δ YTD',
     },
     { id: 'ytd_plan', kind: 'ytd_plan', labelLine1: lbl.ytd ? `Plan ${lbl.ytd}` : 'Plan YTD' },
     {
       id: 'ytd_vs_plan',
       kind: 'ytd_vs_plan',
-      labelLine1: lbl.ytd ? `∆ ${lbl.ytd} − Plan` : '∆ YTD Plan',
+      labelLine1: lbl.ytd ? `Δ ${lbl.ytd} − Plan` : 'Δ YTD Plan',
     },
     { id: 'plan_cm', kind: 'plan_cm', labelLine1: lbl.cm ? `Plan ${cm}` : 'Plan' },
     {
       id: 'plan_vs_actual',
       kind: 'plan_vs_actual',
-      labelLine1: lbl.cm ? `∆ ${cm} Plan` : '∆ Plan',
+      labelLine1: lbl.cm ? `Δ ${cm} − Plan` : 'Δ Plan',
     },
     { id: 'ytg', kind: 'ytg', labelLine1: lbl.cm ? `YTG ${cm}` : 'YTG' },
     { id: 'coverage', kind: 'coverage', labelLine1: 'Coverage' },
@@ -89,13 +89,13 @@ export function buildConsolidationColumnCatalog(
       id: `month_mom:${key}`,
       kind: 'month_mom',
       periodKey: key,
-      labelLine1: `∆ ${p.label} − ${periodLabelFromKey(pmKey, periods)}`,
+      labelLine1: `Δ ${p.label} − ${periodLabelFromKey(pmKey, periods)}`,
     })
     map.set(`month_yoy:${key}`, {
       id: `month_yoy:${key}`,
       kind: 'month_yoy',
       periodKey: key,
-      labelLine1: `∆ ${p.label} − ${periodLabelFromKey(pyKey, periods)}`,
+      labelLine1: `Δ ${p.label} − ${periodLabelFromKey(pyKey, periods)}`,
     })
   }
 
@@ -114,7 +114,7 @@ export function consolidationMonthDelta(
     kind: 'month_delta',
     periodKeyA: aKey,
     periodKeyB: bKey,
-    labelLine1: `∆ ${la} − ${lb}`,
+    labelLine1: `Δ ${la} − ${lb}`,
   }
 }
 
