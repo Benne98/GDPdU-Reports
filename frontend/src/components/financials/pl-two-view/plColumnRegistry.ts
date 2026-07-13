@@ -97,7 +97,7 @@ export const DEFAULT_WEEK_PL_TABLE_COLUMN_IDS = [
   'ytg',
 ]
 
-/** BS / WC table defaults in weekly view. */
+/** BS / WC table defaults in weekly view (no YTD columns — YTD is meaningless for balance-sheet snapshots). */
 export const DEFAULT_WEEK_BS_TABLE_COLUMN_IDS = [
   'py_cm',
   'pm',
@@ -106,10 +106,19 @@ export const DEFAULT_WEEK_BS_TABLE_COLUMN_IDS = [
   'yoy',
   'plan_cm',
   'plan_vs_actual',
-  'ytd',
-  'ytd_plan',
-  'ytd_delta',
   'ytg',
+]
+
+/** BS / WC table defaults in monthly view (no YTD columns). */
+export const DEFAULT_BS_TABLE_COLUMN_IDS = [
+  'py_cm',
+  'pm',
+  'cm',
+  'mom',
+  'yoy',
+  'plan_cm',
+  'ytg',
+  'coverage',
 ]
 
 /**
@@ -162,7 +171,9 @@ export function buildDefaultColumns(
       ? stmt === 'bs' || stmt === 'wc' || stmt === 'cf'
         ? DEFAULT_WEEK_BS_TABLE_COLUMN_IDS
         : DEFAULT_WEEK_PL_TABLE_COLUMN_IDS
-      : DEFAULT_TABLE_COLUMN_IDS
+      : stmt === 'bs' || stmt === 'wc'
+        ? DEFAULT_BS_TABLE_COLUMN_IDS
+        : DEFAULT_TABLE_COLUMN_IDS
   const active = hasPlanData
     ? ids
     : ids.filter(id => {

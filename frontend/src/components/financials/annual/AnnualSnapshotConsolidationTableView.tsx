@@ -236,7 +236,7 @@ export default function AnnualSnapshotConsolidationTableView({
     if (isTitle) {
       nodes.push(
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '1px solid #E2E8F0' }}>
-          <td colSpan={totalCols} className="px-3 py-2 text-xs font-bold uppercase tracking-wide" style={{ color: '#1E3A5F' }}>
+          <td colSpan={totalCols} className="px-3 py-1 text-xs font-bold uppercase tracking-wide" style={{ color: '#1E3A5F' }}>
             {row.label}
           </td>
         </tr>,
@@ -258,7 +258,7 @@ export default function AnnualSnapshotConsolidationTableView({
             background: isKpi ? '#F8FAFC' : undefined,
           }}
         >
-          <td className="py-2 text-left whitespace-nowrap" style={{ minWidth: 200, paddingLeft: pad, paddingRight: 12 }}>
+          <td className="py-1 text-left whitespace-nowrap" style={{ minWidth: 200, paddingLeft: pad, paddingRight: 12 }}>
             <div className="flex items-center gap-0.5">
               {showChevron ? (
                 <button type="button" onClick={() => toggle(row.id)} className="p-0.5 rounded shrink-0" style={{ color: '#1E3A5F' }}>

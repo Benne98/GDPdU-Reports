@@ -6,7 +6,6 @@
 import { useMemo, useState, useEffect } from 'react'
 import { ChevronRight, Pin } from 'lucide-react'
 import { ErSnapshotResponse, ErStatementRow, ErSnapshotColLabels } from '../../../lib/api'
-import { fmtKpi, fmtPct, fmtDays } from '../../../lib/fmt'
 import { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlExportMenu, { type PlExportKind } from '../pl-two-view/PlExportMenu'
 import PlViewToggleButton, { type PlViewMode } from '../pl-two-view/PlViewToggleButton'
@@ -25,6 +24,7 @@ import type { PeriodSelection } from '../../../lib/periodSelection'
 import { buildAnnualSnapshotNarrativeResponse } from './erAnnualNarrative'
 import ErSnapshotReportView from './ErSnapshotReportView'
 import { computeAutoExpandedIds } from '../statementRowExpansion'
+import { DeltaCell, TwoLineHeader, ValCell } from '../pl-two-view/plTableCore'
 
 // ─── Period ranges for drill-down ────────────────────────────────────────────
 
@@ -45,69 +45,7 @@ function periodRange(year: number, month: number, col: SnapCol): { from: string;
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-
-function DeltaBar({ value, maxAbs }: { value: number; maxAbs: number }) {
-  if (maxAbs === 0) return <span className="inline-block" style={{ width: 28 }} />
-  const pct = Math.min((Math.abs(value) / maxAbs) * 100, 100)
-  const isPos = value >= 0
-  return (
-    <span className="inline-block align-middle" style={{ width: 28, height: 6, background: '#F1F5F9', borderRadius: 2, overflow: 'hidden', flexShrink: 0 }}>
-      <span style={{ display: 'block', height: '100%', width: `${pct}%`, background: isPos ? '#10B981' : '#DC2626', borderRadius: 2 }} />
-    </span>
-  )
-}
-
-function deltaColor(value: number, invert: boolean): string {
-  if (value === 0) return '#94A3B8'
-  const looksGood = invert ? value < 0 : value > 0
-  return looksGood ? '#10B981' : '#DC2626'
-}
-
-function DeltaCell({ value, maxAbs, invert, isPct, isDays, onClick }: {
-  value: number; maxAbs: number; invert: boolean; isPct?: boolean; isDays?: boolean; onClick?: () => void
-}) {
-  const color = (isPct || isDays)
-    ? (value > 0 ? '#10B981' : value < 0 ? '#DC2626' : '#94A3B8')
-    : deltaColor(value, invert)
-  const text = isPct
-    ? `${value >= 0 ? '+' : ''}${value.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} PP`
-    : isDays
-      ? `${value >= 0 ? '+' : ''}${fmtDays(Math.abs(value))} d`
-      : fmtKpi(value)
-  return (
-    <td className="px-2.5 py-2 text-right whitespace-nowrap tabular-nums" onClick={onClick} style={{ cursor: onClick ? 'pointer' : 'default' }}>
-      <span className="flex items-center justify-end gap-1.5">
-        <span style={{ color, fontWeight: 500, fontSize: '0.72rem', fontStyle: 'italic' }}>{text}</span>
-        {!isPct && !isDays && <DeltaBar value={value} maxAbs={maxAbs} />}
-      </span>
-    </td>
-  )
-}
-
-function ValCell({ value, highlighted = false, bold = false, isPct = false, isDays = false, italic = false, onClick }: {
-  value: number; highlighted?: boolean; bold?: boolean; isPct?: boolean; isDays?: boolean; italic?: boolean; onClick?: () => void
-}) {
-  const [hovered, setHovered] = useState(false)
-  const text = isDays ? fmtDays(value) : isPct ? fmtPct(value) : fmtKpi(value)
-  return (
-    <td
-      className="px-2.5 py-2 text-right whitespace-nowrap tabular-nums"
-      onClick={onClick}
-      onMouseEnter={() => onClick && setHovered(true)}
-      onMouseLeave={() => onClick && setHovered(false)}
-      style={{
-        background: highlighted ? 'rgba(30,58,95,0.04)' : undefined,
-        cursor: onClick ? 'pointer' : 'default',
-        fontWeight: bold ? 600 : 400,
-        fontStyle: italic ? 'italic' : undefined,
-        fontSize: '0.72rem',
-        color: hovered ? '#1E3A5F' : '#111827',
-      }}
-    >
-      {text}
-    </td>
-  )
-}
+// ValCell, DeltaCell, DeltaBar, TwoLineHeader imported from plTableCore (compact mode)
 
 function collectNumericRows(rows: ErStatementRow[]): ErStatementRow[] {
   const out: ErStatementRow[] = []
@@ -119,6 +57,9 @@ function collectNumericRows(rows: ErStatementRow[]): ErStatementRow[] {
   for (const r of rows) walk(r)
   return out
 }
+
+/** Gross margin %, EBITDA margin %, Net profit margin % — bold label + values in KPI rows. */
+const BOLD_MARGIN_KPI_CODES = new Set(['GROSS_MARGIN_PCT', 'EBITDA_MARGIN_PCT', 'NET_PROFIT_MARGIN_PCT'])
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -224,14 +165,19 @@ export default function ErSnapshotTable({
     })
   }
 
-  // 7 data columns (dec_py2 | fy_py | fy | ∆FY | cm_py | cm | ∆CM); cm is index 5 (0-based)
-  const COLS = 7
-  const CM_IDX = 5
+  // 8 data columns (dec_py2 | fy_py | fy | CAGR | ∆FY | cm_py | cm | ∆CM)
+  // CAGR at index 3 (0-based), cm at index 6
+  const COLS = 8
+  const CM_IDX = 6
+  const CAGR_IDX = 3
 
   function renderRow(row: ErStatementRow, depth: number): JSX.Element {
-    const isTitle    = row.row_kind === 'title'
-    const isKpi      = row.row_kind === 'kpi'
-    const isKpiHdr   = row.row_kind === 'kpi_header'
+    const isTitle       = row.row_kind === 'title'
+    const isKpi         = row.row_kind === 'kpi'
+    const isKpiHdr      = row.row_kind === 'kpi_header'
+    const isSubtotal    = row.row_kind === 'subtotal'
+    const isAccount     = row.row_kind === 'account'
+    const isMarginKpiBold = isKpi && !!row.line_code && BOLD_MARGIN_KPI_CODES.has(row.line_code)
     const pad = 12 + depth * 14
     const isOpen = checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0 || (row.accounts?.length ?? 0) > 0
@@ -240,12 +186,12 @@ export default function ErSnapshotTable({
       return (
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: isKpiHdr ? '2px solid #E2E8F0' : '1px solid #E2E8F0' }}>
           <td colSpan={isKpiHdr ? undefined : COLS + 1}
-              className="px-3 py-2 text-xs font-bold uppercase tracking-wide"
+              className="px-3 py-1 text-[12px] font-bold uppercase tracking-wide"
               style={{ color: '#1E3A5F', fontStyle: isKpiHdr ? 'italic' : undefined, textTransform: isKpiHdr ? 'none' : undefined, fontWeight: isKpiHdr ? 600 : undefined }}>
             {row.label}
           </td>
           {isKpiHdr && Array.from({ length: COLS }).map((_, i) => (
-            <td key={i} style={{ background: i === CM_IDX ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+            <td key={i} style={{ background: (i === CM_IDX || i === CAGR_IDX) ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
           ))}
         </tr>
       )
@@ -254,11 +200,16 @@ export default function ErSnapshotTable({
     const am  = row.amounts  ?? {}
     const d   = row.deltas   ?? {}
     const inv = row.invert_delta
-    const isSubtotal = row.row_kind === 'subtotal'
-    const isAccount  = row.row_kind === 'account'
 
     const get  = (k: string) => (am as Record<string, number>)[k] ?? 0
     const dget = (k: string) => (d  as Record<string, number>)[k] ?? 0
+
+    // CAGR: Dec-3 → Dec-1, 2-period compound growth
+    const decPy2v = Number(am.dec_py2 ?? 0)
+    const fyv     = Number(am.fy ?? 0)
+    const cagrVal = !isKpi && Math.abs(decPy2v) > 1e-3
+      ? (Math.pow(fyv / decPy2v, 1 / 2) - 1) * 100
+      : null
 
     return (
       <tr
@@ -269,15 +220,15 @@ export default function ErSnapshotTable({
           background: isKpi ? '#F8FAFC' : isSubtotal && depth === 0 ? '#F8FAFC' : undefined,
         }}
       >
-        <td className="py-2 text-left whitespace-nowrap" style={{ minWidth: 220, paddingLeft: pad, paddingRight: 12 }}>
+        <td className="py-1 text-left whitespace-nowrap" style={{ minWidth: 220, paddingLeft: pad, paddingRight: 12 }}>
           <div className="flex items-center gap-0.5">
             {showChevron ? (
               <button type="button" onClick={() => toggle(row.id)} className="p-0.5 rounded shrink-0" style={{ color: '#1E3A5F' }} aria-expanded={isOpen}>
                 <ChevronRight size={14} style={{ transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }} />
               </button>
             ) : <span style={{ width: 22 }} />}
-            <span className="text-xs" style={{
-              fontWeight: row.is_bold || isSubtotal ? 600 : 500,
+            <span className="text-[13px]" style={{
+              fontWeight: row.is_bold || isSubtotal || isMarginKpiBold ? 600 : 500,
               fontStyle: isKpi ? 'italic' : undefined,
               color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
             }}>
@@ -290,36 +241,53 @@ export default function ErSnapshotTable({
           isWc ? (
             /* WC KPIs — days */
             <>
-              <ValCell value={get('dec_py2')} isDays italic />
-              <ValCell value={get('fy_py')} isDays italic />
-              <ValCell value={get('fy')}    isDays italic />
-              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isDays />
-              <ValCell value={get('cm_py')} isDays italic />
-              <ValCell value={get('cm')}    isDays highlighted italic />
-              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isDays />
+              <ValCell value={get('dec_py2')} isDays italic compact />
+              <ValCell value={get('fy_py')} isDays italic compact />
+              <ValCell value={get('fy')}    isDays italic compact />
+              <td style={{ background: 'rgba(30,58,95,0.04)' }} />
+              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isDays compact />
+              <ValCell value={get('cm_py')} isDays italic compact />
+              <ValCell value={get('cm')}    isDays highlighted italic compact />
+              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isDays compact />
             </>
           ) : (
             /* BS KPIs — percentages */
             <>
-              <ValCell value={get('dec_py2')} isPct italic />
-            <ValCell value={get('fy_py')} isPct italic />
-              <ValCell value={get('fy')}    isPct italic />
-              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isPct />
-              <ValCell value={get('cm_py')} isPct italic />
-              <ValCell value={get('cm')}    isPct highlighted italic />
-              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isPct />
+              <ValCell value={get('dec_py2')} isPct italic compact />
+              <ValCell value={get('fy_py')} isPct italic compact />
+              <ValCell value={get('fy')}    isPct italic compact />
+              <td style={{ background: 'rgba(30,58,95,0.04)' }} />
+              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isPct compact />
+              <ValCell value={get('cm_py')} isPct italic compact />
+              <ValCell value={get('cm')}    isPct highlighted italic compact />
+              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isPct compact />
             </>
           )
         ) : (
           <>
-            <ValCell value={get('dec_py2')} bold={row.is_bold} onClick={row.drill ? () => openDrill(row, 'dec_py2', lbl?.dec_py2 ?? '') : undefined} />
-            <ValCell value={get('fy_py')} bold={row.is_bold} onClick={row.drill ? () => openDrill(row, 'fy_py', lbl?.fy_py ?? '') : undefined} />
-            <ValCell value={get('fy')}    bold={row.is_bold} onClick={row.drill ? () => openDrill(row, 'fy',    lbl?.fy    ?? '') : undefined} />
-            <DeltaCell value={dget('delta_fy')} maxAbs={maxDeltaFy} invert={inv}
+            <ValCell value={get('dec_py2')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'dec_py2', lbl?.dec_py2 ?? '') : undefined} />
+            <ValCell value={get('fy_py')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'fy_py', lbl?.fy_py ?? '') : undefined} />
+            <ValCell value={get('fy')}    bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'fy',    lbl?.fy    ?? '') : undefined} />
+            {/* CAGR: (Dec-1 / Dec-3)^(1/2) − 1, client-side, blank for KPI rows */}
+            <td
+              className="px-1.5 py-1 text-right whitespace-nowrap tabular-nums"
+              style={{
+                background: 'rgba(30,58,95,0.04)',
+                fontSize: '0.8125rem',
+                fontWeight: row.is_bold ? 600 : 400,
+                color: cagrVal == null || cagrVal === 0 ? '#94A3B8' : cagrVal > 0 ? '#10B981' : '#DC2626',
+                fontStyle: 'italic',
+              }}
+            >
+              {cagrVal == null
+                ? '—'
+                : `${cagrVal >= 0 ? '+' : ''}${cagrVal.toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`}
+            </td>
+            <DeltaCell value={dget('delta_fy')} maxAbs={maxDeltaFy} invert={inv} compact
               onClick={row.drill ? () => openDrill(row, 'fy', `${lbl?.fy} vs ${lbl?.fy_py}`) : undefined} />
-            <ValCell value={get('cm_py')} bold={row.is_bold} onClick={row.drill ? () => openDrill(row, 'cm_py', lbl?.cm_py ?? '') : undefined} />
-            <ValCell value={get('cm')}    bold={row.is_bold} highlighted onClick={row.drill ? () => openDrill(row, 'cm', lbl?.cm ?? '') : undefined} />
-            <DeltaCell value={dget('delta_cm')} maxAbs={maxDeltaCm} invert={inv}
+            <ValCell value={get('cm_py')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'cm_py', lbl?.cm_py ?? '') : undefined} />
+            <ValCell value={get('cm')}    bold={row.is_bold} compact highlighted onClick={row.drill ? () => openDrill(row, 'cm', lbl?.cm ?? '') : undefined} />
+            <DeltaCell value={dget('delta_cm')} maxAbs={maxDeltaCm} invert={inv} compact
               onClick={row.drill ? () => openDrill(row, 'cm', `${lbl?.cm} vs ${lbl?.cm_py}`) : undefined} />
           </>
         )}
@@ -340,9 +308,9 @@ export default function ErSnapshotTable({
         const kpiLabel = data?.statement === 'wc' ? 'KPIs — working capital days' : 'KPIs'
         nodes.push(
           <tr key="er-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td className="px-3 py-2 text-xs font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>{kpiLabel}</td>
+            <td className="px-3 py-1 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>{kpiLabel}</td>
             {Array.from({ length: COLS }).map((_, i) => (
-              <td key={i} style={{ background: i === CM_IDX ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+              <td key={i} style={{ background: (i === CM_IDX || i === CAGR_IDX) ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
             ))}
           </tr>
         )
@@ -380,12 +348,13 @@ export default function ErSnapshotTable({
       lbl?.dec_py2 ?? 'Dec-3',
       lbl?.fy_py ?? 'Dec-2',
       lbl?.fy ?? 'Dec-1',
+      'CAGR',
       lbl ? `Δ ${lbl.fy_py} − ${lbl.fy}` : 'Δ FY',
       lbl?.cm_py ?? 'CM PY',
       lbl?.cm ?? 'CM',
       lbl ? `Δ ${lbl.cm_py} − ${lbl.cm}` : 'Δ CM',
     ]
-    const columnKinds = ['', '', '', '', 'delta', '', 'cm', 'delta']
+    const columnKinds = ['', '', '', '', 'cagr', 'delta', '', 'cm', 'delta']
     const base = `ER_${stmtName.replace(/ /g, '_')}_${todayStr()}`
     if (kind === 'pptx') {
       await exportFlatTablePptx({
@@ -481,17 +450,18 @@ export default function ErSnapshotTable({
         />
       ) : (
         <div className="overflow-x-auto px-6 py-4">
-          <table className="w-full border-collapse text-xs">
+          <table className="w-full border-collapse text-[12px]">
             <thead>
-              <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
-                <th className="px-3 py-2.5 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.dec_py2}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy_py}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaFy}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.cm_py}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#1E3A5F' }}>{lbl?.cm}</th>
-                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaCm}</th>
+              <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
+                <th className="px-3 py-2 text-left font-semibold text-[13px]" style={{ color: '#475569' }}>EURk</th>
+                <TwoLineHeader line1={lbl?.dec_py2 ?? ''} line2="FY end" />
+                <TwoLineHeader line1={lbl?.fy_py ?? ''} line2="FY end" />
+                <TwoLineHeader line1={lbl?.fy ?? ''} line2="FY end" highlighted />
+                <TwoLineHeader line1="CAGR" line2={`${lbl?.dec_py2 ?? ''} – ${lbl?.fy ?? ''}`} />
+                <TwoLineHeader line1={hdrDeltaFy} line2="vs prior FY" />
+                <TwoLineHeader line1={lbl?.cm_py ?? ''} line2="Prior year CM" />
+                <TwoLineHeader line1={lbl?.cm ?? ''} line2="Current period" highlighted />
+                <TwoLineHeader line1={hdrDeltaCm} line2="vs prior CM" />
               </tr>
             </thead>
             <tbody>{walkRows(data.rows, 0)}</tbody>
