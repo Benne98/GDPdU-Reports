@@ -1,5 +1,6 @@
 /**
  * Annual BS entity-breakdown table view — Dec22 … Jul25 + deltas + CAGR per entity column.
+ * Accepts optional extraColumns (target-specific snapshot cols) added via the section editor.
  */
 import { useEffect, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
@@ -18,6 +19,7 @@ import {
   type SnapshotConsolTarget,
 } from './snapshotConsolidationCellResolver'
 import { computeAutoExpandedIds } from '../statementRowExpansion'
+import type { SnapshotConsolExtraCol } from './snapshotColumnRegistry'
 
 const WC_KPI_HEADER_LABEL = 'KPIs — working capital days'
 
@@ -127,10 +129,23 @@ function NumCell({
   )
 }
 
+function targetDisplayLabel(target: SnapshotConsolTarget, entities: ConsolidationResponse['entities']): string {
+  switch (target.kind) {
+    case 'entity': {
+      const ent = entities.find(e => e.code === target.code)
+      return ent?.label ?? target.code
+    }
+    case 'aggregated':    return 'Aggregated'
+    case 'consolidation': return 'Consolidation'
+    case 'ic':            return 'IC Elim.'
+  }
+}
+
 type Props = {
   data: ConsolidationResponse
   year: number
   month: number
+  extraColumns: SnapshotConsolExtraCol[]
   onDrill: (d: FinancialsDrillOpen) => void
   onRegisterCheckOpen?: (checkOpen: (id: string) => boolean) => void
 }
@@ -139,6 +154,7 @@ export default function AnnualSnapshotConsolidationTableView({
   data,
   year,
   month,
+  extraColumns,
   onDrill,
   onRegisterCheckOpen,
 }: Props) {
@@ -176,8 +192,9 @@ export default function AnnualSnapshotConsolidationTableView({
   )
 
   const entityCodes = data.entities.map(e => e.code)
-  const totalCols = 1 + subCols.length
   const colsPerGroup = valueCols.length
+  // +1 for label col, +subCols for per-group grid, +extraColumns for standalone extra cols
+  const totalCols = 1 + subCols.length + extraColumns.length
 
   const maxDeltas = useMemo(() => {
     let maxFy = 0
@@ -222,16 +239,49 @@ export default function AnnualSnapshotConsolidationTableView({
     })
   }
 
+  /** Render one extra-column cell for a given row and extra col def. */
+  function extraCell(ec: SnapshotConsolExtraCol, row: ConsolidationRow): JSX.Element {
+    const key = `${row.id}-extra-${ec.id}`
+    const isKpi = row.row_kind === 'kpi'
+    const v = snapshotConsolidationCellValue(row, ec.target, ec.snapshotColId)
+    if (v == null) {
+      return (
+        <td key={key} className="px-2.5 py-2 text-right text-xs text-slate-300">—</td>
+      )
+    }
+    const colDef = valueCols.find(c => c.id === ec.snapshotColId)
+    return (
+      <NumCell
+        key={key}
+        value={v}
+        bold={row.is_bold}
+        isKpi={isKpi}
+        isDays={isKpi && data.statement === 'wc'}
+        isDelta={colDef?.isDelta}
+        isPct={colDef?.isPct}
+        maxDelta={
+          ec.snapshotColId === 'delta_fy' ? maxDeltas.maxFy
+          : ec.snapshotColId === 'delta_cm' ? maxDeltas.maxCm
+          : undefined
+        }
+      />
+    )
+  }
+
   function renderRow(row: ConsolidationRow, depth: number): JSX.Element[] {
     const pad = 12 + depth * 14
-    const isTitle = row.row_kind === 'title'
+    const isTitle     = row.row_kind === 'title'
     const isKpiHeader = row.row_kind === 'kpi_header'
-    const isKpi = row.row_kind === 'kpi'
-    const isOpen = checkOpen(row.id)
+    const isKpi       = row.row_kind === 'kpi'
+    const isOpen      = checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0
     const nodes: JSX.Element[] = []
 
     if (!shouldDisplayConsolidationRow(row, entityCodes)) return nodes
+
+    const emptyExtra = extraColumns.map(ec => (
+      <td key={`${row.id}-extra-${ec.id}`} style={{ background: '#F8FAFC' }} />
+    ))
 
     if (isTitle) {
       nodes.push(
@@ -246,6 +296,7 @@ export default function AnnualSnapshotConsolidationTableView({
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
           <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>{row.label}</td>
           {subCols.map(s => <td key={`${row.id}-${s.key}`} style={{ background: '#F8FAFC' }} />)}
+          {emptyExtra}
         </tr>,
       )
     } else {
@@ -318,6 +369,8 @@ export default function AnnualSnapshotConsolidationTableView({
               />
             )
           })}
+          {/* Extra standalone columns */}
+          {extraColumns.map(ec => extraCell(ec, row))}
         </tr>,
       )
     }
@@ -329,11 +382,12 @@ export default function AnnualSnapshotConsolidationTableView({
     return nodes
   }
 
-  function renderKpiHeaderFallback(): JSX.Element {
+  function renderKpiHeaderFallback(label: string): JSX.Element {
     return (
-      <tr key="wc-consol-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-        <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>{WC_KPI_HEADER_LABEL}</td>
+      <tr key="consol-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
+        <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>{label}</td>
         {subCols.map(s => <td key={`kpi-hdr-${s.key}`} style={{ background: '#F8FAFC' }} />)}
+        {extraColumns.map(ec => <td key={`kpi-hdr-extra-${ec.id}`} style={{ background: '#F8FAFC' }} />)}
       </tr>
     )
   }
@@ -349,16 +403,11 @@ export default function AnnualSnapshotConsolidationTableView({
       }
       if (row.row_kind === 'kpi' && !kpiHeaderInserted && data.statement === 'wc') {
         kpiHeaderInserted = true
-        nodes.push(renderKpiHeaderFallback())
+        nodes.push(renderKpiHeaderFallback(WC_KPI_HEADER_LABEL))
       }
       if (row.row_kind === 'kpi' && !kpiHeaderInserted && data.statement === 'bs') {
         kpiHeaderInserted = true
-        nodes.push(
-          <tr key="bs-consol-kpi-header-fallback" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>KPIs</td>
-            {subCols.map(s => <td key={`kpi-hdr-${s.key}`} style={{ background: '#F8FAFC' }} />)}
-          </tr>,
-        )
+        nodes.push(renderKpiHeaderFallback('KPIs'))
       }
       nodes.push(...renderRow(row, 0))
     }
@@ -369,6 +418,7 @@ export default function AnnualSnapshotConsolidationTableView({
     <div className="overflow-x-auto">
       <table className="w-full border-collapse text-xs">
         <thead>
+          {/* Row 1: group headers + extra col headers (rowSpan=2) */}
           <tr style={{ borderBottom: '1px solid #E2E8F0', background: '#F8FAFC' }}>
             <th rowSpan={2} className="px-3 py-2 text-left font-semibold align-bottom" style={{ color: '#475569' }}>
               EURk
@@ -386,7 +436,20 @@ export default function AnnualSnapshotConsolidationTableView({
                 {g.title}
               </th>
             ))}
+            {/* Extra columns: each gets rowSpan=2 with target label as subtitle */}
+            {extraColumns.map(ec => (
+              <th
+                key={ec.id}
+                rowSpan={2}
+                className="px-2 py-2 text-right font-medium whitespace-nowrap border-l border-slate-200 align-bottom"
+                style={{ color: '#475569', minWidth: 72 }}
+              >
+                <div className="text-[0.65rem] text-slate-400">{ec.labelLine2 ?? targetDisplayLabel(ec.target, data.entities)}</div>
+                <div>{ec.labelLine1}</div>
+              </th>
+            ))}
           </tr>
+          {/* Row 2: per-col sub-headers (only for main group cols; extra cols handled by rowSpan above) */}
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#FAFBFC' }}>
             {colGroups.flatMap(g =>
               valueCols.map(def => (

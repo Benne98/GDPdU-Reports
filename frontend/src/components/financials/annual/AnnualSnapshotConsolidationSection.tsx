@@ -1,8 +1,8 @@
 /**
  * Annual entity-breakdown for snapshot statements (BS, WC): table, entity report, group report.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Pin } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { ChevronDown, ChevronUp, GripVertical, Pencil, Pin, X } from 'lucide-react'
 import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
 import type { ConsolidationResponse, ErSnapshotResponse, FinancialStatementRow } from '../../../lib/api'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
@@ -24,6 +24,16 @@ import AnnualConsolidationViewToggle, {
   type AnnualConsolViewMode,
 } from './AnnualConsolidationViewToggle'
 import { fetchAnnualSnapshotForEntity } from '../statement-two-view/consolidation/statementConsolidationApi'
+import type { ErSnapshotColLabels } from '../../../lib/api'
+import {
+  buildSnapshotCatalog,
+  loadConsolExtraCols,
+  makeConsolExtraColId,
+  saveConsolExtraCols,
+  type SnapshotConsolExtraCol,
+  type SnapshotColId,
+} from './snapshotColumnRegistry'
+import type { SnapshotConsolTarget } from './snapshotConsolidationCellResolver'
 
 const VIEW_KEY_BS = 'finssentials.annual.bs.consol.viewMode.v1'
 const VIEW_KEY_WC = 'finssentials.annual.wc.consol.viewMode.v1'
@@ -71,6 +81,51 @@ function loadEntityIndex(statement: 'bs' | 'wc', max: number): number {
   }
 }
 
+// ─── Editor helpers ───────────────────────────────────────────────────────────
+
+function EditorSection({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="border border-slate-200 rounded-lg overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-50 hover:bg-slate-100"
+      >
+        {title}
+        <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && <div className="p-3 space-y-2">{children}</div>}
+    </div>
+  )
+}
+
+const CONSOL_TARGET_OPTIONS: Array<{ id: 'aggregated' | 'consolidation' | 'entity'; label: string }> = [
+  { id: 'entity',        label: 'All entities' },
+  { id: 'aggregated',    label: 'Aggregated' },
+  { id: 'consolidation', label: 'Consolidation' },
+]
+
+const SNAPSHOT_PALETTE_GROUPS: Array<{ title: string; ids: SnapshotColId[] }> = [
+  { title: 'Year-end balances', ids: ['dec_py2', 'fy_py', 'fy', 'cm_py'] },
+  { title: 'Deltas & CAGR',     ids: ['delta_fy', 'delta_cm', 'cagr'] },
+  { title: 'Current period',    ids: ['cm'] },
+]
+
+function targetDisplayLabel(target: SnapshotConsolTarget, entities: ConsolidationResponse['entities']): string {
+  switch (target.kind) {
+    case 'entity': {
+      const ent = entities.find(e => e.code === target.code)
+      return ent?.label ?? target.code
+    }
+    case 'aggregated':    return 'Aggregated'
+    case 'consolidation': return 'Consolidation'
+    case 'ic':            return 'IC Elim.'
+  }
+}
+
+// ─── Props ────────────────────────────────────────────────────────────────────
+
 interface Props {
   statement: 'bs' | 'wc'
   consol: ConsolidationResponse | null
@@ -97,8 +152,69 @@ export default function AnnualSnapshotConsolidationSection({
   const checkOpenRef = useRef<((id: string) => boolean) | null>(null)
   const notesCtx = useOptionalActionNotesContext()
 
+  // Column editor state
+  const [extraCols, setExtraCols] = useState<SnapshotConsolExtraCol[]>(() => loadConsolExtraCols(statement))
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [consolDragIdx, setConsolDragIdx] = useState<number | null>(null)
+  const [addTarget, setAddTarget] = useState<'aggregated' | 'consolidation' | 'entity'>('aggregated')
+
   const entities = consol?.entities ?? []
   const selected = entities[entityIndex]
+
+  // Rebuild catalog labels when consol col_labels updates
+  const catalog = useMemo(
+    () => buildSnapshotCatalog(consol?.col_labels as ErSnapshotColLabels | undefined),
+    [consol?.col_labels],
+  )
+
+  function persistExtra(cols: SnapshotConsolExtraCol[]) {
+    setExtraCols(cols)
+    saveConsolExtraCols(statement, cols)
+  }
+
+  function addExtraCol(snapshotColId: SnapshotColId) {
+    const colDef = catalog[snapshotColId]
+    if (!colDef) return
+
+    if (addTarget === 'entity') {
+      // Add one column per entity (skip any already present)
+      const additions: SnapshotConsolExtraCol[] = []
+      for (const e of entities) {
+        const target: SnapshotConsolTarget = { kind: 'entity', code: e.code }
+        const id = makeConsolExtraColId(target, snapshotColId)
+        if (extraCols.some(c => c.id === id)) continue
+        additions.push({ id, snapshotColId, target, labelLine1: colDef.labelLine1, labelLine2: e.label })
+      }
+      if (additions.length) persistExtra([...extraCols, ...additions])
+      return
+    }
+
+    const target: SnapshotConsolTarget = addTarget === 'aggregated'
+      ? { kind: 'aggregated' }
+      : { kind: 'consolidation' }
+    const id = makeConsolExtraColId(target, snapshotColId)
+    if (extraCols.some(c => c.id === id)) return
+    persistExtra([...extraCols, {
+      id,
+      snapshotColId,
+      target,
+      labelLine1: colDef.labelLine1,
+      labelLine2: targetDisplayLabel(target, entities),
+    }])
+  }
+
+  function removeExtraAt(idx: number) {
+    persistExtra(extraCols.filter((_, i) => i !== idx))
+  }
+
+  function moveExtra(idx: number, dir: -1 | 1) {
+    const j = idx + dir
+    if (j < 0 || j >= extraCols.length) return
+    const next = [...extraCols]
+    const [item] = next.splice(idx, 1)
+    next.splice(j, 0, item)
+    persistExtra(next)
+  }
 
   const entityExpansion = usePlRowExpansion(
     (entityStmt?.rows ?? []) as FinancialStatementRow[],
@@ -174,7 +290,6 @@ export default function AnnualSnapshotConsolidationSection({
       const footerRight = `${periodLabel} · Values in EURk`
       const checkOpen = checkOpenRef.current ?? (() => false)
       if (kind === 'pdf') {
-        // No dedicated PDF exporter for annual snapshot consolidation yet — fall back to browser print.
         window.print()
         return
       }
@@ -272,6 +387,18 @@ export default function AnnualSnapshotConsolidationSection({
         )}
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <AnnualConsolidationViewToggle mode={viewMode} onChange={handleViewChange} disabled={loading} />
+          {/* Pencil only shown in table mode (snapshot period_grain check handled by parent) */}
+          {viewMode === 'table' && (
+            <button
+              type="button"
+              title="Add extra columns"
+              onClick={() => setEditorOpen(true)}
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+            >
+              <Pencil size={14} strokeWidth={1.75} />
+            </button>
+          )}
           {notesCtx && consol && (
             <button
               type="button"
@@ -299,6 +426,7 @@ export default function AnnualSnapshotConsolidationSection({
               data={consol}
               year={year}
               month={month}
+              extraColumns={extraCols}
               onDrill={onDrill}
               onRegisterCheckOpen={handleRegisterCheckOpen}
             />
@@ -348,6 +476,140 @@ export default function AnnualSnapshotConsolidationSection({
           statement={statement}
           onDrill={onDrill}
         />
+      )}
+
+      {/* Extra columns editor drawer */}
+      {editorOpen && (
+        <>
+          <div className="fixed inset-0 z-40 bg-slate-900/20" onClick={() => setEditorOpen(false)} aria-hidden />
+          <div
+            className="fixed inset-y-0 right-0 z-50 w-full max-w-md shadow-2xl flex flex-col"
+            style={{ background: '#fff', borderLeft: '1px solid #E2E8F0' }}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 shrink-0">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Table builder</p>
+                <p className="text-[0.65rem] text-slate-500 mt-0.5">Add extra snapshot columns alongside the entity breakdown</p>
+              </div>
+              <button type="button" onClick={() => setEditorOpen(false)} className="p-1 rounded hover:bg-slate-100" aria-label="Close">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {/* Target selector */}
+              <section>
+                <p className="text-xs font-semibold text-slate-700 mb-2">Apply column to</p>
+                <div className="grid grid-cols-3 gap-1 p-0.5 rounded-lg bg-slate-100">
+                  {CONSOL_TARGET_OPTIONS.map(opt => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      className={`text-[0.65rem] font-medium py-1.5 rounded-md ${
+                        addTarget === opt.id ? 'bg-white shadow text-[#1E3A5F]' : 'text-slate-600'
+                      }`}
+                      onClick={() => setAddTarget(opt.id)}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              {/* Current extra columns */}
+              <section>
+                <p className="text-xs font-semibold text-slate-700 mb-2">
+                  Extra columns ({extraCols.length})
+                </p>
+                {extraCols.length === 0 ? (
+                  <p className="text-xs text-slate-500">No extra columns — showing default layout only.</p>
+                ) : (
+                  <ul className="space-y-1">
+                    {extraCols.map((c, idx) => (
+                      <li
+                        key={c.id}
+                        draggable
+                        onDragStart={() => setConsolDragIdx(idx)}
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={() => {
+                          if (consolDragIdx == null || consolDragIdx === idx) return
+                          const next = [...extraCols]
+                          const [item] = next.splice(consolDragIdx, 1)
+                          next.splice(idx, 0, item)
+                          setConsolDragIdx(null)
+                          persistExtra(next)
+                        }}
+                        onDragEnd={() => setConsolDragIdx(null)}
+                        className={`flex items-center gap-1 rounded-lg border px-2 py-1.5 bg-white ${
+                          consolDragIdx === idx ? 'border-[#1E3A5F] ring-1 ring-[#1E3A5F]/20' : 'border-slate-200'
+                        }`}
+                      >
+                        <GripVertical size={14} className="shrink-0 text-slate-400 cursor-grab" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[0.65rem] text-slate-500 truncate">{c.labelLine2 ?? targetDisplayLabel(c.target, entities)}</p>
+                          <p className="text-xs font-medium text-slate-800 truncate">{c.labelLine1}</p>
+                        </div>
+                        <div className="flex shrink-0">
+                          <button type="button" onClick={() => moveExtra(idx, -1)} disabled={idx === 0} className="p-1 text-slate-500 disabled:opacity-30" aria-label="Move up">
+                            <ChevronUp size={14} />
+                          </button>
+                          <button type="button" onClick={() => moveExtra(idx, 1)} disabled={idx === extraCols.length - 1} className="p-1 text-slate-500 disabled:opacity-30" aria-label="Move down">
+                            <ChevronDown size={14} />
+                          </button>
+                          <button type="button" onClick={() => removeExtraAt(idx)} className="p-1 text-slate-500 hover:text-rose-600" aria-label="Remove">
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              {/* Palette groups */}
+              {SNAPSHOT_PALETTE_GROUPS.map(group => {
+                const groupCols = group.ids.map(id => catalog[id]).filter(Boolean)
+                if (!groupCols.length) return null
+                return (
+                  <EditorSection key={group.title} title={group.title}>
+                    <div className="flex flex-wrap gap-1.5">
+                      {groupCols.map(c => {
+                        const wouldAdd: SnapshotConsolTarget[] =
+                          addTarget === 'entity'
+                            ? entities.map(e => ({ kind: 'entity' as const, code: e.code }))
+                            : [addTarget === 'aggregated' ? { kind: 'aggregated' as const } : { kind: 'consolidation' as const }]
+                        const allPresent = wouldAdd.length > 0 && wouldAdd.every(t =>
+                          extraCols.some(ec => ec.id === makeConsolExtraColId(t, c.id)),
+                        )
+                        return (
+                          <button
+                            key={c.id}
+                            type="button"
+                            disabled={allPresent}
+                            onClick={() => addExtraCol(c.id)}
+                            className="px-2 py-1.5 rounded-md text-[0.7rem] text-left disabled:opacity-40 hover:bg-slate-50"
+                            style={{ border: '1px solid #E2E8F0', color: '#475569' }}
+                          >
+                            {c.labelLine1}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </EditorSection>
+                )
+              })}
+
+              {/* Reset */}
+              <button
+                type="button"
+                onClick={() => persistExtra([])}
+                className="text-xs font-medium w-full py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
+              >
+                Reset — default columns only
+              </button>
+            </div>
+          </div>
+        </>
       )}
     </div>
   )

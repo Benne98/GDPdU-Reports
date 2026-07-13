@@ -1,10 +1,11 @@
 /**
  * ErSnapshotTable — Exit Readiness table for snapshot statements (BS, WC).
  *
- * Columns: Dec{yr-2} | Dec{yr-1} | ∆FY | {month}{yr-1} | {month}{yr} | ∆CM
+ * Columns are registry-driven and user-configurable via the Table Builder pencil.
+ * Default: Dec{yr-2} | Dec{yr-1} | Dec{yr} | CAGR | Δ FY | {month}{yr-1} | {month}{yr} | Δ CM
  */
-import { useMemo, useState, useEffect } from 'react'
-import { ChevronRight, Pin } from 'lucide-react'
+import { useMemo, useState, useEffect, type ReactNode } from 'react'
+import { ChevronDown, ChevronRight, ChevronUp, GripVertical, Pencil, Pin, X } from 'lucide-react'
 import { ErSnapshotResponse, ErStatementRow, ErSnapshotColLabels } from '../../../lib/api'
 import { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlExportMenu, { type PlExportKind } from '../pl-two-view/PlExportMenu'
@@ -25,6 +26,14 @@ import { buildAnnualSnapshotNarrativeResponse } from './erAnnualNarrative'
 import ErSnapshotReportView from './ErSnapshotReportView'
 import { computeAutoExpandedIds } from '../statementRowExpansion'
 import { DeltaCell, TwoLineHeader, ValCell } from '../pl-two-view/plTableCore'
+import {
+  buildSnapshotCatalog,
+  DEFAULT_SNAPSHOT_COLUMN_IDS,
+  loadSnapshotColumns,
+  saveSnapshotColumns,
+  type SnapshotColumnDef,
+  type SnapshotColId,
+} from './snapshotColumnRegistry'
 
 // ─── Period ranges for drill-down ────────────────────────────────────────────
 
@@ -45,7 +54,6 @@ function periodRange(year: number, month: number, col: SnapCol): { from: string;
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-// ValCell, DeltaCell, DeltaBar, TwoLineHeader imported from plTableCore (compact mode)
 
 function collectNumericRows(rows: ErStatementRow[]): ErStatementRow[] {
   const out: ErStatementRow[] = []
@@ -60,6 +68,31 @@ function collectNumericRows(rows: ErStatementRow[]): ErStatementRow[] {
 
 /** Gross margin %, EBITDA margin %, Net profit margin % — bold label + values in KPI rows. */
 const BOLD_MARGIN_KPI_CODES = new Set(['GROSS_MARGIN_PCT', 'EBITDA_MARGIN_PCT', 'NET_PROFIT_MARGIN_PCT'])
+
+// ─── Editor helper ────────────────────────────────────────────────────────────
+
+function EditorSection({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="border border-slate-200 rounded-lg overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-50 hover:bg-slate-100"
+      >
+        {title}
+        <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && <div className="p-3 space-y-2">{children}</div>}
+    </div>
+  )
+}
+
+const SNAPSHOT_PALETTE_GROUPS: Array<{ title: string; ids: SnapshotColId[] }> = [
+  { title: 'Year-end balances', ids: ['dec_py2', 'fy_py', 'fy', 'cm_py'] },
+  { title: 'Deltas & CAGR',     ids: ['delta_fy', 'delta_cm', 'cagr'] },
+  { title: 'Current period',    ids: ['cm'] },
+]
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -82,10 +115,30 @@ interface ErSnapshotTableProps {
 export default function ErSnapshotTable({
   data, loading, error, year, month, entity, periodSelection, entityDisplayName, onDrill, pinId, pinLabel,
 }: ErSnapshotTableProps) {
-  const statementKey = data?.statement === 'wc' ? 'wc' : 'bs'
+  const statementKey = (data?.statement === 'wc' ? 'wc' : 'bs') as 'bs' | 'wc'
   const stmtCfg = getStatementConfig(statementKey)
   const [viewMode, setViewMode] = useState<PlViewMode>(() => loadStatementViewMode(statementKey) as PlViewMode)
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
+  const [columnIds, setColumnIds] = useState<SnapshotColId[]>(DEFAULT_SNAPSHOT_COLUMN_IDS)
+  const [columnEditorOpen, setColumnEditorOpen] = useState(false)
+  const [dragIdx, setDragIdx] = useState<number | null>(null)
+
+  const lbl = data?.col_labels as ErSnapshotColLabels | undefined
+  const isWc = data?.statement === 'wc'
+
+  const catalog = useMemo(() => buildSnapshotCatalog(lbl), [lbl])
+
+  // Hydrate from localStorage once we know the statement key
+  useEffect(() => {
+    const saved = loadSnapshotColumns(statementKey)
+    if (saved) setColumnIds(saved)
+    else setColumnIds(DEFAULT_SNAPSHOT_COLUMN_IDS)
+  }, [statementKey])
+
+  const columns = useMemo(
+    () => columnIds.map(id => catalog[id]).filter((c): c is SnapshotColumnDef => Boolean(c)),
+    [columnIds, catalog],
+  )
 
   useEffect(() => {
     applyViewModeFromSearchParams(setViewMode)
@@ -133,12 +186,9 @@ export default function ErSnapshotTable({
   const { maxDeltaFy, maxDeltaCm } = useMemo(() => {
     if (!data?.rows) return { maxDeltaFy: 1, maxDeltaCm: 1 }
     const nonKpi = collectNumericRows(data.rows).filter(r => r.row_kind !== 'kpi')
-    const maxOf = (key: string) => Math.max(1, ...nonKpi.map(r => Math.abs((r.deltas as any)?.[key] ?? 0)))
+    const maxOf = (key: string) => Math.max(1, ...nonKpi.map(r => Math.abs((r.deltas as Record<string, number>)?.[key] ?? 0)))
     return { maxDeltaFy: maxOf('delta_fy'), maxDeltaCm: maxOf('delta_cm') }
   }, [data])
-
-  const lbl = data?.col_labels as ErSnapshotColLabels | undefined
-  const isWc = data?.statement === 'wc'
 
   const clientNarrative = useMemo(() => {
     if (!data?.rows || !lbl) return null
@@ -165,18 +215,19 @@ export default function ErSnapshotTable({
     })
   }
 
-  // 8 data columns (dec_py2 | fy_py | fy | CAGR | ∆FY | cm_py | cm | ∆CM)
-  // CAGR at index 3 (0-based), cm at index 6
-  const COLS = 8
-  const CM_IDX = 6
-  const CAGR_IDX = 3
+  function persist(ids: SnapshotColId[]) {
+    setColumnIds(ids)
+    saveSnapshotColumns(statementKey, ids)
+  }
+
+  // ─── Row rendering ───────────────────────────────────────────────────────────
 
   function renderRow(row: ErStatementRow, depth: number): JSX.Element {
-    const isTitle       = row.row_kind === 'title'
-    const isKpi         = row.row_kind === 'kpi'
-    const isKpiHdr      = row.row_kind === 'kpi_header'
-    const isSubtotal    = row.row_kind === 'subtotal'
-    const isAccount     = row.row_kind === 'account'
+    const isTitle    = row.row_kind === 'title'
+    const isKpi      = row.row_kind === 'kpi'
+    const isKpiHdr   = row.row_kind === 'kpi_header'
+    const isSubtotal = row.row_kind === 'subtotal'
+    const isAccount  = row.row_kind === 'account'
     const isMarginKpiBold = isKpi && !!row.line_code && BOLD_MARGIN_KPI_CODES.has(row.line_code)
     const pad = 12 + depth * 14
     const isOpen = checkOpen(row.id)
@@ -185,13 +236,20 @@ export default function ErSnapshotTable({
     if (isTitle || isKpiHdr) {
       return (
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: isKpiHdr ? '2px solid #E2E8F0' : '1px solid #E2E8F0' }}>
-          <td colSpan={isKpiHdr ? undefined : COLS + 1}
-              className="px-3 py-1 text-[12px] font-bold uppercase tracking-wide"
-              style={{ color: '#1E3A5F', fontStyle: isKpiHdr ? 'italic' : undefined, textTransform: isKpiHdr ? 'none' : undefined, fontWeight: isKpiHdr ? 600 : undefined }}>
+          <td
+            colSpan={isKpiHdr ? undefined : columns.length + 1}
+            className="px-3 py-1 text-[12px] font-bold uppercase tracking-wide"
+            style={{
+              color: '#1E3A5F',
+              fontStyle: isKpiHdr ? 'italic' : undefined,
+              textTransform: isKpiHdr ? 'none' : undefined,
+              fontWeight: isKpiHdr ? 600 : undefined,
+            }}
+          >
             {row.label}
           </td>
-          {isKpiHdr && Array.from({ length: COLS }).map((_, i) => (
-            <td key={i} style={{ background: (i === CM_IDX || i === CAGR_IDX) ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+          {isKpiHdr && columns.map(c => (
+            <td key={c.id} style={{ background: (c.highlighted || c.kind === 'cagr') ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
           ))}
         </tr>
       )
@@ -200,16 +258,75 @@ export default function ErSnapshotTable({
     const am  = row.amounts  ?? {}
     const d   = row.deltas   ?? {}
     const inv = row.invert_delta
-
     const get  = (k: string) => (am as Record<string, number>)[k] ?? 0
     const dget = (k: string) => (d  as Record<string, number>)[k] ?? 0
-
-    // CAGR: Dec-3 → Dec-1, 2-period compound growth
     const decPy2v = Number(am.dec_py2 ?? 0)
     const fyv     = Number(am.fy ?? 0)
-    const cagrVal = !isKpi && Math.abs(decPy2v) > 1e-3
-      ? (Math.pow(fyv / decPy2v, 1 / 2) - 1) * 100
-      : null
+
+    function cellFor(col: SnapshotColumnDef): JSX.Element {
+      const key = `${row.id}-${col.id}`
+
+      if (col.kind === 'cagr') {
+        if (isKpi) return <td key={key} style={{ background: 'rgba(30,58,95,0.04)' }} />
+        const cagrVal = Math.abs(decPy2v) > 1e-3
+          ? (Math.pow(fyv / decPy2v, 1 / 2) - 1) * 100
+          : null
+        return (
+          <td
+            key={key}
+            className="px-1.5 py-1 text-right whitespace-nowrap tabular-nums"
+            style={{
+              background: 'rgba(30,58,95,0.04)',
+              fontSize: '0.8125rem',
+              fontWeight: row.is_bold ? 600 : 400,
+              color: cagrVal == null || cagrVal === 0 ? '#94A3B8' : cagrVal > 0 ? '#10B981' : '#DC2626',
+              fontStyle: 'italic',
+            }}
+          >
+            {cagrVal == null
+              ? '—'
+              : `${cagrVal >= 0 ? '+' : ''}${cagrVal.toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`}
+          </td>
+        )
+      }
+
+      if (col.kind === 'delta') {
+        const dKey = col.id  // 'delta_fy' | 'delta_cm'
+        const maxAbs = isKpi ? 1 : dKey === 'delta_fy' ? maxDeltaFy : maxDeltaCm
+        const drillPeriod: SnapCol = dKey === 'delta_fy' ? 'fy' : 'cm'
+        const drillLabel  = dKey === 'delta_fy'
+          ? `${lbl?.fy} vs ${lbl?.fy_py}`
+          : `${lbl?.cm} vs ${lbl?.cm_py}`
+        return (
+          <DeltaCell
+            key={key}
+            value={dget(dKey)}
+            maxAbs={maxAbs}
+            invert={isKpi ? false : inv}
+            isDays={isKpi && isWc}
+            isPct={isKpi && !isWc}
+            compact
+            onClick={!isKpi && row.drill ? () => openDrill(row, drillPeriod, drillLabel) : undefined}
+          />
+        )
+      }
+
+      // kind === 'amount': dec_py2 | fy_py | fy | cm_py | cm
+      const snapDrillCol = col.id as SnapCol
+      return (
+        <ValCell
+          key={key}
+          value={get(col.id)}
+          bold={!isKpi && !!row.is_bold}
+          highlighted={col.highlighted}
+          isPct={isKpi && !isWc}
+          isDays={isKpi && isWc}
+          italic={isKpi}
+          compact
+          onClick={!isKpi && row.drill ? () => openDrill(row, snapDrillCol, lbl?.[snapDrillCol] ?? '') : undefined}
+        />
+      )
+    }
 
     return (
       <tr
@@ -236,61 +353,7 @@ export default function ErSnapshotTable({
             </span>
           </div>
         </td>
-
-        {isKpi ? (
-          isWc ? (
-            /* WC KPIs — days */
-            <>
-              <ValCell value={get('dec_py2')} isDays italic compact />
-              <ValCell value={get('fy_py')} isDays italic compact />
-              <ValCell value={get('fy')}    isDays italic compact />
-              <td style={{ background: 'rgba(30,58,95,0.04)' }} />
-              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isDays compact />
-              <ValCell value={get('cm_py')} isDays italic compact />
-              <ValCell value={get('cm')}    isDays highlighted italic compact />
-              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isDays compact />
-            </>
-          ) : (
-            /* BS KPIs — percentages */
-            <>
-              <ValCell value={get('dec_py2')} isPct italic compact />
-              <ValCell value={get('fy_py')} isPct italic compact />
-              <ValCell value={get('fy')}    isPct italic compact />
-              <td style={{ background: 'rgba(30,58,95,0.04)' }} />
-              <DeltaCell value={dget('delta_fy')} maxAbs={1} invert={false} isPct compact />
-              <ValCell value={get('cm_py')} isPct italic compact />
-              <ValCell value={get('cm')}    isPct highlighted italic compact />
-              <DeltaCell value={dget('delta_cm')} maxAbs={1} invert={false} isPct compact />
-            </>
-          )
-        ) : (
-          <>
-            <ValCell value={get('dec_py2')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'dec_py2', lbl?.dec_py2 ?? '') : undefined} />
-            <ValCell value={get('fy_py')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'fy_py', lbl?.fy_py ?? '') : undefined} />
-            <ValCell value={get('fy')}    bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'fy',    lbl?.fy    ?? '') : undefined} />
-            {/* CAGR: (Dec-1 / Dec-3)^(1/2) − 1, client-side, blank for KPI rows */}
-            <td
-              className="px-1.5 py-1 text-right whitespace-nowrap tabular-nums"
-              style={{
-                background: 'rgba(30,58,95,0.04)',
-                fontSize: '0.8125rem',
-                fontWeight: row.is_bold ? 600 : 400,
-                color: cagrVal == null || cagrVal === 0 ? '#94A3B8' : cagrVal > 0 ? '#10B981' : '#DC2626',
-                fontStyle: 'italic',
-              }}
-            >
-              {cagrVal == null
-                ? '—'
-                : `${cagrVal >= 0 ? '+' : ''}${cagrVal.toLocaleString('de-DE', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`}
-            </td>
-            <DeltaCell value={dget('delta_fy')} maxAbs={maxDeltaFy} invert={inv} compact
-              onClick={row.drill ? () => openDrill(row, 'fy', `${lbl?.fy} vs ${lbl?.fy_py}`) : undefined} />
-            <ValCell value={get('cm_py')} bold={row.is_bold} compact onClick={row.drill ? () => openDrill(row, 'cm_py', lbl?.cm_py ?? '') : undefined} />
-            <ValCell value={get('cm')}    bold={row.is_bold} compact highlighted onClick={row.drill ? () => openDrill(row, 'cm', lbl?.cm ?? '') : undefined} />
-            <DeltaCell value={dget('delta_cm')} maxAbs={maxDeltaCm} invert={inv} compact
-              onClick={row.drill ? () => openDrill(row, 'cm', `${lbl?.cm} vs ${lbl?.cm_py}`) : undefined} />
-          </>
-        )}
+        {columns.map(col => cellFor(col))}
       </tr>
     )
   }
@@ -309,10 +372,10 @@ export default function ErSnapshotTable({
         nodes.push(
           <tr key="er-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
             <td className="px-3 py-1 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>{kpiLabel}</td>
-            {Array.from({ length: COLS }).map((_, i) => (
-              <td key={i} style={{ background: (i === CM_IDX || i === CAGR_IDX) ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+            {columns.map(c => (
+              <td key={c.id} style={{ background: (c.highlighted || c.kind === 'cagr') ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
             ))}
-          </tr>
+          </tr>,
         )
       }
       nodes.push(renderRow(row, depth))
@@ -324,37 +387,27 @@ export default function ErSnapshotTable({
     return nodes
   }
 
-  const STATEMENT_TITLES: Record<string, string> = {
-    bs: 'Balance sheet',
-    wc: 'Working capital',
-  }
+  // ─── Export ──────────────────────────────────────────────────────────────────
+
+  const STATEMENT_TITLES: Record<string, string> = { bs: 'Balance sheet', wc: 'Working capital' }
 
   async function handleExport(kind: PlExportKind) {
     if (!data) return
-    if (kind === 'pdf') {
-      // No dedicated PDF exporter for ErSnapshotResponse yet — fall back to browser print.
-      window.print()
-      return
-    }
+    if (kind === 'pdf') { window.print(); return }
     const stmtName = STATEMENT_TITLES[data.statement] ?? 'Statement'
+    // CAGR is client-side; exclude from flattenTree keys but include as a header placeholder
+    const amountCols = columns.filter(c => c.kind === 'amount')
+    const deltaCols  = columns.filter(c => c.kind === 'delta')
     const rows = flattenTree(
       data.rows,
-      ['dec_py2', 'fy_py', 'fy', 'cm_py', 'cm'],
-      ['delta_fy', 'delta_cm'],
+      amountCols.map(c => c.id),
+      deltaCols.map(c => c.id),
       { isRowOpen: checkOpen },
     )
-    const headers = [
-      'EURk',
-      lbl?.dec_py2 ?? 'Dec-3',
-      lbl?.fy_py ?? 'Dec-2',
-      lbl?.fy ?? 'Dec-1',
-      'CAGR',
-      lbl ? `Δ ${lbl.fy_py} − ${lbl.fy}` : 'Δ FY',
-      lbl?.cm_py ?? 'CM PY',
-      lbl?.cm ?? 'CM',
-      lbl ? `Δ ${lbl.cm_py} − ${lbl.cm}` : 'Δ CM',
-    ]
-    const columnKinds = ['', '', '', '', 'cagr', 'delta', '', 'cm', 'delta']
+    const headers = ['EURk', ...columns.map(c => c.labelLine2 ? `${c.labelLine1} ${c.labelLine2}` : c.labelLine1)]
+    const columnKinds = ['', ...columns.map(c =>
+      c.kind === 'delta' ? 'delta' : c.highlighted ? 'cm' : c.kind === 'cagr' ? 'cagr' : '',
+    )]
     const base = `ER_${stmtName.replace(/ /g, '_')}_${todayStr()}`
     if (kind === 'pptx') {
       await exportFlatTablePptx({
@@ -378,6 +431,8 @@ export default function ErSnapshotTable({
     })
   }
 
+  // ─── Render guards ───────────────────────────────────────────────────────────
+
   if (error) return (
     <div className="rounded-xl p-8 text-center text-sm" style={{ background: '#FFF', border: '1px solid #FECACA', color: '#B91C1C' }}>{error}</div>
   )
@@ -389,21 +444,19 @@ export default function ErSnapshotTable({
   )
 
   const tableTitle = stmtCfg.cardTitle || (STATEMENT_TITLES[data.statement] ?? 'Statement')
-  const hdrDeltaFy = lbl ? `Δ ${lbl.fy_py} − ${lbl.fy}` : 'Δ'
-  const hdrDeltaCm = lbl ? `Δ ${lbl.cm_py} − ${lbl.cm}` : 'Δ'
   const periodBadge = lbl?.cm ?? ''
+
+  // ─── JSX ─────────────────────────────────────────────────────────────────────
 
   return (
     <div className="rounded-xl" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+      {/* Toolbar */}
       <div className="px-4 pt-4 pb-3 flex items-start justify-between gap-3" style={{ borderBottom: '1px solid #F1F5F9' }}>
         <div>
           <div className="flex items-center gap-2 mb-0.5">
             <span className="text-sm font-semibold" style={{ color: '#111827' }}>{tableTitle}</span>
             {periodBadge && (
-              <span
-                className="text-xs font-medium px-2 py-0.5 rounded-md"
-                style={{ background: 'rgba(30,58,95,0.08)', color: '#1E3A5F', border: '1px solid rgba(30,58,95,0.15)' }}
-              >
+              <span className="text-xs font-medium px-2 py-0.5 rounded-md" style={{ background: 'rgba(30,58,95,0.08)', color: '#1E3A5F', border: '1px solid rgba(30,58,95,0.15)' }}>
                 {periodBadge}
               </span>
             )}
@@ -414,6 +467,17 @@ export default function ErSnapshotTable({
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <PlViewToggleButton mode={viewMode} onChange={setViewMode} disabled={loading} />
+          {viewMode === 'table' && (
+            <button
+              type="button"
+              title="Build table columns"
+              onClick={() => setColumnEditorOpen(true)}
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+            >
+              <Pencil size={14} strokeWidth={1.75} />
+            </button>
+          )}
           {notesCtx && pinId && (
             <button
               type="button"
@@ -433,6 +497,7 @@ export default function ErSnapshotTable({
         </div>
       </div>
 
+      {/* Content */}
       {viewMode === 'report' ? (
         <ErSnapshotReportView
           data={data}
@@ -454,19 +519,150 @@ export default function ErSnapshotTable({
             <thead>
               <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
                 <th className="px-3 py-2 text-left font-semibold text-[13px]" style={{ color: '#475569' }}>EURk</th>
-                <TwoLineHeader line1={lbl?.dec_py2 ?? ''} line2="FY end" />
-                <TwoLineHeader line1={lbl?.fy_py ?? ''} line2="FY end" />
-                <TwoLineHeader line1={lbl?.fy ?? ''} line2="FY end" highlighted />
-                <TwoLineHeader line1="CAGR" line2={`${lbl?.dec_py2 ?? ''} – ${lbl?.fy ?? ''}`} />
-                <TwoLineHeader line1={hdrDeltaFy} line2="vs prior FY" />
-                <TwoLineHeader line1={lbl?.cm_py ?? ''} line2="Prior year CM" />
-                <TwoLineHeader line1={lbl?.cm ?? ''} line2="Current period" highlighted />
-                <TwoLineHeader line1={hdrDeltaCm} line2="vs prior CM" />
+                {columns.map(c => (
+                  <TwoLineHeader
+                    key={c.id}
+                    line1={c.labelLine1}
+                    line2={c.labelLine2}
+                    highlighted={c.highlighted}
+                  />
+                ))}
               </tr>
             </thead>
             <tbody>{walkRows(data.rows, 0)}</tbody>
           </table>
         </div>
+      )}
+
+      {/* Column editor drawer */}
+      {columnEditorOpen && viewMode === 'table' && (
+        <>
+          <div className="fixed inset-0 z-40 bg-slate-900/20" onClick={() => setColumnEditorOpen(false)} aria-hidden />
+          <div
+            className="fixed inset-y-0 right-0 z-50 w-full max-w-md shadow-2xl flex flex-col"
+            style={{ background: '#fff', borderLeft: '1px solid #E2E8F0' }}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 shrink-0">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Table builder</p>
+                <p className="text-[0.65rem] text-slate-500 mt-0.5">Add and reorder columns for Table View</p>
+              </div>
+              <button type="button" onClick={() => setColumnEditorOpen(false)} className="p-1 rounded hover:bg-slate-100" aria-label="Close">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {/* Column order list */}
+              <section>
+                <p className="text-xs font-semibold text-slate-700 mb-2">Column order ({columns.length})</p>
+                {columns.length === 0 ? (
+                  <p className="text-xs text-slate-500">No columns selected.</p>
+                ) : (
+                  <ul className="space-y-1">
+                    {columns.map((c, idx) => (
+                      <li
+                        key={c.id}
+                        draggable
+                        onDragStart={() => setDragIdx(idx)}
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={() => {
+                          if (dragIdx == null || dragIdx === idx) return
+                          const next = [...columnIds]
+                          const [item] = next.splice(dragIdx, 1)
+                          next.splice(idx, 0, item)
+                          setDragIdx(null)
+                          persist(next)
+                        }}
+                        onDragEnd={() => setDragIdx(null)}
+                        className={`flex items-center gap-1 rounded-lg border px-2 py-1.5 bg-white ${dragIdx === idx ? 'border-[#1E3A5F] ring-1 ring-[#1E3A5F]/20' : 'border-slate-200'}`}
+                      >
+                        <GripVertical size={14} className="shrink-0 text-slate-400 cursor-grab" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium text-slate-800 truncate">{c.labelLine1}</p>
+                          {c.labelLine2 && <p className="text-[0.65rem] text-slate-500 truncate">{c.labelLine2}</p>}
+                        </div>
+                        <div className="flex shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (idx === 0) return
+                              const next = [...columnIds]
+                              const [item] = next.splice(idx, 1)
+                              next.splice(idx - 1, 0, item)
+                              persist(next)
+                            }}
+                            disabled={idx === 0}
+                            className="p-1 text-slate-500 disabled:opacity-30"
+                            aria-label="Move up"
+                          >
+                            <ChevronUp size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (idx === columns.length - 1) return
+                              const next = [...columnIds]
+                              const [item] = next.splice(idx, 1)
+                              next.splice(idx + 1, 0, item)
+                              persist(next)
+                            }}
+                            disabled={idx === columns.length - 1}
+                            className="p-1 text-slate-500 disabled:opacity-30"
+                            aria-label="Move down"
+                          >
+                            <ChevronDown size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => persist(columnIds.filter(id => id !== c.id))}
+                            className="p-1 text-slate-500 hover:text-rose-600"
+                            aria-label="Remove"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              {/* Palette groups */}
+              {SNAPSHOT_PALETTE_GROUPS.map(group => {
+                const groupCols = group.ids.map(id => catalog[id]).filter(Boolean)
+                if (!groupCols.length) return null
+                return (
+                  <EditorSection key={group.title} title={group.title}>
+                    <div className="flex flex-wrap gap-1.5">
+                      {groupCols.map(c => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          disabled={columnIds.includes(c.id)}
+                          onClick={() => persist([...columnIds, c.id])}
+                          className="px-2 py-1.5 rounded-md text-[0.7rem] text-left disabled:opacity-40 hover:bg-slate-50"
+                          style={{ border: '1px solid #E2E8F0', color: '#475569' }}
+                        >
+                          {c.labelLine1}
+                        </button>
+                      ))}
+                    </div>
+                  </EditorSection>
+                )
+              })}
+
+              {/* Reset */}
+              <button
+                type="button"
+                onClick={() => persist(DEFAULT_SNAPSHOT_COLUMN_IDS)}
+                className="text-xs font-medium w-full py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50"
+              >
+                Reset to default layout
+              </button>
+            </div>
+          </div>
+        </>
       )}
     </div>
   )
