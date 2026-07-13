@@ -1677,7 +1677,9 @@ def build_pl_consolidation(
                 "id": f"pl-{rc}", "label": r["balance_title"],
                 "row_kind": "kpi", "is_bold": bool(r.get("is_bold", False)),
                 "entity_amounts": entity_kpi,
-                "aggregated": 0.0, "ic_eliminations": 0.0,
+                # Aggregated ratio == consolidated ratio (no intercompany
+                # eliminations), so the Aggregated column shows the KPI too.
+                "aggregated": consl_kpi, "ic_eliminations": 0.0,
                 "consolidation": consl_kpi,
                 "has_children": False, "children": [],
             })

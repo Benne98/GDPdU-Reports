@@ -319,22 +319,32 @@ export default function PlConsolidationTableView({
               if (isKpi && sub.col) {
                 return <td key={sub.key} />
               }
-              if (allIcZero && sub.target.kind === 'ic' && !isKpi) {
-                return (
-                  <td
-                    key={sub.key}
-                    className={FIN_TABLE_CELL_CLASS}
-                    style={{
-                      backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)',
-                    }}
-                  />
-                )
+              // IC Elim. column: KPI rows always stay empty; when there are no
+              // eliminations at all, leave the whole column blank (no diagonal
+              // hatch); otherwise show the elimination amount.
+              if (sub.target.kind === 'ic') {
+                if (isKpi || allIcZero) {
+                  return <td key={sub.key} className={FIN_TABLE_CELL_CLASS} />
+                }
+                const icv = cellValue(row, sub)
+                if (icv == null || icv === 0) {
+                  return (
+                    <td key={sub.key} className="px-1.5 py-1 text-right text-xs text-slate-300">
+                      —
+                    </td>
+                  )
+                }
+                return <NumCell key={sub.key} value={icv} muted />
               }
               const v = cellValue(row, sub)
               if (isKpi && !sub.col) {
                 if (v == null || v === 0) {
                   return (
-                    <td key={sub.key} className="px-1.5 py-1 text-right text-xs text-slate-300">
+                    <td
+                      key={sub.key}
+                      className="px-1.5 py-1 text-right text-xs text-slate-300"
+                      style={{ background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined }}
+                    >
                       —
                     </td>
                   )
@@ -437,7 +447,6 @@ export default function PlConsolidationTableView({
                       style={{
                         color: '#64748B',
                         background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
-                        backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                       }}
                     >
                       {sub.label}
@@ -460,7 +469,6 @@ export default function PlConsolidationTableView({
                     style={{
                       color: g.muted ? '#94A3B8' : '#1E3A5F',
                       background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
-                      backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                     }}
                   >
                     <div>{g.title}</div>
