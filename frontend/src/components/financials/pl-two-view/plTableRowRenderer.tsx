@@ -121,6 +121,8 @@ function renderDynamicColumns(
 ): ReactNode {
   const inv = row.invert_delta
   const isKpi = row.row_kind === 'kpi'
+  // WC KPI rows (DSO/DIO/DPO/CCC) are in DAYS, not %. All other statement KPIs stay %.
+  const isWcKpi = isKpi && ctx.data.statement === 'wc'
   return (
     <>
       {ctx.columns.map(col => {
@@ -188,7 +190,8 @@ function renderDynamicColumns(
               value={v}
               maxAbs={maxAbs}
               invert={isKpi ? false : inv}
-              isPct={isKpi}
+              isPct={isKpi && !isWcKpi}
+              isDays={isWcKpi}
               compact={ctx.compact}
               exportLayout={ctx.exportMode}
             />
@@ -198,7 +201,8 @@ function renderDynamicColumns(
           <ValCell
             key={col.id}
             value={v}
-            isPct={isKpi || isCoverage}
+            isPct={(isKpi && !isWcKpi) || isCoverage}
+            isDays={isWcKpi && !isCoverage}
             italic={isKpi}
             highlighted={highlighted}
             compact={ctx.compact}
@@ -325,6 +329,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
     const isOpen = ctx.checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0 || (row.accounts?.length ?? 0) > 0
     const isKpi = row.row_kind === 'kpi'
+    const isWcKpi = isKpi && ctx.data.statement === 'wc'
     const isAccount = row.row_kind === 'account'
 
     nodes.push(
@@ -363,18 +368,31 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
           useDynamic
             ? renderDynamicColumns(ctx, row, maxima)
             : isKpi
-              ? (
-                <>
-                  <ValCell value={row.amounts.py_cm} isPct italic compact={ctx.compact} />
-                  <ValCell value={row.amounts.pm} isPct italic compact={ctx.compact} />
-                  <ValCell value={row.amounts.cm} isPct highlighted italic compact={ctx.compact} />
-                  <DeltaCell value={row.deltas.mom} maxAbs={maxKpiMom} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
-                  <DeltaCell value={row.deltas.yoy} maxAbs={maxKpiYoy} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
-                  <ValCell value={row.amounts.ytd} isPct highlighted italic compact={ctx.compact} />
-                  <ValCell value={row.amounts.ytd_py} isPct italic compact={ctx.compact} />
-                  <DeltaCell value={row.deltas.ytd} maxAbs={maxKpiYtd} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
-                </>
-              )
+              ? isWcKpi
+                ? (
+                  <>
+                    <ValCell value={row.amounts.py_cm} isDays italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.pm} isDays italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.cm} isDays highlighted italic compact={ctx.compact} />
+                    <DeltaCell value={row.deltas.mom} maxAbs={maxKpiMom} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                    <DeltaCell value={row.deltas.yoy} maxAbs={maxKpiYoy} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                    <ValCell value={row.amounts.ytd} isDays highlighted italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd_py} isDays italic compact={ctx.compact} />
+                    <DeltaCell value={row.deltas.ytd} maxAbs={maxKpiYtd} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                  </>
+                )
+                : (
+                  <>
+                    <ValCell value={row.amounts.py_cm} isPct italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.pm} isPct italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.cm} isPct highlighted italic compact={ctx.compact} />
+                    <DeltaCell value={row.deltas.mom} maxAbs={maxKpiMom} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                    <DeltaCell value={row.deltas.yoy} maxAbs={maxKpiYoy} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                    <ValCell value={row.amounts.ytd} isPct highlighted italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd_py} isPct italic compact={ctx.compact} />
+                    <DeltaCell value={row.deltas.ytd} maxAbs={maxKpiYtd} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
+                  </>
+                )
               : renderLegacyColumns(ctx, row, lbl, maxMom, maxYoy, maxYtd)
         )}
       </tr>,

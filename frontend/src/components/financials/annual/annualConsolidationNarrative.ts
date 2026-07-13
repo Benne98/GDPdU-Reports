@@ -19,8 +19,6 @@ import {
 const SKIP_ROW_KINDS = new Set(['title', 'kpi', 'kpi_header', 'account', 'detail'])
 const AGGREGATE_LABELS = /^(total output|gross profit|ebitda|ebit|ebt|net profit)/i
 const BS_AGGREGATE_LABELS = /^(total assets|total equity|total liabilities|equity & liabilities|net working capital)/i
-const CF_AGGREGATE_LABELS =
-  /^(cash flow from operating|free cash flow|net cash flow|cash flow from investing|cash flow from financing)/i
 const TOP_N = 5
 const MATERIAL_EUR = 500
 
@@ -195,7 +193,6 @@ function collectCandidateRows(rows: ConsolidationRow[], statement: Consolidation
       }
       if (AGGREGATE_LABELS.test(r.label.trim())) continue
       if (statement === 'bs' && BS_AGGREGATE_LABELS.test(r.label.trim())) continue
-      if (statement === 'cf' && CF_AGGREGATE_LABELS.test(r.label.trim())) continue
       if (Math.abs(r.consolidation) > 1e-3) out.push(r)
       walk(r.children ?? [])
     }
