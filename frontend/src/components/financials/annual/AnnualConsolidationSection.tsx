@@ -4,12 +4,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Pin } from 'lucide-react'
 import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
-import type { ConsolidationResponse, ErFlowResponse, FinancialStatementRow } from '../../../lib/api'
+import type { ConsolidationResponse, ErFlowResponse, FinancialStatementResponse, FinancialStatementRow } from '../../../lib/api'
 import { api } from '../../../lib/api'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlExportMenu, { type PlExportKind } from '../pl-two-view/PlExportMenu'
+import PlConsolidationColumnEditor from '../pl-two-view/PlConsolidationColumnEditor'
 import PlConsolidationTableView from '../pl-two-view/PlConsolidationTableView'
 import { exportConsolidationTableXlsx, exportConsolidationTablePptx } from '../pl-two-view/plConsolidationExport'
+import {
+  loadConsolidationColumns,
+  type PlConsolidationColumnDef,
+} from '../pl-two-view/plConsolidationColumnRegistry'
 import { formatConsolidationPeriodLabel, labelActual } from '../../../lib/periodColumnLabels'
 import { monthLabelShort } from '../../../lib/periodSelection'
 import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesContext'
@@ -77,6 +82,13 @@ export default function AnnualConsolidationSection({
   const [entityIndex, setEntityIndex] = useState(0)
   const [entityStmt, setEntityStmt] = useState<ErFlowResponse | null>(null)
   const [entityLoading, setEntityLoading] = useState(false)
+  const [extraColumns, setExtraColumns] = useState<PlConsolidationColumnDef[]>(
+    () => loadConsolidationColumns('pl-annual'),
+  )
+  const [stmtCache, setStmtCache] = useState<Map<string, FinancialStatementResponse>>(
+    () => new Map(),
+  )
+  const [groupStatement, setGroupStatement] = useState<FinancialStatementResponse | null>(null)
   const checkOpenRef = useRef<((id: string) => boolean) | null>(null)
   const notesCtx = useOptionalActionNotesContext()
 
@@ -129,6 +141,42 @@ export default function AnnualConsolidationSection({
     }
   }, [viewMode, selected?.code, year, month])
 
+  // Reset the annual-statement cache when the period changes.
+  useEffect(() => {
+    setStmtCache(new Map())
+    setGroupStatement(null)
+  }, [year, month])
+
+  // Fetch the annual group statement for aggregated/consolidation extra columns.
+  useEffect(() => {
+    if (viewMode !== 'table') return
+    let cancelled = false
+    void api.financialsPlStatementPeriod({ period_grain: 'year', year, month })
+      .then(res => { if (!cancelled) setGroupStatement(res) })
+      .catch(() => { if (!cancelled) setGroupStatement(null) })
+    return () => { cancelled = true }
+  }, [viewMode, year, month])
+
+  // Fetch annual FinancialStatementResponse for each entity referenced in extraColumns.
+  useEffect(() => {
+    if (!consol?.entities.length || !extraColumns.length) return
+    const needed = new Set<string>()
+    for (const c of extraColumns) {
+      if (c.entityCode) needed.add(c.entityCode)
+    }
+    for (const code of needed) {
+      if (!stmtCache.has(code)) {
+        void api.financialsPlStatementPeriod({ period_grain: 'year', year, month, entity: code })
+          .then(res => setStmtCache(prev => new Map(prev).set(code, res)))
+          .catch(() => { /* silently ignore — cell resolver will show "—" */ })
+      }
+    }
+  // stmtCache intentionally excluded from deps: stale closure is fine as a
+  // has() guard; including it would cause the effect to re-trigger on every
+  // resolved fetch (matches PlConsolidationSection's pattern).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consol, extraColumns, year, month])
+
   const annualCfReportColumns = useMemo(
     () => buildAnnualFlowReportColumns(entityStmt?.col_labels, year, month, entityStmt?.has_plan_data ?? false),
     [entityStmt?.col_labels, year, month, entityStmt?.has_plan_data],
@@ -148,6 +196,11 @@ export default function AnnualConsolidationSection({
       selected?.code,
     )
   }, [entityStmt, year, month, fy3BaseLabel, fy2BaseLabel, selected?.code])
+
+  // col_labels for the annual grain — needed by PlConsolidationColumnEditor catalog builder.
+  const colLabels =
+    groupStatement?.col_labels ??
+    (stmtCache.size > 0 ? [...stmtCache.values()][0]?.col_labels : undefined)
 
   const handleViewChange = (m: AnnualConsolViewMode) => {
     setViewMode(m)
@@ -169,12 +222,12 @@ export default function AnnualConsolidationSection({
         return
       }
       if (kind === 'xlsx') {
-        await exportConsolidationTableXlsx(consol, [], new Map(), null, {}, null, checkOpen)
+        await exportConsolidationTableXlsx(consol, extraColumns, stmtCache, groupStatement, {}, null, checkOpen)
       } else if (kind === 'pptx') {
-        await exportConsolidationTablePptx(consol, [], new Map(), null, null, footerRight, checkOpen)
+        await exportConsolidationTablePptx(consol, extraColumns, stmtCache, groupStatement, null, footerRight, checkOpen)
       }
     },
-    [consol, ytdLabel],
+    [consol, ytdLabel, extraColumns, stmtCache, groupStatement],
   )
 
   useEffect(() => {
@@ -263,6 +316,17 @@ export default function AnnualConsolidationSection({
         )}
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <AnnualConsolidationViewToggle mode={viewMode} onChange={handleViewChange} disabled={loading} />
+          {viewMode === 'table' && (
+            <PlConsolidationColumnEditor
+              consol={consol}
+              colLabels={colLabels}
+              monthly={null}
+              columns={extraColumns}
+              onChange={setExtraColumns}
+              carouselEntityCode={selected?.code}
+              statement="pl-annual"
+            />
+          )}
           {notesCtx && consol && (
             <button
               type="button"
@@ -290,9 +354,9 @@ export default function AnnualConsolidationSection({
             year={year}
             month={month}
             periodColumnLabel={ytdLabel}
-            extraColumns={[]}
-            statementByEntity={new Map()}
-            groupStatement={null}
+            extraColumns={extraColumns}
+            statementByEntity={stmtCache}
+            groupStatement={groupStatement}
             monthly={null}
             onDrill={onDrill}
             onRegisterCheckOpen={handleRegisterCheckOpen}
