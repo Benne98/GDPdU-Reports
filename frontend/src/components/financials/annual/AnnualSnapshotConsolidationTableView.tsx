@@ -306,7 +306,9 @@ export default function AnnualSnapshotConsolidationTableView({
           style={{
             borderBottom: isKpi ? 'none' : '1px solid #E2E8F0',
             borderTop: row.row_kind === 'subtotal' && depth === 0 ? '2px solid #E2E8F0' : undefined,
-            background: isKpi ? '#F8FAFC' : undefined,
+            // Grey only the grand totals (depth-0 subtotals, e.g. Assets / Equity &
+            // liabilities); nested subtotals stay bold-only.
+            background: isKpi || (row.row_kind === 'subtotal' && depth === 0) ? '#F8FAFC' : undefined,
           }}
         >
           <td className="py-1 text-left whitespace-nowrap" style={{ minWidth: 200, paddingLeft: pad, paddingRight: 12 }}>
@@ -318,7 +320,7 @@ export default function AnnualSnapshotConsolidationTableView({
               ) : (
                 <span style={{ width: 22 }} />
               )}
-              <span className="text-xs" style={{ fontWeight: row.is_bold ? 600 : 500, color: isKpi ? '#64748B' : '#111827', fontStyle: isKpi ? 'italic' : undefined }}>
+              <span className="text-xs" style={{ fontWeight: row.is_bold || row.row_kind === 'subtotal' ? 600 : 500, color: isKpi ? '#64748B' : '#111827', fontStyle: isKpi ? 'italic' : undefined }}>
                 {row.label}
               </span>
             </div>
