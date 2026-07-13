@@ -19,6 +19,6 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
  * has identical column proportions regardless of how many plan/OPlan columns
  * are present. Extra horizontal space is absorbed by the label column.
  */
-export const REPORT_LABEL_COL_MIN_PX = 260  // "EURk"/position column width → sets the "#" column x-position across all aligned tables (matches the group report's previous label width)
+export const REPORT_LABEL_COL_MIN_PX = 276  // "EURk"/position column width → sets the "#" column x-position across all aligned tables (matches the group report's previous label width)
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
 export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)
