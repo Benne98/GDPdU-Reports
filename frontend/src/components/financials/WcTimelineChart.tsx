@@ -4,11 +4,15 @@ import {
   ResponsiveContainer, Legend, ReferenceLine,
 } from 'recharts'
 import { motion } from 'framer-motion'
+import { Pin } from 'lucide-react'
 import { api, WcTimelineResponse, WcTimelinePoint } from '../../lib/api'
 import { FinancialsDrillOpen } from './FinancialStatementTable'
 import { fmtKpi } from '../../lib/fmt'
 import { PAGE_CHART_ATTR } from '../../hooks/usePageChartKeyboardNav'
 import { useChartLoadReporter } from '../../hooks/useChartLoadReporter'
+import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
+import { captureChartByTarget } from '../../lib/actionNotes/chartCapture'
+import { STATEMENT_TOOLBAR_ICON_BTN, STATEMENT_TOOLBAR_BTN_STYLE } from './statement-two-view/statementToolbarButton'
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 type Grain = 'month' | 'week' | 'day'
@@ -167,6 +171,8 @@ interface WcTimelineChartProps {
   onDrill: (d: FinancialsDrillOpen) => void
 }
 
+const WC_TIMELINE_CHART_ID = 'wc-timeline-chart'
+
 export default function WcTimelineChart({ year, month, entity, onDrill }: WcTimelineChartProps) {
   const [grain, setGrain]     = useState<Grain>('month')
   const [res,   setRes]       = useState<WcTimelineResponse | null>(null)
@@ -174,6 +180,21 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
   const [error, setError]     = useState<string | null>(null)
   // Incremented to trigger a manual retry without changing other deps
   const [retryCount, setRetryCount] = useState(0)
+  const notesCtx = useOptionalActionNotesContext()
+
+  // ─── Chart pin registration ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!notesCtx) return
+    notesCtx.registerChartCandidate({
+      id: WC_TIMELINE_CHART_ID,
+      label: 'Working Capital — timeline',
+      description: 'Working capital timeline chart',
+      capture: () => captureChartByTarget(WC_TIMELINE_CHART_ID),
+      viewState: { grain },
+    })
+    return () => notesCtx.unregisterChartCandidate(WC_TIMELINE_CHART_ID)
+  }, [notesCtx, grain])
+
   useEffect(() => {
     setLoading(true)
     setError(null)
@@ -262,6 +283,8 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
   return (
     <motion.div
       {...{ [PAGE_CHART_ATTR]: '' }}
+      id={WC_TIMELINE_CHART_ID}
+      data-expert-chart-target={WC_TIMELINE_CHART_ID}
       tabIndex={-1}
       initial={{ opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
@@ -296,6 +319,26 @@ export default function WcTimelineChart({ year, month, entity, onDrill }: WcTime
               </button>
             ))}
           </div>
+
+          {/* Pin */}
+          {notesCtx && (
+            <>
+              <div className="w-px h-4" style={{ background: '#E2E8F0' }} />
+              <button
+                type="button"
+                title="Pin chart to Action Notes"
+                className={STATEMENT_TOOLBAR_ICON_BTN}
+                style={STATEMENT_TOOLBAR_BTN_STYLE}
+                onClick={async () => {
+                  const snap = await notesCtx.pinChartById(WC_TIMELINE_CHART_ID)
+                  if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin chart in panel')
+                  else notesCtx.setToast('No chart data to pin')
+                }}
+              >
+                <Pin size={14} strokeWidth={1.75} />
+              </button>
+            </>
+          )}
         </div>
       </div>
       {/* Chart */}

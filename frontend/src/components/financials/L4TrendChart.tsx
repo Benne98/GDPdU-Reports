@@ -4,6 +4,7 @@ import {
   ResponsiveContainer, LabelList,
 } from 'recharts'
 import { motion } from 'framer-motion'
+import { Pin } from 'lucide-react'
 import {
   api, FinancialStatementResponse, FinancialStatementRow,
   L4TrendPoint,
@@ -14,6 +15,7 @@ import { PAGE_CHART_ATTR } from '../../hooks/usePageChartKeyboardNav'
 import { useChartLoadReporter } from '../../hooks/useChartLoadReporter'
 import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
 import { captureChartByTarget } from '../../lib/actionNotes/chartCapture'
+import { STATEMENT_TOOLBAR_ICON_BTN, STATEMENT_TOOLBAR_BTN_STYLE } from './statement-two-view/statementToolbarButton'
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Grain = 'year' | 'quarter' | 'month'
@@ -298,6 +300,26 @@ export default function L4TrendChart({
               </button>
             ))}
           </div>
+
+          {/* Pin */}
+          {notesCtx && (
+            <>
+              <div className="w-px h-4" style={{ background: '#E2E8F0' }} />
+              <button
+                type="button"
+                title="Pin chart to Action Notes"
+                className={STATEMENT_TOOLBAR_ICON_BTN}
+                style={STATEMENT_TOOLBAR_BTN_STYLE}
+                onClick={async () => {
+                  const snap = await notesCtx.pinChartById(chartTargetId)
+                  if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin chart in panel')
+                  else notesCtx.setToast('No chart data to pin')
+                }}
+              >
+                <Pin size={14} strokeWidth={1.75} />
+              </button>
+            </>
+          )}
         </div>
       </div>
       {/* Chart */}

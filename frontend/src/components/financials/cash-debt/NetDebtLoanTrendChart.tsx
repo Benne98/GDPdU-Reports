@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import {
   Bar,
   BarChart,
@@ -7,10 +8,16 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { Pin } from 'lucide-react'
 import type { CashDebtPositionBookingsResponse } from '../../../lib/api'
 import { fmtChartKpi } from '../../../lib/fmt'
 import { FA_NAVY } from '../fixed-assets/fixedAssetsTableTheme'
 import { aggregateBookingsMonthly, topMonthShare } from './netDebtBookingSeries'
+import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesContext'
+import { captureChartByTarget } from '../../../lib/actionNotes/chartCapture'
+import { STATEMENT_TOOLBAR_ICON_BTN, STATEMENT_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
+
+const CHART_ID = 'net-debt-loan-trend-chart'
 
 type Props = {
   data: CashDebtPositionBookingsResponse | null
@@ -21,6 +28,20 @@ type Props = {
 }
 
 export default function NetDebtLoanTrendChart({ data, loading, loanLabel, compact }: Props) {
+  // Hooks must be unconditional — before any early returns
+  const notesCtx = useOptionalActionNotesContext()
+
+  useEffect(() => {
+    if (!notesCtx || !data) return
+    notesCtx.registerChartCandidate({
+      id: CHART_ID,
+      label: `Net Debt — ${loanLabel ?? data.account_name}`,
+      description: 'Monthly loan payment seasonality',
+      capture: () => captureChartByTarget(CHART_ID),
+    })
+    return () => notesCtx.unregisterChartCandidate(CHART_ID)
+  }, [notesCtx, data, loanLabel])
+
   if (loading) {
     return <p className="text-sm text-slate-500 py-2">Loading payment history…</p>
   }
@@ -38,7 +59,7 @@ export default function NetDebtLoanTrendChart({ data, loading, loanLabel, compac
 
   if (points.length === 0) {
     return (
-      <div>
+      <div id={CHART_ID} data-expert-chart-target={CHART_ID}>
         {!compact && <h4 className="text-sm font-semibold mb-1" style={{ color: FA_NAVY }}>{title}</h4>}
         <p className="text-xs text-slate-500">No postings in {data.from_date} → {data.to_date}.</p>
       </div>
@@ -52,20 +73,51 @@ export default function NetDebtLoanTrendChart({ data, loading, loanLabel, compac
         ? 'Moderate monthly clustering — several months drive most of the volume.'
         : 'Payments are spread relatively evenly across months.'
 
+  const handlePin = async () => {
+    if (!notesCtx) return
+    const snap = await notesCtx.pinChartById(CHART_ID)
+    if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin chart in panel')
+    else notesCtx.setToast('No chart data to pin')
+  }
+
   return (
-    <div>
+    <div id={CHART_ID} data-expert-chart-target={CHART_ID}>
       {!compact && (
         <>
-          <h4 className="text-sm font-semibold mb-0.5" style={{ color: FA_NAVY }}>{title}</h4>
+          <div className="flex items-center justify-between mb-0.5">
+            <h4 className="text-sm font-semibold" style={{ color: FA_NAVY }}>{title}</h4>
+            {notesCtx && (
+              <button
+                type="button"
+                title="Pin chart to Action Notes"
+                className={STATEMENT_TOOLBAR_ICON_BTN}
+                style={STATEMENT_TOOLBAR_BTN_STYLE}
+                onClick={handlePin}
+              >
+                <Pin size={14} strokeWidth={1.75} />
+              </button>
+            )}
+          </div>
           <p className="text-xs text-slate-500 mb-3">
             Monthly payment volume · kEUR · {data.from_date} → {data.to_date}
           </p>
         </>
       )}
       {compact && (
-        <p className="text-xs text-slate-500 mb-2">
-          kEUR · {data.from_date} → {data.to_date}
-        </p>
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs text-slate-500">kEUR · {data.from_date} → {data.to_date}</p>
+          {notesCtx && (
+            <button
+              type="button"
+              title="Pin chart to Action Notes"
+              className={STATEMENT_TOOLBAR_ICON_BTN}
+              style={STATEMENT_TOOLBAR_BTN_STYLE}
+              onClick={handlePin}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
+        </div>
       )}
       <div className="h-52 w-full">
         <ResponsiveContainer width="100%" height="100%">
