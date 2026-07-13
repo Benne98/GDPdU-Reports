@@ -320,11 +320,22 @@ export default function PlConsolidationTableView({
                 return <td key={sub.key} />
               }
               // IC Elim. column: KPI rows always stay empty; when there are no
-              // eliminations at all, leave the whole column blank (no diagonal
-              // hatch); otherwise show the elimination amount.
+              // eliminations at all (every row = 0) the data rows get a diagonal
+              // hatch instead of a column of zeros; otherwise show the amount.
               if (sub.target.kind === 'ic') {
-                if (isKpi || allIcZero) {
+                if (isKpi) {
                   return <td key={sub.key} className={FIN_TABLE_CELL_CLASS} />
+                }
+                if (allIcZero) {
+                  return (
+                    <td
+                      key={sub.key}
+                      className={FIN_TABLE_CELL_CLASS}
+                      style={{
+                        backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)',
+                      }}
+                    />
+                  )
                 }
                 const icv = cellValue(row, sub)
                 if (icv == null || icv === 0) {
@@ -447,6 +458,7 @@ export default function PlConsolidationTableView({
                       style={{
                         color: '#64748B',
                         background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
+                        backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                       }}
                     >
                       {sub.label}
@@ -469,6 +481,7 @@ export default function PlConsolidationTableView({
                     style={{
                       color: g.muted ? '#94A3B8' : '#1E3A5F',
                       background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
+                      backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                     }}
                   >
                     <div>{g.title}</div>
