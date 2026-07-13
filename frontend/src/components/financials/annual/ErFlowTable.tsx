@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Pencil, X } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { ChevronDown, ChevronRight, ChevronUp, GripVertical, Pencil, X } from 'lucide-react'
 import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesContext'
 import { captureErFlowSnapshot } from '../../action-notes/captureExitReadiness'
 import { ErFlowResponse, ErStatementRow, ErFlowColLabels } from '../../../lib/api'
@@ -26,6 +26,7 @@ import {
   resolveAnnualForecastColumnLabel,
 } from '../../../lib/periodColumnLabels'
 import { buildAnnualFlowReportColumns } from './annualFlowReportColumns'
+import { STATEMENT_TOOLBAR_ICON_BTN, STATEMENT_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
 import { shouldDisplayErStatementRow } from './annualRowVisibility'
 import { IS_OVERVIEW_V2 } from '../../../lib/overviewV2Mode'
 
@@ -135,6 +136,34 @@ function resolveCoveragePct(amounts: Record<string, number> | null | undefined):
 
 // DeltaBar, DeltaCell, ValCell imported from plTableCore above
 
+// ─── Annual editor helper ─────────────────────────────────────────────────────
+
+function AnnualEditorSection({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="border border-slate-200 rounded-lg overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-50 hover:bg-slate-100"
+      >
+        {title}
+        <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && <div className="p-3 space-y-2">{children}</div>}
+    </div>
+  )
+}
+
+const ANNUAL_COLUMN_GROUPS: Array<{ title: string; ids: string[] }> = [
+  { title: 'Historical FY & CAGR', ids: ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy'] },
+  { title: 'Year to date', ids: ['ytd_py', 'ytd', 'delta_ytd'] },
+  { title: 'Last twelve months', ids: ['ltm_py', 'ltm', 'delta_ltm'] },
+  { title: 'Forecast & plan', ids: ['fy_f', 'plan_cm', 'coverage_pct'] },
+]
+
+// ─── Main component ───────────────────────────────────────────────────────────
+
 export default function ErFlowTable({
   data, loading, error, year, month, entity, periodSelection, entityDisplayName, onDrill, pinId, pinLabel,
 }: ErFlowTableProps) {
@@ -149,17 +178,15 @@ export default function ErFlowTable({
   const [viewMode, setViewMode] = useState<ErViewMode>(() => loadStatementViewMode(statementKey) as ErViewMode)
   const [tableColIds, setTableColIds] = useState<string[]>([])
   const [columnEditorOpen, setColumnEditorOpen] = useState(false)
+  const [dragIdx, setDragIdx] = useState<number | null>(null)
   const notesCtx = useOptionalActionNotesContext()
   const defaultTableColIds = useMemo(
     () => {
-      const ids =
-        statementKey === 'cf'
-          ? ['fy2', 'fy3', 'cagr', 'ytd', 'forecast', 'coverage_pct']
-          : ['fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm']
+      const ids = ['fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm']
       return hasPlanData ? ids : ids.filter(id => !PLAN_ONLY_COL_IDS.includes(id))
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [statementKey, hasPlanData],
+    [hasPlanData],
   )
 
   useEffect(() => {
@@ -234,14 +261,11 @@ export default function ErFlowTable({
   }}, [lbl?.fy1, lbl?.fy2, lbl?.fy3, lbl?.ltm, lbl?.ltm_py, lbl?.fy_f, lbl?.ytd, lbl?.ytd_py, lbl?.plan_cm, year, fy2BaseLabel, fy3BaseLabel, ytdBaseLabel, ytdPyBaseLabel, month, currentYearTag])
 
   const availableTableColumns = useMemo(() => {
-    const ids =
-      statementKey === 'cf'
-        ? ['fy2', 'fy3', 'cagr', 'ytd', 'forecast', 'coverage_pct']
-        : ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm', 'plan_cm', 'coverage_pct']
+    const ids = ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm', 'plan_cm', 'coverage_pct']
     const gated = hasPlanData ? ids : ids.filter(id => !PLAN_ONLY_COL_IDS.includes(id))
     return gated.map(id => catalog[id]).filter(Boolean)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalog, statementKey, hasPlanData])
+  }, [catalog, hasPlanData])
   const tableColumns = useMemo(() => {
     const allowed = new Set(availableTableColumns.map(c => c.id))
     return tableColIds.filter(id => allowed.has(id)).map(id => catalog[id]).filter(Boolean)
@@ -496,7 +520,7 @@ export default function ErFlowTable({
   }
 
   return (
-    <div className="rounded-xl overflow-x-auto" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+    <div className="rounded-xl" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
       <div className="px-4 pt-4 pb-3 flex items-start justify-between gap-3" style={{ borderBottom: '1px solid #F1F5F9' }}>
         <div>
           <div className="flex items-center gap-2 mb-0.5">
@@ -519,12 +543,12 @@ export default function ErFlowTable({
           {effectiveViewMode === 'table' && (
             <button
               type="button"
+              title="Build table columns"
               onClick={() => setColumnEditorOpen(true)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium"
-              style={{ background: '#F4F6F9', border: '1px solid #E2E8F0', color: '#1E3A5F' }}
+              className={STATEMENT_TOOLBAR_ICON_BTN}
+              style={STATEMENT_TOOLBAR_BTN_STYLE}
             >
-              <Pencil size={12} />
-              Columns
+              <Pencil size={14} strokeWidth={1.75} />
             </button>
           )}
           <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
@@ -549,19 +573,21 @@ export default function ErFlowTable({
           fy3Label={fy3BaseLabel}
         />
       ) : (
-        <table className="w-full border-collapse text-[12px]">
-          <thead>
-            <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
-              <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
-              {tableColumns.map(c => (
-                <th key={c.id} className="px-2 py-2 text-right font-semibold whitespace-nowrap" style={{ color: c.highlighted ? '#1E3A5F' : '#475569' }}>
-                  {c.kind === 'delta' && c.labelLine2 ? <TwoLineHdr top={c.labelLine1} bottom={c.labelLine2} /> : c.labelLine1}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>{walkRows(data.rows, 0)}</tbody>
-        </table>
+        <div className="overflow-x-auto px-6 py-4">
+          <table className="w-full border-collapse text-[12px]">
+            <thead>
+              <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
+                <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
+                {tableColumns.map(c => (
+                  <th key={c.id} className="px-2 py-2 text-right font-semibold whitespace-nowrap" style={{ color: c.highlighted ? '#1E3A5F' : '#475569' }}>
+                    {c.kind === 'delta' && c.labelLine2 ? <TwoLineHdr top={c.labelLine1} bottom={c.labelLine2} /> : c.labelLine1}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>{walkRows(data.rows, 0)}</tbody>
+          </table>
+        </div>
       )}
 
       {columnEditorOpen && effectiveViewMode === 'table' && (
@@ -580,84 +606,114 @@ export default function ErFlowTable({
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
               <section>
                 <p className="text-xs font-semibold text-slate-700 mb-2">Column order ({tableColumns.length})</p>
-                <ul className="space-y-1">
-                  {tableColumns.map((c, idx) => (
-                    <li key={c.id} className="flex items-center gap-1 rounded-lg border px-2 py-1.5 bg-white border-slate-200">
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-medium text-slate-800 truncate">{c.labelLine1}</p>
-                        {c.labelLine2 && <p className="text-[0.65rem] text-slate-500 truncate">{c.labelLine2}</p>}
-                      </div>
-                      <div className="flex shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (idx === 0) return
-                            const next = [...tableColIds]
-                            const [item] = next.splice(idx, 1)
-                            next.splice(idx - 1, 0, item)
-                            setTableColIds(next)
-                            saveTableCols(statementKey, next)
-                          }}
-                          disabled={idx === 0}
-                          className="p-1 text-slate-500 disabled:opacity-30"
-                          aria-label="Move up"
-                        >
-                          <ChevronUp size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (idx === tableColumns.length - 1) return
-                            const next = [...tableColIds]
-                            const [item] = next.splice(idx, 1)
-                            next.splice(idx + 1, 0, item)
-                            setTableColIds(next)
-                            saveTableCols(statementKey, next)
-                          }}
-                          disabled={idx === tableColumns.length - 1}
-                          className="p-1 text-slate-500 disabled:opacity-30"
-                          aria-label="Move down"
-                        >
-                          <ChevronDown size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const next = tableColIds.filter(id => id !== c.id)
-                            setTableColIds(next)
-                            saveTableCols(statementKey, next)
-                          }}
-                          className="p-1 text-slate-500 hover:text-rose-600"
-                          aria-label="Remove"
-                        >
-                          <X size={14} />
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+                {tableColumns.length === 0 ? (
+                  <p className="text-xs text-slate-500">No columns selected.</p>
+                ) : (
+                  <ul className="space-y-1">
+                    {tableColumns.map((c, idx) => (
+                      <li
+                        key={c.id}
+                        draggable
+                        onDragStart={() => setDragIdx(idx)}
+                        onDragOver={e => e.preventDefault()}
+                        onDrop={() => {
+                          if (dragIdx == null || dragIdx === idx) return
+                          const next = [...tableColIds]
+                          const [item] = next.splice(dragIdx, 1)
+                          next.splice(idx, 0, item)
+                          setDragIdx(null)
+                          setTableColIds(next)
+                          saveTableCols(statementKey, next)
+                        }}
+                        onDragEnd={() => setDragIdx(null)}
+                        className={`flex items-center gap-1 rounded-lg border px-2 py-1.5 bg-white ${dragIdx === idx ? 'border-[#1E3A5F] ring-1 ring-[#1E3A5F]/20' : 'border-slate-200'}`}
+                      >
+                        <GripVertical size={14} className="shrink-0 text-slate-400 cursor-grab" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium text-slate-800 truncate">{c.labelLine1}</p>
+                          {c.labelLine2 && <p className="text-[0.65rem] text-slate-500 truncate">{c.labelLine2}</p>}
+                        </div>
+                        <div className="flex shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (idx === 0) return
+                              const next = [...tableColIds]
+                              const [item] = next.splice(idx, 1)
+                              next.splice(idx - 1, 0, item)
+                              setTableColIds(next)
+                              saveTableCols(statementKey, next)
+                            }}
+                            disabled={idx === 0}
+                            className="p-1 text-slate-500 disabled:opacity-30"
+                            aria-label="Move up"
+                          >
+                            <ChevronUp size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (idx === tableColumns.length - 1) return
+                              const next = [...tableColIds]
+                              const [item] = next.splice(idx, 1)
+                              next.splice(idx + 1, 0, item)
+                              setTableColIds(next)
+                              saveTableCols(statementKey, next)
+                            }}
+                            disabled={idx === tableColumns.length - 1}
+                            className="p-1 text-slate-500 disabled:opacity-30"
+                            aria-label="Move down"
+                          >
+                            <ChevronDown size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = tableColIds.filter(id => id !== c.id)
+                              setTableColIds(next)
+                              saveTableCols(statementKey, next)
+                            }}
+                            className="p-1 text-slate-500 hover:text-rose-600"
+                            aria-label="Remove"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </section>
-              <section>
-                <p className="text-xs font-semibold text-slate-700 mb-2">Add columns</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {availableTableColumns.map(c => (
-                    <button
-                      key={c.id}
-                      type="button"
-                      disabled={tableColIds.includes(c.id)}
-                      onClick={() => {
-                        const next = [...tableColIds, c.id]
-                        setTableColIds(next)
-                        saveTableCols(statementKey, next)
-                      }}
-                      className="px-2 py-1.5 rounded-md text-[0.7rem] text-left disabled:opacity-40 hover:bg-slate-50"
-                      style={{ border: '1px solid #E2E8F0', color: '#475569' }}
-                    >
-                      {c.labelLine1}
-                    </button>
-                  ))}
-                </div>
-              </section>
+
+              {ANNUAL_COLUMN_GROUPS.map(group => {
+                const groupCols = group.ids
+                  .map(id => availableTableColumns.find(c => c.id === id))
+                  .filter((c): c is ErColDef => Boolean(c))
+                if (groupCols.length === 0) return null
+                return (
+                  <AnnualEditorSection key={group.title} title={group.title}>
+                    <div className="flex flex-wrap gap-1.5">
+                      {groupCols.map(c => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          disabled={tableColIds.includes(c.id)}
+                          onClick={() => {
+                            const next = [...tableColIds, c.id]
+                            setTableColIds(next)
+                            saveTableCols(statementKey, next)
+                          }}
+                          className="px-2 py-1.5 rounded-md text-[0.7rem] text-left disabled:opacity-40 hover:bg-slate-50"
+                          style={{ border: '1px solid #E2E8F0', color: '#475569' }}
+                        >
+                          {c.labelLine1}
+                        </button>
+                      ))}
+                    </div>
+                  </AnnualEditorSection>
+                )
+              })}
+
               <button
                 type="button"
                 onClick={() => {

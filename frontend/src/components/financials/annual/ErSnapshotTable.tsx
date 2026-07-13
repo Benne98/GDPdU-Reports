@@ -420,7 +420,7 @@ export default function ErSnapshotTable({
   const periodBadge = lbl?.cm ?? ''
 
   return (
-    <div className="rounded-xl overflow-x-auto" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+    <div className="rounded-xl" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
       <div className="px-4 pt-4 pb-3 flex items-start justify-between gap-3" style={{ borderBottom: '1px solid #F1F5F9' }}>
         <div>
           <div className="flex items-center gap-2 mb-0.5">
@@ -475,21 +475,23 @@ export default function ErSnapshotTable({
           useClientNarrativeFallback={false}
         />
       ) : (
-      <table className="w-full border-collapse text-xs">
-        <thead>
-          <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
-            <th className="px-3 py-2.5 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.dec_py2}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy_py}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaFy}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.cm_py}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#1E3A5F' }}>{lbl?.cm}</th>
-            <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaCm}</th>
-          </tr>
-        </thead>
-        <tbody>{walkRows(data.rows, 0)}</tbody>
-      </table>
+        <div className="overflow-x-auto px-6 py-4">
+          <table className="w-full border-collapse text-xs">
+            <thead>
+              <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
+                <th className="px-3 py-2.5 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.dec_py2}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy_py}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.fy}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaFy}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{lbl?.cm_py}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#1E3A5F' }}>{lbl?.cm}</th>
+                <th className="px-2.5 py-2.5 text-right font-semibold whitespace-nowrap" style={{ color: '#475569' }}>{hdrDeltaCm}</th>
+              </tr>
+            </thead>
+            <tbody>{walkRows(data.rows, 0)}</tbody>
+          </table>
+        </div>
       )}
     </div>
   )
