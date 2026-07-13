@@ -52,6 +52,7 @@ export function AnnualRowLabel({
   onToggle,
   isKpi,
   isAccount,
+  bold,
 }: {
   row: ErStatementRow
   showChevron: boolean
@@ -59,6 +60,8 @@ export function AnnualRowLabel({
   onToggle: () => void
   isKpi: boolean
   isAccount?: boolean
+  /** Override: force bold (e.g. for the three margin KPI rows). */
+  bold?: boolean
 }) {
   return (
     <div className="flex items-center gap-0.5">
@@ -70,7 +73,7 @@ export function AnnualRowLabel({
       <span
         className="text-xs"
         style={{
-          fontWeight: row.row_kind === 'subtotal' || row.is_bold ? 600 : 400,
+          fontWeight: row.row_kind === 'subtotal' || row.is_bold || bold ? 600 : 400,
           fontStyle: isKpi ? 'italic' : undefined,
           color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
         }}

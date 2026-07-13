@@ -2,7 +2,6 @@ import type { ErSnapshotResponse, ErStatementRow } from '../../../lib/api'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import { DeltaCell, ValCell } from '../pl-two-view/plTableCore'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
-import { REPORT_MARKER_COL_PX, REPORT_PERIOD_COL_PX } from '../statement-two-view/finReportLayout'
 import {
   AnnualRowLabel,
   annualChildRows,
@@ -11,6 +10,9 @@ import {
 } from './annualMiniTableCore'
 
 import type { AnnualSnapshotColDef, AnnualSnapshotReportColId } from './annualSnapshotReportColumns'
+
+/** Gross margin %, EBITDA margin %, Net profit margin % — bold label + values. */
+const BOLD_MARGIN_KPI_CODES = new Set(['GROSS_MARGIN_PCT', 'EBITDA_MARGIN_PCT', 'NET_PROFIT_MARGIN_PCT'])
 
 type SnapCol = AnnualSnapshotReportColId
 
@@ -98,6 +100,7 @@ export default function ErSnapshotMiniTable({
     const isKpi = row.row_kind === 'kpi'
     const isSubtotal = row.row_kind === 'subtotal'
     const isAccount = row.row_kind === 'account'
+    const isMarginKpiBold = isKpi && BOLD_MARGIN_KPI_CODES.has(row.line_code)
     const isOpen = checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0 || (row.accounts?.length ?? 0) > 0
     const am = row.amounts ?? {}
@@ -163,6 +166,7 @@ export default function ErSnapshotMiniTable({
             onToggle={() => toggle(row.id)}
             isKpi={isKpi}
             isAccount={isAccount}
+            bold={isMarginKpiBold}
           />
         </td>
         {renderAnnualCommentCell(marker, hasCommentCol)}
@@ -178,6 +182,7 @@ export default function ErSnapshotMiniTable({
                     value={val}
                     isDays
                     italic
+                    bold={isMarginKpiBold}
                     highlighted={col.highlighted}
                     compact
                   />
@@ -189,6 +194,7 @@ export default function ErSnapshotMiniTable({
                   value={val}
                   isPct
                   italic
+                  bold={isMarginKpiBold}
                   highlighted={col.highlighted}
                   compact
                 />
@@ -209,9 +215,9 @@ export default function ErSnapshotMiniTable({
           const val = col.id === 'fy_f' ? NaN : get(col.id)
           if (isKpi) {
             if (isWc) {
-              return <ValCell key={`${row.id}-${col.id}`} value={val} isDays italic highlighted={col.highlighted} compact />
+              return <ValCell key={`${row.id}-${col.id}`} value={val} isDays italic bold={isMarginKpiBold} highlighted={col.highlighted} compact />
             }
-            return <ValCell key={`${row.id}-${col.id}`} value={val} isPct italic highlighted={col.highlighted} compact />
+            return <ValCell key={`${row.id}-${col.id}`} value={val} isPct italic bold={isMarginKpiBold} highlighted={col.highlighted} compact />
           }
           return (
             <ValCell
@@ -255,15 +261,8 @@ export default function ErSnapshotMiniTable({
   }
 
   return (
-    <div className="min-w-0 w-full overflow-x-auto">
-      <table className="w-full border-collapse text-xs table-fixed">
-        <colgroup>
-          <col />{/* label: auto → absorbs all remaining horizontal space */}
-          {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
-          {columns.map((_c, i) => (
-            <col key={i} style={{ width: REPORT_PERIOD_COL_PX }} />
-          ))}
-        </colgroup>
+    <div className="min-w-0 w-full">
+      <table className="w-full border-collapse text-xs">
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
             <th className="px-2 py-2 text-left font-semibold text-xs" style={{ color: '#475569' }}>EURk</th>

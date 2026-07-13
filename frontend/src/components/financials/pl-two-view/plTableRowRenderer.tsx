@@ -18,7 +18,9 @@ import { KPI_TABLE_COLUMN_KINDS, resolveCellValue } from './plColumnRegistry'
 import type { MonthlyResponse } from '../../../lib/api'
 import PlCommentIndexBadge from './PlCommentIndexBadge'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
-import { REPORT_LABEL_COL_MIN_PX } from '../statement-two-view/finReportLayout'
+
+/** Gross margin %, EBITDA margin %, Net profit margin % — bold label + values. */
+const BOLD_MARGIN_KPI_CODES = new Set(['GROSS_MARGIN_PCT', 'EBITDA_MARGIN_PCT', 'NET_PROFIT_MARGIN_PCT'])
 
 /** Expandable children/accounts: largest CM first (PL); BS/WC keep backend order. */
 function sortRowsByCmDesc(rows: FinancialStatementRow[]): FinancialStatementRow[] {
@@ -123,6 +125,7 @@ function renderDynamicColumns(
   const isKpi = row.row_kind === 'kpi'
   // WC KPI rows (DSO/DIO/DPO/CCC) are in DAYS, not %. All other statement KPIs stay %.
   const isWcKpi = isKpi && ctx.data.statement === 'wc'
+  const isMarginKpiBold = isKpi && BOLD_MARGIN_KPI_CODES.has(row.line_code)
   return (
     <>
       {ctx.columns.map(col => {
@@ -207,7 +210,7 @@ function renderDynamicColumns(
             highlighted={highlighted}
             compact={ctx.compact}
             muted={!isKpi && col.kind === 'ytg' && Math.abs(v) < 1e-6}
-            bold={isSubtotalRow(row)}
+            bold={isSubtotalRow(row) || isMarginKpiBold}
             onClick={
               !isKpi && row.drill && (col.kind === 'py_cm' || col.kind === 'pm' || col.kind === 'cm' || col.kind === 'ytd' || col.kind === 'ytd_py')
                 ? () => openDrill(ctx, row, col.kind as ValueCol, ctx.data.col_labels[col.kind as keyof typeof ctx.data.col_labels] ?? col.labelLine1)
@@ -331,6 +334,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
     const isKpi = row.row_kind === 'kpi'
     const isWcKpi = isKpi && ctx.data.statement === 'wc'
     const isAccount = row.row_kind === 'account'
+    const isMarginKpiBold = isKpi && BOLD_MARGIN_KPI_CODES.has(row.line_code)
 
     nodes.push(
       <tr
@@ -344,7 +348,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
         <td
           className={`${ctx.compact ? 'py-1' : 'py-2'} text-left`}
           style={{
-            minWidth: ctx.exportMode ? 140 : REPORT_LABEL_COL_MIN_PX,
+            minWidth: ctx.exportMode ? 140 : 180,
             maxWidth: ctx.exportMode ? 280 : undefined,
             paddingLeft: pad,
             paddingRight: 12,
@@ -361,6 +365,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
             isKpi={isKpi}
             isAccount={isAccount}
             exportMode={ctx.exportMode}
+            bold={isMarginKpiBold}
           />
         </td>
         {renderCommentIndexCell(ctx, row)}
@@ -371,25 +376,25 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
               ? isWcKpi
                 ? (
                   <>
-                    <ValCell value={row.amounts.py_cm} isDays italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.pm} isDays italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.cm} isDays highlighted italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.py_cm} isDays italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.pm} isDays italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.cm} isDays highlighted italic bold={isMarginKpiBold} compact={ctx.compact} />
                     <DeltaCell value={row.deltas.mom} maxAbs={maxKpiMom} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
                     <DeltaCell value={row.deltas.yoy} maxAbs={maxKpiYoy} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
-                    <ValCell value={row.amounts.ytd} isDays highlighted italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.ytd_py} isDays italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd} isDays highlighted italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd_py} isDays italic bold={isMarginKpiBold} compact={ctx.compact} />
                     <DeltaCell value={row.deltas.ytd} maxAbs={maxKpiYtd} invert={false} isDays italic compact={ctx.compact} exportLayout={ctx.exportMode} />
                   </>
                 )
                 : (
                   <>
-                    <ValCell value={row.amounts.py_cm} isPct italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.pm} isPct italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.cm} isPct highlighted italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.py_cm} isPct italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.pm} isPct italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.cm} isPct highlighted italic bold={isMarginKpiBold} compact={ctx.compact} />
                     <DeltaCell value={row.deltas.mom} maxAbs={maxKpiMom} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
                     <DeltaCell value={row.deltas.yoy} maxAbs={maxKpiYoy} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
-                    <ValCell value={row.amounts.ytd} isPct highlighted italic compact={ctx.compact} />
-                    <ValCell value={row.amounts.ytd_py} isPct italic compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd} isPct highlighted italic bold={isMarginKpiBold} compact={ctx.compact} />
+                    <ValCell value={row.amounts.ytd_py} isPct italic bold={isMarginKpiBold} compact={ctx.compact} />
                     <DeltaCell value={row.deltas.ytd} maxAbs={maxKpiYtd} invert={false} isPct italic compact={ctx.compact} exportLayout={ctx.exportMode} />
                   </>
                 )
@@ -421,6 +426,7 @@ function PlRowLabel({
   isKpi,
   isAccount,
   exportMode,
+  bold,
 }: {
   row: FinancialStatementRow
   showChevron: boolean
@@ -429,6 +435,8 @@ function PlRowLabel({
   isKpi: boolean
   isAccount?: boolean
   exportMode?: boolean
+  /** Override: force bold (e.g. for the three margin KPI rows). */
+  bold?: boolean
 }) {
   return (
     <div className="flex items-center gap-0.5">
@@ -436,7 +444,7 @@ function PlRowLabel({
       <span
         className="text-xs"
         style={{
-          fontWeight: row.row_kind === 'subtotal' ? 600 : 400,
+          fontWeight: row.row_kind === 'subtotal' || bold ? 600 : 400,
           fontStyle: isKpi ? 'italic' : undefined,
           color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
         }}

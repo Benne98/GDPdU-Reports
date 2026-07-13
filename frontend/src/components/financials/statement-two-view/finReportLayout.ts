@@ -21,4 +21,4 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
  */
 export const REPORT_LABEL_COL_MIN_PX = 180  // label/position column floor (absorbs extra space)
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
-export const REPORT_PERIOD_COL_PX = 88       // each period/value column (year, month, week)
+export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)

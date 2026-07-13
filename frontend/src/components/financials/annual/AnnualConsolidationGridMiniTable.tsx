@@ -18,6 +18,9 @@ function valueColPct(entityCount: number, hasCommentCol: boolean): number {
   return remaining / valueColCount
 }
 
+/** The three margin KPI rows that must render bold (label + value cells). */
+const BOLD_MARGIN_KPI_LABELS = new Set(['Gross margin %', 'EBITDA margin %', 'Net profit margin %'])
+
 type Props = {
   consol: ConsolidationResponse
   year: number
@@ -97,7 +100,7 @@ export default function AnnualConsolidationGridMiniTable({
     const isKpiHeader = row.row_kind === 'kpi_header'
     const isKpi = row.row_kind === 'kpi'
     const isSubtotal = row.row_kind === 'subtotal'
-    const isBold = row.is_bold || isSubtotal
+    const isBold = row.is_bold || isSubtotal || (isKpi && BOLD_MARGIN_KPI_LABELS.has(row.label))
     const marker = commentMarkersByLineCode?.[row.id]
     const pad = 8 + depth * 12
     const showChevron = (row.children?.length ?? 0) > 0
