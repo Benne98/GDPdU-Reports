@@ -669,10 +669,12 @@ def build_cf_consolidation(
     line_entity = _compute_cf_section_values(struct_cf, mapping_entity, entity_codes)
 
     def _consl_row(rid: str, label: str, row_kind: str, is_bold: bool,
-                   am: dict[str, float]) -> dict:
+                   am: dict[str, float], line_code: str | None = None) -> dict:
         agg = sum(am.get(ec, 0.0) for ec in entity_codes)
         return {
-            "id": rid, "label": label, "row_kind": row_kind, "is_bold": is_bold,
+            # line_code is required so _nest_cf_detail_rows can match cluster parents
+            # + detail leaves (and so the group narrative can anchor bullets to rows).
+            "id": rid, "line_code": line_code, "label": label, "row_kind": row_kind, "is_bold": is_bold,
             "entity_amounts": {ec: round(am.get(ec, 0.0), 2) for ec in entity_codes},
             "aggregated": round(agg, 2),
             "ic_eliminations": 0.0,
@@ -687,11 +689,17 @@ def build_cf_consolidation(
         if rt == "title":
             rows_out.append(_consl_row(f"cf-{rc}", r["balance_title"], "title",
                                        bool(r.get("is_bold", False)),
-                                       {ec: 0.0 for ec in entity_codes}))
+                                       {ec: 0.0 for ec in entity_codes}, rc))
             continue
         am = line_entity.get(rc, {ec: 0.0 for ec in entity_codes})
         rows_out.append(_consl_row(f"cf-{rc}", r["balance_title"], _row_kind_for_cf(rt),
-                                   bool(r.get("is_bold", False)), am))
+                                   bool(r.get("is_bold", False)), am, rc))
+
+    # Nest detail leaves under their cluster subtotals (TWC / OWC / Other operating)
+    # so the group report shows expand chevrons + indentation, mirroring the
+    # single-entity CF statement; drop blank spacer rows for parity.
+    rows_out = _nest_cf_detail_rows(rows_out, struct_cf)
+    rows_out = _filter_cf_rows(rows_out)
 
     col_label = (
         labels.get("ytd", period_label(yr, mo))
