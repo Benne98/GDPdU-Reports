@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import type { FinancialStatementResponse } from '../../../../lib/api'
 import type { FinancialsDrillOpen } from '../../FinancialStatementTable'
 import { TwoLineHeader } from '../../pl-two-view/plTableCore'
-import { buildDefaultColumns } from '../../pl-two-view/plColumnRegistry'
+import { buildDefaultColumns, PLAN_ONLY_COL_KINDS } from '../../pl-two-view/plColumnRegistry'
 import { buildPlanMapFromStatement } from '../../pl-two-view/plPlanMap'
 import { renderPlTableRows, type PlTableRenderCtx } from '../../pl-two-view/plTableRowRenderer'
 import { usePlRowExpansion } from '../../pl-two-view/usePlRowExpansion'
@@ -25,6 +25,7 @@ type Props = {
   data: FinancialStatementResponse
   year: number
   month: number
+  hasPlanData?: boolean
   onDrill: (d: FinancialsDrillOpen) => void
   commentMarkersByLineCode?: ReportCommentMarkerMap
   checkOpen?: (id: string) => boolean
@@ -35,6 +36,7 @@ export default function CfMiniTable({
   data,
   year,
   month,
+  hasPlanData = false,
   onDrill,
   commentMarkersByLineCode,
   checkOpen: checkOpenProp,
@@ -52,8 +54,11 @@ export default function CfMiniTable({
   const columns = useMemo(() => {
     const kinds = grain === 'week' ? MINI_KINDS_WEEK : MINI_KINDS_MONTH
     const all = buildDefaultColumns(lbl, grain, data.statement)
-    return all.filter(c => (kinds as readonly string[]).includes(c.kind))
-  }, [lbl, grain, data.statement])
+    return all.filter(c =>
+      (kinds as readonly string[]).includes(c.kind) &&
+      (hasPlanData || !PLAN_ONLY_COL_KINDS.has(c.kind))
+    )
+  }, [lbl, grain, data.statement, hasPlanData])
 
   const hasCommentCol = Boolean(commentMarkersByLineCode)
 

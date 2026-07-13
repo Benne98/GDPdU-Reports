@@ -342,6 +342,7 @@ export default function WcStatementSection({
             entity={entity}
             periodSelection={periodSelection}
             entityDisplayName={entityLabel === 'all' ? undefined : groupLabel}
+            hasPlanData={hasPlanData}
             onDrill={onDrill}
             onBulletSelect={setDetailBullet}
             onNarrativeLoaded={setNarrative}

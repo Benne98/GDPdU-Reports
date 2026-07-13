@@ -64,6 +64,7 @@ type ReportViewProps = {
   periodSelection?: PeriodSelection
   entity?: string
   entityDisplayName?: string
+  hasPlanData?: boolean
   onDrill: (d: FinancialsDrillOpen) => void
   onBulletSelect: (b: PlNarrativeBullet) => void
   onNarrativeLoaded?: (narrative: PlNarrativeResponse | null) => void
@@ -369,14 +370,16 @@ export default function StatementConsolidationSection({
     return buildDefaultColumns(entityStmt.col_labels, grain, entityStmt.statement)
   }, [entityStmt])
 
+  const entityHasPlanData = entityStmt?.plan?.has_plan_data ?? false
+
   const miniColumns = useMemo(() => {
     const grain = entityStmt?.period_grain === 'week' ? 'week' : 'month'
     const kinds =
       grain === 'week'
-        ? ['pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual']
-        : ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual']
+        ? (entityHasPlanData ? ['pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual'] : ['pm', 'cm', 'mom', 'mtd'])
+        : (entityHasPlanData ? ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'] : ['pm', 'cm', 'mom'])
     return entityTableColumns.filter(c => kinds.includes(c.kind))
-  }, [entityTableColumns, entityStmt?.period_grain])
+  }, [entityTableColumns, entityStmt?.period_grain, entityHasPlanData])
 
   const exportBullets = useStatementExportBullets(entityStmt, narrative, null)
 
@@ -640,6 +643,7 @@ export default function StatementConsolidationSection({
               periodSelection={periodSelection}
               entity={selected?.code}
               entityDisplayName={selected?.label}
+              hasPlanData={entityHasPlanData}
               onDrill={d => onDrill({ ...d, entityOverride: selected?.code })}
               onBulletSelect={setDetailBullet}
               onNarrativeLoaded={setNarrative}

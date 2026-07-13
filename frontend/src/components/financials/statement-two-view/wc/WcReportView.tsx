@@ -26,6 +26,7 @@ type Props = {
   entity?: string
   periodSelection?: PeriodSelection
   entityDisplayName?: string
+  hasPlanData?: boolean
   onDrill: (d: FinancialsDrillOpen) => void
   onBulletSelect: (b: WcNarrativeBullet) => void
   onNarrativeLoaded?: (narrative: PlNarrativeResponse | null) => void
@@ -40,6 +41,7 @@ export default function WcReportView({
   entity,
   periodSelection,
   entityDisplayName,
+  hasPlanData = false,
   onDrill,
   onBulletSelect,
   onNarrativeLoaded,
@@ -127,6 +129,7 @@ export default function WcReportView({
             data={data}
             year={year}
             month={month}
+            hasPlanData={hasPlanData}
             onDrill={onDrill}
             commentMarkersByLineCode={commentMarkersByLineCode}
             checkOpen={checkOpen}
