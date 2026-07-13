@@ -19,7 +19,8 @@ import PlExportMenu, { type PlExportKind } from './PlExportMenu'
 import PlReportView from './PlReportView'
 import PlSectionHeading from './PlSectionHeading'
 import { buildConsolidatedTableHeading } from './plReportSectionHeadings'
-import PlViewToggleButton, { type PlViewMode } from './PlViewToggleButton'
+import AnnualConsolidationGridMiniTable from '../annual/AnnualConsolidationGridMiniTable'
+import PlConsolViewToggle, { type PlConsolViewMode } from './PlConsolViewToggle'
 import {
   loadConsolidationColumns,
   type PlConsolidationColumnDef,
@@ -43,12 +44,16 @@ import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesCon
 import { captureConsolidationSnapshot } from '../../action-notes/captureConsolidationTable'
 import { useChartLoadReporter } from '../../../hooks/useChartLoadReporter'
 
-const VIEW_KEY = 'finssentials.pl.consolidation.viewMode.v1'
+const VIEW_KEY = 'finssentials.pl.consolidation.viewMode.v2'
 const ENTITY_IDX_KEY = 'finssentials.pl.consolidation.entityIndex.v1'
 
-function loadViewMode(): PlViewMode {
+const VALID_VIEW_MODES = new Set<PlConsolViewMode>(['report', 'table', 'group'])
+
+function loadViewMode(): PlConsolViewMode {
   try {
-    return localStorage.getItem(VIEW_KEY) === 'table' ? 'table' : 'report'
+    const v = localStorage.getItem(VIEW_KEY) as PlConsolViewMode | null
+    if (v && VALID_VIEW_MODES.has(v)) return v
+    return 'report'
   } catch {
     return 'report'
   }
@@ -100,7 +105,7 @@ export default function PlConsolidationSection({
     () => (periodSelection ? periodCacheKey(periodSelection) : `m-${year}-${month}`),
     [periodSelection, year, month],
   )
-  const [viewMode, setViewMode] = useState<PlViewMode>(loadViewMode)
+  const [viewMode, setViewMode] = useState<PlConsolViewMode>(loadViewMode)
   const [entityIndex, setEntityIndex] = useState(0)
   const [entityStmt, setEntityStmt] = useState<FinancialStatementResponse | null>(null)
   const [entityLoading, setEntityLoading] = useState(false)
@@ -176,7 +181,7 @@ export default function PlConsolidationSection({
   }, [selected?.code, periodParams, planAnchor.year, planAnchor.month])
 
   useEffect(() => {
-    if (viewMode !== 'table') return
+    if (viewMode !== 'table' && viewMode !== 'group') return
     let cancelled = false
     void (async () => {
       try {
@@ -276,21 +281,26 @@ export default function PlConsolidationSection({
   const handleExport = useCallback(
     async (kind: PlExportKind) => {
       if (!consol) return
-      if (kind === 'pdf' && entityStmt && viewMode === 'report') {
-        const entityCheckOpen = buildExportCheckOpen(entityStmt.rows, entityStmt.statement)
-        const markers = buildReportCommentMarkerMap(exportBullets, entityStmt.rows, entityCheckOpen)
-        await exportPlReportViewPdf(
-          entityStmt,
-          year,
-          month,
-          miniColumns,
-          planMap,
-          exportBullets,
-          exportCtx,
-          narrative,
-          markers,
-          entityCheckOpen,
-        )
+      if (kind === 'pdf') {
+        if (viewMode === 'report' && entityStmt) {
+          const entityCheckOpen = buildExportCheckOpen(entityStmt.rows, entityStmt.statement)
+          const markers = buildReportCommentMarkerMap(exportBullets, entityStmt.rows, entityCheckOpen)
+          await exportPlReportViewPdf(
+            entityStmt,
+            year,
+            month,
+            miniColumns,
+            planMap,
+            exportBullets,
+            exportCtx,
+            narrative,
+            markers,
+            entityCheckOpen,
+          )
+          return
+        }
+        // 'table' and 'group' modes: no dedicated PDF exporter; fall back to browser print.
+        window.print()
         return
       }
       if (kind === 'pptx') {
@@ -299,7 +309,7 @@ export default function PlConsolidationSection({
           : groupStatement
             ? buildExportFooterLine(groupStatement, exportCtx)
             : `${exportCtx.entityDisplayName} · ${consol.col_label ?? ''}A`
-        if (viewMode === 'table') {
+        if (viewMode === 'table' || viewMode === 'group') {
           await exportConsolidationTablePptx(
             consol,
             extraColumns,
@@ -328,7 +338,7 @@ export default function PlConsolidationSection({
         return
       }
       if (kind === 'xlsx') {
-        if (viewMode === 'table') {
+        if (viewMode === 'table' || viewMode === 'group') {
           await exportConsolidationTableXlsx(
             consol,
             extraColumns,
@@ -429,7 +439,9 @@ export default function PlConsolidationSection({
             <p className="text-xs" style={{ color: '#94A3B8' }}>
               {viewMode === 'report'
                 ? 'Per-entity narrative and summary table'
-                : 'All entities, IC eliminations, and consolidation — add columns per entity'}
+                : viewMode === 'group'
+                  ? 'Entity columns with group consolidation'
+                  : 'All entities, IC eliminations, and consolidation — add columns per entity'}
             </p>
           </div>
           {viewMode === 'report' && entities.length > 0 && (
@@ -442,7 +454,7 @@ export default function PlConsolidationSection({
             />
           )}
           <div className="flex flex-wrap items-center gap-2 shrink-0">
-            <PlViewToggleButton mode={viewMode} onChange={setViewMode} disabled={loading} />
+            <PlConsolViewToggle mode={viewMode} onChange={setViewMode} disabled={loading} />
             {viewMode === 'table' && (
               <PlConsolidationColumnEditor
                 consol={consol}
@@ -493,6 +505,16 @@ export default function PlConsolidationSection({
           ) : (
             <div className="p-8 text-center text-sm text-slate-500">No data for this entity.</div>
           )
+        ) : viewMode === 'group' ? (
+          <div className="px-4 pt-4 pb-4">
+            <PlSectionHeading>Consolidated Income Statement</PlSectionHeading>
+            <AnnualConsolidationGridMiniTable
+              consol={consol}
+              year={year}
+              month={month}
+              onDrill={onDrill}
+            />
+          </div>
         ) : (
           <div className="px-4 pt-4 pb-2">
             <PlSectionHeading>{tableViewHeading}</PlSectionHeading>
