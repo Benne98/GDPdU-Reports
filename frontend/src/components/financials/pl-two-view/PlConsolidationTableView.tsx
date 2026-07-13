@@ -203,6 +203,21 @@ export default function PlConsolidationTableView({
     return new Set(collectIds(data.rows, 0))
   }, [data])
 
+  /** True when every non-KPI row has ic_eliminations === 0 — hatch the IC column instead of showing zeros. */
+  const allIcZero = useMemo(() => {
+    if (!data.rows.length) return false
+    function walk(rows: ConsolidationRow[]): boolean {
+      for (const row of rows) {
+        if (row.row_kind !== 'kpi' && row.row_kind !== 'kpi_header') {
+          if (Number(row.ic_eliminations ?? 0) !== 0) return false
+        }
+        if (row.children?.length && !walk(row.children)) return false
+      }
+      return true
+    }
+    return walk(data.rows)
+  }, [data.rows])
+
   function checkOpen(id: string): boolean {
     return autoExpandedIds.has(id) !== userToggles.has(id)
   }
@@ -298,6 +313,17 @@ export default function PlConsolidationTableView({
             g.subCols.map(sub => {
               if (isKpi && sub.col) {
                 return <td key={sub.key} />
+              }
+              if (allIcZero && sub.target.kind === 'ic' && !isKpi) {
+                return (
+                  <td
+                    key={sub.key}
+                    className={FIN_TABLE_CELL_CLASS}
+                    style={{
+                      backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)',
+                    }}
+                  />
+                )
               }
               const v = cellValue(row, sub)
               if (isKpi && !sub.col) {
@@ -405,6 +431,7 @@ export default function PlConsolidationTableView({
                       style={{
                         color: '#64748B',
                         background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
+                        backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                       }}
                     >
                       {sub.label}
@@ -427,6 +454,7 @@ export default function PlConsolidationTableView({
                     style={{
                       color: g.muted ? '#94A3B8' : '#1E3A5F',
                       background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined,
+                      backgroundImage: g.key === '__ic__' && allIcZero ? 'repeating-linear-gradient(45deg, transparent, transparent 4px, #E2E8F0 4px, #E2E8F0 5px)' : undefined,
                     }}
                   >
                     <div>{g.title}</div>

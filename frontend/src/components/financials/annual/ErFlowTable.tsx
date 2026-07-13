@@ -7,7 +7,7 @@ import { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlExportMenu, { type PlExportKind } from '../pl-two-view/PlExportMenu'
 import { exportFlatTablePptx } from '../../../lib/finssentialsExport/exportFlatTablePptx'
 import { exportToXlsx, flattenTree, todayStr } from '../../../lib/exportXlsx'
-import { DeltaCell, ValCell } from '../pl-two-view/plTableCore'
+import { DeltaCell, TwoLineHeader, ValCell } from '../pl-two-view/plTableCore'
 import { buildAnnualFlowNarrativeResponse } from './erAnnualNarrative'
 import PlViewToggleButton, { type PlViewMode } from '../pl-two-view/PlViewToggleButton'
 import { getStatementConfig } from '../statement-two-view/statementConfig'
@@ -162,6 +162,9 @@ const ANNUAL_COLUMN_GROUPS: Array<{ title: string; ids: string[] }> = [
   { title: 'Forecast & plan', ids: ['fy_f', 'plan_cm', 'coverage_pct'] },
 ]
 
+/** Gross margin %, EBITDA margin %, Net profit margin % — bold label + values in KPI rows. */
+const BOLD_MARGIN_KPI_CODES = new Set(['GROSS_MARGIN_PCT', 'EBITDA_MARGIN_PCT', 'NET_PROFIT_MARGIN_PCT'])
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export default function ErFlowTable({
@@ -182,7 +185,7 @@ export default function ErFlowTable({
   const notesCtx = useOptionalActionNotesContext()
   const defaultTableColIds = useMemo(
     () => {
-      const ids = ['fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm']
+      const ids = ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm']
       return hasPlanData ? ids : ids.filter(id => !PLAN_ONLY_COL_IDS.includes(id))
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -234,6 +237,7 @@ export default function ErFlowTable({
 
   const fy3BaseLabel = lbl?.fy3 ?? labelActual(`FY${String(year - 1).slice(-2)}`)
   const fy2BaseLabel = lbl?.fy2 ?? labelActual(`FY${String(year - 2).slice(-2)}`)
+  const fy1BaseLabel = lbl?.fy1 ?? labelActual(`FY${String(year - 3).slice(-2)}`)
   const ytdBaseLabel = lbl?.ytd ?? labelActual(`YTD${monthShort(month)}${currentYearTag}`)
   const ytdPyBaseLabel = lbl?.ytd_py ?? labelActual(`YTD${monthShort(month)}${String(year - 1).slice(-2)}`)
 
@@ -245,7 +249,7 @@ export default function ErFlowTable({
     fy1: { id: 'fy1', kind: 'amount', amountKey: 'fy1', flowCol: 'fy1', labelLine1: lbl?.fy1 ?? labelActual(`FY${String(year - 3).slice(-2)}`), labelLine2: 'Full fiscal year' },
     fy2: { id: 'fy2', kind: 'amount', amountKey: 'fy2', flowCol: 'fy2', labelLine1: fy2BaseLabel, labelLine2: 'Full fiscal year' },
     fy3: { id: 'fy3', kind: 'amount', amountKey: 'fy3', flowCol: 'fy3', labelLine1: fy3BaseLabel, labelLine2: 'Full fiscal year' },
-    cagr: { id: 'cagr', kind: 'amount', amountKey: 'cagr', flowCol: undefined, labelLine1: 'CAGR', labelLine2: `${fy3BaseLabel} – ${fy2BaseLabel}`, isPct: true },
+    cagr: { id: 'cagr', kind: 'amount', amountKey: 'cagr', flowCol: undefined, labelLine1: 'CAGR', labelLine2: `${fy1BaseLabel} – ${fy3BaseLabel}`, isPct: true },
     delta_fy: { id: 'delta_fy', kind: 'delta', deltaKey: 'delta_fy', flowCol: 'fy3', labelLine1: `Δ ${fy3BaseLabel} − ${fy2BaseLabel}`, labelLine2: 'vs prior FY' },
     ytd_py: { id: 'ytd_py', kind: 'amount', amountKey: 'ytd_py', flowCol: 'ytd_py', labelLine1: ytdPyBaseLabel, labelLine2: 'Prior-year YTD' },
     ytd: { id: 'ytd', kind: 'amount', amountKey: 'ytd', flowCol: 'ytd', labelLine1: ytdBaseLabel, labelLine2: 'Year to date', highlighted: true },
@@ -258,7 +262,7 @@ export default function ErFlowTable({
     forecast: { id: 'forecast', kind: 'amount', amountKey: 'fy_f', flowCol: undefined, labelLine1: forecastLabel, labelLine2: 'Forecast FY' },
     coverage_pct: { id: 'coverage_pct', kind: 'amount', amountKey: 'coverage_pct', labelLine1: 'Coverage', labelLine2: 'YTD vs forecast %', isPct: true },
     fy25_proxy: { id: 'fy25_proxy', kind: 'amount', amountKey: 'fy_f', flowCol: undefined, labelLine1: labelForecastFy(year), labelLine2: 'Forecast FY' },
-  }}, [lbl?.fy1, lbl?.fy2, lbl?.fy3, lbl?.ltm, lbl?.ltm_py, lbl?.fy_f, lbl?.ytd, lbl?.ytd_py, lbl?.plan_cm, year, fy2BaseLabel, fy3BaseLabel, ytdBaseLabel, ytdPyBaseLabel, month, currentYearTag])
+  }}, [lbl?.fy1, lbl?.fy2, lbl?.fy3, lbl?.ltm, lbl?.ltm_py, lbl?.fy_f, lbl?.ytd, lbl?.ytd_py, lbl?.plan_cm, year, fy1BaseLabel, fy2BaseLabel, fy3BaseLabel, ytdBaseLabel, ytdPyBaseLabel, month, currentYearTag])
 
   const availableTableColumns = useMemo(() => {
     const ids = ['fy1', 'fy2', 'fy3', 'cagr', 'delta_fy', 'ytd_py', 'ytd', 'delta_ytd', 'ltm_py', 'ltm', 'fy_f', 'delta_ltm', 'plan_cm', 'coverage_pct']
@@ -313,6 +317,7 @@ export default function ErFlowTable({
     const isKpi = row.row_kind === 'kpi'
     const isSubtotal = row.row_kind === 'subtotal'
     const isAccount = row.row_kind === 'account'
+    const isMarginKpiBold = isKpi && !!row.line_code && BOLD_MARGIN_KPI_CODES.has(row.line_code)
     const isOpen = checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0 || (row.accounts?.length ?? 0) > 0
     const am = row.amounts ?? {}
@@ -337,7 +342,7 @@ export default function ErFlowTable({
           background: isKpi ? '#F8FAFC' : isSubtotal && depth === 0 ? '#F8FAFC' : undefined,
         }}
       >
-        <td className="py-1.5 text-left whitespace-nowrap" style={{ minWidth: 220, paddingLeft: 12 + depth * 14, paddingRight: 12 }}>
+        <td className="py-1 text-left whitespace-nowrap" style={{ minWidth: 220, paddingLeft: 12 + depth * 14, paddingRight: 12 }}>
           <div className="flex items-center gap-0.5">
             {showChevron ? (
               <button type="button" onClick={() => toggle(row.id)} className="p-0.5 rounded shrink-0" style={{ color: '#1E3A5F' }} aria-expanded={isOpen}>
@@ -345,7 +350,7 @@ export default function ErFlowTable({
               </button>
             ) : <span style={{ width: 22 }} />}
             <span className="text-[12px]" style={{
-              fontWeight: row.is_bold || isSubtotal ? 600 : 500,
+              fontWeight: row.is_bold || isSubtotal || isMarginKpiBold ? 600 : 500,
               fontStyle: isKpi ? 'italic' : undefined,
               color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
             }}>
@@ -359,17 +364,17 @@ export default function ErFlowTable({
             // CAGR: client-side computation from fy2/fy3
             if (col.id === 'cagr') {
               if (isKpi) return <td key={`${row.id}-cagr`} style={{ background: 'rgba(30,58,95,0.04)' }} />
-              const fy2v = Number(am.fy2 ?? 0)
+              const fy1v = Number(am.fy1 ?? 0)
               const fy3v = Number(am.fy3 ?? 0)
-              const cagr = Math.abs(fy2v) > 1e-3 ? (fy3v / fy2v - 1) * 100 : null
+              const cagr = Math.abs(fy1v) > 1e-3 ? (Math.pow(fy3v / fy1v, 1 / 2) - 1) * 100 : null
               return (
                 <td
                   key={`${row.id}-cagr`}
-                  className="px-2.5 py-2 text-right whitespace-nowrap tabular-nums"
+                  className="px-1.5 py-1 text-right whitespace-nowrap tabular-nums"
                   style={{
                     background: 'rgba(30,58,95,0.04)',
                     fontSize: '0.8125rem',
-                    fontWeight: row.is_bold && !isKpi ? 600 : 400,
+                    fontWeight: (row.is_bold && !isKpi) || isMarginKpiBold ? 600 : 400,
                     color: cagr == null || cagr === 0 ? '#94A3B8' : cagr > 0 ? '#10B981' : '#DC2626',
                     fontStyle: 'italic',
                   }}
@@ -384,7 +389,7 @@ export default function ErFlowTable({
                 <ValCell
                   key={`${row.id}-forecast`}
                   value={forecast}
-                  bold={Boolean(row.is_bold) && !isKpi}
+                  bold={(Boolean(row.is_bold) && !isKpi) || isMarginKpiBold}
                   italic={isKpi}
                   isPct={isKpi}
                   compact
@@ -403,9 +408,10 @@ export default function ErFlowTable({
                 key={`${row.id}-${col.id}`}
                 value={value}
                 highlighted={Boolean(col.highlighted)}
-                bold={Boolean(row.is_bold) && !isKpi}
+                bold={(Boolean(row.is_bold) && !isKpi) || isMarginKpiBold}
                 isPct={isKpi || Boolean(col.isPct)}
                 italic={isKpi}
+                compact
                 onClick={row.drill && col.flowCol ? () => openDrill(row, col.flowCol!, col.labelLine1) : undefined}
               />
             )
@@ -438,9 +444,12 @@ export default function ErFlowTable({
         kpiHeaderInserted = true
         nodes.push(
           <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
+            <td className="px-3 py-1 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
               KPIs — as % of total output
             </td>
+            {activeColumns.map(col => (
+              <td key={col.id} style={{ background: col.highlighted || col.id === 'cagr' ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+            ))}
           </tr>,
         )
         continue
@@ -449,9 +458,12 @@ export default function ErFlowTable({
         kpiHeaderInserted = true
         nodes.push(
           <tr key="er-kpi-header" style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
-            <td colSpan={activeColumns.length + 1} className="px-3 py-1.5 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
+            <td className="px-3 py-1 text-[12px] font-semibold" style={{ color: '#1E3A5F', fontStyle: 'italic' }}>
               KPIs — as % of total output
             </td>
+            {activeColumns.map(col => (
+              <td key={col.id} style={{ background: col.highlighted || col.id === 'cagr' ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />
+            ))}
           </tr>,
         )
       }
@@ -514,15 +526,6 @@ export default function ErFlowTable({
   if (!data?.rows.length) return (
     <div className="rounded-xl p-8 text-center text-sm" style={{ background: '#FFF', border: '1px solid #E2E8F0', color: '#64748B' }}>No rows</div>
   )
-
-  function TwoLineHdr({ top, bottom, color = '#475569' }: { top: string; bottom: string; color?: string }) {
-    return (
-      <div className="flex flex-col items-end justify-end gap-0" style={{ lineHeight: 1.25 }}>
-        <span style={{ color, opacity: 0.75 }}>{top}</span>
-        <span style={{ color, opacity: 0.75 }}>{bottom}</span>
-      </div>
-    )
-  }
 
   return (
     <div className="rounded-xl" style={{ background: '#FFFFFF', border: '1px solid #E2E8F0', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
@@ -599,9 +602,12 @@ export default function ErFlowTable({
               <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
                 <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
                 {tableColumns.map(c => (
-                  <th key={c.id} className="px-2 py-2 text-right font-semibold whitespace-nowrap" style={{ color: c.highlighted ? '#1E3A5F' : '#475569' }}>
-                    {c.kind === 'delta' && c.labelLine2 ? <TwoLineHdr top={c.labelLine1} bottom={c.labelLine2} /> : c.labelLine1}
-                  </th>
+                  <TwoLineHeader
+                    key={c.id}
+                    line1={c.labelLine1}
+                    line2={c.labelLine2}
+                    highlighted={c.highlighted}
+                  />
                 ))}
               </tr>
             </thead>
