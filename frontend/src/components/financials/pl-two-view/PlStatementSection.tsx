@@ -313,6 +313,7 @@ export default function PlStatementSection({
             periodSelection={periodSelection}
             entityDisplayName={entityLabel === 'all' ? undefined : groupLabel}
             planMap={planMap}
+            hasPlanData={hasPlanData}
             onDrill={onDrill}
             onBulletSelect={setDetailBullet}
             onNarrativeLoaded={setNarrative}

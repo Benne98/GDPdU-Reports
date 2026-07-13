@@ -48,13 +48,20 @@ export interface PlTableRenderCtx {
   exportMode?: boolean
   /** line_code → comment marker (report view "#" column) */
   commentMarkersByLineCode?: ReportCommentMarkerMap
+  /**
+   * When true, a width-less spacer <td/> is emitted immediately after the
+   * comment-marker cell so that the numeric columns right-anchor against a
+   * `<colgroup>` defined in the parent table (report-view layout).
+   * Must NOT be set in PlTableView or PlExportTableFrame.
+   */
+  hasSpacerCol?: boolean
   onDrill: (d: FinancialsDrillOpen) => void
   checkOpen: (id: string) => boolean
   toggle: (id: string) => void
 }
 
 function commentColSpan(ctx: PlTableRenderCtx, valueCols: number): number {
-  return valueCols + 1 + (ctx.commentMarkersByLineCode ? 1 : 0)
+  return valueCols + 1 + (ctx.commentMarkersByLineCode ? 1 : 0) + (ctx.hasSpacerCol ? 1 : 0)
 }
 
 function renderCommentIndexCell(ctx: PlTableRenderCtx, row: FinancialStatementRow): ReactNode | null {
@@ -257,6 +264,7 @@ function renderKpiSectionHeader(ctx: PlTableRenderCtx, columns: PlTableColumnDef
         {label}
       </td>
       {ctx.commentMarkersByLineCode && <td style={{ background: '#F8FAFC' }} />}
+      {ctx.hasSpacerCol && <td style={{ background: '#F8FAFC' }} />}
       {columns.map(col => (
         <td key={col.id} style={{ background: headerCellBackground(col.kind) ?? '#F8FAFC' }} />
       ))}
@@ -348,7 +356,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
         <td
           className={`${ctx.compact ? 'py-1' : 'py-2'} text-left`}
           style={{
-            minWidth: ctx.exportMode ? 140 : 180,
+            minWidth: ctx.hasSpacerCol ? undefined : (ctx.exportMode ? 140 : 180),
             maxWidth: ctx.exportMode ? 280 : undefined,
             paddingLeft: pad,
             paddingRight: 12,
@@ -369,6 +377,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
           />
         </td>
         {renderCommentIndexCell(ctx, row)}
+        {ctx.hasSpacerCol && <td />}
         {row.amounts && row.deltas && (
           useDynamic
             ? renderDynamicColumns(ctx, row, maxima)

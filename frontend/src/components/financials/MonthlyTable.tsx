@@ -122,6 +122,11 @@ interface MonthlyTableProps {
   showColumnEditor?: boolean
   /** Annual grain: highlight anchor month per FY on non-PL statements; FY/YTD total columns always styled */
   annualGrain?: boolean
+  /**
+   * When false, the "+ ∆ vs plan" affordance in MonthlyColumnEditor is hidden.
+   * Defaults to undefined (backward-compat: affordance shown for PL as before).
+   */
+  hasPlanData?: boolean
 }
 
 export default function MonthlyTable({
@@ -132,6 +137,7 @@ export default function MonthlyTable({
   enableCellDetail = false,
   showColumnEditor = false,
   annualGrain = false,
+  hasPlanData,
 }: MonthlyTableProps) {
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
   const [selection, setSelection] = useState<MonthlyCellSelection | null>(null)
@@ -800,7 +806,7 @@ export default function MonthlyTable({
               columns={extraColumns}
               onChange={setExtraColumns}
               statement={statement}
-              showPlanVariances={statement === 'pl'}
+              showPlanVariances={statement === 'pl' && hasPlanData !== false}
             />
           )}
           {notesCtx && data && (

@@ -28,6 +28,7 @@ type Props = {
   /** When set, mini-table heading uses "{name}'s Income Statement — …" instead of Consolidated. */
   entityDisplayName?: string
   planMap: PlPlanMap
+  hasPlanData?: boolean
   onDrill: (d: FinancialsDrillOpen) => void
   onBulletSelect: (b: PlNarrativeBullet) => void
   onNarrativeLoaded?: (narrative: PlNarrativeResponse | null) => void
@@ -43,6 +44,7 @@ export default function PlReportView({
   periodSelection,
   entityDisplayName,
   planMap,
+  hasPlanData = false,
   onDrill,
   onBulletSelect,
   onNarrativeLoaded,
@@ -126,6 +128,7 @@ export default function PlReportView({
             year={year}
             month={month}
             planMap={planMap}
+            hasPlanData={hasPlanData}
             onDrill={onDrill}
             commentMarkersByLineCode={commentMarkersByLineCode}
             checkOpen={checkOpen}

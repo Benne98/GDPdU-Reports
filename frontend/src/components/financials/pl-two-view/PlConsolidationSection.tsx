@@ -25,7 +25,7 @@ import {
   type PlConsolidationColumnDef,
 } from './plConsolidationColumnRegistry'
 import { buildPlanMapFromStatement } from './plPlanMap'
-import { buildDefaultColumns } from './plColumnRegistry'
+import { buildDefaultColumns, PLAN_ONLY_COL_KINDS } from './plColumnRegistry'
 import {
   buildClientNarrativeResponse,
   isTrustedApiNarrative,
@@ -220,12 +220,14 @@ export default function PlConsolidationSection({
     entityStmt?.col_labels ??
     groupStatement?.col_labels ??
     (stmtCache.size > 0 ? [...stmtCache.values()][0]?.col_labels : undefined)
+  const entityHasPlanData = entityStmt?.plan?.has_plan_data ?? false
   const miniColumns = useMemo(() => {
     if (!colLabels) return []
     return buildDefaultColumns(colLabels).filter(c =>
-      ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'].includes(c.kind),
+      ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'].includes(c.kind) &&
+      (entityHasPlanData || !PLAN_ONLY_COL_KINDS.has(c.kind))
     )
-  }, [colLabels])
+  }, [colLabels, entityHasPlanData])
 
   const exportCtx = useMemo(
     (): PlExportContext => ({
@@ -483,6 +485,7 @@ export default function PlConsolidationSection({
               entity={selected?.code}
               entityDisplayName={selected?.label}
               planMap={planMap}
+              hasPlanData={entityHasPlanData}
               onDrill={d => onDrill({ ...d, entityOverride: selected?.code })}
               onBulletSelect={setDetailBullet}
               onNarrativeLoaded={setNarrative}

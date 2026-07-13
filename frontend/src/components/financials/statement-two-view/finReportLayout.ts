@@ -22,3 +22,20 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
 export const REPORT_LABEL_COL_MIN_PX = 320  // "EURk"/position column width → sets the "#" column x-position across all aligned tables (matches the group report's previous label width)
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
 export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)
+export const REPORT_DELTA_COL_PX = 128       // delta/variance columns — wider so "Δ vs plan" / "∆ MoM" headers fit on one line
+
+/**
+ * Column kinds that render a Δ/variance header and therefore use
+ * `REPORT_DELTA_COL_PX` in the mini-table colgroup.
+ * Must stay in sync with the `isDelta` guard in plTableRowRenderer.tsx.
+ */
+export const REPORT_DELTA_COL_KINDS = new Set([
+  'mom',
+  'yoy',
+  'ytd_delta',
+  'ytd_vs_plan',
+  'plan_vs_actual',
+  'month_mom',
+  'month_yoy',
+  'month_delta',
+])

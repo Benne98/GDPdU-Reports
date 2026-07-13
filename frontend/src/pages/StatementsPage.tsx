@@ -859,6 +859,7 @@ export default function StatementsPage({
               entity={ent}
               enableCellDetail={getStatementConfig(tab).features.monthlyCellDetail}
               showColumnEditor={getStatementConfig(tab).features.columnEditor}
+              hasPlanData={data?.plan?.has_plan_data ?? false}
               annualGrain
             />
           </>
@@ -983,6 +984,7 @@ export default function StatementsPage({
             entity={ent}
             enableCellDetail={getStatementConfig(tab).features.monthlyCellDetail}
             showColumnEditor={getStatementConfig(tab).features.columnEditor}
+            hasPlanData={data?.plan?.has_plan_data ?? false}
           />
         )}
 
