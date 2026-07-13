@@ -17,13 +17,16 @@ export default defineConfig(({ mode }) => {
   const isV4 = mode === "v4";
   const isMerged = mode === "merged";
   const isV5 = mode === "v5";
+  const isV5E2e = mode === "v5-e2e";
   const devPort = Number(
     env.VITE_DEV_PORT ||
-      (isV5 ? 5181 : isMerged ? 5180 : isV4 ? 5178 : isReportingV2Sandbox ? 5179 : isReportingV2 ? 5177 : isFddMerge ? 5176 : isTest ? 5175 : 5174),
+      (isV5E2e ? 5182 : isV5 ? 5181 : isMerged ? 5180 : isV4 ? 5178 : isReportingV2Sandbox ? 5179 : isReportingV2 ? 5177 : isFddMerge ? 5176 : isTest ? 5175 : 5174),
   );
   const apiTarget = (
     env.VITE_DEV_API_PROXY ||
-    (isV5
+    (isV5E2e
+      ? "http://127.0.0.1:8016"
+      : isV5
       ? "http://127.0.0.1:8015"
       : isMerged
       ? "http://127.0.0.1:8014"
