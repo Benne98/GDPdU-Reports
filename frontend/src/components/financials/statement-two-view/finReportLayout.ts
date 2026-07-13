@@ -22,8 +22,9 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
 export const REPORT_LABEL_COL_MIN_PX = 320  // "EURk"/position column width → sets the "#" column x-position across ALL aligned report tables (group, top consolidated, per-entity)
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
 export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)
-export const REPORT_DELTA_COL_PX = 128       // monthly delta/variance columns — wider so "Δ vs plan" / "∆ MoM" headers fit on one line
+export const REPORT_DELTA_COL_PX = 140       // monthly delta/variance columns — wide enough for "Δ Jun25 − May25"-style headers; the width-less spacer col absorbs it so the table stays the same total width
 export const REPORT_DELTA_COL_WEEK_PX = 148  // weekly delta column width (tunable); wider than REPORT_DELTA_COL_PX so weekly Δ headers like "Δ CW27 − CW26" fit
+export const REPORT_CUM_COL_PX = 120         // cumulative columns (MTD / YTD) — wider than a plain period col so "Year to date" / "MTD Jun25" headers fit; the width-less spacer col absorbs it so the table stays the same total width
 
 /**
  * Column kinds that render a Δ/variance header and therefore use
@@ -40,3 +41,6 @@ export const REPORT_DELTA_COL_KINDS = new Set([
   'month_yoy',
   'month_delta',
 ])
+
+/** Cumulative-to-date columns whose header ("Year to date" / "Month to date") needs the wider `REPORT_CUM_COL_PX`. */
+export const REPORT_CUM_COL_KINDS = new Set(['ytd', 'mtd'])

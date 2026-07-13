@@ -8,6 +8,8 @@ import { renderPlTableRows, type PlTableRenderCtx } from './plTableRowRenderer'
 import { usePlRowExpansion } from './usePlRowExpansion'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
 import {
+  REPORT_CUM_COL_KINDS,
+  REPORT_CUM_COL_PX,
   REPORT_DELTA_COL_KINDS,
   REPORT_DELTA_COL_PX,
   REPORT_DELTA_COL_WEEK_PX,
@@ -81,9 +83,16 @@ export default function PlMiniTable({
           <col style={{ width: REPORT_LABEL_COL_MIN_PX }} />
           {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
           <col />
-          {columns.map(c => (
-            <col key={c.id} style={{ width: REPORT_DELTA_COL_KINDS.has(c.kind) ? (grain === 'week' ? REPORT_DELTA_COL_WEEK_PX : REPORT_DELTA_COL_PX) : REPORT_PERIOD_COL_PX }} />
-          ))}
+          {columns.map(c => {
+            const colWidth = REPORT_DELTA_COL_KINDS.has(c.kind)
+              ? grain === 'week'
+                ? REPORT_DELTA_COL_WEEK_PX
+                : REPORT_DELTA_COL_PX
+              : REPORT_CUM_COL_KINDS.has(c.kind)
+                ? REPORT_CUM_COL_PX
+                : REPORT_PERIOD_COL_PX
+            return <col key={c.id} style={{ width: colWidth }} />
+          })}
         </colgroup>
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
