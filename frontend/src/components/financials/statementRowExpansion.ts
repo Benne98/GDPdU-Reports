@@ -23,7 +23,7 @@ export function computeAutoExpandedIds(
   const stmt = statement ?? 'pl'
   const maxDepth = maxDepthOverride !== undefined
     ? maxDepthOverride
-    : stmt === 'bs' ? 2 : stmt === 'wc' ? 1 : stmt === 'cf' ? 1 : 2
+    : stmt === 'bs' ? 2 : stmt === 'wc' ? 1 : stmt === 'cf' ? 1 : 0
   if (maxDepth === 0) return new Set<string>()
 
   function collectIds(rs: ExpandableRow[], depth: number): string[] {
