@@ -20,9 +20,11 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
  * are present. Extra horizontal space is absorbed by the label column.
  */
 export const REPORT_LABEL_COL_MIN_PX = 320  // "EURk"/position column width → sets the "#" column x-position across all aligned tables (matches the group report's previous label width)
+export const REPORT_LABEL_COL_COMPACT_PX = 240  // compact label width for PlMiniTable (tunable); narrower than REPORT_LABEL_COL_MIN_PX so numerics begin ~80px further left
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
 export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)
-export const REPORT_DELTA_COL_PX = 128       // delta/variance columns — wider so "Δ vs plan" / "∆ MoM" headers fit on one line
+export const REPORT_DELTA_COL_PX = 128       // monthly delta/variance columns — wider so "Δ vs plan" / "∆ MoM" headers fit on one line
+export const REPORT_DELTA_COL_WEEK_PX = 148  // weekly delta column width (tunable); wider than REPORT_DELTA_COL_PX so weekly Δ headers like "Δ CW27 − CW26" fit
 
 /**
  * Column kinds that render a Δ/variance header and therefore use

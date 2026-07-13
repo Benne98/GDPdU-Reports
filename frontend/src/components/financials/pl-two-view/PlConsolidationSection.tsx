@@ -9,7 +9,8 @@ import type {
 } from '../../../lib/api'
 import { api, type FinPeriodParams } from '../../../lib/api'
 import type { PeriodSelection } from '../../../lib/periodSelection'
-import { periodAnchorYearMonth, periodCacheKey, periodQueryParams } from '../../../lib/periodSelection'
+import { monthLabelShort, periodAnchorYearMonth, periodCacheKey, periodQueryParams } from '../../../lib/periodSelection'
+import { formatConsolidationPeriodLabel, labelActual } from '../../../lib/periodColumnLabels'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlConsolidationColumnEditor from './PlConsolidationColumnEditor'
 import PlConsolidationTableView from './PlConsolidationTableView'
@@ -19,7 +20,7 @@ import PlExportMenu, { type PlExportKind } from './PlExportMenu'
 import PlReportView from './PlReportView'
 import PlSectionHeading from './PlSectionHeading'
 import { buildConsolidatedTableHeading } from './plReportSectionHeadings'
-import AnnualConsolidationGridMiniTable from '../annual/AnnualConsolidationGridMiniTable'
+import AnnualConsolidationReportView from '../annual/AnnualConsolidationReportView'
 import PlConsolViewToggle, { type PlConsolViewMode } from './PlConsolViewToggle'
 import {
   loadConsolidationColumns,
@@ -411,6 +412,8 @@ export default function PlConsolidationSection({
   if (!consol?.rows.length) return null
 
   const periodBadge = consol.col_label ? `${consol.col_label}A` : ''
+  const colLabel = consol.col_label ?? ''
+  const groupYtdLabel = formatConsolidationPeriodLabel(colLabel || labelActual(`YTD${monthLabelShort(year, month)}`))
 
   return (
     <>
@@ -506,15 +509,14 @@ export default function PlConsolidationSection({
             <div className="p-8 text-center text-sm text-slate-500">No data for this entity.</div>
           )
         ) : viewMode === 'group' ? (
-          <div className="px-4 pt-4 pb-4">
-            <PlSectionHeading>Consolidated Income Statement</PlSectionHeading>
-            <AnnualConsolidationGridMiniTable
-              consol={consol}
-              year={year}
-              month={month}
-              onDrill={onDrill}
-            />
-          </div>
+          <AnnualConsolidationReportView
+            consol={consol!}
+            year={year}
+            month={month}
+            ytdLabel={groupYtdLabel}
+            periodSelection={periodSelection ?? { year, month, grain: 'month' as const }}
+            onDrill={onDrill}
+          />
         ) : (
           <div className="px-4 pt-4 pb-2">
             <PlSectionHeading>{tableViewHeading}</PlSectionHeading>

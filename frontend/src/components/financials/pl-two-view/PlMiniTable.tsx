@@ -10,13 +10,14 @@ import type { ReportCommentMarkerMap } from '../statement-two-view/reportComment
 import {
   REPORT_DELTA_COL_KINDS,
   REPORT_DELTA_COL_PX,
-  REPORT_LABEL_COL_MIN_PX,
+  REPORT_DELTA_COL_WEEK_PX,
+  REPORT_LABEL_COL_COMPACT_PX,
   REPORT_MARKER_COL_PX,
   REPORT_PERIOD_COL_PX,
 } from '../statement-two-view/finReportLayout'
 
-const MINI_KINDS_MONTH = ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'] as const
-const MINI_KINDS_WEEK = ['pm', 'cm', 'mom', 'mtd', 'plan_cm'] as const
+const MINI_KINDS_MONTH = ['pm', 'cm', 'mom', 'ytd', 'plan_cm', 'plan_vs_actual'] as const
+const MINI_KINDS_WEEK = ['pm', 'cm', 'mom', 'mtd', 'ytd', 'plan_cm'] as const
 
 type Props = {
   data: FinancialStatementResponse
@@ -46,15 +47,16 @@ export default function PlMiniTable({
   const toggle = toggleProp ?? expansion.toggle
   const lbl = data.col_labels
 
+  const grain = data.period_grain === 'week' ? 'week' : 'month'
+
   const columns = useMemo(() => {
-    const grain = data.period_grain === 'week' ? 'week' : 'month'
     const allKinds: readonly string[] = grain === 'week' ? MINI_KINDS_WEEK : MINI_KINDS_MONTH
     const all = buildDefaultColumns(lbl, grain, data.statement)
     return all.filter(c =>
       allKinds.includes(c.kind) &&
       (hasPlanData || !PLAN_ONLY_COL_KINDS.has(c.kind))
     )
-  }, [lbl, data.period_grain, data.statement, hasPlanData])
+  }, [lbl, grain, data.statement, hasPlanData])
 
   const hasCommentCol = Boolean(commentMarkersByLineCode)
 
@@ -76,11 +78,11 @@ export default function PlMiniTable({
     <div className="overflow-x-auto">
       <table className="w-full border-collapse text-xs table-fixed">
         <colgroup>
-          <col style={{ width: REPORT_LABEL_COL_MIN_PX }} />
+          <col style={{ width: REPORT_LABEL_COL_COMPACT_PX }} />
           {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
           <col />
           {columns.map(c => (
-            <col key={c.id} style={{ width: REPORT_DELTA_COL_KINDS.has(c.kind) ? REPORT_DELTA_COL_PX : REPORT_PERIOD_COL_PX }} />
+            <col key={c.id} style={{ width: REPORT_DELTA_COL_KINDS.has(c.kind) ? (grain === 'week' ? REPORT_DELTA_COL_WEEK_PX : REPORT_DELTA_COL_PX) : REPORT_PERIOD_COL_PX }} />
           ))}
         </colgroup>
         <thead>
