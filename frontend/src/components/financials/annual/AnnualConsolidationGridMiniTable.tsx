@@ -133,7 +133,10 @@ export default function AnnualConsolidationGridMiniTable({
           style={{
             borderBottom: isKpi ? 'none' : '1px solid #E2E8F0',
             borderTop: isSubtotal && depth === 0 ? '2px solid #E2E8F0' : undefined,
-            background: isKpi || isSubtotal ? '#F8FAFC' : undefined,
+            // BS: grey only the grand totals (Assets / Equity & liabilities, depth 0);
+            // nested subtotals stay bold-only. WC/PL keep greying all subtotals.
+            background:
+              isKpi || (isSubtotal && (consol.statement !== 'bs' || depth === 0)) ? '#F8FAFC' : undefined,
           }}
         >
           <td
