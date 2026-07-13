@@ -4,7 +4,7 @@ import { api, finPeriodParamsFromStatement } from '../../../../lib/api'
 import type { PeriodSelection } from '../../../../lib/periodSelection'
 import type { FinancialsDrillOpen } from '../../FinancialStatementTable'
 import { usePlRowExpansion } from '../../pl-two-view/usePlRowExpansion'
-import { FIN_REPORT_SPLIT_GRID } from '../finReportLayout'
+import { FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID } from '../finReportLayout'
 import { countVisibleStatementRows, fitBulletsToTable } from '../narrativeFit'
 import { buildReportCommentMarkerMap } from '../reportCommentMarkers'
 import StatementNarrativeList from '../StatementNarrativeList'
@@ -132,7 +132,7 @@ export default function BsReportView({
   return (
     <div className="px-4 pt-6 pb-6">
       <ChartLoadReporter chartId="fin-report-bs" loading={narrativeBusy} />
-      <div className={FIN_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
+      <div className={FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
         <div className="min-w-0" ref={tableWrapRef}>
           <StatementSectionHeading>{tableHeading}</StatementSectionHeading>
           <BsMiniTable
