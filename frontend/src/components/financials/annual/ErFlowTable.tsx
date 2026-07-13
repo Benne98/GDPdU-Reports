@@ -600,7 +600,7 @@ export default function ErFlowTable({
           <table className="w-full border-collapse text-[12px]">
             <thead>
               <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC', verticalAlign: 'bottom' }}>
-                <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>EURk</th>
+                <th className="px-3 py-2 text-left font-semibold text-[13px]" style={{ color: '#475569' }}>EURk</th>
                 {tableColumns.map(c => (
                   <TwoLineHeader
                     key={c.id}

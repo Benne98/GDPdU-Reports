@@ -23,6 +23,9 @@ import { periodRange } from './plTableCore'
 
 const BS_KEEP_CLOSED = new Set(['Deferred tax assets', 'Prepaid expenses'])
 
+/** Margin KPI rows that receive bold treatment matching ErFlowTable. */
+const MARGIN_BOLD_LABELS = new Set(['Gross margin %', 'EBITDA margin %', 'Net profit margin %'])
+
 type SubCol = {
   key: string
   label: string
@@ -264,6 +267,8 @@ export default function PlConsolidationTableView({
     const isTitle = row.row_kind === 'title'
     const isKpiHeader = row.row_kind === 'kpi_header'
     const isKpi = row.row_kind === 'kpi'
+    const isSubtotal = row.row_kind === 'subtotal'
+    const isMarginKpiBold = isKpi && MARGIN_BOLD_LABELS.has((row.label ?? '').trim())
     const isOpen = checkOpen(row.id)
     const showChevron = (row.children?.length ?? 0) > 0
     const nodes: JSX.Element[] = []
@@ -282,7 +287,7 @@ export default function PlConsolidationTableView({
       nodes.push(
         <tr key={row.id} style={{ background: '#F8FAFC', borderTop: '2px solid #E2E8F0' }}>
           <td className="px-3 py-2 text-xs font-semibold italic" style={{ color: '#1E3A5F' }}>{row.label}</td>
-          {colGroups.flatMap(g => g.subCols.map(s => <td key={`${row.id}-${s.key}`} style={{ background: '#F8FAFC' }} />))}
+          {colGroups.flatMap(g => g.subCols.map(s => <td key={`${row.id}-${s.key}`} style={{ background: g.highlighted ? 'rgba(30,58,95,0.04)' : '#F8FAFC' }} />))}
         </tr>,
       )
     } else {
@@ -291,11 +296,11 @@ export default function PlConsolidationTableView({
           key={row.id}
           style={{
             borderBottom: isKpi ? 'none' : '1px solid #E2E8F0',
-            borderTop: row.row_kind === 'subtotal' && depth === 0 ? '2px solid #E2E8F0' : undefined,
-            background: isKpi ? '#F8FAFC' : undefined,
+            borderTop: isSubtotal && depth === 0 ? '2px solid #E2E8F0' : undefined,
+            background: (isKpi || (isSubtotal && depth === 0)) ? '#F8FAFC' : undefined,
           }}
         >
-          <td className="py-2 text-left whitespace-nowrap" style={{ minWidth: 200, paddingLeft: pad, paddingRight: 12 }}>
+          <td className="py-1 text-left whitespace-nowrap" style={{ minWidth: 200, paddingLeft: pad, paddingRight: 12 }}>
             <div className="flex items-center gap-0.5">
               {showChevron ? (
                 <button type="button" onClick={() => toggle(row.id)} className="p-0.5 rounded shrink-0" style={{ color: '#1E3A5F' }}>
@@ -304,7 +309,7 @@ export default function PlConsolidationTableView({
               ) : (
                 <span style={{ width: 22 }} />
               )}
-              <span className="text-xs" style={{ fontWeight: row.is_bold ? 600 : 500, color: isKpi ? '#64748B' : '#111827', fontStyle: isKpi ? 'italic' : undefined }}>
+              <span className="text-[13px]" style={{ fontWeight: row.is_bold || isSubtotal || isMarginKpiBold ? 600 : 500, color: isKpi ? '#64748B' : '#111827', fontStyle: isKpi ? 'italic' : undefined }}>
                 {row.label}
               </span>
             </div>
@@ -329,7 +334,7 @@ export default function PlConsolidationTableView({
               if (isKpi && !sub.col) {
                 if (v == null || v === 0) {
                   return (
-                    <td key={sub.key} className="px-2.5 py-2 text-right text-xs text-slate-300">
+                    <td key={sub.key} className="px-1.5 py-1 text-right text-xs text-slate-300">
                       —
                     </td>
                   )
@@ -338,6 +343,7 @@ export default function PlConsolidationTableView({
                   <NumCell
                     key={sub.key}
                     value={v}
+                    bold={isMarginKpiBold}
                     isKpi
                     isDays={data.statement === 'wc'}
                     highlighted={g.highlighted}
@@ -349,7 +355,7 @@ export default function PlConsolidationTableView({
                 return (
                   <td
                     key={sub.key}
-                    className="px-2.5 py-2 text-right text-xs text-slate-300"
+                    className="px-1.5 py-1 text-right text-xs text-slate-300"
                     style={{ background: g.highlighted ? 'rgba(30,58,95,0.04)' : undefined }}
                   >
                     —
@@ -365,7 +371,7 @@ export default function PlConsolidationTableView({
                 <NumCell
                   key={sub.key}
                   value={v}
-                  bold={row.is_bold}
+                  bold={row.is_bold || isSubtotal || isMarginKpiBold}
                   highlighted={g.highlighted}
                   muted={g.muted}
                   isKpi={isKpi}
@@ -405,7 +411,7 @@ export default function PlConsolidationTableView({
           {twoRowHeader ? (
             <>
               <tr style={{ borderBottom: '1px solid #E2E8F0', background: '#F8FAFC' }}>
-                <th rowSpan={2} className="px-3 py-2 text-left font-semibold align-bottom" style={{ color: '#475569' }}>
+                <th rowSpan={2} className="px-3 py-2 text-left font-semibold align-bottom text-[13px]" style={{ color: '#475569' }}>
                   EURk
                 </th>
                 {colGroups.map(g => (
@@ -442,7 +448,7 @@ export default function PlConsolidationTableView({
             </>
           ) : (
             <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
-              <th className="px-3 py-2 text-left font-semibold" style={{ color: '#475569' }}>
+              <th className="px-3 py-2 text-left font-semibold text-[13px]" style={{ color: '#475569' }}>
                 EURk
               </th>
               {colGroups.map(g => {
