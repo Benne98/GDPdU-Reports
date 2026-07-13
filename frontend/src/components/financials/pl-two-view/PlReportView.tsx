@@ -5,7 +5,7 @@ import type { PeriodSelection } from '../../../lib/periodSelection'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import PlMiniTable from './PlMiniTable'
 import PlNarrativeList from './PlNarrativeList'
-import { FIN_REPORT_SPLIT_GRID } from '../statement-two-view/finReportLayout'
+import { FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID } from '../statement-two-view/finReportLayout'
 import PlSectionHeading from './PlSectionHeading'
 import { KEY_DRIVERS_HEADING, buildReportTableHeading } from './plReportSectionHeadings'
 import { ChartLoadReporter } from '../../../hooks/useChartLoadReporter'
@@ -120,7 +120,7 @@ export default function PlReportView({
   return (
     <div className="px-4 pt-6 pb-6">
       <ChartLoadReporter chartId="fin-report-pl" loading={narrativeBusy} />
-      <div className={FIN_REPORT_SPLIT_GRID}>
+      <div className={FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID}>
         <div className="min-w-0">
           <PlSectionHeading>{tableHeading}</PlSectionHeading>
           <PlMiniTable

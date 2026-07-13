@@ -19,8 +19,7 @@ export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
  * has identical column proportions regardless of how many plan/OPlan columns
  * are present. Extra horizontal space is absorbed by the label column.
  */
-export const REPORT_LABEL_COL_MIN_PX = 320  // "EURk"/position column width → sets the "#" column x-position across all aligned tables (matches the group report's previous label width)
-export const REPORT_LABEL_COL_COMPACT_PX = 240  // compact label width for PlMiniTable (tunable); narrower than REPORT_LABEL_COL_MIN_PX so numerics begin ~80px further left
+export const REPORT_LABEL_COL_MIN_PX = 320  // "EURk"/position column width → sets the "#" column x-position across ALL aligned report tables (group, top consolidated, per-entity)
 export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
 export const REPORT_PERIOD_COL_PX = 104      // each period/value column (year, month, week)
 export const REPORT_DELTA_COL_PX = 128       // monthly delta/variance columns — wider so "Δ vs plan" / "∆ MoM" headers fit on one line

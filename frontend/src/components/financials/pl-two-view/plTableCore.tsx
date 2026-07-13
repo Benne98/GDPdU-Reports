@@ -203,18 +203,29 @@ export function BlankValCell({
   )
 }
 
-export function TwoLineHeader({ line1, line2, highlighted }: { line1: string; line2?: string; highlighted?: boolean }) {
+export function TwoLineHeader({
+  line1,
+  line2,
+  highlighted,
+  spanBothLines,
+}: {
+  line1: string
+  line2?: string
+  highlighted?: boolean
+  /** Drop the subheader and let line1 use (and wrap into) both header lines, vertically centred. */
+  spanBothLines?: boolean
+}) {
   return (
     <th
-      className="px-2 py-2 text-right font-semibold whitespace-nowrap"
+      className={`px-2 py-2 text-right font-semibold ${spanBothLines ? '' : 'whitespace-nowrap'}`}
       style={{
         color: '#475569',
-        verticalAlign: 'bottom',
+        verticalAlign: spanBothLines ? 'middle' : 'bottom',
         background: highlighted ? CM_HIGHLIGHT_BG : undefined,
       }}
     >
       <span className="block leading-tight text-xs">{line1}</span>
-      {line2 && <span className="block leading-tight text-[0.65rem] font-normal mt-0.5" style={{ color: '#94A3B8' }}>{line2}</span>}
+      {!spanBothLines && line2 && <span className="block leading-tight text-[0.65rem] font-normal mt-0.5" style={{ color: '#94A3B8' }}>{line2}</span>}
     </th>
   )
 }

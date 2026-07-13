@@ -11,7 +11,7 @@ import {
   REPORT_DELTA_COL_KINDS,
   REPORT_DELTA_COL_PX,
   REPORT_DELTA_COL_WEEK_PX,
-  REPORT_LABEL_COL_COMPACT_PX,
+  REPORT_LABEL_COL_MIN_PX,
   REPORT_MARKER_COL_PX,
   REPORT_PERIOD_COL_PX,
 } from '../statement-two-view/finReportLayout'
@@ -78,7 +78,7 @@ export default function PlMiniTable({
     <div className="overflow-x-auto">
       <table className="w-full border-collapse text-xs table-fixed">
         <colgroup>
-          <col style={{ width: REPORT_LABEL_COL_COMPACT_PX }} />
+          <col style={{ width: REPORT_LABEL_COL_MIN_PX }} />
           {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
           <col />
           {columns.map(c => (
@@ -92,9 +92,20 @@ export default function PlMiniTable({
               <th className="px-0 py-2 text-center font-medium align-middle" style={{ color: '#94A3B8', fontSize: '0.62rem' }}>#</th>
             )}
             <th />
-            {columns.map(c => (
-              <TwoLineHeader key={c.id} line1={c.labelLine1} line2={c.labelLine2} highlighted={c.kind === 'cm'} />
-            ))}
+            {columns.map(c => {
+              // Weekly delta columns: drop the "vs prior week" subheader and let the
+              // main header use both lines so it fits the (wider) delta column.
+              const deltaSpan = grain === 'week' && REPORT_DELTA_COL_KINDS.has(c.kind)
+              return (
+                <TwoLineHeader
+                  key={c.id}
+                  line1={c.labelLine1}
+                  line2={c.labelLine2}
+                  highlighted={c.kind === 'cm'}
+                  spanBothLines={deltaSpan}
+                />
+              )
+            })}
           </tr>
         </thead>
         <tbody>{renderPlTableRows(ctx, data.rows, 0)}</tbody>
