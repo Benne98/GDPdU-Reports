@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { ErFlowResponse, FinancialStatementRow } from '../../../lib/api'
 import type { PeriodSelection } from '../../../lib/periodSelection'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
-import { FIN_REPORT_SPLIT_GRID } from '../statement-two-view/finReportLayout'
+import { FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID } from '../statement-two-view/finReportLayout'
 import { prepareAnnualSnapshotReportBullets } from './annualReportMarkers'
 import StatementSectionHeading from '../statement-two-view/StatementSectionHeading'
 import StatementNarrativeList from '../statement-two-view/StatementNarrativeList'
@@ -85,7 +85,7 @@ export default function ErFlowReportView({
     <>
       <div className="px-4 pt-6 pb-6">
         <ChartLoadReporter chartId={`fin-report-annual-${statement}`} loading={narrativeBusy} />
-        <div className={FIN_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
+        <div className={FIN_ENTITY_CONSOL_REPORT_SPLIT_GRID} style={{ alignItems: 'stretch' }}>
           <div className="min-w-0">
             <StatementSectionHeading>{tableHeading}</StatementSectionHeading>
             <ErFlowMiniTable

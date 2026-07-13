@@ -7,16 +7,13 @@ import type { ReportCommentMarkerMap } from '../statement-two-view/reportComment
 import { renderAnnualCommentCell } from './annualMiniTableCore'
 import { shouldDisplayConsolidationRow } from './annualRowVisibility'
 import { computeAutoExpandedIds } from '../statementRowExpansion'
+import {
+  REPORT_LABEL_COL_MIN_PX,
+  REPORT_MARKER_COL_PX,
+  REPORT_PERIOD_COL_PX,
+} from '../statement-two-view/finReportLayout'
 
-const COMMENT_COL_PCT = 3
-const LABEL_COL_PCT = 30
 const WC_KPI_HEADER_LABEL = 'KPIs — working capital days'
-
-function valueColPct(entityCount: number, hasCommentCol: boolean): number {
-  const valueColCount = entityCount + 1
-  const remaining = 100 - LABEL_COL_PCT - (hasCommentCol ? COMMENT_COL_PCT : 0)
-  return remaining / valueColCount
-}
 
 /** The three margin KPI rows that must render bold (label + value cells). */
 const BOLD_MARGIN_KPI_LABELS = new Set(['Gross margin %', 'EBITDA margin %', 'Net profit margin %'])
@@ -47,9 +44,9 @@ export default function AnnualConsolidationGridMiniTable({
   onDrill,
 }: Props) {
   const hasCommentCol = Boolean(commentMarkersByLineCode)
-  const colCount = consol.entities.length + 2 + (hasCommentCol ? 1 : 0)
+  // 1 label + optional # + 1 spacer + entities + 1 consolidation
+  const colCount = consol.entities.length + 3 + (hasCommentCol ? 1 : 0)
   const entityCodes = consol.entities.map(e => e.code)
-  const numericColPct = valueColPct(consol.entities.length, hasCommentCol)
 
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
   const autoExpandedIds = useMemo(
@@ -84,6 +81,7 @@ export default function AnnualConsolidationGridMiniTable({
           {label}
         </td>
         {renderAnnualCommentCell(undefined, hasCommentCol)}
+        <td />
         {consol.entities.map(e => (
           <td key={`${key}-${e.code}`} style={{ background: '#F8FAFC' }} />
         ))}
@@ -171,6 +169,7 @@ export default function AnnualConsolidationGridMiniTable({
             </span>
           </td>
           {renderAnnualCommentCell(marker, hasCommentCol)}
+          <td />
           {consol.entities.map(e => {
             const v = row.entity_amounts[e.code]
             const display = isKpi ? Number(v ?? 0) : Number(v ?? 0)
@@ -241,15 +240,16 @@ export default function AnnualConsolidationGridMiniTable({
   }
 
   return (
-    <div className="min-w-0 w-full">
+    <div className="min-w-0 w-full overflow-x-auto">
       <table className="w-full border-collapse text-xs table-fixed">
         <colgroup>
-          <col style={{ width: `${LABEL_COL_PCT}%` }} />
-          {hasCommentCol && <col style={{ width: `${COMMENT_COL_PCT}%` }} />}
+          <col style={{ width: REPORT_LABEL_COL_MIN_PX }} />
+          {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
+          <col />
           {consol.entities.map(e => (
-            <col key={e.code} style={{ width: `${numericColPct}%` }} />
+            <col key={e.code} style={{ width: REPORT_PERIOD_COL_PX }} />
           ))}
-          <col style={{ width: `${numericColPct}%` }} />
+          <col style={{ width: REPORT_PERIOD_COL_PX }} />
         </colgroup>
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
@@ -267,6 +267,7 @@ export default function AnnualConsolidationGridMiniTable({
                 #
               </th>
             )}
+            <th />
             {consol.entities.map(e => (
               <th
                 key={e.code}

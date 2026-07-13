@@ -8,6 +8,11 @@ import {
   annualCommentColSpan,
   renderAnnualCommentCell,
 } from './annualMiniTableCore'
+import {
+  REPORT_LABEL_COL_MIN_PX,
+  REPORT_MARKER_COL_PX,
+  REPORT_PERIOD_COL_PX,
+} from '../statement-two-view/finReportLayout'
 
 import type { AnnualSnapshotColDef, AnnualSnapshotReportColId } from './annualSnapshotReportColumns'
 
@@ -84,6 +89,7 @@ export default function ErSnapshotMiniTable({
           {label}
         </td>
         {hasCommentCol && <td style={{ background: '#F8FAFC' }} />}
+        <td />
         {columns.map(col => (
           <td
             key={`kpi-hdr-${col.id}`}
@@ -116,7 +122,7 @@ export default function ErSnapshotMiniTable({
           }}
         >
           <td
-            colSpan={isKpiHdr ? undefined : annualCommentColSpan(columns.length, hasCommentCol)}
+            colSpan={isKpiHdr ? undefined : annualCommentColSpan(columns.length, hasCommentCol) + 1}
             className="px-3 py-2 text-xs font-semibold"
             style={{
               color: '#1E3A5F',
@@ -128,6 +134,7 @@ export default function ErSnapshotMiniTable({
             {row.label}
           </td>
           {isKpiHdr && hasCommentCol && <td style={{ background: '#F8FAFC' }} />}
+          {isKpiHdr && <td />}
           {isKpiHdr &&
             columns.map(col => (
               <td
@@ -170,6 +177,7 @@ export default function ErSnapshotMiniTable({
           />
         </td>
         {renderAnnualCommentCell(marker, hasCommentCol)}
+        <td />
         {columns.map(col => {
           if (col.isDelta) {
             const d = row.deltas as Record<string, number> | null | undefined
@@ -261,19 +269,26 @@ export default function ErSnapshotMiniTable({
   }
 
   return (
-    <div className="min-w-0 w-full">
-      <table className="w-full border-collapse text-xs">
+    <div className="min-w-0 w-full overflow-x-auto">
+      <table className="w-full border-collapse text-xs table-fixed">
+        <colgroup>
+          <col style={{ width: REPORT_LABEL_COL_MIN_PX }} />
+          {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
+          <col />
+          {columns.map(c => <col key={c.id} style={{ width: REPORT_PERIOD_COL_PX }} />)}
+        </colgroup>
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
             <th className="px-2 py-2 text-left font-semibold text-xs" style={{ color: '#475569' }}>EURk</th>
             {hasCommentCol && (
               <th
                 className="px-0 py-2 text-center font-medium align-middle"
-                style={{ color: '#94A3B8', width: 20, minWidth: 20, maxWidth: 20, fontSize: '0.62rem' }}
+                style={{ color: '#94A3B8', fontSize: '0.62rem' }}
               >
                 #
               </th>
             )}
+            <th />
             {columns.map(c => (
               <th
                 key={c.id}
