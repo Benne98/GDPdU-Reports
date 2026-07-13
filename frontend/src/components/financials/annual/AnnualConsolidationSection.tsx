@@ -2,6 +2,8 @@
  * Annual entity-breakdown: table view, per-entity report (ErFlow), group consolidation report.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Pin } from 'lucide-react'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from '../statement-two-view/statementToolbarButton'
 import type { ConsolidationResponse, ErFlowResponse, FinancialStatementRow } from '../../../lib/api'
 import { api } from '../../../lib/api'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
@@ -161,6 +163,11 @@ export default function AnnualConsolidationSection({
       if (!consol) return
       const footerRight = `${ytdLabel} · Values in EURk`
       const checkOpen = checkOpenRef.current ?? (() => false)
+      if (kind === 'pdf') {
+        // No dedicated PDF exporter for annual consolidation yet — fall back to browser print.
+        window.print()
+        return
+      }
       if (kind === 'xlsx') {
         await exportConsolidationTableXlsx(consol, [], new Map(), null, {}, null, checkOpen)
       } else if (kind === 'pptx') {
@@ -256,7 +263,23 @@ export default function AnnualConsolidationSection({
         )}
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <AnnualConsolidationViewToggle mode={viewMode} onChange={handleViewChange} disabled={loading} />
-          <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!consol} />
+          {notesCtx && consol && (
+            <button
+              type="button"
+              title="Pin to Action Board"
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+              onClick={() => {
+                const pinId = `${consol.statement ?? 'pl'}-annual-consolidation`
+                const snap = notesCtx.pinTableById(pinId)
+                if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                else notesCtx.setToast('No table data to pin')
+              }}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
+          <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!consol} />
         </div>
       </div>
 

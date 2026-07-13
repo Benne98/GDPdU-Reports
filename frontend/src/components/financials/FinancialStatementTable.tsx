@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { ChevronRight } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { ChevronRight, Pin } from 'lucide-react'
 import {
   FinancialStatementRow,
   FinancialStatementResponse,
@@ -8,11 +8,15 @@ import { fmtKpi, fmtPct, fmtDays } from '../../lib/fmt'
 import { FIN_TABLE_CELL_CLASS, FIN_TABLE_VALUE_FONT } from './finReportLayout'
 import { computeAutoExpandedIds } from './statementRowExpansion'
 import PlExportMenu, { type PlExportKind } from './pl-two-view/PlExportMenu'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from './statement-two-view/statementToolbarButton'
 import { exportFinssentialsXlsx } from '../../lib/finssentialsExport'
 import { buildFlatTablePptxConfig } from '../../lib/finssentialsExport/buildPptxExportConfig'
 import { exportFinssentialsPptx } from '../../lib/finssentialsExport/pptx/exportFinssentialsPptx'
 import { buildExportCheckOpen } from '../../lib/finssentialsExport/buildExportCheckOpen'
 import { flattenTreeToExportRows, todayStr } from '../../lib/exportXlsx'
+import { exportFinStatementTableViewPdf } from './pl-two-view/plExportPdf'
+import type { PlTableColumnDef } from './pl-two-view/plColumnRegistry'
+import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
 function lastDay(y: number, m: number): string {
   return new Date(y, m, 0).toISOString().slice(0, 10)
 }
@@ -196,6 +200,7 @@ export default function FinancialStatementTable({
 }: FinancialStatementTableProps) {
   // userToggles tracks rows the user has explicitly toggled (XOR with autoExpanded)
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
+  const notesCtx = useOptionalActionNotesContext()
 
   const autoExpandedIds = useMemo(
     () => computeAutoExpandedIds(data?.rows, data?.statement),
@@ -206,6 +211,32 @@ export default function FinancialStatementTable({
     // XOR: auto-expanded rows are open unless user closed them, and vice-versa
     return autoExpandedIds.has(id) !== userToggles.has(id)
   }
+
+  // ─── Pin registration (non-embedded only) ─────────────────────────────────
+  useEffect(() => {
+    if (embedded) return
+    const stmt = data?.statement ?? 'pl'
+    const pinId = `${stmt}-legacy-statement`
+    if (!notesCtx || !data?.rows?.length) {
+      notesCtx?.unregisterTableCandidate(pinId)
+      return
+    }
+    notesCtx.registerTableCandidate({
+      id: pinId,
+      label: `${stmt.toUpperCase()} financial statement — table view`,
+      description: 'Actuals vs prior month and YTD — values in EURk',
+      capture: () => {
+        if (!data.rows.length) return null
+        const row_preview = data.rows
+          .filter(r => r.row_kind !== 'title' && r.row_kind !== 'kpi_header')
+          .slice(0, 25)
+          .map(r => ({ id: r.id, label: r.label, values: { cm: r.amounts?.cm ?? '—', ytd: r.amounts?.ytd ?? '—' } }))
+        return { component: 'FinancialStatementTable', expanded_row_ids: [], visible_column_ids: ['py_cm', 'pm', 'cm', 'ytd', 'ytd_py'], row_preview }
+      },
+      viewState: { tab: stmt },
+    })
+    return () => notesCtx.unregisterTableCandidate(pinId)
+  }, [notesCtx, data, embedded])
 
   const { maxMom, maxYoy, maxYtd, maxKpiMom, maxKpiYoy, maxKpiYtd } = useMemo(() => {
     if (!data?.rows) {
@@ -462,6 +493,19 @@ export default function FinancialStatementTable({
 
   async function handleExport(kind: PlExportKind) {
     if (!data) return
+    if (kind === 'pdf') {
+      const isRowOpen = buildExportCheckOpen(data.rows, data.statement, userToggles)
+      const fixedCols: PlTableColumnDef[] = [
+        { id: 'py_cm', kind: 'py_cm', labelLine1: lbl?.py_cm ?? 'PY CM' },
+        { id: 'pm',    kind: 'pm',    labelLine1: lbl?.pm    ?? 'PM' },
+        { id: 'cm',    kind: 'cm',    labelLine1: lbl?.cm    ?? 'CM' },
+        { id: 'ytd',   kind: 'ytd',   labelLine1: lbl?.ytd   ?? 'YTD' },
+        { id: 'ytd_py', kind: 'ytd_py', labelLine1: lbl?.ytd_py ?? 'YTD PY' },
+      ]
+      const stmtPrefix = ({ pl: 'PL', bs: 'BS', cf: 'CF', wc: 'WC' } as Record<string, string>)[data.statement] ?? 'PL'
+      await exportFinStatementTableViewPdf(data, year, month, fixedCols, {}, null, { entityLabel: '', entityDisplayName: 'Group' }, 'Financial Statement', stmtPrefix, isRowOpen)
+      return
+    }
     const stmtName = ({
       pl: 'Income Statement', bs: 'Balance Sheet',
       cf: 'Cash Flow Statement', wc: 'Working Capital',
@@ -597,7 +641,23 @@ export default function FinancialStatementTable({
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
+          {notesCtx && data && (
+            <button
+              type="button"
+              title="Pin to Action Board"
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+              onClick={() => {
+                const pinId = `${data.statement}-legacy-statement`
+                const snap = notesCtx.pinTableById(pinId)
+                if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                else notesCtx.setToast('No table data to pin')
+              }}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
+          <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
         </div>
       </div>
       {tableEl}

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Pin } from 'lucide-react'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from './plToolbarButton'
 import type {
   ConsolidationResponse,
   FinancialStatementResponse,
@@ -449,6 +451,22 @@ export default function PlConsolidationSection({
                 carouselEntityCode={selected?.code}
                 statement="pl"
               />
+            )}
+            {notesCtx && consol && (
+              <button
+                type="button"
+                title="Pin to Action Board"
+                className={PL_TOOLBAR_ICON_BTN}
+                style={PL_TOOLBAR_BTN_STYLE}
+                onClick={() => {
+                  const pinId = `${consol.statement ?? 'pl'}-consolidation`
+                  const snap = notesCtx.pinTableById(pinId)
+                  if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                  else notesCtx.setToast('No table data to pin')
+                }}
+              >
+                <Pin size={14} strokeWidth={1.75} />
+              </button>
             )}
             <PlExportMenu onExport={handleExport} disabled={!consol || loading} />
           </div>

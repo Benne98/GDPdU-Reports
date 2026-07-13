@@ -35,7 +35,7 @@ import { useChartLoadReporter } from '../../../../hooks/useChartLoadReporter'
 import WcDetailOverlay from '../wc/WcDetailOverlay'
 import WcReportView from '../wc/WcReportView'
 import { exportConsolidationPptx, exportConsolidationXlsx } from './consolidationExport'
-import { exportStatementReportViewPptx } from '../statementReportExport'
+import { exportStatementReportViewPdf, exportStatementReportViewPptx } from '../statementReportExport'
 import { buildExportCheckOpen } from '../../../../lib/finssentialsExport/buildExportCheckOpen'
 import { buildReportCommentMarkerMap } from '../reportCommentMarkers'
 import type { PeriodSelection } from '../../../../lib/periodSelection'
@@ -398,6 +398,27 @@ export default function StatementConsolidationSection({
     async (kind: PlExportKind) => {
       if (!consol) return
       const footer = `${selected?.label ?? 'Consolidated'} · ${consol.col_label ?? ''}A`
+      if (kind === 'pdf') {
+        if (entityStmt && isEntityReport) {
+          const checkOpen = buildExportCheckOpen(entityStmt.rows, entityStmt.statement)
+          await exportStatementReportViewPdf(
+            statement,
+            entityStmt,
+            year,
+            month,
+            miniColumns,
+            exportBullets,
+            exportCtx,
+            narrative,
+            checkOpen,
+            commentMarkersByLineCode,
+          )
+        } else {
+          // No dedicated PDF exporter for consolidation table/group view — fall back to browser print.
+          window.print()
+        }
+        return
+      }
       if (kind === 'pptx') {
         if (viewMode === 'table') {
           await exportConsolidationPptx(consol, footer, consolidationCheckOpenRef.current ?? undefined)
@@ -563,7 +584,7 @@ export default function StatementConsolidationSection({
                 <Pin size={14} strokeWidth={1.75} />
               </button>
             )}
-            <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!consol || loading} />
+            <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!consol || loading} />
           </div>
         </div>
 

@@ -363,6 +363,11 @@ export default function ErSnapshotTable({
 
   async function handleExport(kind: PlExportKind) {
     if (!data) return
+    if (kind === 'pdf') {
+      // No dedicated PDF exporter for ErSnapshotResponse yet — fall back to browser print.
+      window.print()
+      return
+    }
     const stmtName = STATEMENT_TITLES[data.statement] ?? 'Statement'
     const rows = flattenTree(
       data.rows,
@@ -455,7 +460,7 @@ export default function ErSnapshotTable({
               <Pin size={14} strokeWidth={1.75} />
             </button>
           )}
-          <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
+          <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
         </div>
       </div>
 

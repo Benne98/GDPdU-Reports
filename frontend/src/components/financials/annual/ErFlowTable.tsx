@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, GripVertical, Pencil, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, GripVertical, Pencil, Pin, X } from 'lucide-react'
 import { useOptionalActionNotesContext } from '../../action-notes/ActionNotesContext'
 import { captureErFlowSnapshot } from '../../action-notes/captureExitReadiness'
 import { ErFlowResponse, ErStatementRow, ErFlowColLabels } from '../../../lib/api'
@@ -471,6 +471,11 @@ export default function ErFlowTable({
 
   async function handleExport(kind: PlExportKind) {
     if (!data) return
+    if (kind === 'pdf') {
+      // No dedicated PDF exporter for ErFlowResponse yet — fall back to browser print.
+      window.print()
+      return
+    }
     const exportColumns = effectiveViewMode === 'report' ? reportColumns : activeColumns
     const amountKeys = exportColumns.filter(c => c.kind === 'amount').map(c => c.amountKey!).filter(Boolean)
     const deltaKeys = exportColumns.filter(c => c.kind === 'delta').map(c => c.deltaKey!).filter(Boolean)
@@ -551,7 +556,22 @@ export default function ErFlowTable({
               <Pencil size={14} strokeWidth={1.75} />
             </button>
           )}
-          <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
+          {notesCtx && pinId && (
+            <button
+              type="button"
+              title="Pin to Action Board"
+              className={STATEMENT_TOOLBAR_ICON_BTN}
+              style={STATEMENT_TOOLBAR_BTN_STYLE}
+              onClick={() => {
+                const snap = notesCtx.pinTableById(pinId)
+                if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                else notesCtx.setToast('No table data to pin')
+              }}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
+          <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
         </div>
       </div>
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, Pin } from 'lucide-react'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from './statement-two-view/statementToolbarButton'
 import { MonthlyRow, MonthlyResponse, type MonthlyTotal, type FinancialStatementRow } from '../../lib/api'
 import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
 import { captureMonthlySnapshot } from '../action-notes/captureMonthlyTable'
@@ -333,6 +334,11 @@ export default function MonthlyTable({
   const handleExport = useCallback(
     async (kind: PlExportKind) => {
       if (!data) return
+      if (kind === 'pdf') {
+        // No dedicated PDF exporter for MonthlyResponse yet — fall back to browser print.
+        window.print()
+        return
+      }
       const title = STATEMENT_TITLES[data.statement] ?? 'Monthly View'
       if (kind === 'pptx') {
         await exportMonthlyTablePptx(data, reconciledExtras, planByPeriod, title, 'Monthly view — amounts in EURk', checkOpen)
@@ -476,7 +482,17 @@ export default function MonthlyTable({
 
     const isSubtotal = row.row_kind === 'subtotal'
     const isWc = statement === 'wc'
-    const rowBold = isWc ? isWcMonthlyBoldRow(row) : row.is_bold || isSubtotal
+    // Emphasize the three headline P&L margin KPIs (label + values) — mirrors the
+    // report/annual/consolidated tables.
+    const marginLbl = (row.label ?? '').trim()
+    const isMarginKpiBold =
+      isKpi &&
+      (marginLbl === 'Gross margin %' ||
+        marginLbl === 'EBITDA margin %' ||
+        marginLbl === 'Net profit margin %')
+    const rowBold = isWc
+      ? isWcMonthlyBoldRow(row)
+      : row.is_bold || isSubtotal || isMarginKpiBold
     const wcMappingLine = isWc && !rowBold && !isKpi && row.row_kind !== 'account'
 
     return (
@@ -787,7 +803,23 @@ export default function MonthlyTable({
               showPlanVariances={statement === 'pl'}
             />
           )}
-          <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
+          {notesCtx && data && (
+            <button
+              type="button"
+              title="Pin to Action Board"
+              className={PL_TOOLBAR_ICON_BTN}
+              style={PL_TOOLBAR_BTN_STYLE}
+              onClick={() => {
+                const pinId = `${data.statement}-monthly`
+                const snap = notesCtx.pinTableById(pinId)
+                if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+                else notesCtx.setToast('No table data to pin')
+              }}
+            >
+              <Pin size={14} strokeWidth={1.75} />
+            </button>
+          )}
+          <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
         </div>
       </div>
 

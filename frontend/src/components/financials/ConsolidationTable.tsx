@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, Pin } from 'lucide-react'
 import { ConsolidationRow, ConsolidationResponse } from '../../lib/api'
 import { fmtKpi, fmtPct, fmtDays } from '../../lib/fmt'
 import { FIN_TABLE_CELL_CLASS, FIN_TABLE_VALUE_FONT } from './finReportLayout'
 import PlExportMenu, { type PlExportKind } from './pl-two-view/PlExportMenu'
+import { PL_TOOLBAR_ICON_BTN, PL_TOOLBAR_BTN_STYLE } from './statement-two-view/statementToolbarButton'
 import { exportConsolidationPptx, exportConsolidationXlsx } from './statement-two-view/consolidation/consolidationExport'
 import { computeAutoExpandedIds } from './statementRowExpansion'
+import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
+import { captureConsolidationSnapshot } from '../action-notes/captureConsolidationTable'
 
 const STATEMENT_TITLES: Record<string, string> = {
   pl: 'Income statement (consolidated)',
@@ -67,6 +70,7 @@ export default function ConsolidationTable({
   onRegisterCheckOpen,
 }: ConsolidationTableProps) {
   const [userToggles, setUserToggles] = useState<Set<string>>(() => new Set())
+  const notesCtx = useOptionalActionNotesContext()
 
   const autoExpandedIds = useMemo(
     () => computeAutoExpandedIds(data?.rows, data?.statement),
@@ -81,6 +85,25 @@ export default function ConsolidationTable({
     onRegisterCheckOpen?.(checkOpen)
   }, [checkOpen, onRegisterCheckOpen, userToggles, autoExpandedIds])
 
+  // ─── Pin registration (non-embedded only) ─────────────────────────────────
+  useEffect(() => {
+    if (embedded) return
+    const stmt = data?.statement ?? 'pl'
+    const pinId = `${stmt}-legacy-consol`
+    if (!notesCtx || !data?.rows?.length) {
+      notesCtx?.unregisterTableCandidate(pinId)
+      return
+    }
+    notesCtx.registerTableCandidate({
+      id: pinId,
+      label: `${STATEMENT_TITLES[stmt] ?? 'Consolidation'} — entity breakdown`,
+      description: 'Entity columns with aggregation and consolidation — values in EURk',
+      capture: () => captureConsolidationSnapshot(data, 'ConsolidationTable'),
+      viewState: { tab: stmt },
+    })
+    return () => notesCtx.unregisterTableCandidate(pinId)
+  }, [notesCtx, data, embedded])
+
   function toggle(id: string) {
     setUserToggles(prev => {
       const next = new Set(prev)
@@ -91,6 +114,11 @@ export default function ConsolidationTable({
 
   async function handleExport(kind: PlExportKind) {
     if (!data) return
+    if (kind === 'pdf') {
+      // No dedicated PDF exporter for ConsolidationResponse yet — fall back to browser print.
+      window.print()
+      return
+    }
     const footer = `${data.col_label ?? ''}A · Entity breakdown`
     if (kind === 'pptx') {
       await exportConsolidationPptx(data, footer, checkOpen)
@@ -316,7 +344,23 @@ export default function ConsolidationTable({
             Values in EURk — IC eliminations pending
           </p>
         </div>
-        <PlExportMenu formats={['pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
+        {notesCtx && data && (
+          <button
+            type="button"
+            title="Pin to Action Board"
+            className={PL_TOOLBAR_ICON_BTN}
+            style={PL_TOOLBAR_BTN_STYLE}
+            onClick={() => {
+              const pinId = `${data.statement}-legacy-consol`
+              const snap = notesCtx.pinTableById(pinId)
+              if (snap) notesCtx.setToast('Open Action Notes to save — or use Pin table in panel')
+              else notesCtx.setToast('No table data to pin')
+            }}
+          >
+            <Pin size={14} strokeWidth={1.75} />
+          </button>
+        )}
+        <PlExportMenu formats={['pdf', 'pptx', 'xlsx']} onExport={handleExport} disabled={!data} />
       </div>
       {tableEl}
     </div>
