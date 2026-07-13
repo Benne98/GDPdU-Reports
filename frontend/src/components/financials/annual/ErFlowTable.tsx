@@ -349,7 +349,7 @@ export default function ErFlowTable({
                 <ChevronRight size={14} style={{ transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }} />
               </button>
             ) : <span style={{ width: 22 }} />}
-            <span className="text-[12px]" style={{
+            <span className="text-[13px]" style={{
               fontWeight: row.is_bold || isSubtotal || isMarginKpiBold ? 600 : 500,
               fontStyle: isKpi ? 'italic' : undefined,
               color: isKpi ? '#64748B' : isAccount ? '#475569' : '#111827',
