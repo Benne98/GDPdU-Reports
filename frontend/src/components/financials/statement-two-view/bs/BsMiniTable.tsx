@@ -18,8 +18,10 @@ import {
   REPORT_PERIOD_COL_PX,
 } from '../finReportLayout'
 
-const MINI_KINDS_MONTH = ['pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'] as const
-const MINI_KINDS_WEEK = ['pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual'] as const
+// py_cm = the selected period one year earlier (e.g. Jul24 when Jul25 is picked) —
+// meaningful history for a point-in-time balance; shown first (oldest → current).
+const MINI_KINDS_MONTH = ['py_cm', 'pm', 'cm', 'mom', 'plan_cm', 'plan_vs_actual'] as const
+const MINI_KINDS_WEEK = ['py_cm', 'pm', 'cm', 'mom', 'mtd', 'plan_cm', 'plan_vs_actual'] as const
 
 type Props = {
   data: FinancialStatementResponse

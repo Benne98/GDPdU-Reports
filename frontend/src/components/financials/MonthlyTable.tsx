@@ -179,7 +179,10 @@ export default function MonthlyTable({
 
   const displayCols = useMemo((): DisplayCol[] => {
     if (!totals.length) return periods.map(p => ({ type: 'period' as const, period: p }))
-    const skipFyTotals = annualGrain && (statement === 'bs' || statement === 'wc')
+    // BS/WC are point-in-time: the FY value equals the fiscal-year-end month, so
+    // drop the FY/YTD total columns in every grain (the year-end month is grey-
+    // highlighted instead — see isAnnualHighlightPeriod).
+    const skipFyTotals = statement === 'bs' || statement === 'wc'
     const cols: DisplayCol[] = []
     for (let i = 0; i < periods.length; i++) {
       const p = periods[i]
@@ -401,7 +404,9 @@ export default function MonthlyTable({
   function isAnnualHighlightPeriod(y: number, m: number): boolean {
     // PL & CF: only FY total columns are highlighted, not period / anchor month columns.
     if (statement === 'pl' || statement === 'cf') return false
-    return annualGrain && isAnnualYearEndMonth(y, m)
+    // BS/WC: grey-highlight the fiscal-year-end month (it IS the FY balance) in every
+    // grain, since the separate FY column is dropped for these point-in-time statements.
+    return isAnnualYearEndMonth(y, m)
   }
 
   function isPeriodColumnHighlighted(y: number, m: number, pk: string): boolean {
