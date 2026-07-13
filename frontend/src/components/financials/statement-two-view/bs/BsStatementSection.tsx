@@ -40,6 +40,7 @@ import StatementViewToggleButton from '../StatementViewToggleButton'
 import BsDetailOverlay from './BsDetailOverlay'
 import BsReportView from './BsReportView'
 import type { BsNarrativeBullet } from './bsNarrativeEngine'
+import { labelActual } from '../../../../lib/periodColumnLabels'
 
 type Props = {
   data: FinancialStatementResponse | null
@@ -285,7 +286,7 @@ export default function BsStatementSection({
     )
   }
 
-  const periodBadge = data.col_labels?.cm ? `${data.col_labels.cm}A` : ''
+  const periodBadge = data.col_labels?.cm ? labelActual(data.col_labels.cm) : ''
 
   return (
     <>

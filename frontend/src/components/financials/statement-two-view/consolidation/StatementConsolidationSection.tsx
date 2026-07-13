@@ -417,7 +417,7 @@ export default function StatementConsolidationSection({
   const handleExport = useCallback(
     async (kind: PlExportKind) => {
       if (!consol) return
-      const footer = `${selected?.label ?? 'Consolidated'} · ${consol.col_label ?? ''}A`
+      const footer = `${selected?.label ?? 'Consolidated'} · ${labelActual(consol.col_label ?? '')}`
       if (kind === 'pdf') {
         if (entityStmt && isEntityReport) {
           const checkOpen = buildExportCheckOpen(entityStmt.rows, entityStmt.statement)
@@ -492,7 +492,7 @@ export default function StatementConsolidationSection({
     ],
   )
 
-  const periodBadge = consol?.col_label ? `${consol.col_label}A` : ''
+  const periodBadge = consol?.col_label ? labelActual(consol.col_label) : ''
 
   if (loading && !consol) {
     return (

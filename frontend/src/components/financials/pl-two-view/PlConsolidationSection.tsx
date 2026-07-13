@@ -309,7 +309,7 @@ export default function PlConsolidationSection({
           ? buildExportFooterLine(entityStmt, exportCtx)
           : groupStatement
             ? buildExportFooterLine(groupStatement, exportCtx)
-            : `${exportCtx.entityDisplayName} · ${consol.col_label ?? ''}A`
+            : `${exportCtx.entityDisplayName} · ${labelActual(consol.col_label ?? '')}`
         if (viewMode === 'table' || viewMode === 'group') {
           await exportConsolidationTablePptx(
             consol,
@@ -389,7 +389,7 @@ export default function PlConsolidationSection({
       (stmtCache.size > 0 ? [...stmtCache.values()][0]?.col_labels : undefined)
     if (lbl) return buildConsolidatedTableHeading(lbl)
     return consol.col_label
-      ? `Consolidated Income Statement — ${consol.col_label}A`
+      ? `Consolidated Income Statement — ${labelActual(consol.col_label)}`
       : 'Consolidated Income Statement'
   }, [consol, colLabels, stmtCache])
 
@@ -411,7 +411,7 @@ export default function PlConsolidationSection({
 
   if (!consol?.rows.length) return null
 
-  const periodBadge = consol.col_label ? `${consol.col_label}A` : ''
+  const periodBadge = consol.col_label ? labelActual(consol.col_label) : ''
   const colLabel = consol.col_label ?? ''
   const groupYtdLabel = formatConsolidationPeriodLabel(colLabel || labelActual(`YTD${monthLabelShort(year, month)}`))
 

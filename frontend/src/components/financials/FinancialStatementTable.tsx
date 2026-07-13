@@ -17,6 +17,7 @@ import { flattenTreeToExportRows, todayStr } from '../../lib/exportXlsx'
 import { exportFinStatementTableViewPdf } from './pl-two-view/plExportPdf'
 import type { PlTableColumnDef } from './pl-two-view/plColumnRegistry'
 import { useOptionalActionNotesContext } from '../action-notes/ActionNotesContext'
+import { labelActual } from '../../lib/periodColumnLabels'
 function lastDay(y: number, m: number): string {
   return new Date(y, m, 0).toISOString().slice(0, 10)
 }
@@ -575,7 +576,7 @@ export default function FinancialStatementTable({
     wc: 'Working capital (consolidated)',
   }
   const tableTitle = data.statement ? (STATEMENT_TITLES[data.statement] ?? 'Financial statement') : 'Financial statement'
-  const periodBadge = lbl?.cm ? `${lbl.cm}A` : ''
+  const periodBadge = lbl?.cm ? labelActual(lbl.cm) : ''
 
   const tableEl = (
       <table className="w-full border-collapse text-xs">

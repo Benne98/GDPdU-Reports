@@ -12,6 +12,7 @@ import {
 import { buildPlanMapFromStatement } from './plPlanMap'
 import type { PlPlanMap } from './usePlStatementData'
 import type { ConsolidationRow } from '../../../lib/api'
+import { labelActual } from '../../../lib/periodColumnLabels'
 
 type ExportSubCol = {
   header: string
@@ -23,7 +24,7 @@ function buildExportColumns(
   consol: ConsolidationResponse,
   extraColumns: PlConsolidationColumnDef[],
 ): ExportSubCol[] {
-  const cmLabel = consol.col_label ? `${consol.col_label}A` : 'CM'
+  const cmLabel = consol.col_label ? labelActual(consol.col_label) : 'CM'
   const cols: ExportSubCol[] = []
 
   for (const e of consol.entities) {

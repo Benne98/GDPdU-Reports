@@ -5,6 +5,7 @@ import { exportFinssentialsXlsx, flattenTreeForExport } from '../../../../lib/fi
 import { exportFinssentialsPptx } from '../../../../lib/finssentialsExport/pptx/exportFinssentialsPptx'
 import { computeAutoExpandedIds } from '../../statementRowExpansion'
 import { todayStr } from '../../../../lib/exportXlsx'
+import { labelActual } from '../../../../lib/periodColumnLabels'
 
 const STATEMENT_TITLES: Record<string, string> = {
   pl: 'Income statement (consolidated)',
@@ -64,7 +65,7 @@ export async function exportConsolidationXlsx(
   const rows = flattenConsolidationForExport(data.rows, entityCodes, isRowOpen)
   await exportFinssentialsXlsx({
     tableTitle: `${stmtName} — entity breakdown`,
-    subtitle: `Values in EURk · ${data.col_label}A`,
+    subtitle: `Values in EURk · ${labelActual(data.col_label)}`,
     headers: ['EURk', ...data.entities.map(e => e.label), 'Aggregated', 'IC Elim.', 'Consolidation'],
     rows,
     filename: `Consolidation_${data.statement}_${todayStr()}.xlsx`,

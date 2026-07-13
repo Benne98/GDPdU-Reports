@@ -7,6 +7,7 @@ import StatementSectionShell from './StatementSectionShell'
 import type { FinStatementKind } from './statementTypes'
 import { loadStatementViewMode, saveStatementViewMode } from './statementViewMode'
 import type { StatementViewMode } from './statementTypes'
+import { labelActual } from '../../../lib/periodColumnLabels'
 
 type Props = {
   statement: Exclude<FinStatementKind, 'pl'>
@@ -68,7 +69,7 @@ export default function StatementLegacySection({
     )
   }
 
-  const periodBadge = data.col_labels?.cm ? `${data.col_labels.cm}A` : ''
+  const periodBadge = data.col_labels?.cm ? labelActual(data.col_labels.cm) : ''
 
   return (
     <StatementSectionShell

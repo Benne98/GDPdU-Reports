@@ -38,6 +38,7 @@ import StatementViewToggleButton from '../StatementViewToggleButton'
 import CfDetailOverlay from './CfDetailOverlay'
 import CfReportView from './CfReportView'
 import type { CfNarrativeBullet } from './cfNarrativeEngine'
+import { labelActual } from '../../../../lib/periodColumnLabels'
 
 type Props = {
   data: FinancialStatementResponse | null
@@ -275,7 +276,7 @@ export default function CfStatementSection({
     )
   }
 
-  const periodBadge = data.col_labels?.cm ? `${data.col_labels.cm}A` : ''
+  const periodBadge = data.col_labels?.cm ? labelActual(data.col_labels.cm) : ''
 
   return (
     <>

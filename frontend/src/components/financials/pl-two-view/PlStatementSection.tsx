@@ -28,6 +28,7 @@ import {
   saveStatementViewMode,
 } from '../statement-two-view/statementViewMode'
 import { PL_TOOLBAR_BTN_STYLE, PL_TOOLBAR_ICON_BTN } from './plToolbarButton'
+import { labelActual } from '../../../lib/periodColumnLabels'
 
 type Props = {
   data: FinancialStatementResponse | null
@@ -247,7 +248,7 @@ export default function PlStatementSection({
     )
   }
 
-  const periodBadge = data.col_labels?.cm ? `${data.col_labels.cm}A` : ''
+  const periodBadge = data.col_labels?.cm ? labelActual(data.col_labels.cm) : ''
   return (
     <>
       <div

@@ -39,6 +39,7 @@ import StatementViewToggleButton from '../StatementViewToggleButton'
 import WcDetailOverlay from './WcDetailOverlay'
 import WcReportView from './WcReportView'
 import type { WcNarrativeBullet } from './wcNarrativeEngine'
+import { labelActual } from '../../../../lib/periodColumnLabels'
 
 type Props = {
   data: FinancialStatementResponse | null
@@ -276,7 +277,7 @@ export default function WcStatementSection({
     )
   }
 
-  const periodBadge = data.col_labels?.cm ? `${data.col_labels.cm}A` : ''
+  const periodBadge = data.col_labels?.cm ? labelActual(data.col_labels.cm) : ''
 
   return (
     <>
