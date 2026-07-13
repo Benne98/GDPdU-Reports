@@ -57,6 +57,10 @@ export function shouldDisplayConsolidationRow(
   entityCodes: string[],
 ): boolean {
   if (row.row_kind === 'title' || row.row_kind === 'kpi_header') return true
+  // KPI rows render as a complete block (like their header): keep them even when a
+  // given KPI is all-zero — e.g. WC DIO/DPO are 0 when there is no COGS in scope,
+  // but they must still appear (in days) alongside DSO/CCC.
+  if (row.row_kind === 'kpi') return true
   if (!isConsolidationRowAllZero(row, entityCodes)) return true
   return consolidationBranchHasNonZero(row, entityCodes)
 }

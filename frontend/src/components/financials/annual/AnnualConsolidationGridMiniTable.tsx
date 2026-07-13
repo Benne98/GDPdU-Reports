@@ -97,6 +97,8 @@ export default function AnnualConsolidationGridMiniTable({
     const isTitle = row.row_kind === 'title'
     const isKpiHeader = row.row_kind === 'kpi_header'
     const isKpi = row.row_kind === 'kpi'
+    // WC KPI rows (DIO/DSO/DPO/CCC) are in DAYS, not percent.
+    const isWcKpi = isKpi && consol.statement === 'wc'
     const isSubtotal = row.row_kind === 'subtotal'
     const isBold = row.is_bold || isSubtotal || (isKpi && BOLD_MARGIN_KPI_LABELS.has(row.label))
     const marker = commentMarkersByLineCode?.[row.id]
@@ -178,7 +180,8 @@ export default function AnnualConsolidationGridMiniTable({
                 key={e.code}
                 value={display}
                 bold={isBold}
-                isPct={isKpi}
+                isPct={isKpi && !isWcKpi}
+                isDays={isWcKpi}
                 italic={isKpi}
                 compact
                 denser
@@ -199,7 +202,8 @@ export default function AnnualConsolidationGridMiniTable({
           <ValCell
             value={isKpi ? row.consolidation : row.consolidation}
             bold={isBold}
-            isPct={isKpi}
+            isPct={isKpi && !isWcKpi}
+            isDays={isWcKpi}
             italic={isKpi}
             compact
             denser
