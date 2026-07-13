@@ -12,3 +12,13 @@ export const FIN_TABLE_VALUE_FONT = '0.8125rem' /* 13px */
 export const FIN_TABLE_CELL_CLASS = 'px-1.5 py-1'
 
 export const FIN_TABLE_CELL_DENSE_CLASS = 'px-0.5 py-0.5'
+
+/**
+ * Group-report mini-table fixed column widths.
+ * Used together with `table-fixed` + `<colgroup>` so every statement table
+ * has identical column proportions regardless of how many plan/OPlan columns
+ * are present. Extra horizontal space is absorbed by the label column.
+ */
+export const REPORT_LABEL_COL_MIN_PX = 180  // label/position column floor (absorbs extra space)
+export const REPORT_MARKER_COL_PX = 20       // "#" comment-marker column
+export const REPORT_PERIOD_COL_PX = 88       // each period/value column (year, month, week)

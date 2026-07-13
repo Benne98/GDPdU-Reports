@@ -18,6 +18,7 @@ import { KPI_TABLE_COLUMN_KINDS, resolveCellValue } from './plColumnRegistry'
 import type { MonthlyResponse } from '../../../lib/api'
 import PlCommentIndexBadge from './PlCommentIndexBadge'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
+import { REPORT_LABEL_COL_MIN_PX } from '../statement-two-view/finReportLayout'
 
 /** Expandable children/accounts: largest CM first (PL); BS/WC keep backend order. */
 function sortRowsByCmDesc(rows: FinancialStatementRow[]): FinancialStatementRow[] {
@@ -338,7 +339,7 @@ export function renderPlTableRows(ctx: PlTableRenderCtx, rows: FinancialStatemen
         <td
           className={`${ctx.compact ? 'py-1' : 'py-2'} text-left`}
           style={{
-            minWidth: ctx.exportMode ? 140 : 180,
+            minWidth: ctx.exportMode ? 140 : REPORT_LABEL_COL_MIN_PX,
             maxWidth: ctx.exportMode ? 280 : undefined,
             paddingLeft: pad,
             paddingRight: 12,

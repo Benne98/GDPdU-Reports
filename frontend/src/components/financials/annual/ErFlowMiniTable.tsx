@@ -2,6 +2,7 @@ import type { ErFlowResponse, ErStatementRow } from '../../../lib/api'
 import type { FinancialsDrillOpen } from '../FinancialStatementTable'
 import { TwoLineHeader, DeltaCell, ValCell } from '../pl-two-view/plTableCore'
 import type { ReportCommentMarkerMap } from '../statement-two-view/reportCommentMarkers'
+import { REPORT_MARKER_COL_PX, REPORT_PERIOD_COL_PX } from '../statement-two-view/finReportLayout'
 import {
   AnnualRowLabel,
   annualCommentColSpan,
@@ -301,8 +302,15 @@ export default function ErFlowMiniTable({
   }
 
   return (
-    <div className="min-w-0 w-full">
-      <table className="w-full border-collapse text-xs">
+    <div className="min-w-0 w-full overflow-x-auto">
+      <table className="w-full border-collapse text-xs table-fixed">
+        <colgroup>
+          <col />{/* label: auto → absorbs all remaining horizontal space */}
+          {hasCommentCol && <col style={{ width: REPORT_MARKER_COL_PX }} />}
+          {columns.map((_c, i) => (
+            <col key={i} style={{ width: REPORT_PERIOD_COL_PX }} />
+          ))}
+        </colgroup>
         <thead>
           <tr style={{ borderBottom: '2px solid #E2E8F0', background: '#F8FAFC' }}>
             <th className="px-2 py-2 text-left font-semibold text-xs" style={{ color: '#475569' }}>EURk</th>
