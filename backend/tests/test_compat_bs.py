@@ -354,6 +354,112 @@ class TestBsStatement:
 
 
 # ---------------------------------------------------------------------------
+# (a2) Whole-group statement BALANCES (Total assets == Total equity & liabilities)
+#
+# Root-cause regression: build_bs_statement_compat (entity=None) MUST tie out the
+# same way build_bs_consolidation does.  The bug was that bs_grain_sql_month/week
+# used the LIFETIME-hybrid balance (_bal_case), which — under
+# OPENING_BALANCE_MODE=in_data — dropped every per-FY Jan-1 retained-earnings
+# carry-forward from equity while keeping all cumulative asset movements, so the
+# single statement's equity base was understated (negative) and Assets ≠ E&L.  The
+# fix scopes each column to its fiscal year (_bal_case_fy), matching the
+# consolidation / snapshot / monthly / trial-balance grains.
+#
+# FORMULA (why FY-scoping ties out, per column k, raw signs assets +, credit −):
+#   all_bs_raw[k] = Σ_BS[ OB(FY)@Jan-1  +  in-FY BS movements ≤ cutoff ]
+#     Σ OB(FY) = 0                         (balanced opening snapshot incl. Gewinnvortrag)
+#     Σ_BS(movements) = −Σ_PL(movements)   (every journal entry balances BS+PL)
+#   net_profit[k] = Σ_PL(amount × −1) = −Σ_PL(raw)
+#   ⇒ all_bs_raw[k] = net_profit[k]  ⇒  imbalance = all_bs_raw − net_profit = 0.
+#
+# WORKED EXAMPLE (cm column, balanced ledger below):
+#   assets cm = 600 + 400 = 1000 ; credit raw cm = −400 + −520 = −920
+#   Σ raw BS = 1000 − 920 = 80 ; Σ P&L YTD = 80  → total_eq_liab = 920 + 80 = 1000
+#   → Total assets (1000) == Total equity & liabilities (1000).  imbalance = 0.
+# ---------------------------------------------------------------------------
+# Balanced whole-group ledger: Σ raw BS per column == the P&L net profit per column.
+_BS_GRAIN_BALANCED = [
+    _bs_grain("Assets", "Current assets", "Trade receivables", "AT1200",
+              cm=600, pm=550, py_cm=500, ytd=600, ytd_py=500, mtd=600),
+    _bs_grain("Assets", "Current assets", "Inventories", "AT1400",
+              cm=400, pm=400, py_cm=350, ytd=400, ytd_py=350, mtd=400),
+    _bs_grain("Equity & liabilities", "Liabilities", "Trade payables", "AT3300",
+              cm=-400, pm=-350, py_cm=-300, ytd=-400, ytd_py=-300, mtd=-400),
+    _bs_grain("Equity & liabilities", "Equity", "Retained earnings", "AT2800",
+              cm=-520, pm=-520, py_cm=-480, ytd=-520, ytd_py=-480, mtd=-520),
+]
+# P&L net profit == Σ raw BS per column (the accounting identity FY-scoping yields).
+_NET_PROFIT_BALANCED = {"py_cm": 70.0, "pm": 80.0, "cm": 80.0, "ytd": 80.0,
+                        "ytd_py": 70.0, "mtd": 80.0}
+
+
+class TestBsStatementBalances:
+    """Total assets == Total equity & liabilities for the whole-group statement."""
+
+    def _balance_check(self, out):
+        return out["balance_check"]
+
+    def _assert_balanced(self, out, keys):
+        bc = self._balance_check(out)
+        for k in keys:
+            assert abs(bc["total_assets"][k] - bc["total_eq_liab"][k]) < 0.01, (
+                f"column {k}: assets {bc['total_assets'][k]} != "
+                f"E&L {bc['total_eq_liab'][k]}"
+            )
+            assert abs(bc["imbalance"][k]) < 0.01
+        assert bc["is_balanced"] is True
+
+    def test_monthly_statement_balances(self):
+        from app.services.fin_compat_bs import build_bs_statement_compat
+        session = _mock_session(
+            grain_rows=_BS_GRAIN_BALANCED, net_profit=_NET_PROFIT_BALANCED,
+        )
+        out = build_bs_statement_compat(session, period_grain="month", year=2025, month=6)
+        self._assert_balanced(out, _MONTH_KEYS)
+
+    def test_weekly_statement_balances(self):
+        from app.services.fin_compat_bs import build_bs_statement_compat
+        session = _mock_session(
+            grain_rows=_BS_GRAIN_BALANCED, net_profit=_NET_PROFIT_BALANCED,
+        )
+        out = build_bs_statement_compat(
+            session, period_grain="week", iso_year=2025, iso_week=26,
+        )
+        self._assert_balanced(out, _MONTH_KEYS + ["mtd"])
+
+
+class TestBsStatementGrainIsFyScoped:
+    """The single statement grain SQL must be FY-scoped (same as consolidation).
+
+    Guards against a regression to the lifetime-hybrid ``_bal_case`` path, which
+    does NOT balance under OPENING_BALANCE_MODE=in_data.  Mirrors the snapshot's
+    ``test_snapshot_dec_columns_use_year_end_cutoff``.
+    """
+
+    def test_month_grain_fy_scoped(self):
+        from datetime import date
+
+        from app.services.fin_compat_bs_sql import _bal_amount_expr_fy, bs_grain_sql_month
+
+        sql, _ = bs_grain_sql_month(2025, 6, "")
+        # cm / ytd columns are the FY(year) balance at the month-end cutoff.
+        assert _bal_amount_expr_fy(2025, date(2025, 6, 30)) in sql
+        assert "e.fiscal_year = 2025" in sql
+        # py_cm / ytd_py columns are the FY(year-1) balance one year earlier.
+        assert "e.fiscal_year = 2024" in sql
+        # NOT the lifetime-hybrid path (bal_mov CTE) that caused the imbalance.
+        assert "bal_mov AS" not in sql
+
+    def test_week_grain_fy_scoped(self):
+        from app.services.fin_compat_bs_sql import bs_grain_sql_week
+
+        sql, _ = bs_grain_sql_week(2025, 26, "")
+        assert "e.fiscal_year = 2025" in sql   # cm / ytd / mtd / pm
+        assert "e.fiscal_year = 2024" in sql   # py_cm / ytd_py (same week prior year)
+        assert "bal_mov AS" not in sql
+
+
+# ---------------------------------------------------------------------------
 # (e) Structure filter: BS vs P&L row classification
 # ---------------------------------------------------------------------------
 class TestStructureFilter:

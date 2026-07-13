@@ -283,29 +283,46 @@ def bs_grain_sql_month(year: int, month: int, ent_frag: str) -> tuple[str, dict[
     Cutoffs: py_cm/ytd_py = last_day(year-1, month); pm = last_day(prior month);
     cm/ytd = last_day(year, month).  ytd == cm and ytd_py == py_cm because a BS
     column is a stock (the closing balance at the cutoff), not a period sum.
+
+    EACH COLUMN IS FY-SCOPED (``_bal_case_fy``): that fiscal year's Jan-1 opening
+    balance plus in-FY movements through the cutoff — IDENTICAL to
+    :func:`bs_consl_grain_sql_month`, :func:`bs_snapshot_grain_sql`,
+    :func:`bs_monthly_grain_sql` and ``build_bs_trial_balance``.  This is what makes
+    the whole-group (entity=None) statement TIE OUT (Total assets == Total equity &
+    liabilities) the same way the consolidation does under
+    ``OPENING_BALANCE_MODE=in_data`` — where retained earnings are carried as a
+    per-FY Jan-1 opening snapshot (Saldovortrag), NOT as closing movements.  The
+    former lifetime-hybrid ``_bal_case`` kept only the EARLIEST opening snapshot and
+    dropped every later carry-forward, so prior-year retained earnings vanished from
+    equity while assets kept all cumulative movements → a spurious imbalance.
+
+    Each column's FY is aligned to the matching P&L net-profit window in
+    :func:`bs_net_profit_sql_month` (py_cm/ytd_py → FY ``year-1``; pm/cm/ytd → FY
+    ``year``), so ``all_bs_raw == Σ P&L`` per column and ``bs_imbalance_from_grains``
+    returns 0 on a balanced ledger.
     """
     pm_y, pm_m = pm(year, month)
     d_py = last_day(year - 1, month)
     d_pm = last_day(pm_y, pm_m)
     d_cm = last_day(year, month)
     cases = ", ".join([
-        _bal_case(d_py, "py_cm"),
-        _bal_case(d_pm, "pm"),
-        _bal_case(d_cm, "cm"),
-        _bal_case(d_cm, "ytd"),
-        _bal_case(d_py, "ytd_py"),
+        _bal_case_fy(year - 1, d_py, "py_cm"),
+        _bal_case_fy(year, d_pm, "pm"),
+        _bal_case_fy(year, d_cm, "cm"),
+        _bal_case_fy(year, d_cm, "ytd"),
+        _bal_case_fy(year - 1, d_py, "ytd_py"),
     ])
     sql = f"""
         SELECT
             {_BS_GRAIN_DIMS},
             {cases}
-        {_BS_FROM_BAL}
+        {_BS_FROM}
         WHERE a.level_0 = 'BS'
           AND e.posting_date <= '{d_cm.isoformat()}'
           {ent_frag}
         {_BS_GROUP_BY}
     """
-    return _wrap_bs_bal_sql(sql), {}
+    return sql, {}
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +337,13 @@ def bs_grain_sql_week(iso_year: int, iso_week: int, ent_frag: str) -> tuple[str,
     py_cm/ytd_py= balance at the same-week-prior-year Sunday (spy_t).
     ``mtd`` (month-to-date) equals cm for a stock — the balance AT the anchor
     Sunday is the cumulative balance — and is carried so the week schema matches.
+
+    EACH COLUMN IS FY-SCOPED (``_bal_case_fy``), exactly like the month grain and
+    the consolidation, so the whole-group week statement ties out (Total assets ==
+    Total equity & liabilities) under ``OPENING_BALANCE_MODE=in_data``.  Column FYs
+    match the P&L net-profit windows in :func:`bs_net_profit_sql_week`
+    (cm/ytd/mtd/pm → FY ``iso_year``; py_cm/ytd_py → FY ``spy_y``).  See
+    :func:`bs_grain_sql_month` for the full rationale.
     """
     _, d_cm = iso_week_bounds(iso_year, iso_week)
     pw_y, pw_w = prior_iso_week(iso_year, iso_week)
@@ -327,24 +351,24 @@ def bs_grain_sql_week(iso_year: int, iso_week: int, ent_frag: str) -> tuple[str,
     spy_y, spy_w = same_week_prior_year(iso_year, iso_week)
     _, d_py = iso_week_bounds(spy_y, spy_w)
     cases = ", ".join([
-        _bal_case(d_py, "py_cm"),
-        _bal_case(d_pm, "pm"),
-        _bal_case(d_cm, "cm"),
-        _bal_case(d_cm, "ytd"),
-        _bal_case(d_py, "ytd_py"),
-        _bal_case(d_cm, "mtd"),
+        _bal_case_fy(spy_y, d_py, "py_cm"),
+        _bal_case_fy(iso_year, d_pm, "pm"),
+        _bal_case_fy(iso_year, d_cm, "cm"),
+        _bal_case_fy(iso_year, d_cm, "ytd"),
+        _bal_case_fy(spy_y, d_py, "ytd_py"),
+        _bal_case_fy(iso_year, d_cm, "mtd"),
     ])
     sql = f"""
         SELECT
             {_BS_GRAIN_DIMS},
             {cases}
-        {_BS_FROM_BAL}
+        {_BS_FROM}
         WHERE a.level_0 = 'BS'
           AND e.posting_date <= '{d_cm.isoformat()}'
           {ent_frag}
         {_BS_GROUP_BY}
     """
-    return _wrap_bs_bal_sql(sql), {}
+    return sql, {}
 
 
 # ---------------------------------------------------------------------------
