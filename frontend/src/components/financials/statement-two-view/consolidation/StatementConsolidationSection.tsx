@@ -16,10 +16,9 @@ import PlEntityCarousel from '../../pl-two-view/PlEntityCarousel'
 import PlExportMenu, { type PlExportKind } from '../../pl-two-view/PlExportMenu'
 import {
   loadConsolidationColumns,
-  makeConsolidationColumn,
   type PlConsolidationColumnDef,
 } from '../../pl-two-view/plConsolidationColumnRegistry'
-import { buildDefaultColumns, type PlTableColumnDef } from '../../pl-two-view/plColumnRegistry'
+import { buildDefaultColumns } from '../../pl-two-view/plColumnRegistry'
 import { exportPlTableView } from '../../pl-two-view/plExport'
 import { buildPlanMapFromStatement } from '../../pl-two-view/plPlanMap'
 import type { PlNarrativeBullet } from '../../pl-two-view/plNarrativeEngine'
@@ -108,19 +107,6 @@ function bsWcCfViewModeKey(statement: 'bs' | 'wc' | 'cf'): string {
   return `finssentials.${statement}.consol.viewMode.v2`
 }
 
-/**
- * Default extra-columns for the month/week entity-breakdown Table View for BS/WC.
- * Seeds a `pm` (prior-month) column so the prior balance appears beside the current month.
- * Returns [] for annual grain or non-BS/WC statements (those have their own defaults or none).
- */
-function defaultConsolColumns(
-  statement: string,
-  grain: string,
-): PlConsolidationColumnDef[] {
-  if (grain === 'year' || (statement !== 'bs' && statement !== 'wc')) return []
-  const pmTemplate: PlTableColumnDef = { id: 'pm', kind: 'pm', labelLine1: 'PM' }
-  return [makeConsolidationColumn('aggregated', undefined, pmTemplate)]
-}
 
 function loadBsWcCfConsolViewMode(statement: 'bs' | 'wc' | 'cf'): AnnualConsolViewMode {
   try {
@@ -191,10 +177,9 @@ export default function StatementConsolidationSection({
   const [entityLoading, setEntityLoading] = useState(false)
   const [stmtCache, setStmtCache] = useState<Map<string, FinancialStatementResponse>>(() => new Map())
   const [groupStatement, setGroupStatement] = useState<FinancialStatementResponse | null>(null)
-  const [extraColumns, setExtraColumns] = useState<PlConsolidationColumnDef[]>(() => {
-    const saved = loadConsolidationColumns(statement)
-    return saved.length > 0 ? saved : defaultConsolColumns(statement, periodSelection.grain)
-  })
+  const [extraColumns, setExtraColumns] = useState<PlConsolidationColumnDef[]>(
+    () => loadConsolidationColumns(statement),
+  )
   const [detailBullet, setDetailBullet] = useState<PlNarrativeBullet | null>(null)
   const [narrative, setNarrative] = useState<PlNarrativeResponse | null>(null)
 
@@ -276,9 +261,8 @@ export default function StatementConsolidationSection({
   }, [entityIndex, statement])
 
   useEffect(() => {
-    const saved = loadConsolidationColumns(statement)
-    setExtraColumns(saved.length > 0 ? saved : defaultConsolColumns(statement, periodSelection.grain))
-  }, [statement, periodSelection.grain])
+    setExtraColumns(loadConsolidationColumns(statement))
+  }, [statement])
 
   useEffect(() => {
     setNarrative(null)
