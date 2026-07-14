@@ -364,11 +364,13 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         out["pl_kpi_rows"] = seed_pl_kpi_rows(session)
 
         # Supplemental CF structure rows NOT in the external CF Structure sheet (the
-        # 'Other taxes' standalone operating leaf) — re-created idempotently on every
-        # full rebuild for ANY project so the indirect Cash Flow Net-cash-flow ties to
-        # ΔCash.  Additive + idempotent (an existing row is only refreshed, never
-        # duplicated / re-shifted); a no-op once present.  dim_cf_structure is NOT
-        # otherwise touched by the rebuild, so this is the row's re-creation hook.
+        # 'Other taxes' leaf, placed directly after "Taxes on income" so it folds into
+        # Gross cash flow) — re-created / re-positioned idempotently on every full
+        # rebuild for ANY project so the indirect Cash Flow Net-cash-flow ties to
+        # ΔCash.  Idempotent: an already-correctly-placed row is only refreshed (no
+        # sort drift); a stale-position row is moved to the right anchor.
+        # dim_cf_structure is NOT otherwise touched by the rebuild, so this is the
+        # row's re-creation hook.
         from scripts.seed_cf_structure import seed_cf_supplemental_rows  # type: ignore
 
         out["cf_supplemental_rows"] = seed_cf_supplemental_rows(session)

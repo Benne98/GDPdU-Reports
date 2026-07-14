@@ -111,15 +111,16 @@ _SECTION_KEYWORDS: dict[str, str] = {
 # predates them — carries the row.  Derived-by-precedent, same spirit as
 # load_cf_mapping_library._NA_GAP_FILLERS.
 #
-#   * 'Other taxes' — a STANDALONE OPERATING detail leaf placed AFTER the WC / Other-
-#     operating block and immediately BEFORE "Cash flow from operating activities".
-#     It carries its OWN cf_mapping ('Other taxes'), so it is NEITHER in the EBITDA
-#     leaf set NOR folded into Taxes on income: CF EBITDA == P&L EBITDA and Gross cash
-#     flow == EBITDA + Taxes on income stay locked, while Net cash flow now includes
-#     it and ties to the actual change in cash & cash equivalents (ΔCash).  details=0
-#     keeps it top-level (not nested under a cluster subtotal).  Placement is anchored
-#     to the CFO section total, so it lands just above CFO regardless of the sheet's
-#     numbering.
+#   * 'Other taxes' — a detail leaf placed DIRECTLY AFTER "Taxes on income" and
+#     BEFORE the "Gross cash flow" subtotal, so it is PART of the Gross cash flow
+#     build-up (product decision).  It carries its OWN cf_mapping ('Other taxes'), so
+#     CF EBITDA == P&L EBITDA stays LOCKED (Other taxes ∉ the EBITDA leaf set); the
+#     Gross cash flow subtotal now equals EBITDA + Taxes on income + Other taxes (the
+#     previous "EBITDA + Taxes" identity is intentionally superseded); and Net cash
+#     flow still Σ's every non-cash leaf so it ties to ΔCash (only the leaf's POSITION
+#     moved).  details=0 keeps it top-level (not nested under a cluster subtotal).
+#     Placement is anchored to the "Taxes on income" row, so it lands just after it
+#     regardless of the sheet's numbering.
 _CF_SUPPLEMENTAL_ROWS: list[dict] = [
     {
         "line_code": "CF_OTHER_TAXES",
@@ -184,32 +185,36 @@ def _make_kpi_code(
 
 
 def seed_cf_supplemental_rows(session: SASession) -> int:
-    """Idempotently add code-defined CF rows absent from the external CF sheet.
+    """Idempotently add / re-position code-defined CF rows absent from the CF sheet.
 
-    Currently just 'Other taxes' — a STANDALONE OPERATING detail leaf inserted
-    immediately BEFORE the operating-activities section total (CFO), so the indirect
-    Cash Flow Net-cash-flow ties to ΔCash while ``CF EBITDA == P&L EBITDA`` and
-    ``Gross cash flow == EBITDA + Taxes on income`` stay locked (the leaf is neither
-    in the EBITDA leaf set nor folded into Taxes on income).
+    Currently just 'Other taxes' — a detail leaf placed DIRECTLY AFTER the "Taxes on
+    income" mapping row (i.e. BEFORE the "Gross cash flow" subtotal), so it is PART of
+    the Gross cash flow build-up: ``Gross cash flow == EBITDA + Taxes on income +
+    Other taxes``.  ``CF EBITDA == P&L EBITDA`` stays LOCKED (the leaf is its own
+    cf_mapping, not in the EBITDA leaf set) and Net cash flow still Σ's every non-cash
+    leaf, so it ties to ΔCash (only the leaf's POSITION moved).
 
-    Idempotent: an already-present row keeps its placement and only has its
-    presentation attributes refreshed (no re-shift).  Returns rows INSERTED.  Does
-    NOT commit (the caller owns the transaction).
+    RE-POSITIONING (not just insert): the row may already exist at a STALE position
+    (e.g. an earlier build placed it before CFO).  If it is not already the immediate
+    successor of "Taxes on income", it is DELETED and re-inserted at the correct
+    anchor via :func:`structure_autoextend._compute_sort_order` (handles the no-gap
+    shift collision-free).  Idempotent: a second run detects it is already correctly
+    placed and only refreshes presentation attrs (no sort drift).  Returns rows
+    (re-)inserted.  Does NOT commit (the caller owns the transaction).
     """
     # Reuse the tested sort_order allocator (handles the no-gap shift collision-free).
     from app.services.structure_autoextend import _compute_sort_order
 
-    cfo = session.execute(text(
-        "SELECT sort_order FROM dim_cf_structure "
-        "WHERE row_type IN ('subtotal', 'calc') "
-        "  AND balance_title ILIKE '%operating activities%' "
+    anchor = session.execute(text(
+        "SELECT sort_order, line_code FROM dim_cf_structure "
+        "WHERE row_type = 'mapping' AND balance_title ILIKE '%taxes on income%' "
         "ORDER BY sort_order LIMIT 1"
     )).fetchone()
-    if cfo is None:
-        print("  [WARN] no 'Cash flow from operating activities' section total — "
-              "supplemental CF rows skipped.")
+    if anchor is None:
+        print("  [WARN] no 'Taxes on income' row — supplemental CF rows skipped.")
         return 0
-    cfo_sort = int(cfo[0])
+    anchor_sort = int(anchor[0])
+    anchor_lc = str(anchor[1])
 
     inserted = 0
     for spec in _CF_SUPPLEMENTAL_ROWS:
@@ -217,7 +222,16 @@ def seed_cf_supplemental_rows(session: SASession) -> int:
         exists = session.execute(
             text("SELECT 1 FROM dim_cf_structure WHERE line_code = :lc"), {"lc": lc}
         ).fetchone()
-        if exists is not None:
+        # Correctly placed iff it is the immediate successor of the anchor row.
+        succ = session.execute(
+            text("SELECT line_code FROM dim_cf_structure WHERE sort_order > :s "
+                 "ORDER BY sort_order LIMIT 1"),
+            {"s": anchor_sort},
+        ).fetchone()
+        already_ok = exists is not None and succ is not None and str(succ[0]) == lc
+
+        if already_ok:
+            # Refresh presentation attrs only; keep placement (no sort drift).
             session.execute(
                 text(
                     "UPDATE dim_cf_structure SET row_type = :rt, balance_title = :bt, "
@@ -229,14 +243,13 @@ def seed_cf_supplemental_rows(session: SASession) -> int:
                  "lc": lc},
             )
             continue
-        # Anchor AFTER the row directly preceding CFO == insert right before CFO.
-        pred = session.execute(
-            text("SELECT line_code FROM dim_cf_structure WHERE sort_order < :s "
-                 "ORDER BY sort_order DESC LIMIT 1"),
-            {"s": cfo_sort},
-        ).fetchone()
-        after_lc = str(pred[0]) if pred else ""
-        sort_order = _compute_sort_order(session, "dim_cf_structure", "CF", after_lc)
+
+        # Present but mis-placed (stale position) → delete and re-insert at the anchor.
+        if exists is not None:
+            session.execute(
+                text("DELETE FROM dim_cf_structure WHERE line_code = :lc"), {"lc": lc}
+            )
+        sort_order = _compute_sort_order(session, "dim_cf_structure", "CF", anchor_lc)
         session.execute(
             text(
                 "INSERT INTO dim_cf_structure "
@@ -250,8 +263,8 @@ def seed_cf_supplemental_rows(session: SASession) -> int:
         )
         inserted += 1
     if inserted:
-        print(f"  [supplemental] {inserted} code-defined CF row(s) inserted "
-              f"(e.g. CF_OTHER_TAXES before CFO).")
+        print(f"  [supplemental] {inserted} code-defined CF row(s) (re-)inserted "
+              f"(e.g. CF_OTHER_TAXES directly after 'Taxes on income').")
     return inserted
 
 

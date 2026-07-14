@@ -621,14 +621,19 @@ class TestCfReconciliationV2:
         assert cf_eb_ytd == pytest.approx(pl_eb_ytd, rel=1e-6, abs=1.0)
         assert cf_eb_cm == pytest.approx(pl_eb_cm, rel=1e-6, abs=1.0)
 
-        # (3) Gross cash flow = EBITDA + Taxes (operating intermediate).
+        # (3) Gross cash flow = EBITDA + Taxes on income + Other taxes (operating
+        # intermediate).  'Other taxes' is now folded INTO Gross cash flow (its own
+        # leaf placed directly after Taxes on income); when the DB predates the
+        # re-seed the leaf is absent → other_taxes 0.0 → falls back to EBITDA + Taxes.
         gross = cf_rows.get("CF_GROSS_CASH_FLOW") or _row_by_label(cf["rows"], "Gross cash flow")
         taxes = _row_by_label(cf["rows"], "Taxes on income")
         assert gross is not None and taxes is not None
         g_ytd = float((gross.get("amounts") or {}).get("ytd") or 0.0)
         t_ytd = float((taxes.get("amounts") or {}).get("ytd") or 0.0)
+        ot_row = _row_by_label(cf["rows"], "Other taxes")
+        ot_ytd = float((ot_row.get("amounts") or {}).get("ytd") or 0.0) if ot_row else 0.0
         assert g_ytd != 0.0
-        assert g_ytd == pytest.approx(cf_eb_ytd + t_ytd, rel=1e-6, abs=1.0)
+        assert g_ytd == pytest.approx(cf_eb_ytd + t_ytd + ot_ytd, rel=1e-6, abs=1.0)
 
         # (4) Net cash flow non-zero and equals Σ of every mapped CF leaf (YTD).
         net = _row_by_label(cf["rows"], "Net cash flow")
@@ -842,35 +847,38 @@ class TestCfIntraGroupChange:
 
 
 # ===========================================================================
-# (j) 'Other taxes' — dedicated OPERATING leaf reconciles Net CF to ΔCash
+# (j) 'Other taxes' — own leaf INSIDE Gross cash flow; Net CF ties to ΔCash
 # ===========================================================================
 # Locks the mapping-source change: 'Other taxes' (KFZ-Steuer, Grundsteuer,
-# Grundbesitzabgaben) is now its OWN standalone operating leaf placed AFTER the
-# WC / Other-operating block and BEFORE "Cash flow from operating activities".
+# Grundbesitzabgaben) is its OWN leaf placed DIRECTLY AFTER "Taxes on income"
+# (before the "Gross cash flow" subtotal), so it FOLDS INTO Gross cash flow.
 #
 # === WORKED EXAMPLE (cm; extends TestCfIntraGroupChange's live-shaped fixture) ===
-#   Add one leaf  CF_OTHER_TAXES = −99.41  between Δ Other operating items and CFO.
-#   Identities that MUST stay locked (Other taxes in NEITHER):
-#     CF EBITDA            = 529,467.51                       (unchanged)
-#     Gross cash flow      = 519,498.37  (= EBITDA + Taxes)   (unchanged)
-#   Figures that MUST now include Other taxes (it flows into CFO / Net):
+#   Add one leaf  CF_OTHER_TAXES = −99.41  between Taxes on income and Gross cash flow.
+#   Identity that stays LOCKED (Other taxes ∉ the EBITDA leaf set):
+#     CF EBITDA            = 529,467.51                                   (unchanged)
+#   Identity that INTENTIONALLY changes (Other taxes now inside Gross cash flow):
+#     Gross cash flow      = 529,467.51 − 9,969.14 − 99.41 = 519,398.96
+#                            (= EBITDA + Taxes on income + Other taxes)
+#   Totals unchanged (Other taxes was already an operating leaf; only its POSITION):
 #     CFO  = −54,114.44 + (−99.41)   = −54,213.85
 #     Net  = −612,866.13 + (−99.41)  = −612,965.54  == Σ ALL leaves (ties to ΔCash)
 _OTHER_TAXES_CM = -99.41
 
 
 class TestCfOtherTaxesLeaf:
-    """'Other taxes' operating leaf: Net CF ties to Σ all leaves; EBITDA + Gross CF
-    identities unchanged (Other taxes in neither)."""
+    """'Other taxes' leaf placed directly after Taxes on income: it folds into Gross
+    cash flow; CF EBITDA stays locked; Net CF ties to Σ all leaves (== ΔCash)."""
 
     def _structure(self):
-        # Insert the leaf right AFTER CF_OTHER_OPERATING_ITEMS (i.e. before CFO),
-        # exactly the dim_cf_structure placement seed_cf_supplemental_rows produces.
+        # Insert the leaf right AFTER CF_TAXES (== 'Taxes on income'), i.e. BEFORE the
+        # Gross cash flow subtotal — exactly the dim_cf_structure placement
+        # seed_cf_supplemental_rows produces, so Gross cash flow folds it in.
         out = []
         for r in _LIVE_CF_STRUCTURE:
             out.append(r)
-            if r["line_code"] == "CF_OTHER_OPERATING_ITEMS":
-                out.append(_leaf(30205, "CF_OTHER_TAXES", "Other taxes"))
+            if r["line_code"] == "CF_TAXES":
+                out.append(_leaf(30025, "CF_OTHER_TAXES", "Other taxes"))
         return out
 
     def _leaf_cm(self):
@@ -888,24 +896,25 @@ class TestCfOtherTaxesLeaf:
         got = self._compute()
         assert got["CF_OTHER_TAXES"] == _OTHER_TAXES_CM
 
-    def test_ebitda_and_gross_identities_unchanged(self):
-        # Other taxes is in NEITHER the EBITDA leaf set NOR Gross cash flow.
+    def test_ebitda_locked_gross_includes_other_taxes(self):
         got = self._compute()
+        # CF EBITDA stays locked — Other taxes is NOT in the EBITDA leaf set.
         assert got["CF_EBITDA"] == 529467.51
-        assert got["CF_GROSS_CASH_FLOW"] == 519498.37
-        # Gross cash flow == EBITDA + Taxes on income (Other taxes excluded).
+        # Gross cash flow now == EBITDA + Taxes on income + Other taxes.
+        assert got["CF_GROSS_CASH_FLOW"] == 519398.96
         assert got["CF_GROSS_CASH_FLOW"] == pytest.approx(
-            got["CF_EBITDA"] + got["CF_TAXES"], abs=0.01
+            got["CF_EBITDA"] + got["CF_TAXES"] + got["CF_OTHER_TAXES"], abs=0.01
         )
 
-    def test_cfo_and_net_include_other_taxes(self):
+    def test_cfo_and_net_totals_unchanged(self):
         got = self._compute()
         assert got["CF_CFO"] == pytest.approx(-54213.85, abs=0.01)
         assert got["CF_NET"] == pytest.approx(-612965.54, abs=0.01)
-        # Section identity still holds with the extra operating leaf.
+        # Operating total == Gross CF (now incl. Other taxes) + Net WC + Other operating
+        # items — no double count (Other taxes is INSIDE Gross cash flow now).
         assert got["CF_CFO"] == pytest.approx(
             got["CF_GROSS_CASH_FLOW"] + got["CF_NET_WORKING_CAPITAL"]
-            + got["CF_OTHER_OPERATING_ITEMS"] + got["CF_OTHER_TAXES"], abs=0.01
+            + got["CF_OTHER_OPERATING_ITEMS"], abs=0.01
         )
 
     def test_net_ties_to_sum_of_all_leaves(self):
@@ -918,16 +927,16 @@ class TestCfOtherTaxesLeaf:
             got["CF_CFO"] + got["CF_CFI"] + got["CF_CFF"], abs=0.01
         )
 
-    def test_builder_renders_other_taxes_as_operating_line(self):
-        # End-to-end through the flat builder: the leaf renders TOP-LEVEL (not nested)
-        # and Net cash flow ties to the Σ of all account leaves.
+    def test_builder_folds_other_taxes_into_gross(self):
+        # End-to-end through the flat builder: the leaf renders TOP-LEVEL and folds
+        # into Gross cash flow; Net cash flow ties to Σ of all account leaves.
         from app.services.fin_compat_cf import _build_cf_rows
         struct = self._structure()
         grains = [
             _cf_grain("EBITDA", "AT4000", cm=900),
             _cf_grain("Taxes on income", "AT8000", cm=-100),
-            _cf_grain("Other taxes", "AT4463", l1="Cash flow from operating activities",
-                      l2="Other taxes", cm=-30),
+            _cf_grain("Other taxes", "AT4463", l1="Other taxes",
+                      l2="Gross cash flow", cm=-30),
         ]
         rows = _build_cf_rows(struct, grains, ["cm"])
         ot = _row_by_label(rows, "Other taxes")
@@ -937,6 +946,9 @@ class TestCfOtherTaxesLeaf:
         # Top-level (not nested under a cluster subtotal).
         top_codes = {r.get("line_code") for r in rows}
         assert "CF_OTHER_TAXES" in top_codes
+        # Gross cash flow now folds Other taxes in: 900 − 100 − 30 = 770.
+        gross = _row_by_label(rows, "Gross cash flow")
+        assert gross is not None and gross["amounts"]["cm"] == pytest.approx(770.0, abs=0.01)
         # Net cash flow ties to Σ of all matched account leaves (incl. Other taxes).
         net = _row_by_label(rows, "Net cash flow")
         leaf_sum = round(sum(

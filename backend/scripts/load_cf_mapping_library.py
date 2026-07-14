@@ -20,21 +20,23 @@ accumulate):
      dedicated operating leaf** placed AFTER Gross cash flow, see below).
      key_kind='pl_level3'.
 
-     OTHER TAXES — dedicated operating leaf (Option 2), reconciles Net CF to ΔCash
+     OTHER TAXES — own leaf inside Gross cash flow, reconciles Net CF to ΔCash
      ---------------------------------------------------------------------------
      'Other taxes' (KFZ-Steuer, Grundsteuer, Grundbesitzabgaben) is a real non-cash
      P&L expense that WAS previously left UNMAPPED, so it dropped out of the indirect
      Cash Flow and the Net cash flow did NOT tie to the actual change in cash & cash
      equivalents (FY2023: Net CF 8,837 €k vs ΔCash 8,737 €k — a 100 €k gap, exactly
      the presented Other-taxes total ≈ −99.4 €k).  It is now mapped to its OWN
-     ``cf_mapping='Other taxes'`` leaf that the CF structure renders as a STANDALONE
-     OPERATING line placed AFTER "Gross cash flow" and BEFORE "Cash flow from
-     operating activities".  Because it is a separate leaf (NOT in the EBITDA leaf
-     set and NOT folded into Taxes on income) the two locked identities are
-     PRESERVED:
-        * CF EBITDA == P&L EBITDA                        (Other taxes ∉ EBITDA leaf)
-        * Gross cash flow == EBITDA + Taxes on income    (Other taxes ∉ Gross CF)
-     while it now flows into CFO / Net cash flow, so **Net cash flow == ΔCash**.
+     ``cf_mapping='Other taxes'`` leaf that the CF structure places DIRECTLY AFTER
+     "Taxes on income" and BEFORE the "Gross cash flow" subtotal — so it is PART of
+     the Gross cash flow build-up (product decision).  The resulting identities:
+        * CF EBITDA == P&L EBITDA                                (Other taxes ∉ EBITDA
+          leaf set — still LOCKED; Other taxes is its own separate cf_mapping leaf)
+        * Gross cash flow == EBITDA + Taxes on income + Other taxes   (Other taxes now
+          INSIDE Gross cash flow — the previous "EBITDA + Taxes" identity is
+          intentionally superseded)
+        * Net cash flow == ΔCash                                 (unchanged — only the
+          leaf's POSITION moved; the total still Σ's every non-cash leaf)
      See docs/financial-logic.md "Cash Flow mapping library".
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -145,20 +147,22 @@ _PL_LEVEL3_TO_CF: dict[str, dict[str, object]] = {
                                    "l1": "Cash flow from financing activities", "l2": "Financial result"},
     "Write-offs on financial assets": {"cf_mapping": "Financial result",
                                        "l1": "Cash flow from financing activities", "l2": "Financial result"},
-    # --- Other taxes (standalone OPERATING leaf, AFTER Gross cash flow) ----------
-    # Own cf_mapping leaf → NOT in the EBITDA leaf set and NOT folded into Taxes on
-    # income, so CF EBITDA == P&L EBITDA and Gross cash flow == EBITDA + Taxes on
-    # income both stay locked; it flows into CFO / Net cash flow so the indirect CF
-    # ties to ΔCash.  l1/l2 mirror the standalone-P&L-leaf precedent (Financial
-    # result): l1 = the operating section, l2 = the leaf label (deliberately NOT
-    # 'Gross cash flow', which would pull it into that band).  key='Other taxes'
-    # catches KFZ-Steuer (level_3='Other taxes') via the level_3 pass and Grundsteuer/
-    # Grundbesitzabgaben (level_2='Other taxes', level_3='Other') via the level_2
-    # fallback in etl.cf_fill; level_3='Other' under OTHER level_2 categories does
-    # NOT match (the key is 'Other taxes', not 'Other').
+    # --- Other taxes (own leaf, DIRECTLY AFTER Taxes on income → INSIDE Gross CF) --
+    # Own cf_mapping leaf → NOT in the EBITDA leaf set, so CF EBITDA == P&L EBITDA
+    # stays locked.  The CF structure places CF_OTHER_TAXES directly AFTER "Taxes on
+    # income" (BEFORE the "Gross cash flow" subtotal), so it is now PART of the Gross
+    # cash flow build-up: Gross cash flow == EBITDA + Taxes on income + Other taxes.
+    # It still flows into CFO / Net cash flow, so the indirect CF ties to ΔCash
+    # (only its position moved; the Net total is unchanged).  l1/l2 mirror the EBITDA
+    # / Taxes-on-income leaves: l2='Gross cash flow' groups it under Gross cash flow
+    # in the drill / L4-trend; l1='Other taxes' keeps its own leaf label.  key='Other
+    # taxes' catches KFZ-Steuer (level_3='Other taxes') via the level_3 pass and
+    # Grundsteuer/Grundbesitzabgaben (level_2='Other taxes', level_3='Other') via the
+    # level_2 fallback in etl.cf_fill; level_3='Other' under OTHER level_2 categories
+    # does NOT match (the key is 'Other taxes', not 'Other').
     "Other taxes":                {"cf_mapping": "Other taxes",
-                                   "l1": "Cash flow from operating activities",
-                                   "l2": "Other taxes"},
+                                   "l1": "Other taxes",
+                                   "l2": "Gross cash flow"},
 }
 
 # ── NA gap-fillers (derived BY PRECEDENT from rows already in the workbook) ──────
