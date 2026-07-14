@@ -1296,14 +1296,37 @@ Depreciation & amortisation  = level_3 'Depreciation & amortisation'   (sort 11)
 Financial result  = level_3 ∈ {Interest income, Income from investments,
                                Interest expenses, Write-offs on financial assets}
 Taxes on income   = level_3 'Taxes on income'
-Other taxes       = UNMAPPED (excluded — see below)
+Other taxes       = its OWN dedicated operating leaf (cf_mapping='Other taxes') —
+                    see below
 ```
 
-**`Other taxes` is intentionally excluded** (no CF structure leaf; it sits below
-EBITDA between EBT and Net profit). Folding it into EBITDA would break
-`CF EBITDA == P&L EBITDA`; folding it into `Taxes on income` would break
-`Gross cash flow == EBITDA + Taxes on income`. Confirmed by the
-financial-calculation-engineer. Sign convention unchanged (single `× −1` in SQL).
+**`Other taxes` is a dedicated OPERATING leaf** (Option 2). It is a real non-cash P&L
+expense (KFZ-Steuer, Grundsteuer, Grundbesitzabgaben) that WAS previously left
+unmapped and so dropped out of the indirect Cash Flow — making the Net cash flow NOT
+tie to the actual change in cash & cash equivalents (FY2023: Net CF `8,837` €k vs
+ΔCash `8,737` €k, a `100` €k gap = the presented Other-taxes total ≈ `−99.4` €k). It
+is now mapped to its own `cf_mapping='Other taxes'` leaf, which the CF structure
+(`dim_cf_structure` row `CF_OTHER_TAXES`, kpi_code `CF:detail`) renders as a STANDALONE
+operating line placed **AFTER `Gross cash flow`** and immediately **BEFORE
+`Cash flow from operating activities`** (details=0 → top-level, not nested under a
+cluster subtotal). Because it is a SEPARATE leaf — not in the EBITDA leaf set and not
+folded into `Taxes on income` — the two locked identities are **preserved**:
+
+- `CF EBITDA == P&L EBITDA`  (Other taxes ∉ the EBITDA leaf set)
+- `Gross cash flow == EBITDA + Taxes on income`  (Other taxes ∉ Gross cash flow)
+
+while it now flows into `Cash flow from operating activities` and the global cumulative,
+so **`Net cash flow == ΔCash`** (Σ of ALL presented non-cash leaves == −Σ of the cash &
+cash-equivalents leaves). Sign convention unchanged (single `× −1` in SQL). The
+`_PL_LEVEL3_TO_CF` key `'Other taxes'` catches `KFZ-Steuer` (level_3='Other taxes') via
+the level_3 pass and `Grundsteuer`/`Grundbesitzabgaben` (level_2='Other taxes',
+level_3='Other') via the level_2 fallback (`etl.cf_fill`); `level_3='Other'` under OTHER
+level_2 categories does NOT match (the key is `'Other taxes'`, not `'Other'`).
+
+The `CF_OTHER_TAXES` structure row is NOT in the external `CF Structure` sheet, so it is
+re-created idempotently by `seed_cf_structure.seed_cf_supplemental_rows` — called from
+both seed paths AND from the rebuild (`etl.rebuild._stage_structure_recon_refresh`), so
+every project / every rebuild carries it (survives a data reload).
 
 ### Worked example (cm, presented; from the engineer ruling)
 
@@ -1311,8 +1334,10 @@ Net sales +1000, Δ FG&WIP +50, Cost of materials −400, Personnel −300, Othe
 income +30, Other op expenses −80 → CF `EBITDA` = **+300** == P&L EBITDA. D&A −120 →
 `Depreciation & amortisation`. Interest income +10, Income from investments +15,
 Interest expenses −40 → `Financial result` = **−15**. Taxes on income −100 →
-`Taxes on income`. Other taxes −5 → in **no** leaf. `Gross cash flow` = EBITDA +
-Taxes = 300 − 100 = **+200**.
+`Taxes on income`. Other taxes −5 → its OWN `Other taxes` operating leaf (AFTER Gross
+cash flow). `Gross cash flow` = EBITDA + Taxes = 300 − 100 = **+200** (Other taxes NOT
+included — identity preserved); `Cash flow from operating activities` and `Net cash
+flow` DO include the −5 (Net = Σ all leaves), so Net now ties to ΔCash.
 
 Live recon (FY2025, month 7): CF EBITDA YTD = **5,653,120.22** == P&L EBITDA YTD;
 Gross cash flow YTD = 5,106,235.07; Net cash flow YTD = −13,479,020.15 (non-zero).
@@ -1344,7 +1369,10 @@ reference data is shared, so `dim_gl_cf` is byte-identical across both DBs
 `backend/tests/test_compat_cf.py::TestCfReconciliationV2` (`DB_NAME=finssentials_v2`):
 `dim_gl_cf` non-empty; CF EBITDA (cm + YTD) == P&L EBITDA; `Gross cash flow =
 EBITDA + Taxes`; Net cash flow non-zero == Σ all mapped leaves; year-grain EBITDA
-non-zero. (Recommended add: a negative assertion locking `Other taxes` exclusion.)
+non-zero. `TestCfOtherTaxesLeaf` (DB-free) locks the `Other taxes` dedicated leaf:
+with an `Other taxes` operating leaf present, `Net cash flow == Σ all leaves`
+(reconciles) while `CF EBITDA` and `Gross cash flow == EBITDA + Taxes` are UNCHANGED
+(Other taxes in neither).
 
 ## NA mapping library — name-keyed classification + totals-guard re-derive
 

@@ -60,9 +60,11 @@ GROUP BY 1, 2 ORDER BY n DESC;
 """
 
 # Unmatched = a P&L account whose coarse category is at NEITHER level_3 (pass 1) NOR
-# level_2 (pass 2 fallback) — i.e. genuinely uncovered by the library (some intentionally
-# excluded, e.g. 'Other taxes').  An account covered via the level_2 fallback is NOT
-# unmatched, so we exclude both matches.
+# level_2 (pass 2 fallback) — i.e. genuinely uncovered by the library.  ('Other taxes'
+# is now MAPPED to its own operating leaf, so it is no longer an intentional exclusion;
+# it matches via level_3 (KFZ-Steuer) or the level_2 fallback (Grundsteuer/
+# Grundbesitzabgaben).)  An account covered via the level_2 fallback is NOT unmatched,
+# so we exclude both matches.
 _PL_UNMATCHED = """
 SELECT a.level_2, a.level_3, COUNT(*) AS n
 FROM dim_gl_account a
@@ -87,7 +89,7 @@ def _report_unmatched(session: SASession) -> tuple[int, int]:
         print("[unmatched NA] none — every dim_gl_na classification is covered.")
     if pl_un:
         print(f"[unmatched PL] {len(pl_un)} P&L (level_2, level_3) pair(s) with NO library row "
-              f"at EITHER level (some are intentionally excluded, e.g. 'Other taxes'):")
+              f"at EITHER level:")
         for r in pl_un:
             print(f"    level_2={r[0]!r} | level_3={r[1]!r}  ({r[2]} accounts)")
     else:

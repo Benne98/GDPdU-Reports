@@ -103,6 +103,35 @@ _SECTION_KEYWORDS: dict[str, str] = {
              r"gesamt|veränderung\s+der",
 }
 
+# ── Code-defined supplemental CF rows (NOT in the external CF Structure sheet) ──
+# Some CF leaves are required for the statement to RECONCILE but are absent from the
+# curated "CF Structure" sheet.  They are re-created here on every (re-)seed AND on
+# every rebuild (etl.rebuild._stage_structure_recon_refresh) via
+# ``seed_cf_supplemental_rows`` so any project — even one seeded from a sheet that
+# predates them — carries the row.  Derived-by-precedent, same spirit as
+# load_cf_mapping_library._NA_GAP_FILLERS.
+#
+#   * 'Other taxes' — a STANDALONE OPERATING detail leaf placed AFTER the WC / Other-
+#     operating block and immediately BEFORE "Cash flow from operating activities".
+#     It carries its OWN cf_mapping ('Other taxes'), so it is NEITHER in the EBITDA
+#     leaf set NOR folded into Taxes on income: CF EBITDA == P&L EBITDA and Gross cash
+#     flow == EBITDA + Taxes on income stay locked, while Net cash flow now includes
+#     it and ties to the actual change in cash & cash equivalents (ΔCash).  details=0
+#     keeps it top-level (not nested under a cluster subtotal).  Placement is anchored
+#     to the CFO section total, so it lands just above CFO regardless of the sheet's
+#     numbering.
+_CF_SUPPLEMENTAL_ROWS: list[dict] = [
+    {
+        "line_code": "CF_OTHER_TAXES",
+        "balance_title": "Other taxes",
+        "row_type": "mapping",
+        "kpi_code": "CF:detail",
+        "details": 0,
+        "calc_type": 1,
+        "is_bold": False,
+    },
+]
+
 # Known KPI codes for subtotal rows (mirrors seed_pl_structure pattern)
 _KPI_BY_TITLE: dict[str, str] = {
     # normalised title (lower): kpi_code override
@@ -152,6 +181,78 @@ def _make_kpi_code(
     if key in _KPI_BY_TITLE:
         return _KPI_BY_TITLE[key]
     return f"CF:{section}"
+
+
+def seed_cf_supplemental_rows(session: SASession) -> int:
+    """Idempotently add code-defined CF rows absent from the external CF sheet.
+
+    Currently just 'Other taxes' — a STANDALONE OPERATING detail leaf inserted
+    immediately BEFORE the operating-activities section total (CFO), so the indirect
+    Cash Flow Net-cash-flow ties to ΔCash while ``CF EBITDA == P&L EBITDA`` and
+    ``Gross cash flow == EBITDA + Taxes on income`` stay locked (the leaf is neither
+    in the EBITDA leaf set nor folded into Taxes on income).
+
+    Idempotent: an already-present row keeps its placement and only has its
+    presentation attributes refreshed (no re-shift).  Returns rows INSERTED.  Does
+    NOT commit (the caller owns the transaction).
+    """
+    # Reuse the tested sort_order allocator (handles the no-gap shift collision-free).
+    from app.services.structure_autoextend import _compute_sort_order
+
+    cfo = session.execute(text(
+        "SELECT sort_order FROM dim_cf_structure "
+        "WHERE row_type IN ('subtotal', 'calc') "
+        "  AND balance_title ILIKE '%operating activities%' "
+        "ORDER BY sort_order LIMIT 1"
+    )).fetchone()
+    if cfo is None:
+        print("  [WARN] no 'Cash flow from operating activities' section total — "
+              "supplemental CF rows skipped.")
+        return 0
+    cfo_sort = int(cfo[0])
+
+    inserted = 0
+    for spec in _CF_SUPPLEMENTAL_ROWS:
+        lc = spec["line_code"]
+        exists = session.execute(
+            text("SELECT 1 FROM dim_cf_structure WHERE line_code = :lc"), {"lc": lc}
+        ).fetchone()
+        if exists is not None:
+            session.execute(
+                text(
+                    "UPDATE dim_cf_structure SET row_type = :rt, balance_title = :bt, "
+                    "kpi_code = :kpi, details = :det, calc_type = :ct, is_bold = :bold "
+                    "WHERE line_code = :lc"
+                ),
+                {"rt": spec["row_type"], "bt": spec["balance_title"], "kpi": spec["kpi_code"],
+                 "det": spec["details"], "ct": spec["calc_type"], "bold": spec["is_bold"],
+                 "lc": lc},
+            )
+            continue
+        # Anchor AFTER the row directly preceding CFO == insert right before CFO.
+        pred = session.execute(
+            text("SELECT line_code FROM dim_cf_structure WHERE sort_order < :s "
+                 "ORDER BY sort_order DESC LIMIT 1"),
+            {"s": cfo_sort},
+        ).fetchone()
+        after_lc = str(pred[0]) if pred else ""
+        sort_order = _compute_sort_order(session, "dim_cf_structure", "CF", after_lc)
+        session.execute(
+            text(
+                "INSERT INTO dim_cf_structure "
+                "(sort_order, line_code, row_type, balance_title, details, calc_type, "
+                " kpi_code, is_bold) "
+                "VALUES (:so, :lc, :rt, :bt, :det, :ct, :kpi, :bold)"
+            ),
+            {"so": sort_order, "lc": lc, "rt": spec["row_type"], "bt": spec["balance_title"],
+             "det": spec["details"], "ct": spec["calc_type"], "kpi": spec["kpi_code"],
+             "bold": spec["is_bold"]},
+        )
+        inserted += 1
+    if inserted:
+        print(f"  [supplemental] {inserted} code-defined CF row(s) inserted "
+              f"(e.g. CF_OTHER_TAXES before CFO).")
+    return inserted
 
 
 def seed_cf_structure(xlsx_path: str | Path, session: SASession) -> int:
@@ -228,6 +329,7 @@ def seed_cf_structure(xlsx_path: str | Path, session: SASession) -> int:
         )
         upserted += 1
 
+    upserted += seed_cf_supplemental_rows(session)
     session.commit()
     return upserted
 
@@ -283,6 +385,7 @@ def _seed_cf_from_dim_gl_cf(session: SASession) -> int:
         )
         upserted += 1
 
+    upserted += seed_cf_supplemental_rows(session)
     session.commit()
     return upserted
 

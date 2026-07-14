@@ -362,6 +362,16 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         from scripts.seed_pl_structure import seed_pl_kpi_rows  # type: ignore
 
         out["pl_kpi_rows"] = seed_pl_kpi_rows(session)
+
+        # Supplemental CF structure rows NOT in the external CF Structure sheet (the
+        # 'Other taxes' standalone operating leaf) — re-created idempotently on every
+        # full rebuild for ANY project so the indirect Cash Flow Net-cash-flow ties to
+        # ΔCash.  Additive + idempotent (an existing row is only refreshed, never
+        # duplicated / re-shifted); a no-op once present.  dim_cf_structure is NOT
+        # otherwise touched by the rebuild, so this is the row's re-creation hook.
+        from scripts.seed_cf_structure import seed_cf_supplemental_rows  # type: ignore
+
+        out["cf_supplemental_rows"] = seed_cf_supplemental_rows(session)
     except (ImportError, FileNotFoundError) as exc:
         # GRACEFUL — and ONLY here: the recon-mapping source / scripts module is
         # absent (legacy or pure-ETL test schema).  Matches historical behaviour;
@@ -371,6 +381,7 @@ def _stage_structure_recon_refresh(session: Session, scope: RebuildScope) -> dic
         logger.warning("rebuild: structure refresh source absent (%s)", exc)
         out.setdefault("bs_structure_rows", 0)
         out.setdefault("pl_structure_realigned", 0)
+        out.setdefault("cf_supplemental_rows", 0)
         out["error"] = str(exc)
 
     # (C) Guardrail — AFTER the (B) backfill: WARN (do NOT relax any reader filter)
