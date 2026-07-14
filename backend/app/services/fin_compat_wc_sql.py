@@ -98,6 +98,11 @@ WC_PAY_L3 = "Trade payables"
 # P&L level_3 names that drive the LTM denominators (same names as the legacy).
 PL_REV_L3 = "Net sales"
 PL_COGS_L3 = "Cost of materials"
+# In real datasets "Cost of materials" (Materialaufwand) is a level_2 category whose
+# postings live under level_3 sub-buckets (e.g. "Purchased goods and materials",
+# "Purchased services"); some templates carry it at level_3. Match either so the
+# DIO/DPO LTM COGS denominator is populated regardless of where the label sits.
+PL_COGS_L2 = "Cost of materials"
 
 # Per-line WC grain dims (section = l6_na_mapping, line = level_3 / l7 description).
 _WC_GRAIN_DIMS = """
@@ -503,7 +508,7 @@ def wc_pl_window_sql(
             {sel_entity}
             COALESCE(SUM(CASE WHEN TRIM(a.level_3) = '{PL_REV_L3}'
                          THEN l.amount * -1 ELSE 0 END), 0)::float8 AS revenue,
-            ABS(COALESCE(SUM(CASE WHEN TRIM(a.level_3) = '{PL_COGS_L3}'
+            ABS(COALESCE(SUM(CASE WHEN TRIM(a.level_2) = '{PL_COGS_L2}' OR TRIM(a.level_3) = '{PL_COGS_L3}'
                          THEN l.amount ELSE 0 END), 0))::float8     AS cogs
         FROM fact_gl_line l
         JOIN fact_gl_entry e
@@ -513,7 +518,8 @@ def wc_pl_window_sql(
           ON a.account_number_group = l.account_number_group
          AND a.fiscal_year = l.fiscal_year
         WHERE a.level_0 = 'PL'
-          AND TRIM(a.level_3) IN ('{PL_REV_L3}', '{PL_COGS_L3}')
+          AND (TRIM(a.level_3) IN ('{PL_REV_L3}', '{PL_COGS_L3}')
+               OR TRIM(a.level_2) = '{PL_COGS_L2}')
           AND e.posting_date >= '{start.isoformat()}'
           AND e.posting_date <= '{end.isoformat()}'
           {ent_frag}

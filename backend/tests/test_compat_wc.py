@@ -140,6 +140,18 @@ def _flatten(rows: list[dict]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 class TestWcKpis:
 
+    def test_pl_window_sql_matches_cogs_at_level_2(self):
+        # DIO/DPO LTM denominator: "Cost of materials" (Materialaufwand) is a level_2
+        # category in real datasets — its postings live under level_3 sub-buckets
+        # ("Purchased services" / "Purchased goods and materials"), so the query must
+        # match level_2, not only level_3, or cogs_ltm = 0 and DIO/DPO come out 0.
+        from datetime import date
+        from app.services.fin_compat_wc_sql import wc_pl_window_sql
+
+        sql, _ = wc_pl_window_sql(date(2024, 7, 1), date(2025, 6, 30), "")
+        assert "TRIM(a.level_2) = 'Cost of materials'" in sql
+        assert "'Net sales'" in sql
+
     def test_worked_example(self):
         from app.services.fin_compat_wc import compute_wc_kpis
         k = compute_wc_kpis(4_000_000, 5_000_000, 3_000_000, 20_000_000, 12_000_000)
