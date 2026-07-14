@@ -86,7 +86,7 @@ function extractPositions(rows: FinancialStatementRow[], stmt: string): L4Positi
 
 // ─── Custom label ─────────────────────────────────────────────────────────────
 
-function CurrentLabel({ x = 0, y = 0, width = 0, value = 0, index = 0, data }: any) {
+function CurrentLabel({ x = 0, y = 0, width = 0, height = 0, value = 0, index = 0, data }: any) {
   const d: ChartPoint | undefined = data[index]
   if (!d) return null
   const kv    = fmtChartKpi(value)
@@ -94,6 +94,24 @@ function CurrentLabel({ x = 0, y = 0, width = 0, value = 0, index = 0, data }: a
   const hasD  = delta !== null && delta !== undefined && isFinite(delta)
   const dColor = !hasD ? '#94A3B8' : delta >= 0 ? '#10B981' : '#DC2626'
   const cx = x + width / 2
+  // Recharts passes the bar rect as [y, y+height]. Anchor the labels at the bar's
+  // FAR end (away from zero) so they never sit on the bar: above the top for
+  // positive bars, below the bottom for negative bars.
+  if (Number(value) < 0) {
+    const base = y + height
+    return (
+      <g>
+        <text x={cx} y={base + 13} textAnchor="middle" fontSize={11} fontWeight="600" fill="#111827">
+          {kv}
+        </text>
+        {hasD && (
+          <text x={cx} y={base + 26} textAnchor="middle" fontSize={11} fill={dColor}>
+            {fmtPct(delta)}
+          </text>
+        )}
+      </g>
+    )
+  }
   return (
     <g>
       <text x={cx} y={y - (hasD ? 20 : 8)} textAnchor="middle" fontSize={11} fontWeight="600" fill="#111827">
