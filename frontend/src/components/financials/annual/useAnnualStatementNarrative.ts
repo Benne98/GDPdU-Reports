@@ -89,12 +89,12 @@ export function useAnnualStatementNarrative(
 
   const narrative = useMemo(() => {
     if (statement === 'cf') {
-      const trusted = isTrusted(statement, apiNarrative, entity)
       const apiCount = apiNarrative?.bullets?.length ?? 0
-      const clientCount = clientNarrative?.bullets?.length ?? 0
-      if (trusted && apiCount >= 3) return apiNarrative!
-      if (clientCount >= 3) return clientNarrative!
-      if (trusted && apiNarrative) return apiNarrative
+      // The client-side annual CF narratives (top flow + consolidation) are
+      // unreliable — a label-only intro (e.g. "FY24A. YTDJul2025.") and bullets that
+      // do not anchor to the rows. Prefer the API narrative whenever it carries
+      // bullets; fall back to the client only when the API is empty.
+      if (apiCount > 0) return apiNarrative!
       if (clientNarrative?.bullets?.length || clientNarrative?.intro) return clientNarrative
       return apiNarrative ?? clientNarrative
     }
