@@ -194,9 +194,13 @@ def statement_for_narrative(
             from app.services.fin_compat_cf import build_cf_annual_compat
             stmt = build_cf_annual_compat(session, year=year, month=month, entity=entity)
             raw = stmt.get("col_labels") or {}
+            # Year-grain CF: anchor on the completed fiscal years (fy3 vs fy2) shown
+            # in the annual statement. The current-year YTD/LTM window is ~0 in the
+            # GDPdU datasets (only closed FYs carry data), so a ytd/ltm anchor
+            # collapses every figure to €0k. See build_cf_narrative / core.flow_basis.
             return (
-                core.normalize_annual_flow_rows(stmt.get("rows") or []),
-                core.narrative_labels_from_flow_annual(raw),
+                core.normalize_annual_flow_rows(stmt.get("rows") or [], flow_basis="fy"),
+                core.narrative_labels_from_flow_annual(raw, flow_basis="fy"),
             )
         if statement == "wc":
             from app.services.fin_compat_wc import build_wc_snapshot_annual

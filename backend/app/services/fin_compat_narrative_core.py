@@ -894,8 +894,29 @@ def _round_narr_deltas(am: dict[str, float]) -> dict[str, float]:
     }
 
 
-def narrative_labels_from_flow_annual(raw: dict[str, str]) -> dict[str, str]:
-    """Map exit-readiness flow labels (ytd/ltm/…) to narrative cm/pm/py_cm labels."""
+def narrative_labels_from_flow_annual(
+    raw: dict[str, str],
+    *,
+    flow_basis: str = "ytd",
+) -> dict[str, str]:
+    """Map exit-readiness flow labels (ytd/ltm/…) to narrative cm/pm/py_cm labels.
+
+    ``flow_basis`` selects which annual columns anchor the narrative:
+      * ``"ytd"`` (default) — current YTD vs rolling-LTM (unchanged legacy behaviour).
+      * ``"fy"``            — most-recent full fiscal year (fy3) vs prior FY (fy2).
+                              Used for the year-grain cash-flow narrative, whose
+                              current-year YTD/LTM window is empty in datasets that
+                              only carry completed fiscal years, so the real figures
+                              live in the FY columns (see ``build_cf_narrative``).
+    """
+    if flow_basis == "fy":
+        return {
+            "cm": raw.get("fy3") or "",
+            "pm": raw.get("fy2") or "",
+            "py_cm": raw.get("fy2") or "",
+            "ytd": raw.get("fy3") or "",
+            "ytd_py": raw.get("fy2") or "",
+        }
     return {
         "cm": raw.get("ytd") or "",
         "pm": raw.get("ltm") or "",
@@ -920,11 +941,19 @@ def _normalize_row_amounts_for_narrative(
     am: dict[str, Any],
     *,
     snapshot: bool,
+    flow_basis: str = "ytd",
 ) -> dict[str, float]:
     if snapshot:
         cm = float(am.get("cm") or am.get("fy") or 0.0)
         pm = float(am.get("cm_py") or am.get("fy_py") or 0.0)
         py = float(am.get("fy_py") or am.get("cm_py") or pm)
+    elif flow_basis == "fy" and ("fy3" in am or "fy2" in am):
+        # Full-fiscal-year anchor: cm = most-recent FY (fy3), pm = prior FY (fy2).
+        # The YTD/LTM columns are ~0 for datasets that only carry completed years,
+        # so the annual narrative reads the FY columns the annual statement shows.
+        cm = float(am.get("fy3") or 0.0)
+        pm = float(am.get("fy2") or 0.0)
+        py = float(am.get("fy2") or 0.0)
     elif "ytd" in am or "ltm" in am:
         cm = float(am.get("ytd") or 0.0)
         pm = float(am.get("ltm") or 0.0)
@@ -939,6 +968,7 @@ def _normalize_rows_for_narrative(
     rows: list[dict[str, Any]],
     *,
     snapshot: bool,
+    flow_basis: str = "ytd",
 ) -> list[dict[str, Any]]:
     """Deep-copy statement rows; map annual amount keys to narrative cm/pm/py_cm."""
 
@@ -948,7 +978,9 @@ def _normalize_rows_for_narrative(
             nr = dict(r)
             am = nr.get("amounts")
             if isinstance(am, dict) and am:
-                narr_am = _normalize_row_amounts_for_narrative(am, snapshot=snapshot)
+                narr_am = _normalize_row_amounts_for_narrative(
+                    am, snapshot=snapshot, flow_basis=flow_basis,
+                )
                 nr["amounts"] = narr_am
                 nr["deltas"] = _round_narr_deltas(narr_am)
             if nr.get("children"):
@@ -961,8 +993,12 @@ def _normalize_rows_for_narrative(
     return _walk(rows)
 
 
-def normalize_annual_flow_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return _normalize_rows_for_narrative(rows, snapshot=False)
+def normalize_annual_flow_rows(
+    rows: list[dict[str, Any]],
+    *,
+    flow_basis: str = "ytd",
+) -> list[dict[str, Any]]:
+    return _normalize_rows_for_narrative(rows, snapshot=False, flow_basis=flow_basis)
 
 
 def normalize_annual_snapshot_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

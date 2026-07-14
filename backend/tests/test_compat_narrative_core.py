@@ -479,3 +479,64 @@ def test_build_bs_narrative_end_to_end(monkeypatch):
 
     assert out["intro_facts"]["primary_drivers"][0]["label"] == "Trade receivables"
     assert out["meta"]["algorithm_version"] == "bs_narrative_compat_v2"
+
+
+# ---------------------------------------------------------------------------
+# Annual flow narrative basis (year-grain CF fix)
+# ---------------------------------------------------------------------------
+def _annual_flow_row(code: str, label: str, *, fy2: float, fy3: float,
+                     ytd: float, ltm: float, ytd_py: float,
+                     row_kind: str = "line") -> dict[str, Any]:
+    """A build_cf_annual_compat-shaped row (amounts keyed by _ER_FLOW_KEYS)."""
+    return {
+        "line_code": code, "label": label, "row_kind": row_kind,
+        "amounts": {
+            "fy1": 0.0, "fy2": fy2, "fy3": fy3, "ytd": ytd, "ltm": ltm,
+            "ytd_py": ytd_py, "ltm_py": 0.0, "fy_f": 0.0,
+        },
+    }
+
+
+def test_annual_flow_ytd_basis_unchanged():
+    """Default (ytd) basis maps cm<-ytd, pm<-ltm — legacy behaviour, byte-stable."""
+    rows = [_annual_flow_row("EBITDA", "EBITDA",
+                             fy2=14_980_000, fy3=13_770_000,
+                             ytd=8_000_000, ltm=13_000_000, ytd_py=7_500_000)]
+    out = core.normalize_annual_flow_rows(rows)  # default flow_basis="ytd"
+    am = out[0]["amounts"]
+    assert am["cm"] == 8_000_000.0 and am["pm"] == 13_000_000.0
+    assert am["py_cm"] == 7_500_000.0
+    raw = {"ytd": "YTDJul25A", "ltm": "LTMJul25A", "ytd_py": "YTDJul24A",
+           "fy3": "FY24A", "fy2": "FY23A"}
+    assert core.narrative_labels_from_flow_annual(raw)["cm"] == "YTDJul25A"
+
+
+def test_annual_flow_fy_basis_reads_full_year_columns():
+    """fy basis anchors on completed FYs (fy3 vs fy2).
+
+    Regression for the year-grain CF narrative computing €0k: the current-year
+    YTD/LTM window is empty (ytd=ltm=0) in GDPdU datasets, so the narrative must
+    read the FY columns the annual statement shows.  Worked example:
+    EBITDA fy3=13.77M, fy2=14.98M -> cm=13.77M, pm=14.98M, mom=-1.21M (not 0).
+    """
+    rows = [
+        _annual_flow_row("NCF", "Net cash flow", fy2=3_000_000, fy3=2_500_000,
+                         ytd=0.0, ltm=0.0, ytd_py=0.0, row_kind="subtotal"),
+        _annual_flow_row("EBITDA", "EBITDA", fy2=14_980_000, fy3=13_770_000,
+                         ytd=0.0, ltm=0.0, ytd_py=0.0),
+    ]
+
+    # OLD basis collapses to 0 (reproduces the reported bug).
+    old = core.normalize_annual_flow_rows(rows)
+    assert old[1]["amounts"]["cm"] == 0.0
+
+    # NEW basis surfaces the real FY figures + a sensible delta.
+    new = core.normalize_annual_flow_rows(rows, flow_basis="fy")
+    ncf, ebitda = new[0]["amounts"], new[1]["amounts"]
+    assert ncf["cm"] == 2_500_000.0 and ncf["pm"] == 3_000_000.0
+    assert ebitda["cm"] == 13_770_000.0 and ebitda["pm"] == 14_980_000.0
+    assert new[1]["deltas"]["mom"] == -1_210_000.0
+
+    raw = {"fy3": "FY24A", "fy2": "FY23A", "ytd": "YTDJul25A", "ltm": "LTMJul25A"}
+    labels = core.narrative_labels_from_flow_annual(raw, flow_basis="fy")
+    assert labels["cm"] == "FY24A" and labels["pm"] == "FY23A"
