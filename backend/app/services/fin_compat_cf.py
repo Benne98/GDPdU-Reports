@@ -39,10 +39,16 @@ shapes consumed by the verbatim-ported frontend (``StatementsPage`` with
        Cash flow from financing activities= Σ ONLY financing leaves   (CFF, standalone)
        Free cash flow                     = CFO + CFI
        Net cash flow                      = CFO + CFI + CFF (= Σ ALL leaves)     ✓
-   The intra-operating subtotals (Gross cash flow, Δ Trade/Other/Net working
-   capital, Δ Other operating items) read as the running operating cash flow up to
-   that row (snapshot of the operating section sum, no reset).  Net cash flow ties
-   out exactly to the Σ of every mapped CF leaf — asserted in the regression test.
+   The intra-operating subtotals show their OWN GROUP CHANGE (Σ of the detail items
+   under them), NOT a running operating cash flow:
+       Gross cash flow          = Σ pre-WC leaves (EBITDA + Taxes)
+       Δ Trade working capital  = Σ trade-WC detail leaves
+       Δ Other working capital  = Σ other-WC detail leaves
+       Δ Net working capital    = Δ Trade WC + Δ Other WC (pure roll-up, no own leaves)
+       Δ Other operating items  = Σ other-operating detail leaves
+   The section total still equals Gross CF + Net WC + Δ Other operating items
+   (== Σ ALL operating leaves).  Net cash flow ties out exactly to the Σ of every
+   mapped CF leaf — asserted in the regression test.
 
 === SIGN CONVENTION SUMMARY ===
 ``presented = amount * -1`` (applied once in SQL).  inflow +, outflow −:
@@ -209,7 +215,9 @@ def _row_kind_for_cf(row_type: str) -> str:
 #                     kpi in {CF_INV/CF:inv} (inv) / {CF_FIN/CF:fin} (fin).
 #   * intra         : any other subtotal/calc (operating intermediates such as
 #                     Gross cash flow / Δ Trade|Other|Net working capital /
-#                     Δ Other operating items).
+#                     Δ Other operating items).  These present their OWN GROUP
+#                     CHANGE (Σ of their detail leaves), not the running section sum
+#                     — see :func:`_compute_cf_section_values` for the three shapes.
 #
 # NOTE on the seeded tags (scripts/seed_cf_structure.py): detail rows are tagged
 # 'CF:detail', the investing/financing section totals are 'CF_INV'/'CF_FIN' (named
@@ -256,23 +264,47 @@ def _compute_cf_section_values(
     """Section-aware accumulation over the ordered CF structure.
 
     Returns {line_code: {col: value}}:
-      * leaf          → its own values; added to the OPEN section's running sum
-                        and to a global cumulative.
-      * intra         → snapshot of the open section's running sum (no reset; the
-                        operating intermediates therefore read as the running
-                        operating cash flow up to that row).
+      * leaf          → its own values; added to the OPEN section's running sum, to
+                        a global cumulative, AND to the current intra-group leaf
+                        buffer.
+      * intra         → its own GROUP CHANGE (NOT the running section sum), so each
+                        "Δ …" subtotal shows the Σ of the detail items that belong
+                        under it — three shapes, disambiguated deterministically:
+                          1. cluster parent (``line_code`` ∈
+                             :data:`_CF_CLUSTER_PARENT_CODES` — Δ Trade / Δ Other
+                             working capital, Δ Other operating items) → Σ of its
+                             OWN detail leaves (the leaf buffer accumulated since the
+                             last subtotal); this ALSO feeds the sibling roll-up.
+                          2. standalone group subtotal that is NOT a cluster parent
+                             but has its own preceding leaves (Gross cash flow =
+                             EBITDA + Taxes) → Σ of those leaves; it is a boundary
+                             and does NOT feed the roll-up.
+                          3. pure roll-up subtotal with NO own leaves
+                             (Δ Net working capital) → Σ of the preceding sibling
+                             cluster subtotals (Δ Trade WC + Δ Other WC).
       * section_total → snapshot of its section's running sum (standalone section
                         figure: CFO = Σ operating leaves, CFI = Σ investing leaves,
-                        CFF = Σ financing leaves), then RESET that section and
-                        advance the open section op→inv→fin.
+                        CFF = Σ financing leaves), then RESET that section, the group
+                        buffers, and advance the open section op→inv→fin.
       * cross_total   → captured CFO + CFI (Free cash flow).
       * grand_total   → the global cumulative of ALL leaves (Net cash flow), which
                         equals CFO + CFI + CFF and guarantees the tie-out.
-    All per-column independent.
+    The section_total / cross_total / grand_total / leaf accumulation is UNCHANGED —
+    only the ``intra`` presentation switched from "running section sum" to "group
+    change".  All per-column independent.
     """
     run = {s: {k: 0.0 for k in keys} for s in ("op", "inv", "fin")}
     section_total = {s: {k: 0.0 for k in keys} for s in ("op", "inv", "fin")}
     cum_all = {k: 0.0 for k in keys}
+    # Intra-group presentation state (per-column, independent of the section sums):
+    #   leaf_buf    — Σ of the leaves seen since the last subtotal snapshot (a group's
+    #                 own detail items); leaf_count records whether any were seen so a
+    #                 pure roll-up (no own leaves) is distinguishable from Gross CF.
+    #   cluster_sib — Σ of the cluster-parent subtotals since the last roll-up/boundary
+    #                 (the value a pure roll-up subtotal, Δ Net working capital, reports).
+    leaf_buf = {k: 0.0 for k in keys}
+    leaf_count = 0
+    cluster_sib = {k: 0.0 for k in keys}
     open_section = "op"
     out: dict[str, dict[str, float]] = {}
 
@@ -287,19 +319,44 @@ def _compute_cf_section_values(
             for k in keys:
                 run[open_section][k] += vals[k]
                 cum_all[k] += vals[k]
+                leaf_buf[k] += vals[k]
+            leaf_count += 1
             out[code] = vals
         elif role == "section_total":
             tgt = sec or open_section
             out[code] = dict(run[tgt])
             section_total[tgt] = dict(run[tgt])
             run[tgt] = {k: 0.0 for k in keys}
+            # A section boundary closes any open intra group.
+            leaf_buf = {k: 0.0 for k in keys}
+            leaf_count = 0
+            cluster_sib = {k: 0.0 for k in keys}
             open_section = _CF_NEXT_SECTION[open_section]
         elif role == "cross_total":  # Free cash flow = CFO + CFI
             out[code] = {k: section_total["op"][k] + section_total["inv"][k] for k in keys}
         elif role == "grand_total":  # Net cash flow = Σ all leaves (= CFO+CFI+CFF)
             out[code] = dict(cum_all)
-        else:  # intra — snapshot of the open section running sum
-            out[code] = dict(run[open_section])
+        else:  # intra — GROUP CHANGE (Σ of its own detail items), not the running sum
+            if code in _CF_CLUSTER_PARENT_CODES:
+                # (1) cluster parent: Σ its own detail leaves; feeds the roll-up.
+                val = dict(leaf_buf)
+                for k in keys:
+                    cluster_sib[k] += val[k]
+                out[code] = val
+                leaf_buf = {k: 0.0 for k in keys}
+                leaf_count = 0
+            elif leaf_count > 0:
+                # (2) standalone group subtotal with own leaves (Gross cash flow):
+                # a boundary — snapshot its leaves; does NOT feed the roll-up.
+                out[code] = dict(leaf_buf)
+                leaf_buf = {k: 0.0 for k in keys}
+                leaf_count = 0
+                cluster_sib = {k: 0.0 for k in keys}
+            else:
+                # (3) pure roll-up subtotal, no own leaves (Δ Net working capital):
+                # Σ the preceding sibling cluster subtotals (Δ Trade WC + Δ Other WC).
+                out[code] = dict(cluster_sib)
+                cluster_sib = {k: 0.0 for k in keys}
     return out
 
 

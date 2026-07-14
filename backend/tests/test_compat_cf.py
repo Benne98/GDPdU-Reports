@@ -656,5 +656,190 @@ class TestCfReconciliationV2:
         assert float((eb.get("amounts") or {}).get("ytd") or 0.0) != 0.0
 
 
+# ===========================================================================
+# (i) Intra-operating subtotals = GROUP CHANGE (not the running section sum)
+# ===========================================================================
+# Locks the fix: each "Δ …" intra subtotal shows the Σ of its OWN detail leaves;
+# the pure roll-up "Δ Net working capital" == Δ Trade WC + Δ Other WC; and the
+# section totals + Free/Net cash flow are UNCHANGED (still tie out).
+#
+# === WORKED EXAMPLE (cm column, presented signs; live month 2025-06) ===
+#   Pre-WC leaves:        EBITDA +529,467.51 ; Taxes on income −9,969.14
+#   Trade WC leaves:      Δ Inventories 0 ; Δ Trade receivables −313,863.23 ;
+#                         Δ Advance payments received −1,847,064.38 ;
+#                         Δ Trade payables +765,408.94
+#   Other WC leaves:      Δ Other assets −1,134,132.68 ; Δ Prepaid expenses +216,687.51 ;
+#                         Δ Other provision & accruals +619,374.84 ;
+#                         Δ Other liabilities +1,717,041.14 ;
+#                         Δ Receivables from affiliates +4,586.02 ;
+#                         Δ Liabilities due to affiliates −57,964.23 ; Δ Deferred tax assets 0
+#   Other operating:      Δ Accrued taxes −526,287.97 ; Δ Bonus liabilities −17,398.77
+#   Investing leaves:     Depreciation & amortisation −359,775.13 ; Δ Fixed assets −384,295.70
+#   Financing leaves:     Financial result +9,969.14 ; Δ Bank loans +175,350.00
+#
+#   Group-change subtotals (NEW, desired):
+#     Gross cash flow         =   519,498.37   (Σ pre-WC)
+#     Δ Trade working capital = −1,395,518.67  (Σ trade)
+#     Δ Other working capital =  1,365,592.60  (Σ other WC)
+#     Δ Net working capital   =   −29,926.07   (Trade WC + Other WC — roll-up, no own leaves)
+#     Δ Other operating items =  −543,686.74   (Σ other operating)
+#   Section / grand totals (UNCHANGED, must still tie out):
+#     Cash flow from operating = −54,114.44  (= Gross CF + Net WC + Other operating
+#                                             == Σ all operating leaves)
+#     Cash flow from investing = −744,070.83
+#     Free cash flow           = −798,185.27  (= CFO + CFI)
+#     Cash flow from financing =  185,319.14
+#     Net cash flow            = −612,866.13  (= CFO + CFI + CFF == Σ ALL leaves)
+
+# Live-shaped CF structure: three cluster parents (Trade/Other WC, Other operating)
+# + a pure roll-up "Δ Net working capital" with NO own leaves.  ``_LIVE_CF_STRUCTURE``
+# is ordered exactly like the real dim_cf_structure operating block.
+def _leaf(so, code, title):
+    return _cf_struct(so, code, "mapping", "CF:detail", title)
+
+
+def _sub(so, code, title, kpi="CF:op"):
+    return _cf_struct(so, code, "subtotal", kpi, title, is_bold=True)
+
+
+_LIVE_CF_STRUCTURE = [
+    _leaf(3001, "CF_EBITDA", "EBITDA"),
+    _leaf(3002, "CF_TAXES", "Taxes on income"),
+    _sub(3003, "CF_GROSS_CASH_FLOW", "Gross cash flow"),
+    _leaf(3004, "CF_INVENTORIES", f"{_GREEK} Inventories"),
+    _leaf(3005, "CF_TRADE_REC", f"{_GREEK} Trade receivables"),
+    _leaf(3006, "CF_ADV_PAY", f"{_GREEK} Advance payments received"),
+    _leaf(3007, "CF_TRADE_PAY", f"{_GREEK} Trade payables"),
+    _sub(3008, "CF_TRADE_WORKING_CAPITAL", f"{_GREEK} Trade working capital"),
+    _leaf(3009, "CF_OTHER_ASSETS", f"{_GREEK} Other assets"),
+    _leaf(3010, "CF_PREPAID", f"{_GREEK} Prepaid expenses"),
+    _leaf(3011, "CF_OTHER_PROV", f"{_GREEK} Other provision & accruals"),
+    _leaf(3012, "CF_OTHER_LIAB", f"{_GREEK} Other liabilities"),
+    _leaf(3013, "CF_REC_AFF", f"{_GREEK} Receivables from affiliates"),
+    _leaf(3014, "CF_LIAB_AFF", f"{_GREEK} Liabilities due to affiliates"),
+    _leaf(3015, "CF_DTA", f"{_GREEK} Deferred tax assets"),
+    _sub(3016, "CF_OTHER_WORKING_CAPITAL", f"{_GREEK} Other working capital"),
+    _sub(3017, "CF_NET_WORKING_CAPITAL", f"{_GREEK} Net working capital"),
+    _leaf(3018, "CF_ACCRUED_TAX", f"{_GREEK} Accrued taxes"),
+    _leaf(3019, "CF_BONUS", f"{_GREEK} Bonus liabilities"),
+    _sub(3020, "CF_OTHER_OPERATING_ITEMS", f"{_GREEK} Other operating items"),
+    _cf_struct(3021, "CF_CFO", "subtotal", "CF:op",
+               "Cash flow from operating activities", is_bold=True),
+    _leaf(3022, "CF_DA", "Depreciation & amortisation"),
+    _leaf(3023, "CF_FIXED_ASSETS", f"{_GREEK} Fixed assets"),
+    _cf_struct(3024, "CF_CFI", "calc", "CF_INV",
+               "Cash flow from investing activities"),
+    _cf_struct(3025, "CF_FCF", "calc", "CF_FREE_CASH_FLOW", "Free cash flow"),
+    _leaf(3026, "CF_FIN_RESULT", "Financial result"),
+    _leaf(3027, "CF_BANK_LOANS", f"{_GREEK} Bank loans"),
+    _cf_struct(3028, "CF_CFF", "calc", "CF_FIN",
+               "Cash flow from financing activities"),
+    _cf_struct(3029, "CF_NET", "subtotal", "CF:fin", "Net cash flow", is_bold=True),
+]
+
+# Worked-example leaf values (cm column), keyed by line_code.
+_LIVE_CF_LEAF_CM = {
+    "CF_EBITDA": 529467.51, "CF_TAXES": -9969.14,
+    "CF_INVENTORIES": 0.0, "CF_TRADE_REC": -313863.23,
+    "CF_ADV_PAY": -1847064.38, "CF_TRADE_PAY": 765408.94,
+    "CF_OTHER_ASSETS": -1134132.68, "CF_PREPAID": 216687.51,
+    "CF_OTHER_PROV": 619374.84, "CF_OTHER_LIAB": 1717041.14,
+    "CF_REC_AFF": 4586.02, "CF_LIAB_AFF": -57964.23, "CF_DTA": 0.0,
+    "CF_ACCRUED_TAX": -526287.97, "CF_BONUS": -17398.77,
+    "CF_DA": -359775.13, "CF_FIXED_ASSETS": -384295.70,
+    "CF_FIN_RESULT": 9969.14, "CF_BANK_LOANS": 175350.00,
+}
+
+
+def _live_mapping_vals(leaf_cm: dict[str, float]) -> dict[str, dict[str, float]]:
+    return {code: {"cm": v} for code, v in leaf_cm.items()}
+
+
+class TestCfIntraGroupChange:
+    """Intra subtotals = Σ of their own group; roll-up + section totals tie out."""
+
+    def _compute(self, leaf_cm=None):
+        from app.services.fin_compat_cf import _compute_cf_section_values
+        vals = _live_mapping_vals(_LIVE_CF_LEAF_CM if leaf_cm is None else leaf_cm)
+        out = _compute_cf_section_values(_LIVE_CF_STRUCTURE, vals, ["cm"])
+        return {code: round(d["cm"], 2) for code, d in out.items()}
+
+    def test_group_change_subtotals(self):
+        got = self._compute()
+        assert got["CF_GROSS_CASH_FLOW"] == 519498.37
+        assert got["CF_TRADE_WORKING_CAPITAL"] == -1395518.67
+        assert got["CF_OTHER_WORKING_CAPITAL"] == 1365592.60
+        assert got["CF_NET_WORKING_CAPITAL"] == -29926.07
+        assert got["CF_OTHER_OPERATING_ITEMS"] == -543686.74
+
+    def test_net_wc_equals_trade_plus_other(self):
+        got = self._compute()
+        assert got["CF_NET_WORKING_CAPITAL"] == pytest.approx(
+            got["CF_TRADE_WORKING_CAPITAL"] + got["CF_OTHER_WORKING_CAPITAL"], abs=0.01
+        )
+
+    def test_section_totals_unchanged(self):
+        got = self._compute()
+        assert got["CF_CFO"] == -54114.44
+        assert got["CF_CFI"] == -744070.83
+        assert got["CF_CFF"] == 185319.14
+        # Operating total == Gross CF + Net WC + Other operating (no double count).
+        assert got["CF_CFO"] == pytest.approx(
+            got["CF_GROSS_CASH_FLOW"] + got["CF_NET_WORKING_CAPITAL"]
+            + got["CF_OTHER_OPERATING_ITEMS"], abs=0.01
+        )
+
+    def test_grand_totals_unchanged(self):
+        got = self._compute()
+        assert got["CF_FCF"] == -798185.27
+        assert got["CF_NET"] == -612866.13
+        assert got["CF_FCF"] == pytest.approx(got["CF_CFO"] + got["CF_CFI"], abs=0.01)
+        assert got["CF_NET"] == pytest.approx(
+            got["CF_CFO"] + got["CF_CFI"] + got["CF_CFF"], abs=0.01
+        )
+
+    def test_net_cash_flow_tieout_to_all_leaves(self):
+        got = self._compute()
+        leaf_sum = round(sum(_LIVE_CF_LEAF_CM.values()), 2)
+        assert got["CF_NET"] == pytest.approx(leaf_sum, abs=0.01)
+
+    # --- Edge cases -------------------------------------------------------
+    def test_all_zero_group_is_zero(self):
+        # Every trade-WC leaf zero → Δ Trade working capital == 0, and Δ Net WC
+        # collapses to Δ Other WC alone.
+        leaf = dict(_LIVE_CF_LEAF_CM)
+        for c in ("CF_INVENTORIES", "CF_TRADE_REC", "CF_ADV_PAY", "CF_TRADE_PAY"):
+            leaf[c] = 0.0
+        got = self._compute(leaf)
+        assert got["CF_TRADE_WORKING_CAPITAL"] == 0.0
+        assert got["CF_NET_WORKING_CAPITAL"] == pytest.approx(
+            got["CF_OTHER_WORKING_CAPITAL"], abs=0.01
+        )
+
+    def test_no_data_all_zero(self):
+        got = self._compute({c: 0.0 for c in _LIVE_CF_LEAF_CM})
+        for c in ("CF_GROSS_CASH_FLOW", "CF_TRADE_WORKING_CAPITAL",
+                  "CF_OTHER_WORKING_CAPITAL", "CF_NET_WORKING_CAPITAL",
+                  "CF_OTHER_OPERATING_ITEMS", "CF_CFO", "CF_CFI", "CF_CFF",
+                  "CF_FCF", "CF_NET"):
+            assert got[c] == 0.0
+
+    def test_net_wc_one_populated_sibling(self):
+        # Only Δ Trade WC populated (Other WC all zero) → Δ Net WC == Δ Trade WC.
+        leaf = {c: 0.0 for c in _LIVE_CF_LEAF_CM}
+        leaf["CF_TRADE_REC"] = -100.0
+        got = self._compute(leaf)
+        assert got["CF_OTHER_WORKING_CAPITAL"] == 0.0
+        assert got["CF_TRADE_WORKING_CAPITAL"] == -100.0
+        assert got["CF_NET_WORKING_CAPITAL"] == -100.0
+
+    def test_intra_no_longer_duplicates_running_sum(self):
+        # Regression guard: Δ Net working capital must NOT equal the running CFO
+        # (the old bug) — it is a distinct, smaller group change here.
+        got = self._compute()
+        assert got["CF_NET_WORKING_CAPITAL"] != got["CF_CFO"]
+        assert got["CF_OTHER_WORKING_CAPITAL"] != got["CF_NET_WORKING_CAPITAL"]
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
