@@ -6,12 +6,20 @@ from typing import Any
 
 import pandas as pd
 from funktionssammlung import (
+    REVENUE_REPORT_HELPER_START_COL,
     apply_filters,
     build_output_file_path,
     ensure_output_writable,
     fdd_as_of_end,
     fdd_as_of_is_fy_end,
     fdd_current_fy_end_year,
+    parse_invoice_fy_year,
+    revenue_report_col_offset,
+)
+from revenue_reconciliation import (
+    NA_VALUE,
+    RECON_DIFFERENCE_LABEL,
+    sales_basis_labels,
 )
 
 DROP_INDEX_PRINT_LIMIT = 200
@@ -125,11 +133,27 @@ def normalize_config(cfg: dict) -> dict:                #CONFIG Eingaben prüfen
         if not out.get("fx_col"):
             raise ValueError("apply_fx=True aber fx_col fehlt.")
 
-    out.setdefault("total_label", "Total")
-    out.setdefault("table", "ARR Bridge")
+    out["sales_basis"] = sales_basis_labels(out.get("sales_basis")).sales_basis
+    out["total_label"] = sales_basis_labels(out["sales_basis"]).total_label
+    out["invoice_mapping_mode"] = str(
+        out.get("invoice_mapping_mode") or "date"
+    ).strip().lower()
+    if out["invoice_mapping_mode"] not in {"date", "year"}:
+        raise ValueError("CONFIG['invoice_mapping_mode'] muss 'date' oder 'year' sein.")
+    out.setdefault("table", "Churn")
     out.setdefault("first_fy", int(out.get("fy_end_year", 2024)) - 2)
 
     return out
+
+
+def _parse_churn_invoice_dates(series: pd.Series, cfg: dict) -> pd.Series:
+    if cfg.get("invoice_mapping_mode") != "year":
+        return pd.to_datetime(series, errors="coerce", dayfirst=True)
+    years = parse_invoice_fy_year(series)
+    month = int(cfg.get("fy_end_month", 12))
+    day = int(cfg.get("fy_end_day", 31))
+    values = years.astype("string") + f"-{month:02d}-{day:02d}"
+    return pd.to_datetime(values, errors="coerce")
 
 
 def resolve_fy_years(cfg: dict) -> tuple[int, int]:
@@ -156,9 +180,11 @@ def bridge_year_pairs(cfg: dict) -> list[tuple[int, int]]:
     return [(y, y + 1) for y in range(first_fy, latest_closed)]
 
 
-def days_inclusive(start: pd.Series, end: pd.Series) -> pd.Series:    #Funktion die Vertragslaufzeit in Tagen berechnet
-    days = (end - start).dt.days + 1  # +1 weil Mathe
-    return days.clip(lower=1)
+def days_inclusive(start, end) -> pd.Series:
+    """Inclusive day count; coerce to Series so TimedeltaIndex never hits .dt."""
+    start_s = pd.to_datetime(pd.Series(start))
+    end_s = pd.to_datetime(pd.Series(end))
+    return ((end_s - start_s).dt.days + 1).clip(lower=1)
 
 
 def report_drops(before_idx: pd.Index, after_idx: pd.Index, label: str):    #Funktion die nicht verwendbare Zeilen mit Index printt
@@ -183,7 +209,7 @@ def preprocess_contract_lines(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:    #
     # Daten
     d[cfg["start_col"]] = pd.to_datetime(d[cfg["start_col"]], errors="coerce", dayfirst=True)
     d[cfg["end_col"]] = pd.to_datetime(d[cfg["end_col"]], errors="coerce", dayfirst=True)
-    d[cfg["invoice_col"]] = pd.to_datetime(d[cfg["invoice_col"]], errors="coerce", dayfirst=True)
+    d[cfg["invoice_col"]] = _parse_churn_invoice_dates(d[cfg["invoice_col"]], cfg)
 
     #Core Columns
     d["cust_id"] = d[cfg["customer_col"]].astype(str).str.strip()
@@ -256,8 +282,7 @@ def snapshot_arr(d: pd.DataFrame, as_of: pd.Timestamp, cfg: dict) -> pd.DataFram
     overlap_start = dd[start_col].where(dd[start_col] > month_start, month_start)
     overlap_end = dd[end_col].where(dd[end_col] < month_end, month_end)
 
-    overlap_days = (overlap_end - overlap_start).dt.days + 1
-    overlap_days = overlap_days.clip(lower=0)              #Keine negativen vertragstage
+    overlap_days = days_inclusive(overlap_start, overlap_end).clip(lower=0)
 
     # 3) Tagesrate
     daily_rate = dd["contract_value"] / dd["contract_days"]
@@ -291,7 +316,7 @@ def _prepare_for_line_arr(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     d = apply_filters(d, cfg)
     d[cfg["start_col"]] = pd.to_datetime(d[cfg["start_col"]], errors="coerce", dayfirst=True)
     d[cfg["end_col"]] = pd.to_datetime(d[cfg["end_col"]], errors="coerce", dayfirst=True)
-    d[cfg["invoice_col"]] = pd.to_datetime(d[cfg["invoice_col"]], errors="coerce", dayfirst=True)
+    d[cfg["invoice_col"]] = _parse_churn_invoice_dates(d[cfg["invoice_col"]], cfg)
     d["contract_value"] = pd.to_numeric(d[cfg["value_col"]], errors="coerce").fillna(0.0)
     if cfg.get("apply_fx", False):
         fx_col = cfg.get("fx_col")
@@ -313,8 +338,7 @@ def contract_line_arr(d: pd.DataFrame, as_of: pd.Timestamp, cfg: dict) -> pd.Ser
     dd = d[d[inv_col].notna() & (d[inv_col] <= as_of)].copy()
     overlap_start = dd[start_col].where(dd[start_col] > month_start, month_start)
     overlap_end = dd[end_col].where(dd[end_col] < month_end, month_end)
-    overlap_days = (overlap_end - overlap_start).dt.days + 1
-    overlap_days = overlap_days.clip(lower=0)
+    overlap_days = days_inclusive(overlap_start, overlap_end).clip(lower=0)
     daily_rate = dd["contract_value"] / dd["contract_days"]
     mrr = daily_rate * overlap_days
     arr = mrr * 12.0
@@ -981,6 +1005,36 @@ def finalize_merged_bridge_layout(bridge: pd.DataFrame, cfg: dict) -> pd.DataFra
     return out
 
 
+def append_churn_reconciliation_rows(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    labels = sales_basis_labels((cfg or {}).get("sales_basis"))
+    out = df.copy()
+    label_col = "label" if "label" in df.columns else next(
+        c for c in df.columns if c not in CHURN_META_COLS and not _churn_is_numeric_col(c)
+    )
+    label_idx = next(i for i, col in enumerate(out.columns) if col == label_col)
+    row_type_idx = next(i for i, col in enumerate(out.columns) if col == "row_type")
+    if "row_type" in out.columns:
+        total_mask = out["row_type"] == "total"
+        if total_mask.any():
+            out.iloc[total_mask.to_numpy(), label_idx] = labels.total_label
+    rows: list[list[object]] = []
+    for label, row_type in (
+        (RECON_DIFFERENCE_LABEL, "recon"),
+        (labels.reported_label, "reported"),
+    ):
+        row: list[object] = ["" for _ in out.columns]
+        row[label_idx] = label
+        row[row_type_idx] = row_type
+        for idx, col in enumerate(out.columns):
+            if isinstance(col, str) and col.startswith("FY"):
+                row[idx] = NA_VALUE
+        rows.append(row)
+    return pd.concat(
+        [out, pd.DataFrame(rows, columns=out.columns)],
+        ignore_index=True,
+    )
+
+
 def _churn_index_key(values, n_levels: int):
     if n_levels == 1:
         return values[0]
@@ -1029,7 +1083,7 @@ def build_merged_horizontal_bridge(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         total = merged[merged["row_type"] == "total"]
         merged = pd.concat([non_total, total], ignore_index=True)
 
-    return merged
+    return append_churn_reconciliation_rows(merged, cfg)
 
 
 def strip_churn_fy_values(export_df: pd.DataFrame) -> pd.DataFrame:
@@ -1042,7 +1096,8 @@ def strip_churn_fy_values(export_df: pd.DataFrame) -> pd.DataFrame:
 
 def get_churn_excel_layout(cfg: dict, *, formula_mode: bool = True) -> dict[str, Any]:
     n_groups = len(cfg.get("group_cols") or [])
-    col_offset = max(int(cfg.get("excel_formatting", {}).get("col_offset", 3)), n_groups, 3)
+    configured = (cfg.get("excel_formatting") or {}).get("col_offset")
+    col_offset = revenue_report_col_offset(n_groups, configured)
     header_row = 4
     return {
         "formula_mode": formula_mode,
@@ -1054,7 +1109,9 @@ def get_churn_excel_layout(cfg: dict, *, formula_mode: bool = True) -> dict[str,
         "data_start_row": header_row + 1,
         "insert_rows": header_row - 1,
         "label_col": col_offset + 1,
-        "key_cols": list(range(1, min(len(cfg.get("group_cols") or []), col_offset) + 1)),
+        "left_free_col": 1,
+        "right_spacer_col": col_offset,
+        "key_cols": list(range(2, min(len(cfg.get("group_cols") or []), col_offset) + 2)),
         "helper_right_col": col_offset,
     }
 
@@ -1119,7 +1176,7 @@ def _churn_table_bottom_from_row_type(ws, row_type_col: int, data_start: int) ->
     last = data_start - 1
     for r in range(data_start, (ws.max_row or 0) + 1):
         rt = str(ws.cell(row=r, column=row_type_col).value or "").strip().lower()
-        if rt in {"leaf", "parent", "hierarchy", "bucket", "total"}:
+        if rt in {"leaf", "parent", "hierarchy", "bucket", "total", "recon", "reported"}:
             last = r
     return last
 
@@ -1152,7 +1209,7 @@ def apply_churn_vertical_outlines(ws, layout: dict) -> None:
         rt = str(ws.cell(row=r, column=row_type_col).value or "").strip().lower()
         rd = ws.row_dimensions[r]
 
-        if rt in {"total", "bucket"}:
+        if rt in {"total", "bucket", "recon", "reported"}:
             rd.outlineLevel = 0
             rd.hidden = False
             rd.collapsed = False
@@ -1194,10 +1251,12 @@ def write_churn_formula_key_columns(ws, cfg: dict, layout: dict) -> None:
     group_cols = list(cfg.get("group_cols") or [])
     n_keys = len(group_cols)
     col_offset = layout["helper_right_col"]
+    helper_start = REVENUE_REPORT_HELPER_START_COL
 
     for c in range(1, col_offset + 1):
-        ws.cell(row=header_row, column=c).value = group_cols[c - 1] if c <= n_keys else None
-        if c <= n_keys:
+        gc_idx = c - helper_start
+        ws.cell(row=header_row, column=c).value = group_cols[gc_idx] if 0 <= gc_idx < n_keys else None
+        if 0 <= gc_idx < n_keys:
             ws.cell(row=header_row, column=c).font = red_bold_font
         ws.column_dimensions[get_column_letter(c)].hidden = True
         ws.column_dimensions[get_column_letter(c)].outlineLevel = 1
@@ -1217,7 +1276,7 @@ def write_churn_formula_key_columns(ws, cfg: dict, layout: dict) -> None:
             continue
 
         if n_keys == 1:
-            ws.cell(row=r, column=1).value = ws.cell(row=r, column=layout["label_col"]).value
+            ws.cell(row=r, column=helper_start).value = ws.cell(row=r, column=layout["label_col"]).value
         elif key_col and level_col:
             try:
                 row_level = int(ws.cell(row=r, column=level_col).value)
@@ -1227,9 +1286,9 @@ def write_churn_formula_key_columns(ws, cfg: dict, layout: dict) -> None:
                 raw_key = ws.cell(row=r, column=key_col).value
                 parts = split_key_to_n_parts(str(raw_key or ""), n_keys)
                 for i, val in enumerate(parts, start=1):
-                    ws.cell(row=r, column=i).value = val
+                    ws.cell(row=r, column=helper_start + i - 1).value = val
         elif n_keys >= 2:
-            ws.cell(row=r, column=1).value = ws.cell(row=r, column=layout["label_col"]).value
+            ws.cell(row=r, column=helper_start).value = ws.cell(row=r, column=layout["label_col"]).value
 
 
 def format_churn_excel(
@@ -1267,16 +1326,27 @@ def format_churn_excel(
         top=THEME.border_subtotal_top.top,
         bottom=THEME.border_subtotal_top.top,
     )
-    fill_extent = 501
 
-    for r in range(1, fill_extent + 1):
-        for c in range(1, fill_extent + 1):
+    col_headers = _churn_col_header_map(ws, header_row)
+    fy_col_indices = [(h, c) for c, h in sorted(col_headers.items()) if h.startswith("FY")]
+    fy_col_set = {c for _, c in fy_col_indices}
+    bridge_metric_cols = [c for c, h in col_headers.items() if h in CHURN_BRIDGE_METRICS]
+    money_cols = [c for c, h in col_headers.items() if _is_churn_money_header(h)]
+    table_right = max(
+        (c for c in col_headers if c > col_offset and c != row_type_col),
+        default=table_left,
+    )
+    paint_rows = max(table_bottom + 50, ws.max_row + 50, 501)
+    paint_cols = max(table_right + 50, ws.max_column + 50, row_type_col + 10, 501)
+
+    for r in range(1, paint_rows + 1):
+        for c in range(1, paint_cols + 1):
             ws.cell(row=r, column=c).font = THEME.font_base
 
-    for r in range(1, fill_extent + 1):
-        for c in range(col_offset + 1, fill_extent + 1):
+    for r in range(1, paint_rows + 1):
+        for c in range(col_offset + 1, paint_cols + 1):
             ws.cell(row=r, column=c).fill = white_fill
-    for r in range(1, fill_extent + 1):
+    for r in range(1, paint_rows + 1):
         for c in range(1, col_offset + 1):
             ws.cell(row=r, column=c).fill = fill_tech
 
@@ -1290,22 +1360,20 @@ def format_churn_excel(
     title_font = Font(name=THEME.font_name, size=THEME.font_size_title, color=THEME.text_brand_title)
     subtitle_font = Font(name=THEME.font_name, size=THEME.font_size_subtitle, color=THEME.text_brand_title)
     company_font = Font(name=THEME.font_name, size=THEME.font_size_company, color=THEME.text_brand_title)
+    table_name = str(cfg.get("table") or "Churn").strip() or "Churn"
+    company = str(cfg.get("company") or cfg.get("company_name") or "").strip()
+    fy_bits = [h for h, _ in fy_col_indices]
+    period_label = f"{fy_bits[0]}–{fy_bits[-1]}" if len(fy_bits) >= 2 else (fy_bits[0] if fy_bits else "")
     ws.cell(row=1, column=col_offset + 1).value = cfg.get("title", "")
     ws.cell(row=1, column=col_offset + 1).font = title_font
-    ws.cell(row=2, column=col_offset + 1).value = cfg.get("table", "")
-    ws.cell(row=2, column=col_offset + 1).font = subtitle_font
-    ws.cell(row=3, column=col_offset + 1).value = cfg.get("company", "")
-    ws.cell(row=3, column=col_offset + 1).font = company_font
-
-    col_headers = _churn_col_header_map(ws, header_row)
-    fy_col_indices = [(h, c) for c, h in sorted(col_headers.items()) if h.startswith("FY")]
-    fy_col_set = {c for _, c in fy_col_indices}
-    bridge_metric_cols = [c for c, h in col_headers.items() if h in CHURN_BRIDGE_METRICS]
-    money_cols = [c for c, h in col_headers.items() if _is_churn_money_header(h)]
-    table_right = max(
-        (c for c in col_headers if c > col_offset and c != row_type_col),
-        default=table_left,
+    ws.cell(row=2, column=col_offset + 1).value = (
+        f"{table_name} | {period_label}" if period_label else table_name
     )
+    ws.cell(row=2, column=col_offset + 1).font = subtitle_font
+    ws.cell(row=3, column=col_offset + 1).value = (
+        f"{company} | {table_name}" if company else table_name
+    )
+    ws.cell(row=3, column=col_offset + 1).font = company_font
 
     meta_cols = {}
     for name in ("level", "ui_level", "key", "parent_key"):
@@ -1382,6 +1450,12 @@ def format_churn_excel(
                 elif c in money_cols:
                     cell.fill = white_fill
                 cell.border = border_subtotal_tb
+        elif rt in {"recon", "reported"}:
+            for c in range(table_left, table_right + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.fill = subtotal_fill if rt == "reported" else white_fill
+                cell.font = THEME.font_bold if rt == "reported" else THEME.font_base
+                cell.border = border_subtotal_tb
         elif rt == "bucket":
             for c in range(table_left, table_right + 1):
                 cell = ws.cell(row=r, column=c)
@@ -1446,9 +1520,9 @@ def format_churn_excel(
 
 def fy_end_date(year: int, cfg: dict) -> pd.Timestamp:    #Holt Enddaten aus CONFIG
     return pd.Timestamp(
-        year=year,
-        month=cfg["fy_end_month"],
-        day=cfg["fy_end_day"]
+        year=int(year),
+        month=int(cfg["fy_end_month"]),
+        day=int(cfg["fy_end_day"]),
     )
 
 

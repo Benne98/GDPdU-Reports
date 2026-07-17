@@ -6,6 +6,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Undo2 } from 'lucide-react'
 import { getApiBaseUrl } from '../../lib/api'
+import SourceDataAuditWarning, {
+  type SourceDataAuditResult,
+  hasAuditContent,
+} from './SourceDataAuditWarning'
 
 interface PreviewColumn {
   letter: string
@@ -88,7 +92,7 @@ export default function OposColumnMapper({
   const [history, setHistory] = useState<Partial<Record<OposRole, string>>[]>([])
   const [stepIndex, setStepIndex] = useState(0)
   const [submitting, setSubmitting] = useState(false)
-  const [dueDateWarning, setDueDateWarning] = useState<number | null>(null)
+  const [auditResult, setAuditResult] = useState<SourceDataAuditResult | null>(null)
   const [pendingPayload, setPendingPayload] = useState<Record<string, string> | null>(null)
 
   const currentRole = ROLES[stepIndex]?.key
@@ -172,7 +176,7 @@ export default function OposColumnMapper({
     }
     next[currentRole] = letter
     setAssignments(next)
-    setDueDateWarning(null)
+    setAuditResult(null)
     setPendingPayload(null)
 
     const nextStep = ROLES.findIndex(r => !next[r.key])
@@ -184,21 +188,23 @@ export default function OposColumnMapper({
     const prev = history[history.length - 1]
     setHistory(h => h.slice(0, -1))
     setAssignments(prev)
-    setDueDateWarning(null)
+    setAuditResult(null)
     setPendingPayload(null)
     const nextStep = ROLES.findIndex(r => !prev[r.key])
     setStepIndex(nextStep >= 0 ? nextStep : 0)
   }
 
-  const auditMissingDueDates = async (payload: Record<string, string>): Promise<number> => {
-    if (!snapshots.length) return 0
+  const auditMappedColumns = async (
+    payload: Record<string, string>,
+  ): Promise<SourceDataAuditResult | null> => {
+    if (!snapshots.length) return null
     let letters: Record<string, string> = {}
     try {
       letters = JSON.parse(payload.opos_column_letters_json || '{}') as Record<string, string>
     } catch {
-      return 0
+      return null
     }
-    if (!letters.partner && !letters.due_date) return 0
+    if (!letters.partner && !letters.due_date) return null
 
     const base = getApiBaseUrl()
     const resp = await fetch(`${base}/api/v1/fdd/opos/audit-due-dates`, {
@@ -210,13 +216,12 @@ export default function OposColumnMapper({
         snapshots,
       }),
     })
-    if (!resp.ok) return 0
-    const data = (await resp.json()) as { total_excluded?: number }
-    return Number(data.total_excluded || 0)
+    if (!resp.ok) return null
+    return (await resp.json()) as SourceDataAuditResult
   }
 
   const finalizeSubmit = async (payload: Record<string, string>) => {
-    setDueDateWarning(null)
+    setAuditResult(null)
     setPendingPayload(null)
     await onSubmit(payload)
   }
@@ -226,11 +231,18 @@ export default function OposColumnMapper({
     setSubmitting(true)
     try {
       const payload = buildSubmitPayload(assignments, headerByLetter)
-      const excluded = await auditMissingDueDates(payload)
-      if (excluded > 0) {
-        setDueDateWarning(excluded)
-        setPendingPayload(payload)
+      const result = await auditMappedColumns(payload)
+      if (!result) {
+        await finalizeSubmit(payload)
         return
+      }
+      const excluded = Number(result.total_excluded || 0)
+      if (hasAuditContent(result)) {
+        setAuditResult(result)
+        if (excluded > 0) {
+          setPendingPayload(payload)
+          return
+        }
       }
       await finalizeSubmit(payload)
     } finally {
@@ -250,7 +262,7 @@ export default function OposColumnMapper({
 
   const handleReupload = async () => {
     if (submitting || disabled) return
-    setDueDateWarning(null)
+    setAuditResult(null)
     setPendingPayload(null)
     if (onReupload) {
       await onReupload()
@@ -340,37 +352,22 @@ export default function OposColumnMapper({
         </table>
       </div>
 
-      {dueDateWarning !== null && dueDateWarning > 0 && (
-        <div
-          className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
-          role="alert"
-        >
-          <p className="font-medium">
-            {dueDateWarning.toLocaleString('en-US')} row{dueDateWarning === 1 ? '' : 's'} will be
-            excluded due to missing due dates.
-          </p>
-          <p className="mt-1 text-amber-900">
-            Do you want to continue anyway, or correct the file and re-upload?
-          </p>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <button
-              type="button"
-              disabled={disabled || submitting}
-              onClick={handleContinueDespiteWarning}
-              className="rounded-md bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50"
-            >
-              Continue anyway
-            </button>
-            <button
-              type="button"
-              disabled={disabled || submitting}
-              onClick={handleReupload}
-              className="rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
-            >
-              Re-upload files
-            </button>
-          </div>
-        </div>
+      {auditResult && hasAuditContent(auditResult) && (
+        <SourceDataAuditWarning
+          result={auditResult}
+          summary={
+            Number(auditResult.total_excluded || 0) > 0
+              ? `${Number(auditResult.total_excluded).toLocaleString('en-US')} row${
+                  Number(auditResult.total_excluded) === 1 ? '' : 's'
+                } will be excluded due to missing due dates.`
+              : 'Source data review — see details below.'
+          }
+          blockingCount={Number(auditResult.total_excluded || 0)}
+          onContinue={pendingPayload ? handleContinueDespiteWarning : undefined}
+          onReupload={pendingPayload ? handleReupload : undefined}
+          submitting={submitting}
+          disabled={disabled}
+        />
       )}
 
       <div className="flex flex-wrap items-center gap-2 self-start">
@@ -385,7 +382,7 @@ export default function OposColumnMapper({
             Undo
           </button>
         )}
-        {!dueDateWarning && (
+        {!pendingPayload && (
           <button
             type="button"
             disabled={!allMapped || submitting || disabled}

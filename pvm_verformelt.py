@@ -32,6 +32,7 @@ from funktionssammlung import (
     ensure_source_sheet_in_output,
     refresh_source_sheet_from_df,
     source_range_ref,
+    source_column_range_ref,
     build_formula_filter_branches,
     build_sumifs_formula_body,
     build_chunked_row_sum_formula,
@@ -42,6 +43,7 @@ from funktionssammlung import (
     _get_sheet_header_map,
     _normalize_header_name,
     parse_invoice_fy_year,
+    days_inclusive,
 )
 
 from openpyxl import load_workbook
@@ -53,6 +55,12 @@ _SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 from gst_excel_theme import THEME  # noqa: E402
+from revenue_reconciliation import (  # noqa: E402
+    NA_VALUE,
+    RECON_DIFFERENCE_LABEL,
+    sales_basis_labels,
+    write_reconciliation_cells,
+)
 
 # -----------------------
 # Config laden
@@ -101,15 +109,24 @@ def normalize_config(cfg: dict) -> dict:
     out.setdefault("base_sheet_name",     "pvm")
     out.setdefault("apply_fx",            False)
     out.setdefault("sort_by_bridge",      "revenue")
-    if out.get("total_label_revenue") in (None, ""):
-        out["total_label_revenue"] = "Gross sales"
+    _basis = sales_basis_labels(out.get("sales_basis"))
+    out["sales_basis"] = _basis.sales_basis
+    out["total_label_revenue"] = _basis.total_label
     if out.get("total_label_cost") in (None, ""):
         out["total_label_cost"] = "Cost of materials"
-    if out.get("total_label_gp") in (None, ""):
-        out["total_label_gp"] = "Gross profit"
+    if out.get("total_label_gp") in (None, "", "Gross profit", "Net profit"):
+        out["total_label_gp"] = _basis.profit_label
     out.setdefault("profit_mode",         "cost")
     out.setdefault("formula_mode",        True)
     out.setdefault("invoice_mapping_mode", "date")
+    out.setdefault("calc_mode", "invoice")
+    out["calc_mode"] = str(out["calc_mode"]).strip().lower()
+    if out["calc_mode"] not in {"invoice", "accrual"}:
+        raise ValueError("CONFIG['calc_mode'] muss 'invoice' oder 'accrual' sein.")
+    if out["calc_mode"] == "accrual":
+        for key in ("start_col", "end_col"):
+            if not str(out.get(key) or "").strip():
+                raise ValueError(f"CONFIG['{key}'] muss bei calc_mode='accrual' gesetzt sein.")
 
     raw_filters = out.get("filters", {}) or {}
     if isinstance(raw_filters, list):
@@ -287,6 +304,8 @@ def preprocess_pvm_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     ]
 
     required_cols.append(cfg["invoice_col"])
+    if cfg["calc_mode"] == "accrual":
+        required_cols.extend([cfg["start_col"], cfg["end_col"]])
 
     if cfg["profit_mode"] == "cost":
         required_cols.append(cfg["cost_col"])
@@ -305,6 +324,9 @@ def preprocess_pvm_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         )
     else:
         d["_invoice_fy_year"] = parse_invoice_fy_year(d[cfg["invoice_col"]])
+    if cfg["calc_mode"] == "accrual":
+        d[cfg["start_col"]] = pd.to_datetime(d[cfg["start_col"]], errors="coerce", dayfirst=True)
+        d[cfg["end_col"]] = pd.to_datetime(d[cfg["end_col"]], errors="coerce", dayfirst=True)
 
     d[cfg["quantity_col"]] = pd.to_numeric(d[cfg["quantity_col"]], errors="coerce")
     d[cfg["revenue_col"]]  = pd.to_numeric(d[cfg["revenue_col"]],  errors="coerce")
@@ -342,24 +364,34 @@ def preprocess_pvm_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
             d["cost"]                       = d["revenue"] - d["gross_profit"]
 
     if cfg["invoice_mapping_mode"] == "date":
+        required_notna = [cfg["invoice_col"], cfg["group_col"], "volume", "revenue"]
+        if cfg["calc_mode"] == "accrual":
+            required_notna.extend([cfg["start_col"], cfg["end_col"]])
         bad = d[
-            d[cfg["invoice_col"]].isna()
-            | d[cfg["group_col"]].isna()
-            | d["volume"].isna()
-            | d["revenue"].isna()
+            d[required_notna].isna().any(axis=1)
         ]
     else:
-        bad = d[
+        bad_mask = (
             d["_invoice_fy_year"].isna()
             | d[cfg["group_col"]].isna()
             | d["volume"].isna()
             | d["revenue"].isna()
-        ]
+        )
+        if cfg["calc_mode"] == "accrual":
+            bad_mask |= d[[cfg["start_col"], cfg["end_col"]]].isna().any(axis=1)
+        bad = d[bad_mask]
 
     if cfg["invoice_mapping_mode"] == "date":
-        d = d.dropna(subset=[cfg["invoice_col"], cfg["group_col"], "volume", "revenue"])
+        d = d.dropna(subset=required_notna)
+        if cfg["calc_mode"] == "accrual":
+            d = d[d[cfg["end_col"]] >= d[cfg["start_col"]]].copy()
     else:
-        d = d.dropna(subset=["_invoice_fy_year", cfg["group_col"], "volume", "revenue"])
+        required_notna = ["_invoice_fy_year", cfg["group_col"], "volume", "revenue"]
+        if cfg["calc_mode"] == "accrual":
+            required_notna.extend([cfg["start_col"], cfg["end_col"]])
+        d = d.dropna(subset=required_notna)
+        if cfg["calc_mode"] == "accrual":
+            d = d[d[cfg["end_col"]] >= d[cfg["start_col"]]].copy()
 
     d["group_key"] = d[cfg["group_col"]].astype(str).str.strip()
 
@@ -370,13 +402,25 @@ def preprocess_pvm_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def aggregate_year(d: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, cfg: dict) -> pd.DataFrame:
-    if cfg["invoice_mapping_mode"] == "date":
+    if cfg["calc_mode"] == "accrual":
+        contract_start = d[cfg["start_col"]]
+        contract_end = d[cfg["end_col"]]
+        overlap_start = contract_start.where(contract_start > start, start)
+        overlap_end = contract_end.where(contract_end < end, end)
+        overlap_days = days_inclusive(overlap_start, overlap_end).clip(lower=0)
+        contract_days = days_inclusive(contract_start, contract_end).clip(lower=1)
+        fraction = overlap_days / contract_days
+        tmp = d.copy()
+        for metric in ("volume", "revenue", "cost", "gross_profit"):
+            tmp[metric] = pd.to_numeric(tmp[metric], errors="coerce").fillna(0.0) * fraction
+        tmp = tmp[fraction > 0].copy()
+    elif cfg["invoice_mapping_mode"] == "date":
         mask = (d[cfg["invoice_col"]] >= start) & (d[cfg["invoice_col"]] <= end)
+        tmp = d.loc[mask].copy()
     else:
         target_fy_year = int(end.year)
         mask           = pd.to_numeric(d["_invoice_fy_year"], errors="coerce") == target_fy_year
-
-    tmp = d.loc[mask].copy()
+        tmp = d.loc[mask].copy()
 
     out = tmp.groupby("group_key", as_index=False).agg(
         volume=("volume", "sum"),
@@ -525,15 +569,16 @@ def append_recon_and_reported_rows(
     out = df.copy()
 
     recon_row              = {c: "" for c in out.columns}
-    recon_row["group_key"] = "Recon. difference"
+    recon_row["group_key"] = RECON_DIFFERENCE_LABEL
 
     reported_row              = {c: "" for c in out.columns}
-    reported_row["group_key"] = f"{section_label} (reported)"
+    reported_row["group_key"] = sales_basis_labels(cfg.get("sales_basis")).reported_label
 
-    rep_map = build_reported_value_map(cfg, labels, metric_key)
-    for col_name, val in rep_map.items():
+    for label in labels:
+        col_name = raw_period_col(label)
         if col_name in reported_row:
-            reported_row[col_name] = val
+            reported_row[col_name] = NA_VALUE
+            recon_row[col_name] = NA_VALUE
 
     return pd.concat(
         [out, pd.DataFrame([recon_row, reported_row])],
@@ -542,10 +587,7 @@ def append_recon_and_reported_rows(
 
 
 def get_reported_row_labels(cfg: dict) -> set[str]:
-    return {
-        f"{cfg['total_label_revenue']} (reported)",
-        f"{cfg['total_label_gp']} (reported)",
-    }
+    return {sales_basis_labels(cfg.get("sales_basis")).reported_label}
 
 
 def build_bridge_export_columns(cfg: dict, labels: list[str]) -> list[str]:
@@ -723,13 +765,6 @@ def build_two_bridges(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     cost_tbl = append_section_and_total(cost_tbl, cfg["total_label_cost"])
 
     gp = append_section_and_total(gp, cfg["total_label_gp"])
-    gp = append_recon_and_reported_rows(
-        gp,
-        cfg=cfg,
-        labels=labels,
-        metric_key="profit",
-        section_label=cfg["total_label_gp"],
-    )
 
     final = pd.concat([rev, cost_tbl, gp], ignore_index=True)
     return final
@@ -831,6 +866,55 @@ def ensure_pvm_fx_helper_columns(ws_source, source_df: pd.DataFrame, cfg: dict) 
         ensure_one("profit", cfg["profit_col"])
 
     return out
+
+
+def ensure_pvm_accrual_helper_ranges(
+    ws_source,
+    source_sheet_name: str,
+    source_df: pd.DataFrame,
+    cfg: dict,
+    periods: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
+) -> dict[tuple[str, str], str]:
+    if cfg["calc_mode"] != "accrual":
+        return {}
+
+    d = source_df.copy()
+    d.columns = d.columns.astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
+    source_cols = {
+        "quantity": cfg["quantity_col"],
+        "revenue": cfg["revenue_col"],
+    }
+    if cfg["profit_mode"] == "cost":
+        source_cols["cost"] = cfg["cost_col"]
+    else:
+        source_cols["profit"] = cfg["profit_col"]
+
+    if cfg.get("apply_fx", False):
+        fx = pd.to_numeric(d[cfg["fx_col"]], errors="coerce")
+        fx = fx.where(fx.notna() & (fx != 0), 1.0)
+        for metric in ("revenue", "cost", "profit"):
+            source_col = source_cols.get(metric)
+            if source_col:
+                helper_col = f"_PVM_ACCRUAL_FX_{metric.upper()}"
+                d[helper_col] = pd.to_numeric(d[source_col], errors="coerce").fillna(0.0) * fx
+                source_cols[metric] = helper_col
+
+    result: dict[tuple[str, str], str] = {}
+    for period_label, (period_start, period_end) in periods.items():
+        for metric, source_col in source_cols.items():
+            _header, col_idx = add_accrual_col_in_ws(
+                ws_source=ws_source,
+                source_df=d,
+                value_col=source_col,
+                invoice_col=cfg["invoice_col"],
+                start_col=cfg["start_col"],
+                end_col=cfg["end_col"],
+                period_label=f"PVM {metric} {period_label}",
+                period_start=period_start,
+                period_end=period_end,
+            )
+            result[(metric, period_label)] = source_column_range_ref(source_sheet_name, col_idx)
+    return result
 
 
 def _write_period_bounds_to_columns(
@@ -1149,6 +1233,7 @@ def build_metric_body_for_period(
     filter_branches: list[list[tuple[str, str]]],
     fx_helper_cols: dict[str, str],
     ctx: dict,
+    accrual_sum_ranges: dict[tuple[str, str], str] | None = None,
 ) -> str:
     key_ref = f"${get_column_letter(ctx['KEY_COL'])}{row_idx}"
 
@@ -1157,6 +1242,32 @@ def build_metric_body_for_period(
 
     # period_col_idx must be the column that contains period year / start / end (helper or visible FY col).
     bounds_col_idx = period_col_idx
+
+    if cfg["calc_mode"] == "accrual":
+        def accrual_body(source_metric: str, divide_by_1000: bool = True) -> str:
+            sum_rng = (accrual_sum_ranges or {}).get((source_metric, period_label))
+            if not sum_rng:
+                raise ValueError(f"Accrual-Hilfsspalte fehlt für {source_metric}/{period_label}.")
+            return build_sumifs_formula_body(
+                sum_rng,
+                base_pairs,
+                filter_branches,
+                divide_by_1000=divide_by_1000,
+            )
+
+        if metric == "quantity":
+            return accrual_body("quantity", divide_by_1000=False)
+        if metric == "revenue":
+            return accrual_body("revenue")
+        if metric == "cost":
+            if cfg["profit_mode"] == "cost":
+                return accrual_body("cost")
+            return f"(({accrual_body('revenue')})-({accrual_body('profit')}))"
+        if metric == "gross_profit":
+            if cfg["profit_mode"] == "profit":
+                return accrual_body("profit")
+            return f"(({accrual_body('revenue')})-({accrual_body('cost')}))"
+        raise ValueError(f"Unbekannte Kennzahl: {metric}")
 
     if cfg["invoice_mapping_mode"] == "date":
         invoice_rng = source_range_ref(source_sheet_name, source_header_map, cfg["invoice_col"])
@@ -1272,6 +1383,7 @@ def write_pvm_helper_formulas(
     source_header_map: dict,
     filter_branches: list[list[tuple[str, str]]],
     fx_helper_cols: dict[str, str],
+    accrual_sum_ranges: dict[tuple[str, str], str] | None = None,
 ):
     qty_fmt   = '#,##0.00;(#,##0.00);"-"'
     price_fmt = '#,##0.0000;(#,##0.0000);"-"'
@@ -1297,6 +1409,7 @@ def write_pvm_helper_formulas(
                     filter_branches=filter_branches,
                     fx_helper_cols=fx_helper_cols,
                     ctx=ctx,
+                    accrual_sum_ranges=accrual_sum_ranges,
                 )
 
                 amount_body = build_metric_body_for_period(
@@ -1310,6 +1423,7 @@ def write_pvm_helper_formulas(
                     filter_branches=filter_branches,
                     fx_helper_cols=fx_helper_cols,
                     ctx=ctx,
+                    accrual_sum_ranges=accrual_sum_ranges,
                 )
 
                 qty_ref = f"{get_column_letter(qty_col)}{r}"
@@ -1367,6 +1481,43 @@ def apply_recon_difference_formulas(
             ws.cell(row=recon_row, column=col_idx).number_format = '#,##0;(#,##0);"-"'
 
 
+def apply_pvm_reconciliation(
+    wb,
+    report_sheet_name: str,
+    cfg: dict,
+    export_columns: list[str],
+) -> None:
+    labels = sales_basis_labels(cfg.get("sales_basis"))
+    ws = wb[report_sheet_name]
+    ctx = get_pvm_layout_context(ws, cfg)
+    label_col = ctx["TABLE_LEFT_COL"]
+    reported_row = next(
+        (
+            r for r in range(ctx["DATA_START_ROW"], ws.max_row + 1)
+            if str(ws.cell(r, label_col).value or "").strip() == labels.reported_label
+        ),
+        None,
+    )
+    if reported_row is None or reported_row < ctx["DATA_START_ROW"] + 2:
+        return
+    recon_row = reported_row - 1
+    total_row = reported_row - 2
+    period_columns = {
+        raw.split("_", 1)[1]: ctx["TABLE_LEFT_COL"] + idx
+        for idx, raw in enumerate(export_columns)
+        if raw.startswith("PERIOD_")
+    }
+    write_reconciliation_cells(
+        wb,
+        ws,
+        period_columns=period_columns,
+        total_row=total_row,
+        recon_row=recon_row,
+        reported_row=reported_row,
+        sales_basis=labels.sales_basis,
+    )
+
+
 def apply_pvm_formulas(
     wb,
     report_sheet_name: str,
@@ -1406,6 +1557,13 @@ def apply_pvm_formulas(
 
     periods, labels = build_periods(cfg)
     prev_label_map  = build_prev_label_map(labels)
+    accrual_sum_ranges = ensure_pvm_accrual_helper_ranges(
+        ws_source,
+        source_sheet_name,
+        source_df,
+        cfg,
+        periods,
+    )
 
     ctx                     = get_pvm_layout_context(ws, cfg)
     ctx["periods"]          = periods
@@ -1444,6 +1602,7 @@ def apply_pvm_formulas(
         source_header_map=source_header_map,
         filter_branches=filter_branches,
         fx_helper_cols=fx_helper_cols,
+        accrual_sum_ranges=accrual_sum_ranges,
     )
 
     # 2) Sichtbare Perioden + PVM-Effekte
@@ -1471,6 +1630,7 @@ def apply_pvm_formulas(
                         filter_branches=filter_branches,
                         fx_helper_cols=fx_helper_cols,
                         ctx=ctx,
+                        accrual_sum_ranges=accrual_sum_ranges,
                     )
                     cell.value         = f'=IFERROR({body},"n/a")'
                     cell.number_format = '#,##0;(#,##0);"-"'
@@ -1678,6 +1838,9 @@ def format_pvm_excel(
             ws.row_dimensions[helper_rows[-1]].collapsed = False
 
     method_label = cfg["pvm_method"].replace("_", " ")
+    _basis = sales_basis_labels(cfg.get("sales_basis"))
+    table_name = str(cfg.get("table") or "PVM").strip() or "PVM"
+    period_mode = str(cfg.get("period_mode") or "FY").strip().upper()
 
     ws.cell(row=ctx["TITLE_ROW"], column=TABLE_LEFT_COL).value = cfg.get("title", "")
     ws.cell(row=ctx["TITLE_ROW"], column=TABLE_LEFT_COL).font = Font(
@@ -1686,9 +1849,7 @@ def format_pvm_excel(
         color=THEME.text_brand_title,
     )
 
-    subtitle_text = f"{cfg.get('table', '').strip()} ({method_label})".strip()
-    if subtitle_text.startswith("("):
-        subtitle_text = method_label
+    subtitle_text = f"{table_name} ({method_label}) | {period_mode} · {_basis.metric_label}"
     ws.cell(row=ctx["SUBTITLE_ROW"], column=TABLE_LEFT_COL).value = subtitle_text
     ws.cell(row=ctx["SUBTITLE_ROW"], column=TABLE_LEFT_COL).font = Font(
         name=THEME.font_name,
@@ -1696,7 +1857,8 @@ def format_pvm_excel(
         color=THEME.text_brand_title,
     )
 
-    company_line = str(cfg.get("company", "") or "").strip()
+    company = str(cfg.get("company") or cfg.get("company_name") or "").strip()
+    company_line = f"{company} | {table_name}" if company else table_name
     ws.cell(row=ctx["COMPANY_ROW"], column=TABLE_LEFT_COL).value = company_line
     ws.cell(row=ctx["COMPANY_ROW"], column=TABLE_LEFT_COL).font = Font(
         name=THEME.font_name,
@@ -1825,6 +1987,38 @@ def format_pvm_excel(
 # -----------------------
 # MAIN
 # -----------------------
+def run_pvm_in_workbook(cfg: dict, wb) -> str:
+    """Fast Track / session mode: write PVM into an already-open workbook."""
+    from funktionssammlung import ensure_source_sheet_in_workbook
+
+    cfg = normalize_config(cfg)
+    df = pd.read_excel(cfg["file_path"], sheet_name=cfg["sheet_name"], engine="openpyxl")
+    final = build_two_bridges(df, cfg)
+    final = finalize_column_order(final, cfg)
+    final = apply_kEUR_formatting(final, cfg)
+
+    source_sheet_name = ensure_source_sheet_in_workbook(wb, cfg, df)
+    target_sheet_name = get_next_sheet_name_from_wb(wb, cfg.get("base_sheet_name", "pvm"))
+    write_export_df_to_sheet(wb=wb, export_df=final, target_sheet_name=target_sheet_name)
+    format_pvm_excel(
+        wb=wb,
+        target_sheet_name=target_sheet_name,
+        cfg=cfg,
+        export_columns=final.columns.tolist(),
+    )
+    if cfg.get("formula_mode", True):
+        apply_pvm_formulas(
+            wb=wb,
+            report_sheet_name=target_sheet_name,
+            source_sheet_name=source_sheet_name,
+            cfg=cfg,
+            source_df=df.copy(),
+            export_columns=final.columns.tolist(),
+        )
+    apply_pvm_reconciliation(wb, target_sheet_name, cfg, final.columns.tolist())
+    return target_sheet_name
+
+
 def main():
     cfg = normalize_config(CONFIG)
 
@@ -1873,6 +2067,13 @@ def main():
             source_df=df.copy(),
             export_columns=final.columns.tolist(),
         )
+
+    apply_pvm_reconciliation(
+        wb,
+        target_sheet_name,
+        cfg,
+        final.columns.tolist(),
+    )
 
     wb.save(output_path)
     wb.close()

@@ -42,6 +42,8 @@ from funktionssammlung import (
     build_formula_filter_branches,
     build_sumifs_formula_body,
     build_chunked_row_sum_formula,
+    revenue_report_helper_letter,
+    REVENUE_REPORT_HELPER_START_COL,
     write_export_df_to_sheet,
     get_next_sheet_name_from_wb,
     ensure_text_filter_helper_columns_from_cfg_in_ws,
@@ -55,6 +57,13 @@ from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 from gst_excel_theme import THEME  # noqa: E402 — Income Statement–aligned Excel theme
+from revenue_reconciliation import (  # noqa: E402
+    NA_VALUE,
+    RECON_DIFFERENCE_LABEL,
+    canonical_period,
+    sales_basis_labels,
+    write_reconciliation_cells,
+)
 
 # ------------------------
 # Config laden
@@ -136,9 +145,6 @@ def normalize_config(cfg: dict) -> dict:
     if out["invoice_mapping_mode"] not in {"year", "date"}:
         raise ValueError("CONFIG['invoice_mapping_mode'] muss 'year' oder 'date' sein.")
 
-    if out["calc_mode"] == "accrual" and out["invoice_mapping_mode"] != "date":
-        raise ValueError("CONFIG['invoice_mapping_mode']='year' ist nur bei calc_mode='invoice' unterstützt.")
-
     if out["invoice_mapping_mode"] == "year" and (out.get("show_ytd", False) or out.get("show_ltm", False)):
         raise ValueError("CONFIG['invoice_mapping_mode']='year' unterstützt nur FY-Perioden, nicht YTD/LTM.")
 
@@ -157,7 +163,8 @@ def normalize_config(cfg: dict) -> dict:
     out.setdefault("show_revenue", True)
     out.setdefault("show_gp", False)
     out.setdefault("show_gm", False)
-    out.setdefault("total_label", "Total")
+    out["sales_basis"] = sales_basis_labels(out.get("sales_basis")).sales_basis
+    out["total_label"] = sales_basis_labels(out["sales_basis"]).total_label
     out.setdefault("missing_top_group_label", "Other")
     out.setdefault("sort_mode", "FY_LAST")
     out.setdefault("hide_empty_delta_cagr_for_gp_gm", True)
@@ -220,15 +227,17 @@ def normalize_config(cfg: dict) -> dict:
     out.setdefault("formula_mode", True)
     n_gc = len(out["group_cols"])
     if out["formula_mode"]:
-        # Mindestens n_gc versteckte Schlüsselspalten; optional größerer col_offset aus Config.
+        # Spalte A frei, Hilfsschlüssel, Spacer vor sichtbarer Tabelle.
         if "col_offset" in fmt and fmt["col_offset"] is not None and fmt["col_offset"] != "":
             try:
                 co = int(fmt["col_offset"])
             except (TypeError, ValueError):
-                co = n_gc
-            fmt["col_offset"] = max(n_gc, co)
+                co = None
         else:
-            fmt["col_offset"] = n_gc
+            co = None
+        from funktionssammlung import revenue_report_col_offset
+
+        fmt["col_offset"] = revenue_report_col_offset(n_gc, co)
     else:
         fmt.setdefault("col_offset", 3)
 
@@ -392,17 +401,7 @@ def build_reported_value_map(section_cfg: dict, period_defs: dict, cfg: dict) ->
 
 # Baut die Beschriftung der Reported-Zeile abhängig von den aktiven Blöcken.
 def build_reported_label(cfg: dict) -> str:
-    show_revenue = bool(cfg.get("show_revenue", True))
-    show_gp = bool(cfg.get("show_gp", False))
-
-    if show_revenue and show_gp:
-        return "Reported gross sales / GP"
-    if show_revenue:
-        return "Reported gross sales"
-    if show_gp:
-        return "Reported GP"
-
-    return "Reported"
+    return sales_basis_labels(cfg.get("sales_basis")).reported_label
 
 
 # Prüft, ob ein Excel-Zellwert für die Schraffur als fachlich leer gilt.
@@ -440,26 +439,16 @@ def build_reported_rows(period_defs: dict, cfg: dict, blocks: list[tuple[str, st
         "_ui_level": 0,
         "key": "__RECON__",
         "parent_key": "",
-        "label": "Recon. difference",
+        "label": RECON_DIFFERENCE_LABEL,
         "row_type": "recon",
         "_sort_value": np.nan,
         "_display_order": 10**9 + 10,
     }
 
-    sales_map = build_reported_value_map(cfg.get("reported_numbers", {}).get("sales", {}), period_defs, cfg)
-    profit_map = build_reported_value_map(cfg.get("reported_numbers", {}).get("profit", {}), period_defs, cfg)
-
     for block_name, metric_kind in blocks:
-        if block_name == "Revenue":
-            source_map = sales_map
-        elif block_name == "GP":
-            source_map = profit_map
-        else:
-            source_map = {}
-
         for p in period_defs["period_map"].keys():
-            reported_row[f"{block_name}__{p}"] = source_map.get(p, np.nan)
-            recon_row[f"{block_name}__{p}"] = np.nan
+            reported_row[f"{block_name}__{p}"] = NA_VALUE
+            recon_row[f"{block_name}__{p}"] = NA_VALUE
 
     return pd.DataFrame([recon_row, reported_row])
 
@@ -744,8 +733,7 @@ def preprocess_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         date_cols.append(cfg["invoice_col"])
 
     if cfg["calc_mode"] == "accrual":
-        # invoice_col muss datetime sein (recognized_value vergleicht mit period_start/end)
-        date_cols += [cfg["invoice_col"], cfg["start_col"], cfg["end_col"]]
+        date_cols += [cfg["start_col"], cfg["end_col"]]
 
     for c in date_cols:
         d[c] = pd.to_datetime(d[c], errors="coerce", dayfirst=True)
@@ -2132,26 +2120,26 @@ def write_formula_key_columns(ws, cfg: dict, ctx: dict):
     if n < 1 or n > 3:
         raise ValueError("write_formula_key_columns: group_cols muss Länge 1..3 haben.")
 
-    col_offset = int(cfg.get("excel_formatting", {}).get("col_offset", n))
+    col_offset = int(cfg.get("excel_formatting", {}).get("col_offset", n + 2))
+    helper_start = REVENUE_REPORT_HELPER_START_COL
 
     for c in range(1, col_offset + 1):
         ws.cell(row=header_row_1, column=c).value = ""
 
-    for c in range(1, n + 1):
-        ws.cell(row=header_row_2, column=c).value = group_cols[c - 1]
+    for i, group_col in enumerate(group_cols):
+        c = helper_start + i
+        ws.cell(row=header_row_2, column=c).value = group_col
 
-    for c in range(n + 1, col_offset + 1):
-        ws.cell(row=header_row_2, column=c).value = None
-
-    for c in range(1, n + 1):
+    for c in range(helper_start, helper_start + n):
         ws.cell(row=header_row_2, column=c).font = red_bold_font
         ws.cell(row=header_row_2, column=c).alignment = Alignment(horizontal="left", vertical="bottom", wrap_text=True)
         ws.column_dimensions[get_column_letter(c)].hidden = True
         ws.column_dimensions[get_column_letter(c)].outlineLevel = 1
 
-    for c in range(n + 1, col_offset + 1):
-        ws.column_dimensions[get_column_letter(c)].hidden = True
-        ws.column_dimensions[get_column_letter(c)].outlineLevel = 1
+    for c in range(1, col_offset + 1):
+        if c < helper_start or c >= helper_start + n:
+            ws.column_dimensions[get_column_letter(c)].hidden = True
+            ws.column_dimensions[get_column_letter(c)].outlineLevel = 1
 
     ws.column_dimensions[get_column_letter(col_offset + 1)].collapsed = True
 
@@ -2174,7 +2162,7 @@ def write_formula_key_columns(ws, cfg: dict, ctx: dict):
 
         parts = split_key_to_n_parts(str(raw_key or ""), n)
         for i, val in enumerate(parts, start=1):
-            ws.cell(row=r, column=i).value = val
+            ws.cell(row=r, column=helper_start + i - 1).value = val
 
 
 # Funktion, die überprüft ob eine salte schraffiert ist und dann keine Formeln einsetzt
@@ -2449,7 +2437,7 @@ def build_leaf_amount_formula(
     n = len(cfg["group_cols"])
     base_pairs = []
     for i in range(n):
-        col_letter = get_column_letter(i + 1)
+        col_letter = revenue_report_helper_letter(i)
         grp_rng = source_range_ref(source_sheet_name, source_header_map, cfg["group_cols"][i])
         base_pairs.append((grp_rng, f"${col_letter}{row_idx}"))
 
@@ -2919,6 +2907,10 @@ def format_hierarchy_report_excel(
 
     dashed = Side(style="dashed", color=THEME.border_color)
     border_subtotal_top = THEME.border_subtotal_top
+    border_subtotal_tb = Border(
+        top=THEME.border_subtotal_top.top,
+        bottom=THEME.border_subtotal_top.top,
+    )
     border_header_bottom = THEME.border_header_bottom
     border_kpi_top = THEME.border_kpi_section_top
 
@@ -2949,22 +2941,41 @@ def format_hierarchy_report_excel(
         ws.column_dimensions[letter].hidden = True
     ws.column_dimensions[get_column_letter(1 + col_offset)].collapsed = True
 
-    # Titel
+    # Titel (einheitlich mit Bubble / Bars: Project | Table+Period | Company|Table)
     title = str(cfg.get("title", "")).strip()
-    table = str(cfg.get("table", "")).strip()
-    company = str(cfg.get("company", "")).strip()
+    table = str(cfg.get("table", "") or "General sales table").strip()
+    company = str(cfg.get("company", "") or cfg.get("company_name", "")).strip()
     subtitle_suffix = str(cfg.get("subtitle_suffix", "")).strip()
+    period_bits: list[str] = []
+    if cfg.get("first_fy") not in (None, ""):
+        try:
+            period_bits.append(f"FY{int(cfg['first_fy']) % 100:02d}A")
+        except (TypeError, ValueError):
+            pass
+    if cfg.get("current_year") not in (None, ""):
+        try:
+            period_bits.append(f"FY{int(cfg['current_year']) % 100:02d}A")
+        except (TypeError, ValueError):
+            pass
+    if cfg.get("show_ytd", False):
+        period_bits.append("YTD")
+    period_label = "–".join(period_bits[:2]) if period_bits else ""
+    if len(period_bits) > 2:
+        period_label = f"{period_label} + {', '.join(period_bits[2:])}"
 
-    company_line = company
+    table_line = table
     if subtitle_suffix:
-        company_line = f"{company} | {subtitle_suffix}" if company else subtitle_suffix
+        table_line = f"{table} ({subtitle_suffix})"
+    if period_label:
+        table_line = f"{table_line} | {period_label}"
+    company_line = f"{company} | {table}" if company else table
 
     ws.cell(row=1, column=LABEL_COL).value = title
     ws.cell(row=1, column=LABEL_COL).font = Font(
         name=THEME.font_name, size=THEME.font_size_title, color=BLUE_TEXT
     )
 
-    ws.cell(row=2, column=LABEL_COL).value = table
+    ws.cell(row=2, column=LABEL_COL).value = table_line
     ws.cell(row=2, column=LABEL_COL).font = Font(
         name=THEME.font_name, size=THEME.font_size_subtitle, color=BLUE_TEXT
     )
@@ -3034,10 +3045,11 @@ def format_hierarchy_report_excel(
     ws.cell(row=HEADER_ROW_2, column=LABEL_COL).value = "kEUR"
 
     # Mapping Blocktitel
+    _basis = sales_basis_labels(cfg.get("sales_basis"))
     block_title_map = {
-        "Revenue": "Gross sales",
-        "GP": "Gross profit",
-        "GM": "Gross margin",
+        "Revenue": _basis.metric_label,
+        "GP": _basis.profit_label,
+        "GM": _basis.margin_label,
     }
 
     # Nur echte Datenblöcke nach LABEL_COL auswerten
@@ -3175,12 +3187,14 @@ def format_hierarchy_report_excel(
                 cell = ws.cell(row=r, column=c)
                 cell.fill = fill_subtotal
                 cell.font = bold_font
+                cell.border = border_subtotal_tb
 
         if is_recon:
             for c in range(LABEL_COL, VISIBLE_RIGHT_COL + 1):
                 cell = ws.cell(row=r, column=c)
                 cell.fill = white_fill
                 cell.font = base_font
+                cell.border = border_subtotal_tb
 
         if is_kpi:
             for c in range(LABEL_COL, VISIBLE_RIGHT_COL + 1):
@@ -3446,6 +3460,91 @@ def format_hierarchy_report_excel(
                 ws.cell(row=r, column=c).value = None
 
 
+def apply_gst_reconciliation(
+    wb,
+    target_sheet_name: str,
+    export_columns: list[str],
+    cfg: dict,
+) -> None:
+    """Populate the Net/Gross sales bottom schema from PL_Reconciliation Aggregated."""
+    labels = sales_basis_labels(cfg.get("sales_basis"))
+    ws = wb[target_sheet_name]
+    col_offset = int(cfg.get("excel_formatting", {}).get("col_offset", len(cfg["group_cols"])))
+    label_col = col_offset + 1
+    rows_by_label = {
+        str(ws.cell(r, label_col).value or "").strip(): r
+        for r in range(1, ws.max_row + 1)
+    }
+    total_row = rows_by_label.get(labels.total_label)
+    recon_row = rows_by_label.get(RECON_DIFFERENCE_LABEL)
+    reported_row = rows_by_label.get(labels.reported_label)
+    if not all((total_row, recon_row, reported_row)):
+        return
+
+    period_columns: dict[str, int] = {}
+    for idx, raw in enumerate(export_columns):
+        block_name, raw_label = parse_export_column(raw)
+        if block_name != "Revenue" or canonical_period(raw_label) is None:
+            continue
+        period_columns[raw_label] = label_col + idx
+
+    write_reconciliation_cells(
+        wb,
+        ws,
+        period_columns=period_columns,
+        total_row=total_row,
+        recon_row=recon_row,
+        reported_row=reported_row,
+        sales_basis=labels.sales_basis,
+    )
+
+
+def run_hierarchy_report_in_workbook(cfg: dict, wb) -> str:
+    """Fast Track / session mode: write GST into an already-open workbook."""
+    from funktionssammlung import ensure_source_sheet_in_workbook
+
+    cfg = normalize_config(cfg)
+    df = pd.read_excel(cfg["file_path"], sheet_name=cfg["sheet_name"], engine="openpyxl")
+    period_defs = build_period_definitions(cfg)
+    d = preprocess_input(df, cfg)
+    final, blocks = build_final_table(d, period_defs, cfg)
+    final = arrange_columns(final, period_defs, cfg, blocks)
+    final = convert_display_values(final, period_defs, cfg, blocks)
+    export_df = prepare_export_table(final, blocks, period_defs, cfg)
+
+    source_sheet_name = ensure_source_sheet_in_workbook(wb, cfg, df)
+    target_sheet_name = get_next_sheet_name_from_wb(wb, cfg.get("base_sheet_name", "hierarchy_report"))
+    write_export_df_to_sheet(wb, export_df, target_sheet_name)
+    format_hierarchy_report_excel(
+        wb=wb,
+        target_sheet_name=target_sheet_name,
+        period_defs=period_defs,
+        cfg=cfg,
+        blocks=blocks,
+    )
+    if cfg.get("formula_mode", True):
+        prepare_formula_mode_layout(
+            wb=wb,
+            report_sheet_name=target_sheet_name,
+            source_sheet_name=source_sheet_name,
+            period_defs=period_defs,
+            cfg=cfg,
+            source_df=df.copy(),
+        )
+        apply_report_formulas(
+            wb=wb,
+            report_sheet_name=target_sheet_name,
+            source_sheet_name=source_sheet_name,
+            period_defs=period_defs,
+            cfg=cfg,
+            blocks=blocks,
+            source_df=df.copy(),
+            export_columns=export_df.columns.tolist(),
+        )
+    apply_gst_reconciliation(wb, target_sheet_name, export_df.columns.tolist(), cfg)
+    return target_sheet_name
+
+
 def main():
     cfg = normalize_config(CONFIG)
 
@@ -3519,6 +3618,13 @@ def main():
         )
 
         print("Formeln eingesetzt.")
+
+    apply_gst_reconciliation(
+        wb,
+        target_sheet_name,
+        export_df.columns.tolist(),
+        cfg,
+    )
 
     wb.save(output_path)
     wb.close()

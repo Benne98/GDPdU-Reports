@@ -34,6 +34,10 @@ from databook_periods import (  # noqa: E402
     is_ytd_grid_label,
     ytd_reporting_fy_end_year,
 )
+from scripts.revenue_column_matching import (  # noqa: E402
+    fast_track_defaults,
+    suggest_for_slot,
+)
 from urllib.parse import quote
 
 from config import FASTAPI_BASE_URL, FILTER_OPERATORS, MONTH_NAMES, UPLOAD_BASE_DIR
@@ -162,7 +166,7 @@ def _resolve_output_download_file(result: dict, tracker: Tracker | None = None) 
             try:
                 from pathlib import Path
 
-                for pattern in ("*_Master.xlsx", "*_Workbook.xlsx"):
+                for pattern in ("*_FastTrack.xlsx", "*FastTrack*.xlsx", "*_Master.xlsx", "*_Workbook.xlsx"):
                     for p in sorted(
                         Path(folder).glob(pattern),
                         key=lambda item: item.stat().st_mtime,
@@ -1203,6 +1207,115 @@ def _churn_sort_config_from_payload(tracker: Tracker, payload: dict | None) -> d
     return sort
 
 
+def _is_fast_track(tracker: Tracker, payload: dict | None = None) -> bool:
+    if payload:
+        ft = payload.get("fast_track", payload.get("fast_track_active"))
+        if ft is True or str(ft or "").strip().lower() in ("true", "1", "yes"):
+            return True
+        card = str(payload.get("card") or "").strip()
+        if card.startswith("fast_track_") or card in {"revenue_fast_track"}:
+            return True
+
+    if str(tracker.get_slot("workflow_mode") or "").strip().lower() == "fast_track":
+        return True
+    active = tracker.get_slot("fast_track_active")
+    if active in (True, "true", 1, "1", "True"):
+        return True
+
+    raw_manifest = tracker.get_slot("fast_track_manifest_json")
+    if isinstance(raw_manifest, str) and raw_manifest.strip():
+        try:
+            manifest = json.loads(raw_manifest)
+            if isinstance(manifest, dict) and manifest.get("mode") == "fast_track":
+                return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return False
+
+
+def _fast_track_slot_events() -> list[Any]:
+    return [
+        SlotSet("workflow_mode", "fast_track"),
+        SlotSet("fast_track_active", True),
+    ]
+
+
+def _handle_fast_track_master_upload(
+    dispatcher: CollectingDispatcher,
+    tracker: Tracker,
+    *,
+    file_id: str,
+    file_path: str = "",
+) -> list[Any]:
+    """Store uploaded master for the final batch only — no databook processing yet."""
+    config: dict[str, Any] = {
+        "included": True,
+        "source_mode": "master",
+        "l4_sort_basis": "latest_fy",
+        "entity_order": "auto_latest_fy_net_sales",
+        "create_extended_tables": True,
+        "extract_financial_statements": False,
+        "master_file_id": file_id,
+        "master_file_path": file_path,
+    }
+    dispatcher.utter_message(json_message=_fast_track_fs_choice_card())
+    return _fast_track_section_events(tracker, "databook", config)
+
+
+def _filter_card_fields(
+    tracker: Tracker,
+    context: str,
+    headers: list[str] | None = None,
+) -> dict[str, Any]:
+    """Embed row-filter state for frontend modal editors."""
+    hdrs = _normalize_header_list(headers or [])
+    if not hdrs:
+        hdrs = _normalize_header_list(_headers_from_sources(tracker))
+    return {
+        "filter_context": context,
+        "filter_rules_json": tracker.get_slot(f"{context}_filter_rules_json") or "[]",
+        "filter_rules_display": tracker.get_slot(f"{context}_filter_rules_display") or "",
+        "filter_headers": hdrs,
+        "filter_operators": FILTER_OPERATORS,
+    }
+
+
+def _apply_filter_rules_payload(context: str, rules_json: str) -> list[Any]:
+    try:
+        rules = json.loads(rules_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        rules = []
+    if not isinstance(rules, list):
+        rules = []
+    display = _build_filter_display(rules)
+    return [
+        SlotSet(f"{context}_filter_rules_json", json.dumps(rules, ensure_ascii=False)),
+        SlotSet(f"{context}_filter_rules_display", display),
+        SlotSet("active_filter_context", context),
+    ]
+
+
+def _finish_fast_track_databook_section(
+    dispatcher: CollectingDispatcher, tracker: Tracker
+) -> list[Any]:
+    """After SuSa/Master path through adjustments, ask FS then continue Fast Track at OPOS."""
+    master_path = _abs_master_path_from_tracker(tracker)
+    source_mode = "master" if tracker.get_slot("db_master_imported") in (True, "true", 1) else "susa"
+    config: dict[str, Any] = {
+        "included": True,
+        "source_mode": source_mode,
+        "l4_sort_basis": "latest_fy",
+        "entity_order": "auto_latest_fy_net_sales",
+        "create_extended_tables": True,
+        "extract_financial_statements": False,
+        "master_path": master_path,
+    }
+    if master_path:
+        config["master_file_path"] = master_path
+    dispatcher.utter_message(json_message=_fast_track_fs_choice_card())
+    return _fast_track_section_events(tracker, "databook", config, active_section="databook")
+
+
 def _resolve_filter_context(tracker: Tracker) -> str:
     """
     Which output's filter rules are being edited (gst / pvm / top).
@@ -1211,8 +1324,15 @@ def _resolve_filter_context(tracker: Tracker) -> str:
     chain (Rasa tracker persistence); `desired_output` stays set — use it as fallback.
     """
     raw = tracker.get_slot("active_filter_context")
-    if raw in ("gst", "pvm", "top", "bs", "churn", "opos", "fa", "fte"):
+    valid_contexts = {
+        "gst", "pvm", "top", "bs", "churn", "opos", "fa", "fte",
+        "ft_databook", "ft_opos", "ft_fte", "ft_fa", "ft_revenue",
+    }
+    if raw in valid_contexts:
         return str(raw)
+    fast_track_context = str(tracker.get_slot("fast_track_filter_context") or "").strip()
+    if fast_track_context in valid_contexts:
+        return fast_track_context
     desired = str(tracker.get_slot("desired_output") or "").strip()
     output_type = str(tracker.get_slot("output_type") or "").strip()
     if output_type == "creditor_debitor_aging":
@@ -1507,6 +1627,11 @@ def _column_default(
     cached = _cached_session_column_role(tracker, role)
     if cached:
         return cached
+    headers = _normalize_header_list(_headers_from_sources(tracker, payload))
+    if headers:
+        suggestion = suggest_for_slot(headers, target_slot)
+        if suggestion:
+            return suggestion
     return default
 
 
@@ -2223,6 +2348,1373 @@ def _build_output_type_card() -> dict[str, Any]:
     }
 
 
+def _workflow_mode_card() -> dict[str, Any]:
+    return {
+        "type": "adaptive_card",
+        "card": "workflow_mode",
+        "title": "Choose your workflow",
+        "subtitle": (
+            "Use the guided standard workflow for one output, or collect several inputs "
+            "and run them together with Fast Track."
+        ),
+        "inputs": [
+            {
+                "id": "workflow_mode",
+                "type": "radio",
+                "label": "Workflow",
+                "default": "standard",
+                "options": [
+                    {"label": "Standard workflow", "value": "standard"},
+                    {"label": "Fast Track", "value": "fast_track"},
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+    }
+
+
+_FAST_TRACK_SECTIONS = ("databook", "opos", "fte", "fa", "revenue")
+
+
+def _parse_manifest_from_slot(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        parsed = json.loads(str(raw or "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _fast_track_manifest(tracker: Tracker) -> dict[str, Any]:
+    from fast_track_manifest_store import load_fast_track_manifest, merge_fast_track_manifests
+
+    sid = _fdd_session_id(tracker)
+    persisted = load_fast_track_manifest(sid, UPLOAD_BASE_DIR)
+    slot_manifest = _parse_manifest_from_slot(tracker.get_slot("fast_track_manifest_json"))
+    manifest = merge_fast_track_manifests(persisted, slot_manifest)
+    sections = manifest.get("sections")
+    if not isinstance(sections, dict):
+        manifest["sections"] = {}
+    return manifest
+
+
+def _persist_fast_track_manifest(tracker: Tracker, manifest: dict[str, Any]) -> None:
+    from fast_track_manifest_store import save_fast_track_manifest
+
+    sid = _fdd_session_id(tracker)
+    if sid:
+        save_fast_track_manifest(sid, UPLOAD_BASE_DIR, manifest)
+
+
+def _persist_fast_track_section(tracker: Tracker, section: str, config: dict[str, Any]) -> None:
+    from fast_track_manifest_store import save_fast_track_section
+
+    sid = _fdd_session_id(tracker)
+    if sid:
+        save_fast_track_section(sid, UPLOAD_BASE_DIR, section, config)
+
+
+def _section_explicitly_skipped(raw: Any) -> bool:
+    if raw is False:
+        return True
+    return isinstance(raw, dict) and raw.get("included") is False
+
+
+def _hydrate_fast_track_strand_sections(tracker: Tracker, sections: dict[str, Any]) -> None:
+    """Restore OPOS/FTE/FA from per-section files, flow-state cache, and tracker slots."""
+    from fast_track_manifest_store import load_all_fast_track_sections
+
+    sid = _fdd_session_id(tracker)
+
+    for name, cfg in load_all_fast_track_sections(sid, UPLOAD_BASE_DIR).items():
+        if name not in ("opos", "fte", "fa") or _section_explicitly_skipped(sections.get(name)):
+            continue
+        if isinstance(sections.get(name), dict):
+            merged = dict(cfg)
+            merged.update(sections[name])
+            sections[name] = merged
+        else:
+            sections[name] = dict(cfg)
+
+    flow = _load_bot_flow_state_file(sid)
+
+    if not _section_explicitly_skipped(sections.get("opos")):
+        opos = dict(sections.get("opos") or {}) if isinstance(sections.get("opos"), dict) else {}
+        flow_opos = flow.get("opos") if isinstance(flow.get("opos"), dict) else {}
+        for key in ("snapshots", "columns", "column_letters", "aging_buckets", "sort", "top_bucket"):
+            if key not in opos and flow_opos.get(key) not in (None, "", [], {}):
+                opos[key] = flow_opos[key]
+        raw_snaps = tracker.get_slot("opos_snapshots_json")
+        if not opos.get("snapshots") and raw_snaps:
+            try:
+                parsed = json.loads(str(raw_snaps))
+                if isinstance(parsed, list) and parsed:
+                    opos["snapshots"] = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if opos.get("snapshots") and opos.get("columns"):
+            opos.setdefault("included", True)
+            sections["opos"] = opos
+
+    if not _section_explicitly_skipped(sections.get("fte")):
+        fte = dict(sections.get("fte") or {}) if isinstance(sections.get("fte"), dict) else {}
+        flow_fte = flow.get("fte") if isinstance(flow.get("fte"), dict) else {}
+        if not fte.get("periods") and flow_fte.get("periods"):
+            fte["periods"] = flow_fte["periods"]
+        raw_periods = tracker.get_slot("fte_periods_json")
+        if not fte.get("periods") and raw_periods:
+            try:
+                parsed = json.loads(str(raw_periods))
+                if isinstance(parsed, list) and parsed:
+                    fte["periods"] = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if not fte.get("columns") and flow_fte.get("columns"):
+            fte["columns"] = flow_fte["columns"]
+        elif not fte.get("columns"):
+            employment = str(tracker.get_slot("fte_employment_col") or "").strip()
+            months = str(tracker.get_slot("fte_months_col") or "").strip()
+            payroll_raw = tracker.get_slot("fte_payroll_cols_json") or "[]"
+            try:
+                payroll = json.loads(str(payroll_raw)) if isinstance(payroll_raw, str) else payroll_raw
+            except (json.JSONDecodeError, TypeError):
+                payroll = []
+            grouping = str(tracker.get_slot("fte_group_col") or tracker.get_slot("fte_group_col_1") or "").strip()
+            if employment and months and payroll and grouping:
+                fte["columns"] = {
+                    "employment": employment,
+                    "months_sum": months,
+                    "payroll_cols": [str(x) for x in payroll if str(x).strip()],
+                }
+                fte["group_cols"] = [grouping]
+        if fte.get("periods") and fte.get("columns"):
+            fte.setdefault("included", True)
+            sections["fte"] = fte
+
+    if not _section_explicitly_skipped(sections.get("fa")):
+        fa = dict(sections.get("fa") or {}) if isinstance(sections.get("fa"), dict) else {}
+        flow_fa = flow.get("fa") if isinstance(flow.get("fa"), dict) else {}
+        if not fa.get("periods") and flow_fa.get("periods"):
+            fa["periods"] = flow_fa["periods"]
+        raw_periods = tracker.get_slot("fa_periods_json")
+        if not fa.get("periods") and raw_periods:
+            try:
+                parsed = json.loads(str(raw_periods))
+                if isinstance(parsed, list) and parsed:
+                    fa["periods"] = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if not fa.get("columns") and flow_fa.get("columns"):
+            fa["columns"] = flow_fa["columns"]
+        elif not fa.get("columns"):
+            opening = str(tracker.get_slot("fa_opening_col") or "").strip()
+            additions = str(tracker.get_slot("fa_additions_col") or "").strip()
+            disposals = str(tracker.get_slot("fa_disposals_col") or "").strip()
+            dep_raw = tracker.get_slot("fa_depreciation_cols_json") or "[]"
+            try:
+                dep_cols = json.loads(str(dep_raw)) if isinstance(dep_raw, str) else dep_raw
+            except (json.JSONDecodeError, TypeError):
+                dep_cols = []
+            grouping = str(tracker.get_slot("fa_group_col") or tracker.get_slot("fa_group_col_1") or "").strip()
+            if opening and additions and disposals and dep_cols and grouping:
+                fa["columns"] = {
+                    "opening": opening,
+                    "additions": additions,
+                    "disposals": disposals,
+                    "depreciation_cols": [str(x) for x in dep_cols if str(x).strip()],
+                }
+                fa["group_cols"] = [grouping]
+        if fa.get("periods") and fa.get("columns"):
+            fa.setdefault("included", True)
+            sections["fa"] = fa
+
+
+def _fast_track_manifest_with_section(
+    tracker: Tracker, section: str, config: dict[str, Any]
+) -> dict[str, Any]:
+    manifest = _fast_track_manifest(tracker)
+    sections = dict(manifest.get("sections") or {})
+    sections[section] = config
+    manifest["sections"] = sections
+    return manifest
+
+
+def _fast_track_base_manifest(tracker: Tracker) -> dict[str, Any]:
+    fy_m, fy_d = _fy_end_month_day_from_tracker({}, tracker)
+    return {
+        "version": 1,
+        "mode": "fast_track",
+        "session_id": _fdd_session_id(tracker),
+        "project": {
+            "project_name": tracker.get_slot("project_name") or "",
+            "group_name": tracker.get_slot("group_name") or "",
+        },
+        "dates": {
+            "ltm_month": _ltm_month_from_tracker(tracker) or "",
+            "first_fy": _tracker_first_fy_int(tracker),
+            "fy_end_month": fy_m,
+            "fy_end_day": fy_d,
+        },
+        "sections": {},
+    }
+
+
+def _fast_track_skip_requested(payload: dict[str, Any]) -> bool:
+    raw = payload.get("fast_track_skip", payload.get("skip"))
+    return raw is True or str(raw or "").strip().lower() in ("1", "true", "yes", "skip")
+
+
+def _fast_track_card_shell(
+    card: str,
+    title: str,
+    subtitle: str,
+    *,
+    inputs: list[dict[str, Any]] | None = None,
+    submit_label: str = "Continue",
+    skippable: bool = True,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "type": "adaptive_card",
+        "card": card,
+        "title": title,
+        "subtitle": subtitle,
+        "inputs": inputs or [],
+        "submit_label": submit_label,
+        "fast_track": True,
+    }
+    if skippable:
+        out.update(
+            {
+                "secondary_submit_label": "Skip this section",
+                "secondary_submit_id": "fast_track_skip",
+                "secondary_submit_variant": "link",
+            }
+        )
+    return out
+
+
+def _fast_track_databook_card() -> dict[str, Any]:
+    card = _fast_track_card_shell(
+        "fast_track_databook",
+        "Fast Track — Databook",
+        (
+            "Upload the completed SuSa_Master workbook. It is copied unchanged before "
+            "the batch applies the standard Fast Track outputs."
+        ),
+        inputs=[
+            {
+                "id": "fast_track_databook_file",
+                "type": "file_drop",
+                "label": "Completed SuSa_Master workbook",
+                "accept": ".xlsx",
+                "required": True,
+            }
+        ],
+    )
+    card["wide"] = True
+    card["mapper_role"] = "databook"
+    card["mapper_meta"] = {
+        "accepts_config": "databook_config",
+        "required_source_fields": ["entity_year_files", "column_mapping"],
+    }
+    card["defaults"] = {
+        "l4_sort_basis": "latest_fy",
+        "entity_order": "auto_latest_fy_net_sales",
+        "create_extended_tables": True,
+    }
+    return card
+
+
+def _fast_track_fs_choice_card() -> dict[str, Any]:
+    return _fast_track_card_shell(
+        "fast_track_databook_fs",
+        "Fast Track — Financial statements",
+        "Would you like to include financial-statement extraction?",
+        inputs=[
+            {
+                "id": "extract_financial_statements",
+                "type": "radio",
+                "label": "Financial-statement extraction",
+                "default": "no",
+                "options": [
+                    {"label": "Yes", "value": "yes"},
+                    {"label": "No", "value": "no"},
+                ],
+            }
+        ],
+        skippable=False,
+    )
+
+
+def _fast_track_opos_snapshots_card(tracker: Tracker) -> dict[str, Any]:
+    card = _fast_track_card_shell(
+        "fast_track_opos_snapshots",
+        "Fast Track — OPOS snapshots",
+        "Add the Debitor and Kreditor snapshot files to include in the batch.",
+    )
+    card["mapper_role"] = "opos_snapshots"
+    card["mapper_meta"] = {"session_id": _fdd_session_id(tracker)}
+    return card
+
+
+def _fast_track_opos_mapper_card(
+    tracker: Tracker, snapshots: list[dict[str, Any]]
+) -> dict[str, Any]:
+    first = snapshots[0] if snapshots else {}
+    preview = first.get("debitor") if isinstance(first.get("debitor"), dict) else first
+    card = _fast_track_card_shell(
+        "fast_track_opos_mapper",
+        "Fast Track — Map OPOS columns",
+        "Map partner, amount, and due-date columns. Standard Fast Track aging defaults are applied.",
+        skippable=False,
+    )
+    card.update(
+        {
+            "wide": True,
+            "mapper_role": "opos",
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": str((preview or {}).get("file_id") or ""),
+                "sheet_name": str((preview or {}).get("sheet_name") or ""),
+                "header_row": 0,
+                "snapshots_json": json.dumps(snapshots, ensure_ascii=False),
+            },
+            **_filter_card_fields(
+                tracker,
+                "ft_opos",
+                _headers_for_period_file(
+                    tracker,
+                    str((preview or {}).get("file_id") or ""),
+                    str((preview or {}).get("sheet_name") or ""),
+                ),
+            ),
+        }
+    )
+    return card
+
+
+def _fast_track_fte_files_card(tracker: Tracker) -> dict[str, Any]:
+    card = _fast_track_card_shell(
+        "fast_track_fte_files",
+        "Fast Track — FTE files",
+        "Upload one personnel or payroll table for each available period.",
+    )
+    card["inputs"] = [
+        {
+            "id": "susa_files",
+            "type": "susa_grid",
+            "label": "Personnel files",
+            "options": _databook_grid_options(tracker),
+            "entity_count": 1,
+            "grid_mode": "single_file",
+            "fixed_entity_name": "FTE",
+        }
+    ]
+    return card
+
+
+def _fast_track_fte_mapper_card(
+    tracker: Tracker, periods: list[dict[str, Any]]
+) -> dict[str, Any]:
+    first = periods[0] if periods else {}
+    card = _fast_track_card_shell(
+        "fast_track_fte_mapper",
+        "Fast Track — Map FTE columns",
+        "Map employment, working-time, payroll, and one grouping field.",
+        skippable=False,
+    )
+    card.update(
+        {
+            "wide": True,
+            "mapper_role": "fte",
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": str(first.get("file_id") or ""),
+                "sheet_name": str(first.get("sheet_name") or ""),
+                "header_row": 0,
+                "periods_json": json.dumps(periods, ensure_ascii=False),
+                "grouping_fields": 1,
+            },
+            **_filter_card_fields(
+                tracker,
+                "ft_fte",
+                _headers_for_period_file(
+                    tracker,
+                    str(first.get("file_id") or ""),
+                    str(first.get("sheet_name") or ""),
+                ),
+            ),
+        }
+    )
+    return card
+
+
+def _fast_track_fa_files_card(tracker: Tracker) -> dict[str, Any]:
+    card = _fast_track_card_shell(
+        "fast_track_fa_files",
+        "Fast Track — Fixed-asset files",
+        "Upload one fixed-asset register extract for each available period.",
+    )
+    card["inputs"] = [
+        {
+            "id": "susa_files",
+            "type": "susa_grid",
+            "label": "Fixed-asset register files",
+            "options": _databook_grid_options(tracker),
+            "entity_count": 1,
+            "grid_mode": "single_file",
+            "fixed_entity_name": "Fixed assets",
+        }
+    ]
+    return card
+
+
+def _fast_track_fa_mapper_card(
+    tracker: Tracker, periods: list[dict[str, Any]]
+) -> dict[str, Any]:
+    first = periods[0] if periods else {}
+    card = _fast_track_card_shell(
+        "fast_track_fa_mapper",
+        "Fast Track — Map fixed-asset columns",
+        "Map opening, additions, disposals, depreciation, and one grouping field.",
+        skippable=False,
+    )
+    card.update(
+        {
+            "wide": True,
+            "mapper_role": "fa",
+            "mapper_meta": {
+                "session_id": _fdd_session_id(tracker),
+                "preview_file_id": str(first.get("file_id") or ""),
+                "sheet_name": str(first.get("sheet_name") or ""),
+                "header_row": 0,
+                "periods_json": json.dumps(periods, ensure_ascii=False),
+                "grouping_fields": 1,
+            },
+            **_filter_card_fields(
+                tracker,
+                "ft_fa",
+                _headers_for_period_file(
+                    tracker,
+                    str(first.get("file_id") or ""),
+                    str(first.get("sheet_name") or ""),
+                ),
+            ),
+        }
+    )
+    return card
+
+
+def _fast_track_revenue_sheet_card(
+    tracker: Tracker,
+    *,
+    file_id: str,
+    sheet_names: list[str],
+    file_path: str = "",
+) -> dict[str, Any]:
+    options = [{"label": str(s), "value": str(s)} for s in sheet_names if str(s).strip()]
+    card = _fast_track_card_shell(
+        "fast_track_revenue_sheet",
+        "Fast Track — Select sales sheet",
+        "Please select the worksheet that contains your sales data.",
+        inputs=[
+            {
+                "id": "sheet_name",
+                "type": "dropdown",
+                "label": "Data sheet",
+                "options": options,
+                "default": options[0]["value"] if options else "",
+            },
+            {"id": "revenue_file_id", "type": "text", "hidden": True, "default": file_id},
+            {"id": "file_path", "type": "text", "hidden": True, "default": file_path},
+        ],
+        submit_label="Continue",
+        skippable=False,
+    )
+    card["metadata"] = {"file_id": file_id, "sheet_names": sheet_names}
+    return card
+
+
+def _fast_track_revenue_upload_card() -> dict[str, Any]:
+    return _fast_track_card_shell(
+        "fast_track_revenue_upload",
+        "Fast Track — Revenue data",
+        "Upload the sales workbook used for the selected revenue analyses.",
+        inputs=[
+            {
+                "id": "revenue_file",
+                "type": "file_drop",
+                "label": "Sales workbook",
+                "accept": ".xlsx",
+                "required": True,
+            }
+        ],
+    )
+
+
+def _fast_track_revenue_card(
+    tracker: Tracker,
+    *,
+    file_id: str,
+    sheet_name: str,
+    headers: list[str],
+) -> dict[str, Any]:
+    card = _fast_track_card_shell(
+        "revenue_fast_track",
+        "Fast Track — Revenue configuration",
+        "Choose the analyses and map the shared sales-data fields before reviewing the batch.",
+        submit_label="Review batch",
+        skippable=False,
+    )
+    card.update(
+        {
+            "wide": True,
+            "headers": headers,
+            "metadata": {
+                "session_id": _fdd_session_id(tracker),
+                "file_id": file_id,
+                "sheet_name": sheet_name,
+                "first_fy": _tracker_first_fy_int(tracker),
+                **_fdd_date_params_from_tracker(tracker),
+            },
+            "defaults": {
+                "apply_fx": False,
+                "period_basis": "fy",
+                "selected_analyses": [
+                    "gst",
+                    "pvm",
+                    "top",
+                    "churn",
+                    "bubble",
+                    "bars",
+                    "gpbridge",
+                    "hbar",
+                    "arrbridge",
+                ],
+                **fast_track_defaults(headers),
+            },
+            **_filter_card_fields(tracker, "ft_revenue", headers),
+        }
+    )
+    return card
+
+
+def _fast_track_review_card(tracker: Tracker) -> dict[str, Any]:
+    manifest = _fast_track_manifest(tracker)
+    sections = manifest.get("sections") or {}
+    included = [
+        name.title()
+        for name in _FAST_TRACK_SECTIONS
+        if isinstance(sections.get(name), dict) and sections[name].get("included")
+    ]
+    return {
+        "type": "adaptive_card",
+        "card": "fast_track_review",
+        "title": "Review Fast Track batch",
+        "subtitle": (
+            "Included: " + ", ".join(included)
+            if included
+            else "No sections are currently included."
+        ),
+        "review_manifest": manifest,
+        "inputs": [],
+        "submit_label": "Run Fast Track",
+        "fast_track": True,
+    }
+
+
+def _fast_track_section_events(
+    tracker: Tracker,
+    section: str,
+    config: dict[str, Any],
+    *,
+    active_section: str | None = None,
+) -> list[Any]:
+    manifest = _fast_track_manifest_with_section(tracker, section, config)
+    _persist_fast_track_section(tracker, section, config)
+    _persist_fast_track_manifest(tracker, manifest)
+    active = active_section or section
+    filter_ctx = f"ft_{active}" if active in {"opos", "fte", "fa", "revenue"} else None
+    events: list[Any] = [
+        SlotSet("fast_track_manifest_json", json.dumps(manifest, ensure_ascii=False)),
+        SlotSet("fast_track_active_section", active),
+    ]
+    if filter_ctx:
+        events.extend(
+            [
+                SlotSet("fast_track_filter_context", filter_ctx),
+                SlotSet("active_filter_context", filter_ctx),
+            ]
+        )
+    return events
+
+
+def _fast_track_periods_from_payload(
+    payload: dict[str, Any], tracker: Tracker, kind: str
+) -> list[dict[str, str]]:
+    groups = _parse_susa_grid_file_groups(payload)
+    if kind == "fte":
+        return _fte_periods_from_grid(groups, tracker)
+    return _fa_periods_from_grid(groups, tracker)
+
+
+class ActionProcessWorkflowMode(Action):
+    def name(self) -> str:
+        return "action_process_workflow_mode"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        mode = str(payload.get("workflow_mode") or "").strip().lower()
+        if mode == "standard":
+            dispatcher.utter_message(json_message=_build_output_type_card())
+            return [SlotSet("workflow_mode", "standard"), SlotSet("fast_track_active", False)]
+        if mode == "fast_track":
+            dispatcher.utter_message(
+                text="Fast Track will collect your inputs first and run one combined batch at the end."
+            )
+            dispatcher.utter_message(
+                json_message=_utter_databook_susa_format_card_payload(fast_track=True)
+            )
+            manifest = _fast_track_base_manifest(tracker)
+            sid = _fdd_session_id(tracker)
+            if sid:
+                from fast_track_manifest_store import save_fast_track_manifest
+
+                save_fast_track_manifest(sid, UPLOAD_BASE_DIR, manifest)
+            return [
+                SlotSet("workflow_mode", "fast_track"),
+                SlotSet("fast_track_active", True),
+                SlotSet("fast_track_active_section", "databook"),
+                SlotSet("fast_track_manifest_json", json.dumps(manifest, ensure_ascii=False)),
+            ]
+        dispatcher.utter_message(text="Please choose Standard workflow or Fast Track.")
+        dispatcher.utter_message(json_message=_workflow_mode_card())
+        return []
+
+
+class ActionProcessFastTrackDatabook(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_databook"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        if _fast_track_skip_requested(payload):
+            dispatcher.utter_message(json_message=_fast_track_opos_snapshots_card(tracker))
+            return _fast_track_section_events(
+                tracker, "databook", {"included": False}, active_section="opos"
+            )
+        file_id = str(
+            payload.get("fast_track_databook_file_file_id")
+            or payload.get("fast_track_databook_file_id")
+            or payload.get("file_id")
+            or ""
+        ).strip()
+        if not file_id:
+            dispatcher.utter_message(text="Please upload a completed SuSa_Master workbook or skip this section.")
+            dispatcher.utter_message(json_message=_fast_track_databook_card())
+            return []
+        return _handle_fast_track_master_upload(
+            dispatcher,
+            tracker,
+            file_id=file_id,
+            file_path=str(payload.get("file_path") or ""),
+        ) + _fast_track_slot_events()
+
+
+class ActionProcessFastTrackDatabookFs(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_databook_fs"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        yes = str(payload.get("extract_financial_statements") or "no").lower() == "yes"
+        manifest = _fast_track_manifest(tracker)
+        config = dict((manifest.get("sections") or {}).get("databook") or {})
+        config["extract_financial_statements"] = yes
+        if yes:
+            dispatcher.utter_message(
+                text="Financial-statement extraction is recorded as a placeholder for this Fast Track batch."
+            )
+        dispatcher.utter_message(json_message=_fast_track_opos_snapshots_card(tracker))
+        return _fast_track_section_events(tracker, "databook", config, active_section="opos")
+
+
+class ActionProcessFastTrackOposSnapshots(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_opos_snapshots"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        if _fast_track_skip_requested(payload):
+            dispatcher.utter_message(json_message=_fast_track_fte_files_card(tracker))
+            return _fast_track_section_events(
+                tracker, "opos", {"included": False}, active_section="fte"
+            )
+        try:
+            snapshots = _parse_opos_snapshots_payload(payload)
+        except ValueError as exc:
+            dispatcher.utter_message(text=str(exc))
+            dispatcher.utter_message(json_message=_fast_track_opos_snapshots_card(tracker))
+            return []
+        dispatcher.utter_message(json_message=_fast_track_opos_mapper_card(tracker, snapshots))
+        events = _fast_track_section_events(
+            tracker, "opos", {"included": True, "snapshots": snapshots}
+        )
+        _opos_state(tracker)["snapshots"] = snapshots
+        _sync_flow_state_to_disk(tracker)
+        return events + [
+            SlotSet("opos_snapshots_json", json.dumps(snapshots, ensure_ascii=False)),
+        ]
+
+
+class ActionProcessFastTrackOposMapper(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_opos_mapper"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        partner = str(payload.get("opos_partner_col") or payload.get("opos_partner_id_col") or "").strip()
+        amount = str(payload.get("opos_amount_col") or "").strip()
+        due_date = str(payload.get("opos_due_date_col") or "").strip()
+        if not all((partner, amount, due_date)):
+            dispatcher.utter_message(text="Please map partner, amount, and due-date columns.")
+            manifest = _fast_track_manifest(tracker)
+            snapshots = ((manifest.get("sections") or {}).get("opos") or {}).get("snapshots") or []
+            dispatcher.utter_message(json_message=_fast_track_opos_mapper_card(tracker, snapshots))
+            return []
+        manifest = _fast_track_manifest(tracker)
+        config = dict((manifest.get("sections") or {}).get("opos") or {})
+        letters_raw = payload.get("opos_column_letters_json")
+        if isinstance(letters_raw, str):
+            try:
+                column_letters = json.loads(letters_raw)
+            except json.JSONDecodeError:
+                column_letters = {}
+        elif isinstance(letters_raw, dict):
+            column_letters = letters_raw
+        else:
+            column_letters = {}
+        config.update(
+            {
+                "included": True,
+                "mapper_confirmed": True,
+                "columns": {
+                    "partner_id": partner,
+                    "partner_name": str(payload.get("opos_partner_name_col") or partner).strip(),
+                    "amount": amount,
+                    "due_date": due_date,
+                },
+                "column_letters": column_letters,
+                "aging_buckets": {"ranges": _default_opos_aging_ranges()},
+                "sort": {"basis": "most_recent", "metric": "total"},
+                "top_bucket": {
+                    "enabled": True,
+                    "cumulative_thresholds": [0.2, 0.5, 0.8],
+                    "create_other_bucket": True,
+                },
+            }
+        )
+        _opos_state(tracker).update(
+            {
+                "snapshots": config.get("snapshots"),
+                "columns": config.get("columns"),
+                "column_letters": config.get("column_letters"),
+                "aging_buckets": config.get("aging_buckets"),
+                "sort": config.get("sort"),
+                "top_bucket": config.get("top_bucket"),
+            }
+        )
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_fast_track_fte_files_card(tracker))
+        return _fast_track_section_events(tracker, "opos", config, active_section="fte")
+
+
+class ActionProcessFastTrackFteFiles(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_fte_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        if _fast_track_skip_requested(payload):
+            dispatcher.utter_message(json_message=_fast_track_fa_files_card(tracker))
+            return _fast_track_section_events(
+                tracker, "fte", {"included": False}, active_section="fa"
+            )
+        periods = _fast_track_periods_from_payload(payload, tracker, "fte")
+        if not periods:
+            dispatcher.utter_message(text="Please upload at least one personnel file or skip this section.")
+            dispatcher.utter_message(json_message=_fast_track_fte_files_card(tracker))
+            return []
+        dispatcher.utter_message(json_message=_fast_track_fte_mapper_card(tracker, periods))
+        _fte_state(tracker)["periods"] = periods
+        _sync_flow_state_to_disk(tracker)
+        return _fast_track_section_events(tracker, "fte", {"included": True, "periods": periods}) + [
+            SlotSet("fte_periods_json", json.dumps(periods, ensure_ascii=False)),
+        ]
+
+
+class ActionProcessFastTrackFteMapper(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_fte_mapper"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        employment = str(payload.get("fte_employment_col") or "").strip()
+        months = str(payload.get("fte_months_col") or "").strip()
+        payroll = payload.get("fte_payroll_cols_json") or payload.get("fte_payroll_cols") or []
+        if isinstance(payroll, str):
+            try:
+                payroll = json.loads(payroll)
+            except json.JSONDecodeError:
+                payroll = []
+        grouping = str(payload.get("fte_group_col") or payload.get("fte_group_col_1") or "").strip()
+        if not employment or not months or not payroll or not grouping:
+            dispatcher.utter_message(
+                text="Please map employment, working time, payroll columns, and one grouping field."
+            )
+            manifest = _fast_track_manifest(tracker)
+            periods = ((manifest.get("sections") or {}).get("fte") or {}).get("periods") or []
+            dispatcher.utter_message(json_message=_fast_track_fte_mapper_card(tracker, periods))
+            return []
+        manifest = _fast_track_manifest(tracker)
+        config = dict((manifest.get("sections") or {}).get("fte") or {})
+        config.update(
+            {
+                "included": True,
+                "mapper_confirmed": True,
+                "columns": {
+                    "employment": employment,
+                    "months_sum": months,
+                    "payroll_cols": [str(x) for x in payroll],
+                },
+                "group_cols": [grouping],
+            }
+        )
+        _fte_state(tracker).update({"periods": config.get("periods"), "columns": config.get("columns"), "group_cols": config.get("group_cols")})
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_fast_track_fa_files_card(tracker))
+        return _fast_track_section_events(tracker, "fte", config, active_section="fa")
+
+
+class ActionProcessFastTrackFaFiles(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_fa_files"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        if _fast_track_skip_requested(payload):
+            dispatcher.utter_message(json_message=_fast_track_revenue_upload_card())
+            return _fast_track_section_events(
+                tracker, "fa", {"included": False}, active_section="revenue"
+            )
+        periods = _fast_track_periods_from_payload(payload, tracker, "fa")
+        if not periods:
+            dispatcher.utter_message(text="Please upload at least one fixed-asset file or skip this section.")
+            dispatcher.utter_message(json_message=_fast_track_fa_files_card(tracker))
+            return []
+        dispatcher.utter_message(json_message=_fast_track_fa_mapper_card(tracker, periods))
+        _fa_state(tracker)["periods"] = periods
+        _sync_flow_state_to_disk(tracker)
+        return _fast_track_section_events(tracker, "fa", {"included": True, "periods": periods}) + [
+            SlotSet("fa_periods_json", json.dumps(periods, ensure_ascii=False)),
+        ]
+
+
+class ActionProcessFastTrackFaMapper(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_fa_mapper"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        opening = str(payload.get("fa_opening_col") or "").strip()
+        additions = str(payload.get("fa_additions_col") or "").strip()
+        disposals = str(payload.get("fa_disposals_col") or "").strip()
+        depreciation = payload.get("fa_depreciation_cols_json") or payload.get("fa_depreciation_cols") or []
+        if isinstance(depreciation, str):
+            try:
+                depreciation = json.loads(depreciation)
+            except json.JSONDecodeError:
+                depreciation = []
+        grouping = str(payload.get("fa_group_col") or payload.get("fa_group_col_1") or "").strip()
+        if not all((opening, additions, disposals, grouping)) or not depreciation:
+            dispatcher.utter_message(
+                text="Please map opening, additions, disposals, depreciation, and one grouping field."
+            )
+            manifest = _fast_track_manifest(tracker)
+            periods = ((manifest.get("sections") or {}).get("fa") or {}).get("periods") or []
+            dispatcher.utter_message(json_message=_fast_track_fa_mapper_card(tracker, periods))
+            return []
+        manifest = _fast_track_manifest(tracker)
+        config = dict((manifest.get("sections") or {}).get("fa") or {})
+        config.update(
+            {
+                "included": True,
+                "mapper_confirmed": True,
+                "columns": {
+                    "opening": opening,
+                    "additions": additions,
+                    "disposals": disposals,
+                    "depreciation_cols": [str(x) for x in depreciation],
+                },
+                "group_cols": [grouping],
+            }
+        )
+        _fa_state(tracker).update({"periods": config.get("periods"), "columns": config.get("columns"), "group_cols": config.get("group_cols")})
+        _sync_flow_state_to_disk(tracker)
+        dispatcher.utter_message(json_message=_fast_track_revenue_upload_card())
+        return _fast_track_section_events(tracker, "fa", config, active_section="revenue")
+
+
+class ActionProcessFastTrackRevenueUpload(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_revenue_upload"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        if _fast_track_skip_requested(payload):
+            events = _fast_track_section_events(tracker, "revenue", {"included": False})
+            manifest = _fast_track_manifest_with_section(tracker, "revenue", {"included": False})
+            events[0] = SlotSet("fast_track_manifest_json", json.dumps(manifest, ensure_ascii=False))
+            # Build the card from the updated manifest, since tracker events apply after this action.
+            shadow = dict(manifest)
+            included = [
+                name.title()
+                for name in _FAST_TRACK_SECTIONS
+                if ((shadow.get("sections") or {}).get(name) or {}).get("included")
+            ]
+            card = _fast_track_review_card(tracker)
+            card["review_manifest"] = manifest
+            card["subtitle"] = (
+                "Included: " + ", ".join(included) if included else "No sections are currently included."
+            )
+            dispatcher.utter_message(json_message=card)
+            return events
+        file_id = str(
+            payload.get("revenue_file_file_id")
+            or payload.get("revenue_file_id")
+            or payload.get("file_id")
+            or ""
+        ).strip()
+        if not file_id:
+            dispatcher.utter_message(text="Please upload a sales workbook or skip this section.")
+            dispatcher.utter_message(json_message=_fast_track_revenue_upload_card())
+            return []
+        sheets = payload.get("sheet_names") or []
+        if isinstance(sheets, str):
+            try:
+                sheets = json.loads(sheets)
+            except json.JSONDecodeError:
+                sheets = []
+        sheet_name = str(payload.get("sheet_name") or (sheets[0] if sheets else "")).strip()
+        if not sheet_name and file_id:
+            slot_sheets = tracker.get_slot("sheet_names") or "[]"
+            try:
+                sheets = json.loads(slot_sheets) if isinstance(slot_sheets, str) else list(slot_sheets or [])
+            except (json.JSONDecodeError, TypeError):
+                sheets = []
+            if len(sheets) > 1:
+                dispatcher.utter_message(
+                    json_message=_fast_track_revenue_sheet_card(
+                        tracker,
+                        file_id=file_id,
+                        sheet_names=[str(s) for s in sheets],
+                        file_path=str(payload.get("file_path") or ""),
+                    )
+                )
+                return [
+                    SlotSet("fast_track_revenue_file_id", file_id),
+                    SlotSet("fast_track_active_section", "revenue"),
+                    SlotSet("fast_track_filter_context", "ft_revenue"),
+                    SlotSet("active_filter_context", "ft_revenue"),
+                ]
+            sheet_name = str(sheets[0] if sheets else "").strip()
+        headers = _normalize_header_list(payload.get("headers"))
+        if not headers:
+            headers = _headers_for_period_file(tracker, file_id, sheet_name)
+        if not headers:
+            dispatcher.utter_message(
+                text="The sales workbook was uploaded, but no column headers could be read."
+            )
+            dispatcher.utter_message(json_message=_fast_track_revenue_upload_card())
+            return []
+        config = {
+            "included": True,
+            "file_id": file_id,
+            "file_path": str(payload.get("file_path") or ""),
+            "sheet_name": sheet_name,
+            "headers": headers,
+        }
+        dispatcher.utter_message(
+            json_message=_fast_track_revenue_card(
+                tracker, file_id=file_id, sheet_name=sheet_name, headers=headers
+            )
+        )
+        return _fast_track_section_events(tracker, "revenue", config) + [
+            SlotSet("fast_track_revenue_file_id", file_id),
+            SlotSet("fast_track_revenue_sheet_name", sheet_name),
+            SlotSet("fast_track_revenue_headers", headers),
+        ]
+
+
+class ActionProcessFastTrackRevenueSheet(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_revenue_sheet"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        file_id = str(
+            payload.get("revenue_file_id")
+            or payload.get("file_id")
+            or tracker.get_slot("fast_track_revenue_file_id")
+            or ""
+        ).strip()
+        sheet_name = str(payload.get("sheet_name") or "").strip()
+        if not file_id or not sheet_name:
+            dispatcher.utter_message(text="Please select a worksheet for the sales data.")
+            sheets = payload.get("sheet_names") or []
+            if isinstance(sheets, str):
+                try:
+                    sheets = json.loads(sheets)
+                except json.JSONDecodeError:
+                    sheets = []
+            dispatcher.utter_message(
+                json_message=_fast_track_revenue_sheet_card(
+                    tracker,
+                    file_id=file_id,
+                    sheet_names=[str(s) for s in sheets if str(s).strip()],
+                    file_path=str(payload.get("file_path") or ""),
+                )
+            )
+            return []
+        headers = _headers_for_period_file(tracker, file_id, sheet_name)
+        if not headers:
+            dispatcher.utter_message(
+                text="The selected worksheet has no readable column headers."
+            )
+            dispatcher.utter_message(json_message=_fast_track_revenue_upload_card())
+            return []
+        config = {
+            "included": True,
+            "file_id": file_id,
+            "file_path": str(payload.get("file_path") or ""),
+            "sheet_name": sheet_name,
+            "headers": headers,
+        }
+        dispatcher.utter_message(
+            json_message=_fast_track_revenue_card(
+                tracker, file_id=file_id, sheet_name=sheet_name, headers=headers
+            )
+        )
+        return _fast_track_section_events(tracker, "revenue", config) + [
+            SlotSet("fast_track_revenue_file_id", file_id),
+            SlotSet("fast_track_revenue_sheet_name", sheet_name),
+            SlotSet("fast_track_revenue_headers", headers),
+        ]
+
+
+def _complete_fast_track_manifest(
+    tracker: Tracker, manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    from fast_track_manifest_store import load_fast_track_manifest, merge_fast_track_manifests, resolve_master_upload_path
+
+    sid = _fdd_session_id(tracker)
+    persisted = load_fast_track_manifest(sid, UPLOAD_BASE_DIR)
+    completed = merge_fast_track_manifests(persisted, dict(manifest or _fast_track_manifest(tracker)))
+    sections = dict(completed.get("sections") or {})
+    filters: dict[str, Any] = {}
+    for section in _FAST_TRACK_SECTIONS:
+        filters[section] = _fdd_filters_payload(
+            tracker.get_slot(f"ft_{section}_filter_rules_json") or "[]"
+        )
+        if isinstance(sections.get(section), dict):
+            sections[section] = {**sections[section], "filters": filters[section]}
+    completed.update(_fast_track_base_manifest(tracker))
+    master_path = str(completed.get("master_path") or "").strip()
+    if not master_path:
+        master_path = _abs_master_path_from_tracker(tracker)
+    if not master_path or not os.path.isfile(master_path):
+        master_path = resolve_master_upload_path(sid, UPLOAD_BASE_DIR)
+    if master_path:
+        completed["master_path"] = master_path
+        databook = sections.get("databook")
+        explicitly_skipped = databook is False or (
+            isinstance(databook, dict) and databook.get("included") is False
+        )
+        if not explicitly_skipped:
+            if not isinstance(databook, dict):
+                databook = {}
+            databook.setdefault("included", True)
+            databook.setdefault("master_path", master_path)
+            databook.setdefault("master_file_path", master_path)
+            databook.setdefault("create_extended_tables", True)
+            databook.setdefault("l4_sort_basis", "latest_fy")
+            sections["databook"] = databook
+    completed["sections"] = sections
+    completed["filters"] = filters
+    _hydrate_fast_track_strand_sections(tracker, completed["sections"])
+    from scripts.fast_track_upload_hydration import hydrate_strand_sections_from_uploads
+
+    hydrate_strand_sections_from_uploads(
+        sid,
+        UPLOAD_BASE_DIR,
+        completed["sections"],
+        dates=completed.get("dates") if isinstance(completed.get("dates"), dict) else {},
+    )
+    for name in ("opos", "fte", "fa"):
+        cfg = completed["sections"].get(name)
+        if isinstance(cfg, dict) and cfg.get("included"):
+            _persist_fast_track_section(tracker, name, cfg)
+    completed["output_path"] = _expected_fast_track_output_path(tracker)
+    _persist_fast_track_manifest(tracker, completed)
+    return completed
+
+
+def _fast_track_workbook_filename(tracker: Tracker) -> str:
+    import re
+
+    sid = _fdd_session_id(tracker)
+    project = str(tracker.get_slot("project_name") or "").strip()
+    if project:
+        safe = re.sub(r"[^\w\-]+", "_", project).strip("_")
+        if safe:
+            return f"{safe[:80]}_FastTrack.xlsx"
+    return f"{sid}_FastTrack.xlsx"
+
+
+def _fast_track_output_folders(tracker: Tracker) -> list[str]:
+    folders: list[str] = []
+    raw = str(tracker.get_slot("output_folder") or "").strip()
+    if raw:
+        expanded = _expand_output_folder(raw)
+        if expanded:
+            folders.append(expanded)
+    sid = _fdd_session_id(tracker)
+    session_out = os.path.join(UPLOAD_BASE_DIR, sid, "output")
+    if session_out not in folders:
+        folders.append(session_out)
+    return folders
+
+
+def _expected_fast_track_output_path(tracker: Tracker) -> str:
+    folders = _fast_track_output_folders(tracker)
+    folder = folders[0] if folders else os.path.join(UPLOAD_BASE_DIR, _fdd_session_id(tracker), "output")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.abspath(os.path.join(folder, _fast_track_workbook_filename(tracker)))
+
+
+def _resolve_fast_track_workbook_path(tracker: Tracker, explicit: str = "") -> str:
+    """Resolve the Fast Track workbook from the current session (same run), not a manual pick."""
+    explicit = str(explicit or "").strip()
+    if explicit and os.path.isfile(explicit):
+        return os.path.abspath(explicit)
+
+    slot = str(tracker.get_slot("fast_track_output_workbook_path") or "").strip()
+    if slot and os.path.isfile(slot):
+        return os.path.abspath(slot)
+
+    manifest = _fast_track_manifest(tracker)
+    manifest_path = str(manifest.get("output_path") or "").strip()
+    if manifest_path and os.path.isfile(manifest_path):
+        return os.path.abspath(manifest_path)
+
+    fname = _fast_track_workbook_filename(tracker)
+    for folder in _fast_track_output_folders(tracker):
+        candidate = os.path.join(folder, fname)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+    from pathlib import Path
+
+    best: tuple[float, str] | None = None
+    for folder in _fast_track_output_folders(tracker):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            for p in Path(folder).glob("*FastTrack*.xlsx"):
+                if not p.is_file():
+                    continue
+                mtime = p.stat().st_mtime
+                if best is None or mtime > best[0]:
+                    best = (mtime, str(p.resolve()))
+        except OSError:
+            continue
+    if best:
+        return best[1]
+
+    return ""
+
+
+def _start_fast_track_job(
+    dispatcher: CollectingDispatcher, tracker: Tracker, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    result = _fdd_post(
+        "/api/v1/fdd/run/fast-track/async",
+        {
+            "session_id": _fdd_session_id(tracker),
+            "output_folder": tracker.get_slot("output_folder") or "",
+            "manifest": manifest,
+        },
+        timeout=30,
+    )
+    run_id = result.get("run_id")
+    if run_id:
+        dispatcher.utter_message(text="Starting the Fast Track batch…")
+        dispatcher.utter_message(
+            json_message={
+                "type": "adaptive_card",
+                "card": "script_job",
+                "title": "Fast Track",
+                "run_id": run_id,
+                "session_id": result.get("session_id") or manifest.get("session_id"),
+                "script_key": "fast_track",
+                "inputs": [],
+            }
+        )
+    return result
+
+
+class ActionProcessFastTrackRevenue(Action):
+    def name(self) -> str:
+        return "action_process_fast_track_revenue"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        selected = payload.get("selected_analyses") or payload.get("analyses") or []
+        if isinstance(selected, str):
+            try:
+                selected = json.loads(selected)
+            except json.JSONDecodeError:
+                selected = [x.strip() for x in selected.split(",") if x.strip()]
+        selected = [str(x).strip().lower() for x in selected if str(x).strip()]
+        if not selected:
+            dispatcher.utter_message(text="Please select at least one revenue analysis.")
+            dispatcher.utter_message(
+                json_message=_fast_track_revenue_card(
+                    tracker,
+                    file_id=str(tracker.get_slot("fast_track_revenue_file_id") or ""),
+                    sheet_name=str(tracker.get_slot("fast_track_revenue_sheet_name") or ""),
+                    headers=_normalize_header_list(tracker.get_slot("fast_track_revenue_headers")),
+                )
+            )
+            return []
+        manifest = _fast_track_manifest(tracker)
+        config = dict((manifest.get("sections") or {}).get("revenue") or {})
+        config.update(
+            {
+                "selected_analyses": selected,
+                "sheet_name": str(
+                    config.get("sheet_name")
+                    or tracker.get_slot("fast_track_revenue_sheet_name")
+                    or payload.get("sheet_name")
+                    or ""
+                ).strip(),
+                "file_id": str(config.get("file_id") or tracker.get_slot("fast_track_revenue_file_id") or ""),
+                "file_path": str(config.get("file_path") or payload.get("file_path") or ""),
+                "config": {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in ("card", "selected_analyses", "analyses")
+                },
+            }
+        )
+        updated = _fast_track_manifest_with_section(tracker, "revenue", config)
+        completed = _complete_fast_track_manifest(tracker, updated)
+        result = _start_fast_track_job(dispatcher, tracker, completed)
+        if not result.get("run_id"):
+            dispatcher.utter_message(
+                text=f"Could not start Fast Track:\n{result.get('message', 'Unknown error')}"
+            )
+            dispatcher.utter_message(
+                json_message=_fast_track_revenue_card(
+                    tracker,
+                    file_id=str(config.get("file_id") or ""),
+                    sheet_name=str(config.get("sheet_name") or ""),
+                    headers=_normalize_header_list(config.get("headers")),
+                )
+            )
+            return []
+        expected_out = _expected_fast_track_output_path(tracker)
+        return [
+            SlotSet("fast_track_manifest_json", json.dumps(completed, ensure_ascii=False)),
+            SlotSet("fast_track_active", False),
+            SlotSet("fast_track_active_section", "revenue"),
+            SlotSet("fast_track_filter_context", "ft_revenue"),
+            SlotSet("active_filter_context", "ft_revenue"),
+            SlotSet("output_type", "fast_track"),
+            SlotSet("fast_track_output_workbook_path", expected_out),
+        ]
+
+
+class ActionResumeFastTrackSection(Action):
+    def name(self) -> str:
+        return "action_resume_fast_track_section"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        section = str(tracker.get_slot("fast_track_active_section") or "databook")
+        manifest = _fast_track_manifest(tracker)
+        config = (manifest.get("sections") or {}).get(section) or {}
+        if section == "opos" and config.get("snapshots"):
+            dispatcher.utter_message(json_message=_fast_track_opos_mapper_card(tracker, config["snapshots"]))
+        elif section == "fte" and config.get("periods"):
+            dispatcher.utter_message(json_message=_fast_track_fte_mapper_card(tracker, config["periods"]))
+        elif section == "fa" and config.get("periods"):
+            dispatcher.utter_message(json_message=_fast_track_fa_mapper_card(tracker, config["periods"]))
+        elif section == "revenue" and config.get("file_id"):
+            dispatcher.utter_message(
+                json_message=_fast_track_revenue_card(
+                    tracker,
+                    file_id=str(config.get("file_id") or ""),
+                    sheet_name=str(config.get("sheet_name") or ""),
+                    headers=_normalize_header_list(config.get("headers")),
+                )
+            )
+        else:
+            cards = {
+                "databook": _utter_databook_susa_format_card_payload(fast_track=True),
+                "opos": _fast_track_opos_snapshots_card(tracker),
+                "fte": _fast_track_fte_files_card(tracker),
+                "fa": _fast_track_fa_files_card(tracker),
+                "revenue": _fast_track_revenue_upload_card(),
+            }
+            dispatcher.utter_message(json_message=cards.get(section, _fast_track_review_card(tracker)))
+        return []
+
+
+class ActionRunFastTrack(Action):
+    def name(self) -> str:
+        return "action_run_fast_track"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        manifest = _fast_track_manifest(tracker)
+        sections = dict(manifest.get("sections") or {})
+        included = [
+            name for name in _FAST_TRACK_SECTIONS if (sections.get(name) or {}).get("included")
+        ]
+        if not included:
+            dispatcher.utter_message(
+                text="Fast Track cannot run because every section was skipped. Include at least one section."
+            )
+            dispatcher.utter_message(json_message=_utter_databook_susa_format_card_payload(fast_track=True))
+            return [SlotSet("fast_track_active_section", "databook")]
+
+        manifest = _complete_fast_track_manifest(tracker, manifest)
+        result = _start_fast_track_job(dispatcher, tracker, manifest)
+        if not result.get("run_id"):
+            dispatcher.utter_message(
+                text=f"Could not start Fast Track:\n{result.get('message', 'Unknown error')}"
+            )
+            dispatcher.utter_message(json_message=_fast_track_review_card(tracker))
+            return []
+        expected_out = _expected_fast_track_output_path(tracker)
+        return [
+            SlotSet("fast_track_manifest_json", json.dumps(manifest, ensure_ascii=False)),
+            SlotSet("fast_track_active", False),
+            SlotSet("output_type", "fast_track"),
+            SlotSet("fast_track_output_workbook_path", expected_out),
+        ]
+
+
 def _revenue_sales_reuse_card(tracker: Tracker, payload: dict | None = None) -> dict[str, Any]:
     fp = str(tracker.get_slot("file_path") or (payload or {}).get("file_path") or "")
     label = os.path.basename(fp) if fp else "your uploaded workbook"
@@ -2323,9 +3815,25 @@ class ActionDispatchCard(Action):
         instances: dict[str, Any] = {
             "main_welcome": ActionProcessMainCard(),
             "dates": ActionProcessDatesCard(),
+            "workflow_mode": ActionProcessWorkflowMode(),
             "base_path": ActionNavigateFolders(),
             "folder_select": ActionProcessFolderSelection(),
             "build_databook": ActionProcessBuildDatabook(),
+            # Fast Track collection (no scripts run before final review)
+            "fast_track_databook": ActionProcessFastTrackDatabook(),
+            "fast_track_databook_fs": ActionProcessFastTrackDatabookFs(),
+            "fast_track_opos_snapshots": ActionProcessFastTrackOposSnapshots(),
+            "fast_track_opos_mapper": ActionProcessFastTrackOposMapper(),
+            "fast_track_fte_files": ActionProcessFastTrackFteFiles(),
+            "fast_track_fte_mapper": ActionProcessFastTrackFteMapper(),
+            "fast_track_fa_files": ActionProcessFastTrackFaFiles(),
+            "fast_track_fa_mapper": ActionProcessFastTrackFaMapper(),
+            "fast_track_revenue_upload": ActionProcessFastTrackRevenueUpload(),
+            "fast_track_revenue_sheet": ActionProcessFastTrackRevenueSheet(),
+            "revenue_fast_track": ActionProcessFastTrackRevenue(),
+            "fast_track_review": ActionRunFastTrack(),
+            "filter_rules_save": ActionSaveFilterRules(),
+            "fast_track_filter_open": ActionStartFilter(),
             "preload_file": ActionPreloadFile(),
             "reuse_sales_file": ActionProcessReuseSalesFile(),
             "file_upload": ActionUploadFile(),
@@ -2408,6 +3916,7 @@ class ActionDispatchCard(Action):
             "filter_done": ActionFinishFilters(),
             # Post-output
             "next_action": ActionProcessNextAction(),
+            "pdf_report_prompt": ActionProcessPdfReportPrompt(),
             # Coming soon stubs
             "coming_soon": ActionProcessComingSoon(),
             # Databook
@@ -2571,6 +4080,7 @@ def _undo_redo_handlers() -> dict[str, Any]:
         "action_show_fte_grouping": ActionShowFteGrouping(),
         "action_enter_fte_filter_checkpoint": ActionEnterFteFilterCheckpoint(),
         "action_enter_strand_run_target": ActionEnterStrandRunTarget(),
+        "action_resume_fast_track_section": ActionResumeFastTrackSection(),
     }
     return _UNDO_REDO_HANDLERS
 
@@ -2735,8 +4245,8 @@ class ActionProcessDatesCard(Action):
             events.append(SlotSet("first_fy", fy_val))
             events.append(SlotSet("gst_first_fy_override", fy_val))
             events.append(SlotSet("pvm_first_fy_override", fy_val))
-        # Outputs go to session upload folder; user downloads via file_attachment cards.
-        dispatcher.utter_message(json_message=_build_output_type_card())
+        # Choose between the unchanged single-output flow and batch collection.
+        dispatcher.utter_message(json_message=_workflow_mode_card())
         return events
 
 
@@ -6168,6 +7678,11 @@ def _emit_fa_rollf_columns_card(
             },
             "inputs": [],
             "submit_label": "Continue",
+            **_filter_card_fields(
+                tracker,
+                "fa",
+                _headers_for_period_file(tracker, preview_id, preview_sheet),
+            ),
         }
     )
 
@@ -6571,6 +8086,11 @@ def _emit_fte_columns_card(
             },
             "inputs": [],
             "submit_label": "Continue",
+            **_filter_card_fields(
+                tracker,
+                "fte",
+                _headers_for_period_file(tracker, preview_id, preview_sheet),
+            ),
         }
     )
 
@@ -6909,6 +8429,89 @@ class ActionRunFtePayroll(Action):
 
 # ─── OPOS (Creditor / Debitor Aging) ───────────────────────────────────────────
 
+class _OposAgingRangeValidationError(ValueError):
+    pass
+
+
+_DEFAULT_OPOS_AGING_RANGES: tuple[tuple[int, int], ...] = (
+    (1, 30),
+    (31, 60),
+    (61, 90),
+    (91, 180),
+)
+
+
+def _default_opos_aging_range_tuples() -> list[tuple[int, int]]:
+    return list(_DEFAULT_OPOS_AGING_RANGES)
+
+
+def _validate_opos_aging_ranges(raw_ranges) -> list[tuple[int, int]]:
+    if not raw_ranges:
+        raise _OposAgingRangeValidationError("At least one overdue bucket range is required.")
+    pairs: list[tuple[int, int]] = []
+    for raw in raw_ranges:
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            raise _OposAgingRangeValidationError(f"Each range must be [lo, hi], got {raw!r}")
+        lo, hi = int(raw[0]), int(raw[1])
+        pairs.append((lo, hi))
+    for lo, hi in pairs:
+        if lo < 1 or hi < 1:
+            raise _OposAgingRangeValidationError("Range bounds must be positive integers.")
+        if lo > hi:
+            raise _OposAgingRangeValidationError(f"Invalid range {lo}-{hi}: start must be <= end.")
+    pairs.sort(key=lambda x: x[0])
+    if pairs[0][0] != 1:
+        raise _OposAgingRangeValidationError("The first overdue bucket must start at day 1.")
+    for i in range(1, len(pairs)):
+        prev_lo, prev_hi = pairs[i - 1]
+        lo, hi = pairs[i]
+        if lo <= prev_hi:
+            raise _OposAgingRangeValidationError(
+                f"Ranges overlap: {prev_lo}-{prev_hi} and {lo}-{hi}."
+            )
+        if lo != prev_hi + 1:
+            raise _OposAgingRangeValidationError(
+                f"Gap between buckets: {prev_lo}-{prev_hi} and {lo}-{hi}."
+            )
+    return pairs
+
+
+def _opos_bucket_key_for_range(lo: int, hi: int) -> str:
+    return f"overdue_{lo}_{hi}"
+
+
+def _opos_bucket_key_for_tail(max_hi: int) -> str:
+    return f"overdue_over_{max_hi}"
+
+
+def _opos_bucket_label_for_range(lo: int, hi: int) -> str:
+    return f"{lo}-{hi} days"
+
+
+def _opos_bucket_label_for_tail(max_hi: int) -> str:
+    return f">{max_hi} days"
+
+
+def _opos_bucket_options_from_ranges(
+    ranges: list[tuple[int, int]], *, include_current: bool = True
+) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    if include_current:
+        out.append(("not_yet_due", "Not yet due"))
+    for lo, hi in ranges:
+        out.append((_opos_bucket_key_for_range(lo, hi), _opos_bucket_label_for_range(lo, hi)))
+    if ranges:
+        max_hi = ranges[-1][1]
+        out.append((_opos_bucket_key_for_tail(max_hi), _opos_bucket_label_for_tail(max_hi)))
+    return out
+
+
+def _opos_bucket_keys_from_ranges(
+    ranges: list[tuple[int, int]], *, include_current: bool = True
+) -> list[str]:
+    return [k for k, _ in _opos_bucket_options_from_ranges(ranges, include_current=include_current)]
+
+
 OPOS_SORT_BUCKETS: list[tuple[str, str]] = [
     ("not_yet_due", "Not yet due"),
     ("overdue_1_30", "1-30 days"),
@@ -6917,6 +8520,56 @@ OPOS_SORT_BUCKETS: list[tuple[str, str]] = [
     ("overdue_91_180", "91-180 days"),
     ("overdue_over_180", ">180 days"),
 ]
+
+
+def _default_opos_aging_ranges() -> list[list[int]]:
+    return [list(r) for r in _default_opos_aging_range_tuples()]
+
+
+def _parse_opos_aging_ranges(raw: Any) -> list[tuple[int, int]]:
+    if isinstance(raw, list) and raw:
+        if isinstance(raw[0], (list, tuple)):
+            return _validate_opos_aging_ranges(raw)
+        return _validate_opos_aging_ranges([[int(x) for x in raw]])
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return _default_opos_aging_range_tuples()
+        return _validate_opos_aging_ranges(parsed)
+    return _default_opos_aging_range_tuples()
+
+
+def _opos_aging_ranges_from_tracker(tracker: Tracker) -> list[list[int]]:
+    cached = _opos_state(tracker).get("aging_ranges")
+    if isinstance(cached, list) and cached:
+        try:
+            return [list(r) for r in _validate_opos_aging_ranges(cached)]
+        except _OposAgingRangeValidationError:
+            pass
+    slot_raw = tracker.get_slot("opos_aging_ranges_json")
+    if slot_raw:
+        try:
+            return [list(r) for r in _parse_opos_aging_ranges(slot_raw)]
+        except _OposAgingRangeValidationError:
+            pass
+    return _default_opos_aging_ranges()
+
+
+def _opos_sort_buckets_from_tracker(tracker: Tracker) -> list[tuple[str, str]]:
+    try:
+        ranges = _parse_opos_aging_ranges(_opos_aging_ranges_from_tracker(tracker))
+    except _OposAgingRangeValidationError:
+        ranges = _default_opos_aging_range_tuples()
+    return _opos_bucket_options_from_ranges(ranges)
+
+
+def _default_opos_sort_keys() -> list[str]:
+    return [
+        k
+        for k, _ in _opos_bucket_options_from_ranges(_default_opos_aging_range_tuples())
+        if k != "not_yet_due"
+    ]
 
 
 def _session_output_workbook_path(tracker: Tracker) -> str:
@@ -6972,31 +8625,19 @@ def _opos_top_bucket_enabled(raw: Any, *, default: bool = True) -> bool:
     return default
 
 
-def _default_opos_display_bucket_keys() -> list[str]:
-    return [k for k, _ in OPOS_SORT_BUCKETS]
-
-
-def _default_opos_sort_keys() -> list[str]:
-    return [k for k, _ in OPOS_SORT_BUCKETS if k != "not_yet_due"]
-
-
 def _opos_display_buckets_card(tracker: Tracker) -> dict[str, Any]:
     snapshots = _opos_snapshots_from_sources(tracker)
     multiple = len(snapshots) > 1
-    defaults_raw = tracker.get_slot("opos_display_bucket_keys_json") or json.dumps(
-        _default_opos_display_bucket_keys()
-    )
-    defaults = _parse_list(defaults_raw, _default_opos_display_bucket_keys())
+    defaults = _opos_aging_ranges_from_tracker(tracker)
     return {
         "type": "adaptive_card",
         "card": "opos_display_buckets",
-        "title": "Choose buckets to display",
+        "title": "Configure aging buckets",
         "subtitle": (
-            "Select which aging buckets appear in the report. "
-            "Deselected buckets are omitted from the output entirely."
+            "Define contiguous overdue day ranges. All buckets are always included in the output. "
+            "Ranges must not overlap or leave gaps."
         ),
-        "bucket_options": [{"label": lbl, "value": key} for key, lbl in OPOS_SORT_BUCKETS],
-        "bucket_defaults": defaults,
+        "aging_range_defaults": defaults,
         "multiple_snapshots": multiple,
         "sort_basis_default": tracker.get_slot("opos_sort_basis") or "most_recent",
         "submit_label": "Continue",
@@ -7004,7 +8645,10 @@ def _opos_display_buckets_card(tracker: Tracker) -> dict[str, Any]:
 
 
 def _opos_sort_card(tracker: Tracker) -> dict[str, Any]:
-    defaults = tracker.get_slot("opos_sort_bucket_keys_json") or json.dumps(_default_opos_sort_keys())
+    sort_buckets = _opos_sort_buckets_from_tracker(tracker)
+    defaults = tracker.get_slot("opos_sort_bucket_keys_json") or json.dumps(
+        [k for k, _ in sort_buckets if k != "not_yet_due"]
+    )
     sort_metric = tracker.get_slot("opos_sort_metric") or "total"
     return {
         "type": "adaptive_card",
@@ -7040,7 +8684,7 @@ def _opos_sort_card(tracker: Tracker) -> dict[str, Any]:
                 "type": "multi_select",
                 "label": "Buckets included in sort total",
                 "default": _parse_list(defaults, _default_opos_sort_keys()),
-                "options": [{"label": lbl, "value": key} for key, lbl in OPOS_SORT_BUCKETS],
+                "options": [{"label": lbl, "value": key} for key, lbl in sort_buckets],
                 "showWhen": {"field": "opos_sort_metric", "value": "buckets"},
             },
         ],
@@ -7223,6 +8867,11 @@ def _emit_opos_columns_card(
             },
             "inputs": [],
             "submit_label": "Continue",
+            **_filter_card_fields(
+                tracker,
+                "opos",
+                _headers_for_period_file(tracker, preview_id, preview_sheet),
+            ),
         }
     )
 
@@ -7427,14 +9076,14 @@ class ActionProcessOposColumns(Action):
         events.append(SlotSet("opos_sort_metric", "buckets"))
         events.append(
             SlotSet(
-                "opos_display_bucket_keys_json",
-                json.dumps(_default_opos_display_bucket_keys()),
+                "opos_aging_ranges_json",
+                json.dumps(_default_opos_aging_ranges()),
             )
         )
         events.append(
             SlotSet(
                 "opos_sort_bucket_keys_json",
-                json.dumps(_default_opos_display_bucket_keys()),
+                json.dumps(_opos_bucket_keys_from_ranges(_default_opos_aging_range_tuples())),
             )
         )
         events.append(SlotSet("opos_top_bucket_enabled", "on"))
@@ -7473,15 +9122,11 @@ class ActionProcessOposDisplayBuckets(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
-        raw_keys = payload.get("opos_display_bucket_keys")
-        if isinstance(raw_keys, list):
-            keys = [str(k).strip() for k in raw_keys if str(k).strip()]
-        else:
-            keys = _parse_list(str(raw_keys or "[]"), _default_opos_display_bucket_keys())
-        valid = {k for k, _ in OPOS_SORT_BUCKETS}
-        keys = [k for k in keys if k in valid]
-        if not keys:
-            dispatcher.utter_message(text="Please select at least one bucket to display.")
+        raw_ranges = payload.get("opos_aging_ranges")
+        try:
+            ranges = _parse_opos_aging_ranges(raw_ranges)
+        except _OposAgingRangeValidationError as exc:
+            dispatcher.utter_message(text=str(exc))
             dispatcher.utter_message(json_message=_opos_display_buckets_card(tracker))
             return []
 
@@ -7493,13 +9138,15 @@ class ActionProcessOposDisplayBuckets(Action):
         else:
             basis = "most_recent"
 
+        range_lists = [list(r) for r in ranges]
+        bucket_keys = _opos_bucket_keys_from_ranges(ranges)
         events: list[Any] = [
-            SlotSet("opos_display_bucket_keys_json", json.dumps(keys)),
+            SlotSet("opos_aging_ranges_json", json.dumps(range_lists)),
             SlotSet("opos_sort_basis", basis),
             SlotSet("opos_sort_metric", "buckets"),
-            SlotSet("opos_sort_bucket_keys_json", json.dumps(keys)),
+            SlotSet("opos_sort_bucket_keys_json", json.dumps(bucket_keys)),
         ]
-        _opos_state(tracker)["display_bucket_keys"] = keys
+        _opos_state(tracker)["aging_ranges"] = range_lists
         _sync_flow_state_to_disk(tracker)
 
         pending = str(tracker.get_slot("opos_pending_rerun") or "").strip().lower()
@@ -7640,22 +9287,21 @@ class ActionRunOpos(Action):
         else:
             column_letters = dict(_opos_state(tracker).get("column_letters") or {})
 
-        cached_display = _opos_state(tracker).get("display_bucket_keys")
-        if isinstance(cached_display, list) and cached_display:
-            display_keys = [str(k).strip() for k in cached_display if str(k).strip()]
+        aging_ranges = _opos_aging_ranges_from_tracker(tracker)
+        sort_metric = str(pick("opos_sort_metric", s.get("opos_sort_metric") or "buckets")).strip().lower()
+        if sort_metric not in ("total", "buckets"):
+            sort_metric = "buckets"
+        sort_raw = pick("opos_sort_bucket_keys_json", s.get("opos_sort_bucket_keys_json"))
+        if isinstance(sort_raw, list):
+            sort_keys_list = [str(k).strip() for k in sort_raw if str(k).strip()]
         else:
-            display_raw = pick("opos_display_bucket_keys_json", s.get("opos_display_bucket_keys_json"))
-            if isinstance(display_raw, list):
-                display_keys = [str(k).strip() for k in display_raw if str(k).strip()]
-            else:
-                display_keys = _parse_list(str(display_raw or "[]"), _default_opos_display_bucket_keys())
-        valid = {k for k, _ in OPOS_SORT_BUCKETS}
-        display_keys = [k for k in display_keys if k in valid]
-        if not display_keys:
-            display_keys = _default_opos_display_bucket_keys()
-
-        sort_metric = "buckets"
-        sort_keys_list = list(display_keys)
+            try:
+                ranges = _parse_opos_aging_ranges(aging_ranges)
+                sort_keys_list = _opos_bucket_keys_from_ranges(ranges)
+            except _OposAgingRangeValidationError:
+                sort_keys_list = _opos_bucket_keys_from_ranges(_default_opos_aging_range_tuples())
+        if sort_metric == "total":
+            sort_keys_list = ["__total__"]
         top_enabled = _opos_top_bucket_enabled(
             pick(
                 "opos_top_bucket_enabled",
@@ -7697,7 +9343,7 @@ class ActionRunOpos(Action):
                 "metric": sort_metric,
                 "bucket_keys": sort_keys_list,
             },
-            "display_bucket_keys": display_keys,
+            "aging_buckets": {"ranges": aging_ranges},
             "top_bucket": {
                 "enabled": top_enabled,
                 "numbers": top_numbers,
@@ -7817,7 +9463,28 @@ class ActionStartFilter(Action):
         return "action_start_filter"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
-        headers = _headers_from_sources(tracker)
+        context = _resolve_filter_context(tracker)
+        headers: list[str] = []
+        if context.startswith("ft_"):
+            section = context.removeprefix("ft_")
+            config = ((_fast_track_manifest(tracker).get("sections") or {}).get(section) or {})
+            headers = _normalize_header_list(config.get("headers"))
+            if not headers:
+                periods = config.get("periods") or []
+                if isinstance(periods, list):
+                    headers = _headers_union_for_periods(tracker, periods)
+            if not headers and section == "opos":
+                snapshots = config.get("snapshots") or []
+                if snapshots:
+                    first = snapshots[0]
+                    preview = first.get("debitor") if isinstance(first.get("debitor"), dict) else first
+                    headers = _headers_for_period_file(
+                        tracker,
+                        str((preview or {}).get("file_id") or ""),
+                        str((preview or {}).get("sheet_name") or ""),
+                    )
+        if not headers:
+            headers = _headers_from_sources(tracker)
         dispatcher.utter_message(
             json_message={
                 "type": "adaptive_card",
@@ -7838,8 +9505,10 @@ class ActionStartFilter(Action):
                 "submit_label": "Add Filter",
             }
         )
-        ctx = _resolve_filter_context(tracker)
-        return [SlotSet("active_filter_context", ctx)]
+        return [
+            SlotSet("active_filter_context", context),
+            SlotSet("fast_track_filter_context", context if context.startswith("ft_") else None),
+        ]
 
 
 class ActionProcessFilterRule(Action):
@@ -7927,6 +9596,34 @@ class ActionProcessFilterRule(Action):
         ]
 
 
+class ActionSaveFilterRules(Action):
+    """Persist filter rules from the frontend modal without posting chat cards."""
+
+    def name(self) -> str:
+        return "action_save_filter_rules"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        context = str(
+            payload.get("filter_context")
+            or tracker.get_slot("active_filter_context")
+            or tracker.get_slot("fast_track_filter_context")
+            or ""
+        ).strip()
+        valid = {
+            "gst", "pvm", "top", "bs", "churn", "opos", "fa", "fte",
+            "ft_opos", "ft_fte", "ft_fa", "ft_revenue",
+        }
+        if context not in valid:
+            return []
+        raw_rules = payload.get("filter_rules_json", "[]")
+        if isinstance(raw_rules, list):
+            rules_json = json.dumps(raw_rules, ensure_ascii=False)
+        else:
+            rules_json = str(raw_rules or "[]")
+        return _apply_filter_rules_payload(context, rules_json)
+
+
 class ActionFinishFilters(Action):
     def name(self) -> str:
         return "action_finish_filters"
@@ -7947,12 +9644,83 @@ class ActionFinishFilters(Action):
             "fa": "action_enter_fa_filter_checkpoint",
             "opos": "action_enter_opos_filter_checkpoint",
             "fte": "action_enter_fte_filter_checkpoint",
+            "ft_databook": "action_resume_fast_track_section",
+            "ft_opos": "action_resume_fast_track_section",
+            "ft_fte": "action_resume_fast_track_section",
+            "ft_fa": "action_resume_fast_track_section",
+            "ft_revenue": "action_resume_fast_track_section",
         }
         next_action = follow_map.get(context, "utter_default")
         return [FollowupAction(next_action)]
 
 
 # ─── Post-analysis next action ────────────────────────────────────────────────
+
+
+class ActionProcessPdfReportPrompt(Action):
+    def name(self) -> str:
+        return "action_process_pdf_report_prompt"
+
+    def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        payload = _parse_payload(tracker)
+        choice = str(payload.get("pdf_report_choice") or "N").strip().upper()
+        if choice in {"N", "NO", "FALSE", "0"}:
+            dispatcher.utter_message(text="Understood — no PDF report will be created.")
+            return []
+
+        workbook_path = _resolve_fast_track_workbook_path(
+            tracker,
+            str(payload.get("workbook_path") or "").strip(),
+        )
+        if not workbook_path:
+            dispatcher.utter_message(
+                text=(
+                    "Could not find the Fast Track Excel from this session. "
+                    "Please run Fast Track again, then create the PDF when prompted."
+                )
+            )
+            return []
+
+        output_folder = str(tracker.get_slot("output_folder") or "").strip()
+        project_name = str(tracker.get_slot("project_name") or "").strip()
+        group_name = str(tracker.get_slot("group_name") or "").strip()
+        workbook_dir = os.path.dirname(workbook_path)
+
+        body = {
+            "session_id": _fdd_session_id(tracker),
+            "workbook_path": workbook_path,
+            "output_folder": output_folder or workbook_dir,
+            "project_name": project_name,
+            "company_name": group_name,
+            "group_name": group_name,
+            "config": {
+                "workbook_path": workbook_path,
+                "output_folder": output_folder or workbook_dir,
+                "project_name": project_name,
+                "company_name": group_name,
+                "group_name": group_name,
+            },
+        }
+        result = _fdd_post("/api/v1/fdd/run/fast-track-pdf/async", body, timeout=30)
+        if not result.get("success") and not result.get("run_id"):
+            msg = result.get("detail") or result.get("message") or "Could not start PDF report."
+            if isinstance(msg, list):
+                msg = "; ".join(str(x) for x in msg)
+            dispatcher.utter_message(text=f"PDF report failed to start: {msg}")
+            return []
+
+        dispatcher.utter_message(
+            json_message={
+                "type": "adaptive_card",
+                "card": "script_job",
+                "title": "Fast Track PDF Report",
+                "run_id": result.get("run_id"),
+                "session_id": result.get("session_id") or body["session_id"],
+                "script_key": "fast_track_pdf",
+                "inputs": [],
+            }
+        )
+        return [SlotSet("fast_track_output_workbook_path", workbook_path)]
 
 
 class ActionProcessNextAction(Action):
@@ -8100,41 +9868,47 @@ def _compute_fy_years(tracker: Tracker) -> list[str]:
     return _compute_databook_fy_labels(tracker)
 
 
+def _utter_databook_susa_format_card_payload(*, fast_track: bool = False) -> dict[str, Any]:
+    card: dict[str, Any] = {
+        "type": "adaptive_card",
+        "card": "databook_susa_format",
+        "title": "Databook — Trial balance file layout",
+        "inputs": [
+            {
+                "id": "db_susa_layout_format",
+                "type": "radio",
+                "label": "How are monthly trial balances provided?",
+                "options": [
+                    {
+                        "label": "12 separate Excel files per fiscal year (one workbook per month)",
+                        "value": "monthly_workbooks",
+                    },
+                    {
+                        "label": "One Excel per fiscal year — one sheet per month (12 sheets)",
+                        "value": "monthly_sheets",
+                    },
+                    {
+                        "label": "One Excel per fiscal year — all months on a single sheet",
+                        "value": "single_sheet",
+                    },
+                ],
+            }
+        ],
+        "submit_label": "Continue",
+        "secondary_submit_label": (
+            "I already have a finished SuSa_Master in the correct format"
+        ),
+        "secondary_submit_id": "db_use_existing_master",
+        "secondary_submit_variant": "link",
+    }
+    if fast_track:
+        card["fast_track"] = True
+        card["fast_track_active"] = True
+    return card
+
+
 def _utter_databook_susa_format_card(dispatcher: CollectingDispatcher) -> None:
-    dispatcher.utter_message(
-        json_message={
-            "type": "adaptive_card",
-            "card": "databook_susa_format",
-            "title": "Databook — Trial balance file layout",
-            "inputs": [
-                {
-                    "id": "db_susa_layout_format",
-                    "type": "radio",
-                    "label": "How are monthly trial balances provided?",
-                    "options": [
-                        {
-                            "label": "12 separate Excel files per fiscal year (one workbook per month)",
-                            "value": "monthly_workbooks",
-                        },
-                        {
-                            "label": "One Excel per fiscal year — one sheet per month (12 sheets)",
-                            "value": "monthly_sheets",
-                        },
-                        {
-                            "label": "One Excel per fiscal year — all months on a single sheet",
-                            "value": "single_sheet",
-                        },
-                    ],
-                }
-            ],
-            "submit_label": "Continue",
-            "secondary_submit_label": (
-                "I already have a finished SuSa_Master in the correct format"
-            ),
-            "secondary_submit_id": "db_use_existing_master",
-            "secondary_submit_variant": "link",
-        }
-    )
+    dispatcher.utter_message(json_message=_utter_databook_susa_format_card_payload())
 
 
 def _utter_databook_master_upload_card(dispatcher: CollectingDispatcher) -> None:
@@ -8260,6 +10034,9 @@ class ActionProcessDatabookSusaFormat(Action):
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
         if payload.get("db_use_existing_master"):
+            if _is_fast_track(tracker, payload):
+                dispatcher.utter_message(json_message=_fast_track_databook_card())
+                return [SlotSet("db_master_imported", False), *_fast_track_slot_events()]
             _utter_databook_master_upload_card(dispatcher)
             return [SlotSet("db_master_imported", False)]
 
@@ -8281,6 +10058,9 @@ class ActionShowDatabookMasterUpload(Action):
         return "action_show_databook_master_upload"
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
+        if _is_fast_track(tracker):
+            dispatcher.utter_message(json_message=_fast_track_databook_card())
+            return []
         _utter_databook_master_upload_card(dispatcher)
         return []
 
@@ -8291,6 +10071,7 @@ class ActionProcessDatabookMasterUpload(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
+        is_ft = _is_fast_track(tracker, payload)
         file_id = (
             payload.get("master_workbook_file_file_id")
             or payload.get("master_workbook_file_id")
@@ -8298,9 +10079,21 @@ class ActionProcessDatabookMasterUpload(Action):
             or payload.get("master_workbook_file")
         )
         if not file_id:
+            if is_ft:
+                dispatcher.utter_message(text="Please upload a completed SuSa_Master workbook (.xlsx).")
+                dispatcher.utter_message(json_message=_fast_track_databook_card())
+                return []
             dispatcher.utter_message(text="Please upload a SuSa_Master workbook (.xlsx).")
             _utter_databook_master_upload_card(dispatcher)
             return []
+
+        if is_ft:
+            return _handle_fast_track_master_upload(
+                dispatcher,
+                tracker,
+                file_id=str(file_id),
+                file_path=str(payload.get("file_path") or ""),
+            ) + _fast_track_slot_events()
 
         body = {
             "session_id": _fdd_session_id(tracker),
@@ -8328,7 +10121,10 @@ class ActionProcessDatabookMasterUpload(Action):
                 SlotSet("db_susa_mapping_confirmed", True),
                 SlotSet("db_master_imported", True),
             ])
-            _utter_databook_l4_sort_card(dispatcher, tracker)
+            if _is_fast_track(tracker, payload):
+                events.extend(_finish_fast_track_databook_section(dispatcher, tracker))
+            else:
+                _utter_databook_l4_sort_card(dispatcher, tracker)
         else:
             dispatcher.utter_message(
                 text=f"Import failed: {result.get('message', 'Unknown error')}"
@@ -8603,6 +10399,9 @@ def _utter_databook_consolidation_account_card(dispatcher: CollectingDispatcher)
                 }
             ],
             "submit_label": "Continue",
+            "secondary_submit_label": "Skip this step",
+            "secondary_submit_id": "db_skip_consolidation",
+            "secondary_submit_variant": "link",
         }
     )
 
@@ -8809,6 +10608,9 @@ def _utter_databook_adjustments_card(dispatcher: CollectingDispatcher) -> None:
                 }
             ],
             "submit_label": "Continue",
+            "secondary_submit_label": "Skip this step",
+            "secondary_submit_id": "db_skip_adjustments",
+            "secondary_submit_variant": "link",
         }
     )
 
@@ -9304,6 +11106,9 @@ class ActionProcessDatabookConsolidationAccount(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
+        if payload.get("db_skip_consolidation"):
+            _utter_databook_adjustments_card(dispatcher)
+            return [SlotSet("db_consolidation_account_level", "skipped")]
         level = str(payload.get("db_consolidation_account_level") or "no").strip().lower()
         _utter_databook_consolidation_level_card(dispatcher)
         return [SlotSet("db_consolidation_account_level", level)]
@@ -9413,9 +11218,18 @@ class ActionProcessDatabookAdjustments(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
+        if payload.get("db_skip_adjustments"):
+            if _is_fast_track(tracker, payload):
+                return _finish_fast_track_databook_section(dispatcher, tracker) + [
+                    SlotSet("db_apply_adjustments", "skipped")
+                ]
+            _utter_databook_l4_sort_card(dispatcher, tracker)
+            return [SlotSet("db_apply_adjustments", "skipped")]
         apply_adj = str(payload.get("db_apply_adjustments") or "no").strip().lower()
         events = [SlotSet("db_apply_adjustments", apply_adj)]
         if apply_adj == "no":
+            if _is_fast_track(tracker, payload):
+                return _finish_fast_track_databook_section(dispatcher, tracker) + events
             _utter_databook_l4_sort_card(dispatcher, tracker)
         else:
             fy_end_m, fy_end_d = _fy_end_month_day_from_tracker({}, tracker)
@@ -9481,7 +11295,10 @@ class ActionProcessDatabookAdjustmentsUpload(Action):
             master_path = _master_path_from_result(result, tracker)
             if master_path:
                 events.append(SlotSet("db_master_workbook_path", master_path))
-            _utter_databook_l4_sort_card(dispatcher, tracker)
+            if _is_fast_track(tracker, payload):
+                events.extend(_finish_fast_track_databook_section(dispatcher, tracker))
+            else:
+                _utter_databook_l4_sort_card(dispatcher, tracker)
         else:
             dispatcher.utter_message(
                 text=f"Adjustments error: {result.get('message', 'Unknown error')}"
@@ -9496,6 +11313,8 @@ class ActionProcessDatabookL4Sort(Action):
 
     def run(self, dispatcher: CollectingDispatcher, tracker: Tracker, domain: dict) -> list:
         payload = _parse_payload(tracker)
+        if _is_fast_track(tracker, payload):
+            return _finish_fast_track_databook_section(dispatcher, tracker)
         basis = str(payload.get("db_l4_sort_basis") or "latest_fy").strip().lower()
         if basis not in ("all_fy", "latest_fy", "ytd"):
             dispatcher.utter_message(text="Please choose how L4 lines should be sorted.")
@@ -9646,6 +11465,7 @@ class ActionProcessDatabookReconOrder(Action):
             "company_name": tracker.get_slot("group_name") or "Group",
             "entity_order": list(entity_order),
             "l4_sort_basis": tracker.get_slot("db_l4_sort_basis") or "latest_fy",
+            "preserve_master_sheets": bool(tracker.get_slot("db_master_imported")),
         }
         result = _fdd_post("/api/v1/fdd/run/databook/recon-core", body, timeout=900)
         events = [SlotSet("db_recon_entity_order", list(entity_order))]
@@ -9697,6 +11517,7 @@ class ActionProcessDatabookExtendedTables(Action):
             "company_name": tracker.get_slot("group_name") or "Group",
             "entity_order": tracker.get_slot("db_recon_entity_order") or [],
             "l4_sort_basis": tracker.get_slot("db_l4_sort_basis") or "latest_fy",
+            "preserve_master_sheets": bool(tracker.get_slot("db_master_imported")),
         }
         result = _fdd_post("/api/v1/fdd/run/databook/extended-tables", body, timeout=1200)
         events = [SlotSet("db_create_extended_tables", choice)]

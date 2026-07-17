@@ -27,6 +27,7 @@ from funktionssammlung import (  # noqa: E402
     build_chunked_row_sum_formula,
     build_output_file_path,
     build_sumifs_formula_body,
+    revenue_report_helper_letter,
     ensure_output_writable,
     ensure_source_sheet_in_output,
     ensure_text_filter_helper_columns_from_cfg_in_ws,
@@ -37,6 +38,11 @@ from funktionssammlung import (  # noqa: E402
     source_range_ref,
     _get_sheet_header_map,
     _normalize_header_name,
+)
+from revenue_reconciliation import (  # noqa: E402
+    RECON_DIFFERENCE_LABEL,
+    sales_basis_labels,
+    write_reconciliation_cells,
 )
 
 
@@ -189,7 +195,7 @@ def _leaf_sumifs_formula(
         if not _source_header_present(src_header, gc):
             continue
         rng = source_range_ref(source_sheet_name, src_header, gc)
-        key_ref = f"${get_column_letter(i + 1)}${r}"
+        key_ref = f"${revenue_report_helper_letter(i)}${r}"
         pairs.append((rng, key_ref))
     if not pairs:
         return None
@@ -262,7 +268,7 @@ def apply_churn_formulas(
                     gc = group_cols[0]
                     if _source_header_present(src_header, gc):
                         rng = source_range_ref(source_sheet_name, src_header, gc)
-                        key_ref = f"${get_column_letter(1)}${r}"
+                        key_ref = f"${revenue_report_helper_letter(0)}${r}"
                         body = build_sumifs_formula_body(sum_rng, [(rng, key_ref)], [[]], divide_by_1000=False)
                         apply_col_formula(r, col_idx, "=" + body)
                 elif rt == "leaf":
@@ -306,6 +312,78 @@ def apply_churn_formulas(
     wb.calculation.forceFullCalc = True
 
 
+def apply_churn_reconciliation(wb, report_sheet: str, layout: dict, cfg: dict | None = None) -> None:
+    labels = sales_basis_labels((cfg or {}).get("sales_basis"))
+    ws = wb[report_sheet]
+    label_col = layout["label_col"]
+    row_type_col = layout.get("row_type_col")
+    rows_by_label = {
+        str(ws.cell(r, label_col).value or "").strip(): r
+        for r in range(layout["data_start_row"], ws.max_row + 1)
+    }
+    total_row = rows_by_label.get(labels.total_label)
+    recon_row = rows_by_label.get(RECON_DIFFERENCE_LABEL)
+    reported_row = rows_by_label.get(labels.reported_label)
+    # Prefer row_type markers — more reliable than label text after hierarchy edits.
+    if row_type_col:
+        for r in range(layout["data_start_row"], (ws.max_row or 0) + 1):
+            rt = str(ws.cell(r, row_type_col).value or "").strip().lower()
+            if rt == "total" and total_row is None:
+                total_row = r
+            elif rt == "recon":
+                recon_row = r
+            elif rt == "reported":
+                reported_row = r
+    if not all((total_row, recon_row, reported_row)):
+        return
+    period_columns = {
+        label: col_idx for label, col_idx in layout.get("fy_col_indices", [])
+    }
+    if not period_columns:
+        return
+    write_reconciliation_cells(
+        wb,
+        ws,
+        period_columns=period_columns,
+        total_row=total_row,
+        recon_row=recon_row,
+        reported_row=reported_row,
+        sales_basis=labels.sales_basis,
+    )
+
+
+def run_churn_in_workbook(cfg: dict, wb) -> str:
+    """Fast Track / session mode: write Churn into an already-open workbook."""
+    from funktionssammlung import ensure_source_sheet_in_workbook
+
+    cfg = normalize_config(cfg)
+    sheet = cfg.get("sheet_name") or "Data Template"
+    df = pd.read_excel(cfg["file_path"], sheet_name=sheet, engine="openpyxl")
+    df.columns = df.columns.astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
+    cfg = dict(cfg)
+    cfg["group_cols"] = resolve_column_names_to_df(df, list(cfg["group_cols"]))
+    export_df = build_merged_horizontal_bridge(df, cfg)
+    formula_mode = bool(cfg.get("formula_mode", True))
+    report_sheet = str(cfg.get("base_sheet_name") or "Churn")
+
+    if formula_mode:
+        source_sheet = ensure_source_sheet_in_workbook(wb, cfg, df)
+        refresh_source_sheet_from_df(wb[source_sheet], df, cfg)
+        ensure_text_filter_helper_columns_from_cfg_in_ws(ws_source=wb[source_sheet], source_df=df, cfg=cfg)
+        col_letters = _append_arr_helpers_on_source(wb, source_sheet, df, cfg)
+        report_sheet = get_next_sheet_name_from_wb(wb, report_sheet)
+        write_churn_export_to_workbook(wb, export_df, report_sheet, cfg, formula_mode=True)
+        layout = format_churn_excel(wb, report_sheet, export_df, cfg, formula_mode=True)
+        layout["report_sheet"] = report_sheet
+        apply_churn_formulas(wb, layout, cfg, source_sheet, col_letters)
+        apply_churn_reconciliation(wb, report_sheet, layout, cfg)
+    else:
+        write_churn_export_to_workbook(wb, export_df, report_sheet, cfg, formula_mode=False)
+        layout = format_churn_excel(wb, report_sheet, export_df, cfg, formula_mode=False)
+        apply_churn_reconciliation(wb, report_sheet, layout, cfg)
+    return report_sheet
+
+
 def main() -> str:
     if len(sys.argv) < 2:
         raise ValueError("Bitte den Pfad zur churn config.json als Argument übergeben.")
@@ -343,6 +421,7 @@ def main() -> str:
         layout = format_churn_excel(wb, report_sheet, export_df, cfg, formula_mode=True)
         layout["report_sheet"] = report_sheet
         apply_churn_formulas(wb, layout, cfg, source_sheet, col_letters)
+        apply_churn_reconciliation(wb, report_sheet, layout, cfg)
         wb.save(output_path)
         wb.close()
     else:
@@ -352,7 +431,8 @@ def main() -> str:
         if wb.sheetnames[0] == "Sheet":
             del wb["Sheet"]
         write_churn_export_to_workbook(wb, export_df, report_sheet, cfg, formula_mode=False)
-        format_churn_excel(wb, report_sheet, export_df, cfg, formula_mode=False)
+        layout = format_churn_excel(wb, report_sheet, export_df, cfg, formula_mode=False)
+        apply_churn_reconciliation(wb, report_sheet, layout, cfg)
         wb.save(output_path)
         wb.close()
 

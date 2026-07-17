@@ -18,6 +18,8 @@ export interface BotConversationProps {
   preloadedFile?: File | null
   /** Line under the composer */
   footerNote?: string
+  /** Reserved for embedded chat composers. */
+  inputPlaceholder?: string
   /** Use full width centered content column */
   wide?: boolean
 }

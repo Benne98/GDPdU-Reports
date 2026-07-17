@@ -21,7 +21,7 @@ def _wb_with_strand_tabs():
     wb.create_sheet("__SOURCE__FA_Dec25A")
     wb.create_sheet("FA roll forward")
     wb.create_sheet("FTE Development")
-    wb.create_sheet("__SOURCE__FY25A")
+    wb.create_sheet("__SOURCE__FTE_FY25A")
     wb.create_sheet("PL_Reconciliation")
     return wb
 
@@ -51,7 +51,7 @@ def test_clear_fte_workbook_sheets_preserves_other_strands():
     wb = _wb_with_strand_tabs()
     clear_fte_workbook_sheets(wb)
     assert "FTE Development" not in wb.sheetnames
-    assert "__SOURCE__FY25A" not in wb.sheetnames
+    assert "__SOURCE__FTE_FY25A" not in wb.sheetnames
     assert "Trade debtors aging" in wb.sheetnames
     assert "FA roll forward" in wb.sheetnames
     assert "__SOURCE__FA_Dec25A" in wb.sheetnames

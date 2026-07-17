@@ -110,7 +110,7 @@ class TestFteHelpers(unittest.TestCase):
             resolve_period_header({"label": "FY2025", "header": "YTD25A"}, {}),
             "YTD25A",
         )
-        self.assertEqual(fte_source_sheet_name("FY2023"), "__SOURCE__FY23A")
+        self.assertEqual(fte_source_sheet_name("FY2023"), "__SOURCE__FTE_FY23A")
 
     def test_column_layout_one_group(self):
         layout = fte_column_layout(1)
@@ -165,9 +165,9 @@ class TestFteIntegration(unittest.TestCase):
             self.assertIn("# Average FTEs", joined)
             self.assertIn("Payroll accounting", joined)
             self.assertIn("Personnel expenses", joined)
-            self.assertEqual(len([s for s in wb.sheetnames if s.startswith("__SOURCE__")]), 3)
-            self.assertIn("__SOURCE__FY23A", wb.sheetnames)
-            self.assertIn("__SOURCE__YTD25A", wb.sheetnames)
+            self.assertEqual(len([s for s in wb.sheetnames if s.startswith("__SOURCE__FTE_")]), 3)
+            self.assertIn("__SOURCE__FTE_FY23A", wb.sheetnames)
+            self.assertIn("__SOURCE__FTE_YTD25A", wb.sheetnames)
 
     @unittest.skipUnless(
         all((PERSONNEL_DIR / f"personaltable_{y}.xlsx").is_file() for y in (2023, 2024, 2025)),

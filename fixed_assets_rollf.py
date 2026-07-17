@@ -47,6 +47,23 @@ from databook_excel_layout import (  # noqa: E402
     find_recon_block_start_col,
 )
 from databook_workbook import FA_ROLLF_OUTPUT_SHEET  # noqa: E402
+from source_data_audit import (  # noqa: E402
+    ISSUE_EMPTY_GROUPED_AS_NA,
+    ISSUE_MISSING_OR_INVALID,
+    ISSUE_NON_NUMERIC,
+    MISSING_GROUP_LABEL,
+    audit_column_entry,
+    count_missing_series,
+    count_non_numeric_series,
+    finalize_audit_payload,
+    group_sumifs_criterion,
+    is_blank_group_value,
+    merge_audit_file_result,
+    normalize_group_tuple,
+    normalize_group_value,
+    read_excel_period_df,
+    resolve_header_letter,
+)
 
 FA_TABLE_TITLE = "FA roll forward"
 
@@ -346,7 +363,7 @@ def aggregate_period(
         for key, grp in grouped:
             if not isinstance(key, tuple):
                 key = (key,)
-            key = tuple("" if pd.isna(v) else str(v).strip() for v in key)
+            key = normalize_group_tuple(key if isinstance(key, tuple) else (key,))
             row: dict[str, float] = {}
             for k, col in key_map.items():
                 if k == "depreciation" and isinstance(col, list):
@@ -398,7 +415,12 @@ def build_row_specs(
 
     if len(group_cols) == 1:
         return [
-            RowSpec(row_type="leaf", label=k[0] if k else "", level=1, group_key=k)
+            RowSpec(
+                row_type="leaf",
+                label=normalize_group_value(k[0] if k else ""),
+                level=1,
+                group_key=k,
+            )
             for k in sorted(keys, key=_sort_key)
         ]
     by_l1: dict[str, list[tuple[str, ...]]] = defaultdict(list)
@@ -472,6 +494,107 @@ def build_bridge_columns(
     return columns, []
 
 
+def audit_fa_rollf_mapped_columns(
+    periods: list[dict],
+    columns: dict[str, Any],
+    *,
+    header_row: int = 0,
+    group_cols: list[str] | None = None,
+) -> dict:
+    """Audit mapped FA rollforward columns per period file."""
+    files: list[dict] = []
+    total_invalid = 0
+    group_cols = [str(c).strip() for c in (group_cols or []) if str(c).strip()]
+    amount_roles = (
+        ("opening", str(columns.get("opening") or "").strip()),
+        ("additions", str(columns.get("additions") or "").strip()),
+        ("disposals", str(columns.get("disposals") or "").strip()),
+    )
+    dep_cols = [str(c).strip() for c in (columns.get("depreciation_cols") or []) if str(c).strip()]
+
+    for period in periods:
+        fp = str(period.get("file_path") or "").strip()
+        label = str(period.get("label") or Path(fp).name).strip()
+        if not fp:
+            continue
+        sheet = str(period.get("sheet_name") or "").strip()
+        if not sheet:
+            sheet = _resolve_sheet_name(fp, "")
+        df = read_excel_period_df(fp, sheet, header_row=header_row)
+        d = apply_filters(df.copy(), {"filters": {"enabled": False}})
+
+        col_entries: list[dict] = []
+        invalid_rows = 0
+        notes: list[str] = []
+
+        for role, header in amount_roles:
+            if not header or header not in d.columns:
+                continue
+            bad = count_non_numeric_series(d[header])
+            missing = count_missing_series(d[header])
+            invalid_rows = max(invalid_rows, bad + missing)
+            for count, issue in ((missing, ISSUE_MISSING_OR_INVALID), (bad, ISSUE_NON_NUMERIC)):
+                entry = audit_column_entry(
+                    role=role,
+                    header=header,
+                    count=count,
+                    issue=issue,
+                    letter=resolve_header_letter(d, header, role=role),
+                )
+                if entry:
+                    col_entries.append(entry)
+
+        for i, header in enumerate(dep_cols):
+            if header not in d.columns:
+                continue
+            bad = count_non_numeric_series(d[header])
+            missing = count_missing_series(d[header])
+            invalid_rows = max(invalid_rows, bad + missing)
+            for count, issue in ((missing, ISSUE_MISSING_OR_INVALID), (bad, ISSUE_NON_NUMERIC)):
+                entry = audit_column_entry(
+                    role=f"depreciation_{i}",
+                    header=header,
+                    count=count,
+                    issue=issue,
+                    letter=resolve_header_letter(d, header, role=f"depreciation_{i}"),
+                )
+                if entry:
+                    col_entries.append(entry)
+
+        for i, gc in enumerate(group_cols):
+            if gc not in d.columns:
+                continue
+            empty = int(d[gc].map(is_blank_group_value).sum())
+            if empty > 0:
+                notes.append(
+                    f'{empty} row(s) with empty {gc} will appear under aggregate position "{MISSING_GROUP_LABEL}".'
+                )
+            entry = audit_column_entry(
+                role=f"group_{i}",
+                header=gc,
+                count=empty,
+                issue=ISSUE_EMPTY_GROUPED_AS_NA,
+                letter=resolve_header_letter(d, gc, role=f"group_{i}"),
+            )
+            if entry:
+                col_entries.append(entry)
+
+        total_invalid += invalid_rows
+        merge_audit_file_result(
+            files,
+            label=label,
+            file_path=fp,
+            sheet_name=sheet,
+            columns=col_entries,
+            excluded_rows=invalid_rows,
+            notes=notes,
+        )
+
+    payload = finalize_audit_payload(files, total_excluded=0)
+    payload["total_invalid"] = total_invalid
+    return payload
+
+
 def _divide_by_scale(cfg: dict) -> bool:
     return float(cfg.get("amount_scale") or 1000) == 1000.0
 
@@ -483,6 +606,7 @@ def _group_sumifs_pairs(
     row_idx: int,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for i, gc in enumerate(group_cols):
@@ -490,7 +614,11 @@ def _group_sumifs_pairs(
             break
         col_idx = group_crit_cols[i]
         rng = source_range_ref(source_sheet, header_map, gc)
-        crit = f"${col_letter(col_idx)}{row_idx}"
+        crit_ref = f"${col_letter(col_idx)}{row_idx}"
+        crit_val = None
+        if group_crit_values and i < len(group_crit_values):
+            crit_val = group_crit_values[i]
+        crit = group_sumifs_criterion(crit_ref, crit_val)
         pairs.append((rng, crit))
     return pairs
 
@@ -511,10 +639,16 @@ def _fa_sumifs_formula(
     cfg: dict,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> str:
     amount_rng = source_range_ref(source_sheet, header_map, amount_header)
     base_pairs = _group_sumifs_pairs(
-        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+        source_sheet,
+        header_map,
+        group_cols,
+        row_idx,
+        group_crit_cols=group_crit_cols,
+        group_crit_values=group_crit_values,
     )
     filter_branches = _formula_filter_branches(cfg, source_sheet, header_map)
     body = build_sumifs_formula_body(
@@ -534,6 +668,7 @@ def _fa_depreciation_formula(
     cfg: dict,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> str:
     headers = _depreciation_cols_from_cfg(cfg)
     if len(headers) == 1:
@@ -545,10 +680,16 @@ def _fa_depreciation_formula(
             group_cols,
             cfg,
             group_crit_cols=group_crit_cols,
+            group_crit_values=group_crit_values,
         )
     parts: list[str] = []
     base_pairs = _group_sumifs_pairs(
-        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+        source_sheet,
+        header_map,
+        group_cols,
+        row_idx,
+        group_crit_cols=group_crit_cols,
+        group_crit_values=group_crit_values,
     )
     filter_branches = _formula_filter_branches(cfg, source_sheet, header_map)
     for hdr in headers:
@@ -731,10 +872,14 @@ def write_workbook(
     source_aggs: list[dict],
     source_dfs: list[pd.DataFrame],
     source_header_maps: list[dict[str, int]],
+    *,
+    wb=None,
+    save: bool = True,
 ) -> str:
     cfg = normalize_config(cfg)
     out_path = build_output_file_path(cfg)
-    ensure_output_writable(out_path)
+    if save:
+        ensure_output_writable(out_path)
 
     group_cols = cfg["group_cols"]
     layout = fa_column_layout(len(group_cols))
@@ -778,11 +923,18 @@ def write_workbook(
     total_row = r
     last_table_row = total_row
 
-    wb = open_session_workbook(cfg)
+    if wb is None:
+        wb = open_session_workbook(cfg)
+    else:
+        from databook_workbook import clear_fa_rollf_workbook_sheets
+
+        clear_fa_rollf_workbook_sheets(wb)
     ws = replace_workbook_sheet(wb, cfg["sheet_name"][:31])
 
     project = _sentence_case_title(str(cfg.get("title") or cfg.get("project_name") or "Project"))
-    company = str(cfg.get("company") or cfg.get("group_name") or "").strip()
+    company = str(
+        cfg.get("company") or cfg.get("company_name") or cfg.get("group_name") or ""
+    ).strip()
     sheet_label = str(cfg.get("sheet_name") or "Fixed assets rollforward").strip()
 
     ws.cell(PROJECT_TITLE_ROW, layout.pos_col, project).font = FONT_PROJECT
@@ -866,17 +1018,37 @@ def write_workbook(
                 cell.value = _parent_sum_formula(er, child_rows, bc.col_idx)
             elif bc.kind == "period":
                 cell.value = _fa_sumifs_formula(
-                    src, hmap, opening_header, er, group_cols, cfg, group_crit_cols=group_crit_cols
+                    src,
+                    hmap,
+                    opening_header,
+                    er,
+                    group_cols,
+                    cfg,
+                    group_crit_cols=group_crit_cols,
+                    group_crit_values=spec.group_key,
                 )
             elif bc.kind == "movement":
                 mk = bc.movement_key or "additions"
                 if mk == "depreciation":
                     cell.value = _fa_depreciation_formula(
-                        src, hmap, er, group_cols, cfg, group_crit_cols=group_crit_cols
+                        src,
+                        hmap,
+                        er,
+                        group_cols,
+                        cfg,
+                        group_crit_cols=group_crit_cols,
+                        group_crit_values=spec.group_key,
                     )
                 else:
                     cell.value = _fa_sumifs_formula(
-                        src, hmap, cfg["columns"][mk], er, group_cols, cfg, group_crit_cols=group_crit_cols
+                        src,
+                        hmap,
+                        cfg["columns"][mk],
+                        er,
+                        group_cols,
+                        cfg,
+                        group_crit_cols=group_crit_cols,
+                        group_crit_values=spec.group_key,
                     )
 
             _style_value_cell(cell, bold=is_parent, fill=period_fill if bc.kind == "period" and not is_parent else row_fill)
@@ -908,6 +1080,7 @@ def write_workbook(
         if sheet_title in wb.sheetnames:
             del wb[sheet_title]
         src_ws = wb.create_sheet(sheet_title)
+        src_ws.sheet_state = "visible"
         stub_cfg = {
             "file_path": cfg["periods"][i]["file_path"],
             "sheet_name": _resolve_sheet_name(
@@ -1015,14 +1188,15 @@ def write_workbook(
     _paint_check_source_yellow(ws, layout, check_source_row, table_cols)
     _paint_check_source_yellow(ws, layout, check_bsrec_row, table_cols)
 
-    from databook_workbook import reorder_workbook_sheets
+    if save:
+        from databook_workbook import reorder_workbook_sheets
 
-    reorder_workbook_sheets(wb)
-    wb.save(out_path)
+        reorder_workbook_sheets(wb)
+        wb.save(out_path)
     return out_path
 
 
-def run_fixed_assets_rollf(cfg: dict) -> str:
+def run_fixed_assets_rollf(cfg: dict, wb=None, save: bool = True) -> str:
     cfg = normalize_config(cfg)
     header_row = int(cfg["header_row"])
     period_specs = [
@@ -1047,7 +1221,14 @@ def run_fixed_assets_rollf(cfg: dict) -> str:
         write_source_df_to_ws(tmp_ws, work, stub)
         source_header_maps.append(_get_sheet_header_map(tmp_ws))
 
-    return write_workbook(cfg, source_aggs, source_dfs, source_header_maps)
+    return write_workbook(
+        cfg,
+        source_aggs,
+        source_dfs,
+        source_header_maps,
+        wb=wb,
+        save=save,
+    )
 
 
 def main() -> None:

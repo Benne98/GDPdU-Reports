@@ -18,6 +18,8 @@ const SCRIPT_LABELS: Record<string, string> = {
   bubble: 'Bubble Scatter Plot',
   working_capital: 'Working capital',
   cashflow: 'Cash flow',
+  fast_track: 'Fast Track',
+  fast_track_pdf: 'Fast Track PDF Report',
 }
 
 export function scriptDisplayLabel(scriptKey: string): string {
@@ -148,5 +150,31 @@ export function buildFileAttachmentCard(
     download_url: `/api/v1/fdd/download?path=${encodeURIComponent(outputFile)}`,
     notification: options?.notification,
     inputs: [],
+  }
+}
+
+export function buildPdfReportPromptCard(workbookPath: string): AdaptiveCardPayload {
+  const filename = workbookPath ? workbookPath.split(/[/\\]/).pop() ?? '' : ''
+  return {
+    type: 'adaptive_card',
+    card: 'pdf_report_prompt',
+    title: 'PDF report',
+    subtitle: filename
+      ? `Would you also like to create a PDF report from ${filename}?`
+      : 'Would you also like to create a PDF report from your Fast Track Excel?',
+    metadata: { workbook_path: workbookPath },
+    inputs: [
+      {
+        id: 'pdf_report_choice',
+        type: 'radio',
+        label: 'Create PDF report?',
+        options: [
+          { label: 'Yes', value: 'Y' },
+          { label: 'No', value: 'N' },
+        ],
+        default: 'Y',
+      },
+    ],
+    submit_label: 'Continue',
   }
 }

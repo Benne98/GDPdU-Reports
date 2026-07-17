@@ -40,8 +40,9 @@ from databook_periods import (  # noqa: E402
     split_fy_and_ytd,
 )
 from report_row_layout import (  # noqa: E402
-    CF_BUCKET_ORDER,
     CF_BUCKET_TOTAL_LABELS,
+    CF_FINANCING_NA_BUCKETS,
+    CF_OPERATING_BUCKET_ORDER,
     build_cf_na_bucket_row_structure,
     compute_l4_sort_metric,
     l3_order_from_mapping,
@@ -254,7 +255,7 @@ def normalize_cf_na_bucket(x) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return "Other"
     s = str(x).strip()
-    if s in ("TWC", "OWC", "Other", "ND", "FA", "Equity"):
+    if s in ("TWC", "OWC", "Other", "ND", "DL", "FA", "Equity"):
         return s
     if s.startswith("TWC"):
         return "TWC"
@@ -262,8 +263,12 @@ def normalize_cf_na_bucket(x) -> str:
         return "OWC"
     if s.startswith("ND"):
         return "ND"
+    if s.startswith("DL"):
+        return "DL"
     if s.startswith("FA"):
         return "FA"
+    if s.startswith("Equity"):
+        return "Equity"
     return "Other"
 
 
@@ -354,13 +359,17 @@ def resolve_pl_l3_label(wb, kind: str) -> str:
 
 def subtotal_span_for_l3(struct, idx: int, bucket: str, l3_label: str) -> tuple[int, int]:
     k = idx - 1
-    while (
-        k >= 0
-        and struct[k]["type"] in {"detail", "detail_single"}
-        and struct[k].get("NA") == bucket
-        and struct[k].get("L3") == l3_label
-    ):
-        k -= 1
+    while k >= 0 and struct[k]["type"] in {"detail", "detail_single"}:
+        prev = struct[k]
+        if prev.get("NA") != bucket:
+            break
+        if l3_label == "Equity" and prev.get("L2") == "Equity":
+            k -= 1
+            continue
+        if prev.get("L3") == l3_label and prev.get("L2") != "Equity":
+            k -= 1
+            continue
+        break
     start = DATA_START_ROW + (k + 1)
     end = DATA_START_ROW + (idx - 1)
     return start, end
@@ -379,6 +388,67 @@ def bucket_l3_level_refs(struct, bucket: str, col_l: str) -> list[str]:
 
 def fr_detail_row_refs(struct, col_l: str) -> list[str]:
     return [f"{col_l}{rr['_excel_row']}" for rr in struct if rr["type"] == "fr_detail"]
+
+
+def financing_nd_row_refs(struct, col_l: str) -> list[str]:
+    """Sum ND + Equity financing rows (L3 subtotals / single-line L3) — exclude L4 detail lines."""
+    refs = bucket_l3_level_refs(struct, "ND", col_l)
+    refs.extend(bucket_l3_level_refs(struct, "Equity", col_l))
+    return refs
+
+
+def build_financing_rows(
+    pl_map_df: pd.DataFrame,
+    df_pl: pd.DataFrame,
+    df_bs: pd.DataFrame,
+    *,
+    mapping_l3_order: list[str],
+    source_col: str | None,
+    na_col: str,
+    na_l3_order: dict[str, list[str]],
+) -> list[dict]:
+    l4_order = l4_order_from_pl_l3_mapping(pl_map_df, FINANCIAL_RESULT_L3)
+    pl_source = resolve_source_section_column(df_pl)
+    if pl_source:
+        rep = df_pl[pl_source].astype(str).str.strip().str.lower().eq(REPORTED_FILTER_VALUE)
+        master_l4s = set(
+            df_pl.loc[
+                rep & df_pl["L3"].astype(str).str.strip().str.lower().eq(FINANCIAL_RESULT_L3.lower()),
+                "L4",
+            ]
+            .astype(str)
+            .str.strip()
+        )
+        l4_order = [l4 for l4 in l4_order if l4 in master_l4s]
+
+    rows: list[dict] = []
+    for l4 in l4_order:
+        rows.append(
+            {
+                "type": "fr_detail",
+                "label": l4,
+                "L3": FINANCIAL_RESULT_L3,
+                "L4": l4,
+            }
+        )
+    rows.append({"type": "subtotal_fr", "label": FINANCIAL_RESULT_L3})
+
+    nd_rows = build_cf_na_bucket_row_structure(
+        df_bs,
+        mapping_l3_order,
+        {"l4_sort_basis": L4_SORT_BASIS},
+        source_col=source_col or na_col,
+        bucket_col=na_col,
+        bucket_order=CF_FINANCING_NA_BUCKETS,
+        bucket_total_labels={},
+        normalize_bucket_fn=normalize_cf_na_bucket,
+        na_l3_order=na_l3_order,
+        include_bucket_total=False,
+    )
+    rows.extend(nd_rows)
+    rows.append({"type": "financial_result", "label": "Cash flow from financing activities"})
+    rows.append({"type": "net_cash_flow", "label": "Net cash flow"})
+    return rows
 
 
 def build_pl_adjustment_detail_rows(df_pl: pd.DataFrame) -> list[dict]:
@@ -432,35 +502,6 @@ def pl_adj_detail_row_refs(struct, col_l: str) -> list[str]:
         for rr in struct
         if rr["type"] in {"pl_adj_detail", "pl_adj_detail_single"}
     ]
-
-
-def build_financial_result_rows(pl_map_df: pd.DataFrame, df_pl: pd.DataFrame) -> list[dict]:
-    l4_order = l4_order_from_pl_l3_mapping(pl_map_df, FINANCIAL_RESULT_L3)
-    source_col = resolve_source_section_column(df_pl)
-    if source_col:
-        rep = df_pl[source_col].astype(str).str.strip().str.lower().eq(REPORTED_FILTER_VALUE)
-        master_l4s = set(
-            df_pl.loc[
-                rep & df_pl["L3"].astype(str).str.strip().str.lower().eq(FINANCIAL_RESULT_L3.lower()),
-                "L4",
-            ]
-            .astype(str)
-            .str.strip()
-        )
-        l4_order = [l4 for l4 in l4_order if l4 in master_l4s]
-    rows: list[dict] = []
-    for l4 in l4_order:
-        rows.append(
-            {
-                "type": "fr_detail",
-                "label": l4,
-                "L3": FINANCIAL_RESULT_L3,
-                "L4": l4,
-            }
-        )
-    rows.append({"type": "financial_result", "label": "Cash flow from financing activities"})
-    rows.append({"type": "net_cash_flow", "label": "Net cash flow"})
-    return rows
 
 
 def display_label(r: dict) -> str:
@@ -583,7 +624,8 @@ def main() -> None:
     mapping_l3_order = l3_order_from_mapping(map_df)
 
     na_l3_map_df = pd.read_excel(cf_na_l3_order_file, sheet_name=0, engine="openpyxl")
-    na_l3_order = load_na_l3_orders(na_l3_map_df, CF_BUCKET_ORDER)
+    cf_na_buckets = CF_OPERATING_BUCKET_ORDER + CF_FINANCING_NA_BUCKETS
+    na_l3_order = load_na_l3_orders(na_l3_map_df, cf_na_buckets)
 
     master_bs_ref = SHEET_MASTER_BS
     master_start = 2
@@ -648,7 +690,7 @@ def main() -> None:
         {"l4_sort_basis": L4_SORT_BASIS},
         source_col=source_col or na_col,
         bucket_col=na_col,
-        bucket_order=CF_BUCKET_ORDER,
+        bucket_order=CF_OPERATING_BUCKET_ORDER,
         bucket_total_labels=CF_BUCKET_TOTAL_LABELS,
         normalize_bucket_fn=normalize_cf_na_bucket,
         na_l3_order=na_l3_order,
@@ -668,7 +710,17 @@ def main() -> None:
     row_structure.extend(FIXED_ROWS_AFTER_WC)
 
     pl_map_df = pd.read_excel(pl_mapping_file, sheet_name=0, engine="openpyxl")
-    row_structure.extend(build_financial_result_rows(pl_map_df, df_pl))
+    row_structure.extend(
+        build_financing_rows(
+            pl_map_df,
+            df_pl,
+            df_bs,
+            mapping_l3_order=mapping_l3_order,
+            source_col=source_col,
+            na_col=na_col,
+            na_l3_order=na_l3_order,
+        )
+    )
 
     for i, r in enumerate(row_structure):
         r["_idx"] = i
@@ -781,6 +833,7 @@ def main() -> None:
         "ebitda_adjusted",
         "fcf_before_tax",
         "total_na",
+        "subtotal_fr",
         "financial_result",
     }
     table_right_col = Y_COLS[-1]
@@ -834,6 +887,7 @@ def main() -> None:
             pc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
             ws.row_dimensions[excel_row].outlineLevel = 1
             ws.row_dimensions[excel_row].collapsed = True
+            ws.row_dimensions[excel_row].hidden = True
         elif rt in {"detail_single", "subtotal_l3", "pl_adj_detail_single"}:
             ws.row_dimensions[excel_row].outlineLevel = 0
         else:
@@ -913,7 +967,7 @@ def main() -> None:
                     cell.value = 0
             elif rt == "operating_cf":
                 parts = [f"{col_l}{row_by_type['ebitda_adjusted']}"]
-                for b in CF_BUCKET_ORDER:
+                for b in CF_OPERATING_BUCKET_ORDER:
                     br = bucket_total_row.get(b)
                     if br:
                         parts.append(f"{col_l}{br}")
@@ -939,9 +993,13 @@ def main() -> None:
                     )
                 else:
                     cell.value = 0
-            elif rt == "financial_result":
+            elif rt == "subtotal_fr":
                 refs = fr_detail_row_refs(row_structure, col_l)
                 cell.value = f"=SUM({','.join(refs)})" if refs else 0
+            elif rt == "financial_result":
+                parts = [f"{col_l}{row_by_type['subtotal_fr']}"]
+                parts.extend(financing_nd_row_refs(row_structure, col_l))
+                cell.value = f"=SUM({','.join(parts)})" if parts else 0
             elif rt == "net_cash_flow":
                 cell.value = (
                     f"={col_l}{row_by_type['free_cash_flow']}"
@@ -969,6 +1027,16 @@ def main() -> None:
         else:
             for cc in Y_COLS:
                 ws.cell(excel_row, cc).fill = FILL_WHITE
+
+    # Collapse everything under Free cash flow until KPIs (nested details → level 2)
+    fcf_excel = row_by_type.get("free_cash_flow")
+    if fcf_excel is not None and LAST_TABLE_ROW > fcf_excel:
+        for rr in range(fcf_excel + 1, LAST_TABLE_ROW + 1):
+            rd = ws.row_dimensions[rr]
+            current_lvl = int(rd.outlineLevel or 0)
+            rd.outlineLevel = 2 if current_lvl >= 1 else 1
+            rd.hidden = True
+        ws.row_dimensions[LAST_TABLE_ROW].collapsed = True
 
     # KPI block
     KPI_TITLE_ROW = LAST_TABLE_ROW + 1

@@ -22,3 +22,4 @@ httpx==0.28.*       # required by FastAPI TestClient (smoke_ingest.py + DF5 test
 # FDD script runtime (Mathis stack at repo root)
 matplotlib>=3.8,<4
 requests>=2.31,<3
+reportlab>=4.0,<5

@@ -4,10 +4,10 @@
 
 import { getApiBaseUrl } from '../../lib/api'
 import {
-  buildBuildDatabookCard,
   buildFileAttachmentCard,
   buildNextActionCard,
   buildOposPostOutputCard,
+  buildPdfReportPromptCard,
   buildStrandPostOutputCard,
   scriptDisplayLabel,
 } from './nextActionCard'
@@ -40,6 +40,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+async function persistFastTrackOutputPath(sessionId: string, outputFile: string): Promise<void> {
+  if (!outputFile.trim()) return
+  try {
+    await fetch(`${RASA_URL}/conversations/${encodeURIComponent(sessionId)}/tracker/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'slot',
+        name: 'fast_track_output_workbook_path',
+        value: outputFile,
+      }),
+    })
+  } catch {
+    // Non-fatal: Rasa action resolves the workbook from session state as fallback.
+  }
+}
+
 async function oposHasMultipleSnapshots(sessionId: string): Promise<boolean> {
   try {
     const resp = await fetch(`${RASA_URL}/conversations/${encodeURIComponent(sessionId)}/tracker`)
@@ -70,6 +87,10 @@ function postScriptNextCard(job: ScriptJobPayload, multipleSnapshots?: boolean) 
   )
 }
 
+function isFinalDownloadJob(job: ScriptJobPayload): boolean {
+  return job.script_key === 'fast_track' || job.script_key === 'fast_track_pdf'
+}
+
 async function fetchRunStatus(sessionId: string, runId: string): Promise<RunStatusResponse | null> {
   try {
     const url = `${getApiBaseUrl()}/api/v1/fdd/run/status?session_id=${encodeURIComponent(sessionId)}&run_id=${encodeURIComponent(runId)}`
@@ -84,11 +105,6 @@ async function fetchRunStatus(sessionId: string, runId: string): Promise<RunStat
 export interface ScriptJobCallbacks {
   addMessage: (msg: Omit<ChatMessage, 'id' | 'timestamp'> & { id?: string }) => void
   setScriptJobLoading: (loading: boolean) => void
-}
-
-function completionSubtitle(job: ScriptJobPayload, _status: RunStatusResponse): string {
-  const label = job.title ?? scriptDisplayLabel(job.script_key)
-  return `${label} created successfully. Use the download button below to save your file.`
 }
 
 function longerRunningText(job: ScriptJobPayload): string {
@@ -135,13 +151,26 @@ export async function pollScriptJob(
     if (status?.status === 'done' && status.output_file) {
       const multipleSnapshots =
         job.script_key === 'opos' ? await oposHasMultipleSnapshots(job.session_id) : false
+      const isPdf = (status.output_filename ?? status.output_file).toLowerCase().endsWith('.pdf')
+      if (job.script_key === 'fast_track') {
+        await persistFastTrackOutputPath(job.session_id, status.output_file)
+      }
+      const attachmentTitle =
+        job.script_key === 'fast_track_pdf'
+          ? 'PDF report'
+          : job.script_key === 'fast_track'
+            ? 'Fast Track Excel'
+            : undefined
       if (releasedEarly) {
         addMessage({
           role: 'bot',
           custom: buildFileAttachmentCard(
             status.output_file,
-            status.output_filename ?? 'Output.xlsx',
-            { notification: true, title: `${scriptDisplayLabel(job.script_key)} ready` },
+            status.output_filename ?? (isPdf ? 'Report.pdf' : 'Output.xlsx'),
+            {
+              notification: true,
+              title: `${scriptDisplayLabel(job.script_key)} ready`,
+            },
           ),
         })
       } else {
@@ -149,12 +178,27 @@ export async function pollScriptJob(
           role: 'bot',
           custom: buildFileAttachmentCard(
             status.output_file,
-            status.output_filename ?? 'Output.xlsx',
+            status.output_filename ?? (isPdf ? 'Report.pdf' : 'Output.xlsx'),
+            attachmentTitle ? { title: attachmentTitle } : undefined,
           ),
         })
+        if (job.script_key === 'fast_track') {
+          addMessage({
+            role: 'bot',
+            custom: buildPdfReportPromptCard(status.output_file),
+          })
+        } else if (!isFinalDownloadJob(job)) {
+          addMessage({
+            role: 'bot',
+            custom: postScriptNextCard(job, multipleSnapshots),
+          })
+        }
+      }
+      // Early-release path: still offer PDF prompt when Fast Track finishes in background
+      if (releasedEarly && job.script_key === 'fast_track') {
         addMessage({
           role: 'bot',
-          custom: postScriptNextCard(job, multipleSnapshots),
+          custom: buildPdfReportPromptCard(status.output_file),
         })
       }
       setScriptJobLoading(false)
@@ -177,12 +221,14 @@ export async function pollScriptJob(
     if (!releasedEarly && Date.now() >= deadline) {
       releasedEarly = true
       addMessage({ role: 'bot', text: longerRunningText(job) })
-      const multipleSnapshots =
-        job.script_key === 'opos' ? await oposHasMultipleSnapshots(job.session_id) : false
-      addMessage({
-        role: 'bot',
-        custom: postScriptNextCard(job, multipleSnapshots),
-      })
+      if (!isFinalDownloadJob(job)) {
+        const multipleSnapshots =
+          job.script_key === 'opos' ? await oposHasMultipleSnapshots(job.session_id) : false
+        addMessage({
+          role: 'bot',
+          custom: postScriptNextCard(job, multipleSnapshots),
+        })
+      }
       setScriptJobLoading(false)
     }
 

@@ -53,7 +53,36 @@ from funktionssammlung import (  # noqa: E402
     write_source_df_to_ws,
 )
 from gst_excel_theme import THEME  # noqa: E402
-from databook_excel_layout import FONT_MAPPING  # noqa: E402
+from databook_excel_layout import (  # noqa: E402
+    FONT_MAPPING,
+    FILL_YELLOW,
+    LAYOUT_PL,
+    RECON_BLOCK_TITLE_ROW,
+    RECON_HEADER_ROW,
+    check_row_groups_after_table,
+    collapse_check_outline_rows,
+    find_bs_recon_row_contains,
+    find_recon_aggregated_year_cols,
+    paint_check_source_yellow,
+    write_kpi_section_title_row,
+)
+from source_data_audit import (  # noqa: E402
+    ISSUE_EMPTY_GROUPED_AS_NA,
+    ISSUE_MISSING_OR_INVALID,
+    ISSUE_NON_NUMERIC,
+    MISSING_GROUP_LABEL,
+    audit_column_entry,
+    count_missing_series,
+    count_non_numeric_series,
+    finalize_audit_payload,
+    group_sumifs_criterion,
+    is_blank_group_value,
+    merge_audit_file_result,
+    normalize_group_tuple,
+    normalize_group_value,
+    read_excel_period_df,
+    resolve_header_letter,
+)
 
 PROJECT_TITLE_ROW = 1
 SUBTITLE_ROW = 2
@@ -73,9 +102,16 @@ INDENT = "    "
 _FTE_HELPER_COL = "__FTE_WT__"
 _PL_L2 = "Expense"
 _PL_L3 = "Personnel expenses"
+_PL_TOTAL_OUTPUT_LABEL = "Total output"
 _PL_EXCLUDE_L4 = "Wages & salaries"
 _PL_REPORTED_VALUE = "Reported"
 _PL_SOURCE_COL = "L6"
+SHEET_PL_RECON = "PL_Reconciliation"
+_KPI_TITLE_TEXT = "KPIs in % of total output"
+NUM_FMT_KPI = "0.0;(0.0);-"
+FILL_KPI = THEME.fill_subtotal
+FONT_KPI = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.text_kpi)
+FONT_CHECK_RED = Font(name=THEME.font_name, size=THEME.font_size, color=THEME.delta_negative)
 _ZERO_TOL = 1e-6
 
 FONT_BASE = THEME.font_base
@@ -215,7 +251,7 @@ def resolve_period_header(period: dict, cfg: dict) -> str:
 
 def fte_source_sheet_name(period_label: str, *, header: str | None = None) -> str:
     hdr = str(header or "").strip() or fte_period_header(period_label)
-    return f"__SOURCE__{hdr}"[:31]
+    return f"__SOURCE__FTE_{hdr}"[:31]
 
 
 def col_letter(idx: int) -> str:
@@ -280,7 +316,9 @@ def normalize_config(cfg: dict) -> dict:
     out["amount_scale"] = float(scale) if scale not in (None, "", 0) else 1000.0
     out["sheet_name"] = str(out.get("sheet_name") or "FTE development")
     out["formula_mode"] = bool(out.get("formula_mode", True))
-    out["master_pl_path"] = str(out.get("master_pl_path") or "").strip()
+    out["master_pl_path"] = str(
+        out.get("master_pl_path") or out.get("master_path") or ""
+    ).strip()
     out["master_pl_sheet"] = str(out.get("master_pl_sheet") or "Master_PL").strip()
     raw_filters = out.get("filters", {}) or {}
     if isinstance(raw_filters, list):
@@ -362,10 +400,129 @@ def aggregate_period_keys(
         for key, _grp in work.groupby(g_resolved, dropna=False):
             if not isinstance(key, tuple):
                 key = (key,)
-            keys.add(tuple("" if pd.isna(v) else str(v).strip() for v in key))
+            keys.add(normalize_group_tuple(key))
     else:
         keys.add(())
     return keys, work, col_map
+
+
+def audit_invalid_fte_columns(
+    periods: list[dict],
+    columns: dict[str, Any],
+    *,
+    header_row: int = 0,
+    group_cols: list[str] | None = None,
+    payroll_cols: list[str] | None = None,
+) -> dict:
+    """Audit mapped FTE columns per period file with per-column detail."""
+    files: list[dict] = []
+    total_invalid = 0
+    group_cols = [str(c).strip() for c in (group_cols or []) if str(c).strip()]
+    payroll_cols = [str(c).strip() for c in (payroll_cols or []) if str(c).strip()]
+    employment = str(columns.get("employment") or "").strip()
+    months_sum = str(columns.get("months_sum") or "").strip()
+
+    for period in periods:
+        fp = str(period.get("file_path") or "").strip()
+        label = str(period.get("label") or period.get("header") or Path(fp).name).strip()
+        if not fp:
+            continue
+        sheet = str(period.get("sheet_name") or "").strip()
+        if not sheet:
+            sheet = _resolve_sheet_name(fp, "")
+        df = read_excel_period_df(fp, sheet, header_row=header_row)
+        d = apply_filters(df.copy(), {"filters": {"enabled": False}})
+
+        col_entries: list[dict] = []
+        bad_mask = pd.Series(False, index=d.index)
+
+        if employment and employment in d.columns:
+            emp = d[employment]
+            emp_missing = count_missing_series(emp)
+            emp_bad = count_non_numeric_series(emp)
+            emp_mask = emp.isna() | (emp.astype(str).str.strip() == "") | pd.to_numeric(emp, errors="coerce").isna() & emp.notna()
+            bad_mask |= emp_mask
+            for count, issue in ((emp_missing, ISSUE_MISSING_OR_INVALID), (emp_bad, ISSUE_NON_NUMERIC)):
+                entry = audit_column_entry(
+                    role="employment",
+                    header=employment,
+                    count=count,
+                    issue=issue,
+                    letter=resolve_header_letter(d, employment, role="employment"),
+                )
+                if entry:
+                    col_entries.append(entry)
+
+        if months_sum and months_sum in d.columns:
+            mon = d[months_sum]
+            mon_missing = count_missing_series(mon)
+            mon_bad = count_non_numeric_series(mon)
+            mon_mask = mon.isna() | (mon.astype(str).str.strip() == "") | pd.to_numeric(mon, errors="coerce").isna() & mon.notna()
+            bad_mask |= mon_mask
+            for count, issue in ((mon_missing, ISSUE_MISSING_OR_INVALID), (mon_bad, ISSUE_NON_NUMERIC)):
+                entry = audit_column_entry(
+                    role="months_sum",
+                    header=months_sum,
+                    count=count,
+                    issue=issue,
+                    letter=resolve_header_letter(d, months_sum, role="months_sum"),
+                )
+                if entry:
+                    col_entries.append(entry)
+
+        for ph in payroll_cols:
+            if ph not in d.columns:
+                continue
+            pay = d[ph]
+            bad = count_non_numeric_series(pay)
+            s = pay.astype(str).str.strip()
+            pay_mask = pay.notna() & (s != "") & ~s.str.lower().isin({"nan", "none", "<na>"}) & pd.to_numeric(pay, errors="coerce").isna()
+            bad_mask |= pay_mask
+            entry = audit_column_entry(
+                role="payroll",
+                header=ph,
+                count=bad,
+                issue=ISSUE_NON_NUMERIC,
+                letter=resolve_header_letter(d, ph, role="payroll"),
+            )
+            if entry:
+                col_entries.append(entry)
+
+        invalid_rows = int(bad_mask.sum())
+
+        notes: list[str] = []
+        for i, gc in enumerate(group_cols):
+            if gc not in d.columns:
+                continue
+            empty = int(d[gc].map(is_blank_group_value).sum())
+            if empty > 0:
+                notes.append(
+                    f'{empty} row(s) with empty {gc} will appear under aggregate position "{MISSING_GROUP_LABEL}".'
+                )
+            entry = audit_column_entry(
+                role=f"group_{i}",
+                header=gc,
+                count=empty,
+                issue=ISSUE_EMPTY_GROUPED_AS_NA,
+                letter=resolve_header_letter(d, gc, role=f"group_{i}"),
+            )
+            if entry:
+                col_entries.append(entry)
+
+        total_invalid += invalid_rows
+        merge_audit_file_result(
+            files,
+            label=label,
+            file_path=fp,
+            sheet_name=sheet,
+            columns=col_entries,
+            excluded_rows=invalid_rows,
+            notes=notes,
+        )
+
+    payload = finalize_audit_payload(files, total_excluded=0)
+    payload["total_invalid"] = total_invalid
+    return payload
 
 
 def build_period_columns(
@@ -393,6 +550,7 @@ def _group_sumifs_pairs(
     row_idx: int,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for i, gc in enumerate(group_cols):
@@ -400,7 +558,11 @@ def _group_sumifs_pairs(
             break
         col_idx = group_crit_cols[i]
         rng = source_range_ref(source_sheet, header_map, gc)
-        crit = f"${col_letter(col_idx)}{row_idx}"
+        crit_ref = f"${col_letter(col_idx)}{row_idx}"
+        crit_val = None
+        if group_crit_values and i < len(group_crit_values):
+            crit_val = group_crit_values[i]
+        crit = group_sumifs_criterion(crit_ref, crit_val)
         pairs.append((rng, crit))
     return pairs
 
@@ -413,12 +575,18 @@ def _fte_sumifs_formula(
     cfg: dict,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> str:
     if _normalize_header_name(_FTE_HELPER_COL) not in header_map:
         raise ValueError(f"Source sheet missing {_FTE_HELPER_COL}")
     amount_rng = source_range_ref(source_sheet, header_map, _FTE_HELPER_COL)
     base_pairs = _group_sumifs_pairs(
-        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+        source_sheet,
+        header_map,
+        group_cols,
+        row_idx,
+        group_crit_cols=group_crit_cols,
+        group_crit_values=group_crit_values,
     )
     body = build_sumifs_formula_body(amount_rng, base_pairs, [[]], divide_by_1000=False)
     return f"=ROUND({body},0)"
@@ -433,10 +601,16 @@ def _payroll_sumifs_formula(
     cfg: dict,
     *,
     group_crit_cols: tuple[int, ...],
+    group_crit_values: tuple[str, ...] | None = None,
 ) -> str:
     parts: list[str] = []
     base_pairs = _group_sumifs_pairs(
-        source_sheet, header_map, group_cols, row_idx, group_crit_cols=group_crit_cols
+        source_sheet,
+        header_map,
+        group_cols,
+        row_idx,
+        group_crit_cols=group_crit_cols,
+        group_crit_values=group_crit_values,
     )
     for ph in payroll_headers:
         try:
@@ -476,7 +650,20 @@ def _chunk_sum_formula(rows: list[int], col_idx: int) -> str:
     return f"=({' + '.join(parts)})"
 
 
-def _load_master_pl_frame(master_path: str, sheet_name: str) -> pd.DataFrame | None:
+def _load_master_pl_frame(
+    master_path: str,
+    sheet_name: str,
+    wb=None,
+) -> pd.DataFrame | None:
+    """Load Master_PL from the session workbook when present, else from file."""
+    if wb is not None and sheet_name in getattr(wb, "sheetnames", []):
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return None
+        header = [str(c).strip() if c is not None else "" for c in rows[0]]
+        body = rows[1:]
+        return pd.DataFrame(body, columns=header)
     if not master_path or not Path(master_path).is_file():
         return None
     return pd.read_excel(master_path, sheet_name=sheet_name, header=0, engine="openpyxl")
@@ -490,9 +677,14 @@ def _pl_source_col(df: pd.DataFrame) -> str:
     raise ValueError("Master_PL missing L5/L6 source column")
 
 
-def build_pl_personnel_rows(master_path: str, sheet_name: str, cfg: dict) -> list[dict[str, str]]:
+def build_pl_personnel_rows(
+    master_path: str,
+    sheet_name: str,
+    cfg: dict,
+    wb=None,
+) -> list[dict[str, str]]:
     """Personnel expense L4 lines (excl. W&S), amount-sorted with Other last."""
-    df = _load_master_pl_frame(master_path, sheet_name)
+    df = _load_master_pl_frame(master_path, sheet_name, wb=wb)
     if df is None:
         return [{"display_label": "Other", "L2": _PL_L2, "L3": _PL_L3, "L4": "Other"}]
     source_col = _pl_source_col(df)
@@ -556,8 +748,9 @@ def _master_pl_column_ranges(
     master_path: str,
     sheet_name: str,
     prefix: str,
+    wb=None,
 ) -> dict[str, str]:
-    df = _load_master_pl_frame(master_path, sheet_name)
+    df = _load_master_pl_frame(master_path, sheet_name, wb=wb)
     if df is None:
         return {}
     start, end = 2, len(df) + 1
@@ -619,6 +812,176 @@ def _master_period_col_letter(master_path: str, sheet_name: str, period_header: 
     finally:
         wb.close()
     return None
+
+
+def _find_pl_recon_row_exact(ws_recon, label: str, pos_col: int) -> int | None:
+    target = str(label or "").strip().lower()
+    for rr in range(1, ws_recon.max_row + 1):
+        v = ws_recon.cell(rr, pos_col).value
+        if isinstance(v, str) and v.strip().lower() == target:
+            return rr
+    return None
+
+
+def _write_fte_kpi_and_checks(
+    wb,
+    ws,
+    layout: FteLayout,
+    period_cols: list[PeriodColumn],
+    *,
+    total_pe_row: int,
+    formula_mode: bool,
+) -> dict[str, Any]:
+    value_cols = [pc.col_idx for pc in period_cols]
+    if not value_cols:
+        return {"last_row": total_pe_row}
+
+    kpi_title_row = total_pe_row + 1
+    kpi_pe_row = total_pe_row + 2
+    gap_row_1 = kpi_pe_row + 1
+    gap_row_2 = kpi_pe_row + 2
+    total_output_helper_row = gap_row_2 + 1
+
+    write_kpi_section_title_row(
+        ws,
+        kpi_title_row,
+        title_cols=value_cols,
+        label_col=layout.pos_col,
+        title_text=_KPI_TITLE_TEXT,
+        fill_end_col=value_cols[-1],
+    )
+
+    ws.cell(kpi_pe_row, layout.pos_col, _PL_L3).alignment = ALIGN_LEFT
+    ws.cell(kpi_pe_row, layout.pos_col).font = FONT_KPI
+    for cc in [layout.pos_col, *value_cols]:
+        ws.cell(kpi_pe_row, cc).fill = FILL_KPI
+
+    for gap_rr in (gap_row_1, gap_row_2):
+        for cc in [layout.pos_col, *value_cols]:
+            ws.cell(gap_rr, cc).fill = FILL_WHITE
+
+    ws.row_dimensions[total_output_helper_row].outlineLevel = 2
+    ws.row_dimensions[total_output_helper_row].hidden = True
+    ws.cell(total_output_helper_row, layout.pos_col, _PL_TOTAL_OUTPUT_LABEL).alignment = ALIGN_LEFT
+    ws.cell(total_output_helper_row, layout.pos_col).font = FONT_KPI
+    for cc in value_cols:
+        ws.cell(total_output_helper_row, cc).font = FONT_KPI
+        ws.cell(total_output_helper_row, cc).alignment = ALIGN_RIGHT
+        ws.cell(total_output_helper_row, cc).number_format = NUM_FMT_K
+
+    period_headers = [pc.header for pc in period_cols]
+    recon_year_cols: dict[str, int] = {}
+    recon_total_output_row: int | None = None
+    recon_personnel_row: int | None = None
+    pl_pos_col = LAYOUT_PL.pos_col
+
+    if formula_mode and SHEET_PL_RECON in wb.sheetnames:
+        ws_recon = wb[SHEET_PL_RECON]
+        recon_year_cols = find_recon_aggregated_year_cols(
+            ws_recon,
+            period_headers,
+            block_title_row=RECON_BLOCK_TITLE_ROW,
+            header_row=RECON_HEADER_ROW,
+        )
+        recon_total_output_row = _find_pl_recon_row_exact(
+            ws_recon, _PL_TOTAL_OUTPUT_LABEL, pl_pos_col
+        )
+        recon_personnel_row = _find_pl_recon_row_exact(ws_recon, _PL_L3, pl_pos_col)
+        if recon_total_output_row is None:
+            recon_total_output_row = find_bs_recon_row_contains(
+                ws_recon, _PL_TOTAL_OUTPUT_LABEL, pos_col=pl_pos_col
+            )
+        if recon_personnel_row is None:
+            recon_personnel_row = find_bs_recon_row_contains(
+                ws_recon, _PL_L3, pos_col=pl_pos_col
+            )
+
+    for pi, pc in enumerate(period_cols):
+        cc = pc.col_idx
+        col_l = col_letter(cc)
+        pct_cell = ws.cell(kpi_pe_row, cc)
+        if formula_mode:
+            pct_cell.value = (
+                f'=IFERROR({col_l}{total_pe_row}/{col_l}{total_output_helper_row}*100,"n/a")'
+            )
+        pct_cell.number_format = NUM_FMT_KPI
+        pct_cell.alignment = ALIGN_RIGHT
+        pct_cell.font = FONT_KPI
+
+        helper_cell = ws.cell(total_output_helper_row, cc)
+        hdr = period_headers[pi]
+        if formula_mode and recon_total_output_row and hdr in recon_year_cols:
+            rc = recon_year_cols[hdr]
+            helper_cell.value = f"='{SHEET_PL_RECON}'!{col_letter(rc)}{recon_total_output_row}"
+        elif not formula_mode:
+            helper_cell.value = 0
+        helper_cell.number_format = NUM_FMT_K
+        helper_cell.alignment = ALIGN_RIGHT
+
+    check_src_row, check_delta_row = check_row_groups_after_table(total_output_helper_row, [2])
+    ws.cell(check_src_row, layout.pos_col, "Source - Personnel expenses PL_Reconciliation").font = FONT_BASE
+    ws.cell(check_src_row, layout.pos_col).alignment = ALIGN_LEFT
+    ws.cell(check_delta_row, layout.pos_col, "Check").font = FONT_CHECK_RED
+    ws.cell(check_delta_row, layout.pos_col).alignment = ALIGN_LEFT
+
+    from openpyxl.formatting.rule import CellIsRule
+
+    check_active = bool(
+        formula_mode and recon_personnel_row and recon_year_cols
+    )
+    for pi, pc in enumerate(period_cols):
+        cc = pc.col_idx
+        col_l = col_letter(cc)
+        src_cell = ws.cell(check_src_row, cc)
+        hdr = period_headers[pi]
+        if formula_mode and recon_personnel_row and hdr in recon_year_cols:
+            rc = recon_year_cols[hdr]
+            src_cell.value = f"='{SHEET_PL_RECON}'!{col_letter(rc)}{recon_personnel_row}"
+        elif not formula_mode:
+            src_cell.value = 0
+        src_cell.number_format = NUM_FMT_K
+        src_cell.alignment = ALIGN_RIGHT
+        src_cell.font = FONT_BASE
+
+        delta_cell = ws.cell(check_delta_row, cc)
+        if formula_mode:
+            delta_cell.value = f"={col_l}{total_pe_row}-{src_cell.coordinate}"
+        delta_cell.number_format = NUM_FMT_K
+        delta_cell.alignment = ALIGN_RIGHT
+        delta_cell.font = FONT_CHECK_RED
+        if formula_mode:
+            ws.conditional_formatting.add(
+                delta_cell.coordinate,
+                CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+            )
+
+    if check_active:
+        paint_check_source_yellow(ws, check_src_row, [layout.pos_col, *value_cols])
+        collapse_check_outline_rows(ws, [check_src_row, check_delta_row])
+        ws.sheet_view.showOutlineSymbols = True
+        ws.sheet_properties.outlinePr.summaryBelow = True
+
+    return {
+        "last_row": check_delta_row,
+        "kpi_title_row": kpi_title_row,
+        "kpi_pe_row": kpi_pe_row,
+        "total_output_helper_row": total_output_helper_row,
+        "check_src_row": check_src_row,
+        "check_delta_row": check_delta_row,
+        "value_cols": value_cols,
+    }
+
+
+def _paint_fte_kpi_band(ws, kpi_meta: dict[str, Any], layout: FteLayout) -> None:
+    value_cols = kpi_meta.get("value_cols") or []
+    for rr in (kpi_meta.get("kpi_title_row"), kpi_meta.get("kpi_pe_row")):
+        if not rr:
+            continue
+        for cc in [layout.pos_col, *value_cols]:
+            ws.cell(rr, cc).fill = FILL_KPI
+    check_src_row = kpi_meta.get("check_src_row")
+    if check_src_row and value_cols:
+        paint_check_source_yellow(ws, check_src_row, [layout.pos_col, *value_cols])
 
 
 def _apply_sheet_layout(ws, layout: FteLayout, *, last_used_col: int, last_fill_row: int) -> None:
@@ -765,10 +1128,14 @@ def write_workbook(
     source_works: list[pd.DataFrame],
     source_header_maps: list[dict[str, int]],
     col_maps: list[dict[str, Any]],
+    *,
+    wb=None,
+    save: bool = True,
 ) -> str:
     cfg = normalize_config(cfg)
     out_path = build_output_file_path(cfg)
-    ensure_output_writable(out_path)
+    if save:
+        ensure_output_writable(out_path)
 
     group_cols = cfg["group_cols"]
     layout = fte_column_layout(len(group_cols))
@@ -803,11 +1170,18 @@ def write_workbook(
     )
     last_used_col = period_cols[-1].col_idx if period_cols else layout.first_data_col
 
-    wb = open_session_workbook(cfg)
+    if wb is None:
+        wb = open_session_workbook(cfg)
+    else:
+        from databook_workbook import clear_fte_workbook_sheets
+
+        clear_fte_workbook_sheets(wb)
     ws = replace_workbook_sheet(wb, cfg["sheet_name"][:31])
 
     project = str(cfg.get("title") or cfg.get("project_name") or "Project").strip()
-    company = str(cfg.get("company") or cfg.get("group_name") or "").strip()
+    company = str(
+        cfg.get("company") or cfg.get("company_name") or cfg.get("group_name") or ""
+    ).strip()
     sheet_label = str(cfg.get("sheet_name") or "FTE development").strip()
 
     ws.cell(PROJECT_TITLE_ROW, layout.pos_col, project).font = FONT_PROJECT
@@ -920,9 +1294,9 @@ def write_workbook(
 
     master_path = str(cfg.get("master_pl_path") or "").strip()
     master_sheet = cfg.get("master_pl_sheet", "Master_PL")
-    pl_line_specs = build_pl_personnel_rows(master_path, master_sheet, cfg)
+    pl_line_specs = build_pl_personnel_rows(master_path, master_sheet, cfg, wb=wb)
     pl_prefix = _master_pl_sheet_prefix(cfg, wb)
-    pl_col_ranges = _master_pl_column_ranges(master_path, master_sheet, pl_prefix)
+    pl_col_ranges = _master_pl_column_ranges(master_path, master_sheet, pl_prefix, wb=wb)
 
     pl_rows: list[int] = []
     for pl_spec in pl_line_specs:
@@ -972,6 +1346,7 @@ def write_workbook(
                         group_cols,
                         cfg,
                         group_crit_cols=group_crit_cols,
+                        group_crit_values=spec.group_key,
                     )
             _style_value_cell(fte_cell, bold=is_parent, fill=FILL_PERIOD if not is_parent else FILL_SUBTOTAL, num_fmt=NUM_FMT_INT)
 
@@ -1012,6 +1387,7 @@ def write_workbook(
                         group_cols,
                         cfg,
                         group_crit_cols=group_crit_cols,
+                        group_crit_values=spec.group_key,
                     )
             _style_value_cell(pay_cell, bold=is_parent, fill=FILL_SUBTOTAL if is_parent else FILL_WHITE, num_fmt=NUM_FMT_K)
 
@@ -1039,9 +1415,19 @@ def write_workbook(
         _style_value_cell(total_cell, bold=True, fill=FILL_SUBTOTAL, num_fmt=NUM_FMT_K)
         total_cell.border = BORDER_SUBTOTAL_BOTH
 
+    kpi_meta = _write_fte_kpi_and_checks(
+        wb,
+        ws,
+        layout,
+        period_cols,
+        total_pe_row=total_pe_row,
+        formula_mode=formula_mode,
+    )
+
+    from databook_workbook import is_fte_source_sheet
 
     for name in list(wb.sheetnames):
-        if name.startswith("__SOURCE__"):
+        if is_fte_source_sheet(name):
             del wb[name]
     for i, df in enumerate(source_works):
         period_entry = period_entries[i]
@@ -1050,6 +1436,7 @@ def write_workbook(
         if sheet_title in wb.sheetnames:
             del wb[sheet_title]
         src_ws = wb.create_sheet(sheet_title)
+        src_ws.sheet_state = "visible"
         stub_cfg = {
             "file_path": cfg["periods"][i]["file_path"],
             "sheet_name": _resolve_sheet_name(
@@ -1071,7 +1458,7 @@ def write_workbook(
     for pc in period_cols:
         ws.column_dimensions[col_letter(pc.col_idx)].width = VALUE_COL_WIDTH
 
-    last_row = total_pe_row
+    last_row = kpi_meta.get("last_row", total_pe_row)
     _apply_sheet_layout(ws, layout, last_used_col=last_used_col, last_fill_row=last_row + 50)
     _paint_header_band(
         ws,
@@ -1081,19 +1468,21 @@ def write_workbook(
         group_col_labels=group_cols,
     )
     _paint_total_personnel_row(ws, total_pe_row, layout, last_used_col=last_used_col)
+    _paint_fte_kpi_band(ws, kpi_meta, layout)
     if len(group_cols) >= 2:
         ws.sheet_view.showOutlineSymbols = True
         ws.sheet_properties.outlinePr.summaryBelow = True
         ws.sheet_properties.outlinePr.applyStyles = True
 
-    from databook_workbook import reorder_workbook_sheets
+    if save:
+        from databook_workbook import reorder_workbook_sheets
 
-    reorder_workbook_sheets(wb)
-    wb.save(out_path)
+        reorder_workbook_sheets(wb)
+        wb.save(out_path)
     return out_path
 
 
-def run_fte_payroll(cfg: dict) -> str:
+def run_fte_payroll(cfg: dict, wb=None, save: bool = True) -> str:
     cfg = normalize_config(cfg)
     header_row = int(cfg["header_row"])
     period_specs = [
@@ -1120,7 +1509,14 @@ def run_fte_payroll(cfg: dict) -> str:
             _apply_fte_wt_formulas(tmp_ws, col_map["employment"], col_map["months_sum"])
         source_header_maps.append(_get_sheet_header_map(tmp_ws))
 
-    return write_workbook(cfg, source_works, source_header_maps, col_maps)
+    return write_workbook(
+        cfg,
+        source_works,
+        source_header_maps,
+        col_maps,
+        wb=wb,
+        save=save,
+    )
 
 
 def main() -> None:

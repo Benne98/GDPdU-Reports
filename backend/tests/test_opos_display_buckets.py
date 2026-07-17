@@ -1,6 +1,6 @@
-"""Tests for OPOS display-bucket filtering."""
+"""Tests for OPOS aging bucket configuration."""
 
-from opos import build_aging_bucket_defs
+from opos import build_aging_bucket_defs, default_aging_ranges, normalize_config, validate_aging_ranges
 
 
 def test_build_aging_bucket_defs_all_buckets_by_default():
@@ -16,21 +16,23 @@ def test_build_aging_bucket_defs_all_buckets_by_default():
     ]
 
 
-def test_build_aging_bucket_defs_filters_display_keys():
+def test_build_aging_bucket_defs_always_outputs_all_buckets():
+    """display_bucket_keys no longer filters output — all buckets are always emitted."""
     cfg = {
         "display_bucket_keys": ["overdue_1_30", "overdue_over_180"],
-        "aging_buckets": {"include_current": True},
+        "aging_buckets": {"include_current": True, "ranges": default_aging_ranges()},
     }
     buckets = build_aging_bucket_defs(cfg)
     keys = [b.key for b in buckets]
-    assert keys == ["overdue_1_30", "overdue_over_180"]
+    assert len(keys) == 6
+    assert "overdue_31_60" in keys
 
 
-def test_build_aging_bucket_defs_includes_not_yet_due_when_selected():
-    cfg = {"display_bucket_keys": ["not_yet_due", "overdue_1_30"]}
+def test_build_aging_bucket_defs_custom_range_count():
+    cfg = {"aging_buckets": {"ranges": [[1, 30], [31, 90]]}}
     buckets = build_aging_bucket_defs(cfg)
     keys = [b.key for b in buckets]
-    assert keys == ["not_yet_due", "overdue_1_30"]
+    assert keys == ["not_yet_due", "overdue_1_30", "overdue_31_90", "overdue_over_90"]
 
 
 def test_opos_pos_col_short_helper_layout():
@@ -108,20 +110,6 @@ def test_all_dates_sort_descending_by_combined_totals():
     assert order_kred == ["B", "A"]
 
 
-def test_resolve_bucket_for_due_respects_selected_buckets():
-    from opos import AgingBucket, resolve_bucket_for_due
-    import pandas as pd
-
-    buckets = [
-        AgingBucket("overdue_1_30", "1-30 days", 1, 30),
-        AgingBucket("overdue_over_180", ">180 days", 181, None),
-    ]
-    as_of = pd.Timestamp("2024-12-31")
-    assert resolve_bucket_for_due(pd.Timestamp("2024-12-15"), as_of, buckets) == "overdue_1_30"
-    assert resolve_bucket_for_due(pd.Timestamp("2024-06-01"), as_of, buckets) == "overdue_over_180"
-    assert resolve_bucket_for_due(pd.Timestamp("2024-10-15"), as_of, buckets) is None
-
-
 def test_compute_top_bucket_range_ends_includes_other():
     from opos import compute_top_bucket_range_ends
 
@@ -184,22 +172,13 @@ def test_build_opos_detail_lines_other_bucket_last_line():
     assert lines[-1].bucket_label == "Other"
 
 
-def test_build_aging_bucket_defs_excludes_not_yet_due_when_not_selected():
-    cfg = {
-        "display_bucket_keys": ["overdue_1_30"],
-        "aging_buckets": {"include_current": True},
-    }
-    buckets = build_aging_bucket_defs(cfg)
-    assert [b.key for b in buckets] == ["overdue_1_30"]
-
-
-def test_normalize_single_side_config_include_current_follows_display_keys():
+def test_normalize_single_side_config_stores_aging_ranges():
     from opos import _normalize_single_side_config
 
     cfg = _normalize_single_side_config(
         {
             "side": "debitor",
-            "display_bucket_keys": ["overdue_1_30", "overdue_31_60"],
+            "aging_buckets": {"ranges": [[1, 30], [31, 60]]},
             "columns": {
                 "partner_id": "Konto",
                 "partner_name": "Konto",
@@ -211,29 +190,50 @@ def test_normalize_single_side_config_include_current_follows_display_keys():
             "case_id": "c1",
         }
     )
-    assert cfg["display_bucket_keys"] == ["overdue_1_30", "overdue_31_60"]
-    assert cfg["aging_buckets"]["include_current"] is False
+    assert cfg["aging_buckets"]["ranges"] == [[1, 30], [31, 60]]
+    assert validate_aging_ranges(cfg["aging_buckets"]["ranges"]) == [(1, 30), (31, 60)]
 
 
 def test_normalize_top_bucket_cfg_defaults_other_when_enabled():
     from opos import _normalize_top_bucket_cfg
 
     tb = _normalize_top_bucket_cfg({"top_bucket": {"enabled": True, "numbers": (10, 20)}})
-    assert tb["create_other_bucket"] is True
+    assert tb["create_other_bucket"] is False
+    tb2 = _normalize_top_bucket_cfg(
+        {"top_bucket": {"enabled": True, "numbers": (10, 20), "create_other_bucket": True}}
+    )
+    assert tb2["create_other_bucket"] is True
 
 
-def test_combined_side_inherits_display_bucket_keys():
-    from opos import _SHARED_SIDE_KEYS, build_aging_bucket_defs
+def test_normalize_combined_config_preserves_aging_buckets(tmp_path):
+    import pandas as pd
 
-    parent = {
-        "display_bucket_keys": ["overdue_1_30", "not_yet_due"],
-        "top_bucket": {"enabled": True, "numbers": (10,), "create_other_bucket": True},
-        "sides": {"debitor": {}, "kreditor": {}},
-    }
-    for side in ("debitor", "kreditor"):
-        side_cfg = dict(parent["sides"][side])
-        for key in _SHARED_SIDE_KEYS:
-            if key in parent:
-                side_cfg[key] = parent[key]
-        buckets = build_aging_bucket_defs(side_cfg)
-        assert [b.key for b in buckets] == ["overdue_1_30", "not_yet_due"]
+    df = pd.DataFrame(
+        {
+            "Partner": ["A"],
+            "Amount": [100000.0],
+            "Due": ["2024-12-15"],
+        }
+    )
+    src = tmp_path / "source.xlsx"
+    df.to_excel(src, index=False)
+    snap = {"as_of": "2024-12-31", "file_path": str(src), "sheet_name": "Sheet1"}
+    cfg = normalize_config(
+        {
+            "column_letters": {"partner": "A", "amount": "B", "due_date": "C"},
+            "aging_buckets": {"ranges": [[1, 15], [16, 45]]},
+            "sides": {
+                "debitor": {"snapshots": [snap]},
+                "kreditor": {"snapshots": [snap]},
+            },
+            "output_file_path": str(tmp_path / "out.xlsx"),
+            "case_id": "test",
+        }
+    )
+    deb_ranges = cfg["sides"]["debitor"]["aging_buckets"]["ranges"]
+    assert deb_ranges == [[1, 15], [16, 45]]
+    buckets = build_aging_bucket_defs(cfg["sides"]["debitor"])
+    labels = [b.label for b in buckets]
+    assert "1-15 days" in labels
+    assert "16-45 days" in labels
+    assert "1-30 days" not in labels

@@ -140,6 +140,75 @@ def collapse_check_outline_rows(ws, rows: list[int | None]) -> None:
     collapse_check_portfolio(ws, rows)
 
 
+BS_L3_COLLAPSE_ON_OPEN = frozenset(
+    {
+        "Financial assets",
+        "Inventories",
+        "Other assets",
+        "Other liabilities",
+    }
+)
+BS_L3_COLLAPSE_PREFIXES = ("Deferred",)
+
+
+def should_collapse_bs_l3(label: str) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return False
+    if text in BS_L3_COLLAPSE_ON_OPEN:
+        return True
+    return any(text.startswith(prefix) for prefix in BS_L3_COLLAPSE_PREFIXES)
+
+
+def collapse_bs_l3_groups_on_open(ws, row_structure: list[dict]) -> None:
+    """
+    Collapse selected L3 groups on workbook open (summaryBelow):
+    hide L4 detail rows under the L3 subtotal and mark the subtotal collapsed.
+    """
+    if not row_structure:
+        return
+
+    ws.sheet_properties.outlinePr.summaryBelow = True
+
+    for i, row in enumerate(row_structure):
+        if row.get("type") != "subtotal_l3":
+            continue
+        label = str(row.get("label") or row.get("L3") or "").strip()
+        if not should_collapse_bs_l3(label):
+            continue
+
+        l3 = str(row.get("L3") or label).strip()
+        l5 = row.get("L5")
+        l2 = row.get("L2")
+
+        j = i - 1
+        while j >= 0:
+            prev = row_structure[j]
+            prev_type = prev.get("type")
+            if prev_type not in {"detail", "detail_single"}:
+                break
+            if l5 is not None and prev.get("L5") != l5:
+                break
+            if l2 is not None and prev.get("L2") != l2:
+                break
+            if str(prev.get("L3") or "").strip() != l3:
+                break
+            excel_row = prev.get("_excel_row")
+            if excel_row is not None:
+                rd = ws.row_dimensions[int(excel_row)]
+                rd.outlineLevel = max(int(getattr(rd, "outlineLevel", 0) or 0), 1)
+                rd.hidden = True
+                rd.collapsed = False
+            j -= 1
+
+        summary_row = row.get("_excel_row")
+        if summary_row is not None:
+            rd = ws.row_dimensions[int(summary_row)]
+            rd.outlineLevel = 0
+            rd.hidden = False
+            rd.collapsed = True
+
+
 RECON_BLOCK_TITLE_ROW = 7
 RECON_HEADER_ROW = 8
 DEFAULT_NA_BUCKET_ORDER = ["FA", "TWC", "OWC", "ND", "Other", "Equity"]
@@ -237,7 +306,11 @@ def find_recon_block_col_for_period_label(
     block_title_row: int = RECON_BLOCK_TITLE_ROW,
     header_row: int = RECON_HEADER_ROW,
 ) -> int | None:
-    """Match OPOS snapshot label to recon block column (exact, then FY year suffix e.g. Dec24A→Jul24A)."""
+    """Match OPOS snapshot label to recon block column (exact, then same-YY suffix e.g. Dec24A↔Jul24A).
+
+    No cross-year fallback: if the snapshot year is not in the block, return None
+    so callers leave n/a instead of inventing a prior-year value.
+    """
     exact = find_recon_block_col_by_header(
         ws_recon,
         block_title,

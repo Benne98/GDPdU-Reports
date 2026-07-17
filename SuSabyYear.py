@@ -42,8 +42,11 @@ from susa_column_mapping import (
 
 # GST-aligned Excel theme (shared with General Sales Table)
 _SCRIPTS = Path(__file__).resolve().parent / "scripts"
+_BACKEND = Path(__file__).resolve().parent / "backend"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))
 from gst_excel_theme import THEME  # noqa: E402
 
 # ==============================================================
@@ -779,8 +782,9 @@ def _resolve_sign_dependent_mapping(
             continue
 
         na_series = grp["NA"].astype(str).str.strip().str.upper() if "NA" in grp.columns else pd.Series(dtype=str)
-        nd_rows = grp[na_series == "ND"]
-        pos_rows = grp[na_series != "ND"]
+        debt_like = {"ND", "DL"}
+        nd_rows = grp[na_series.isin(debt_like)]
+        pos_rows = grp[~na_series.isin(debt_like)]
         if nd_rows.empty or pos_rows.empty:
             row = grp.iloc[0].to_dict()
             row["Entity"] = None
@@ -1038,6 +1042,145 @@ def _pl_ytd_mask(
     )
 
 
+def _prior_ytd_window(
+    ytd_reporting_fy: int,
+    ytd_ltm_year: int,
+    ytd_ltm_month: int,
+    df: pd.DataFrame,
+) -> tuple[str, int, int, int] | None:
+    """Prior-year comparable YTD column (YTD24A when current is YTD25A), if month data exists."""
+    prior_reporting_fy = int(ytd_reporting_fy) - 1
+    prior_ltm_year = int(ytd_ltm_year) - 1
+    prior_ltm_month = int(ytd_ltm_month)
+    has_prior_month = (
+        (df["Month"] > 0)
+        & (df["Calendar Year"] == prior_ltm_year)
+        & (df["Month"] == prior_ltm_month)
+    ).any()
+    if not has_prior_month:
+        return None
+    prior_col = f"YTD{str(prior_reporting_fy)[-2:]}A"
+    return prior_col, prior_reporting_fy, prior_ltm_year, prior_ltm_month
+
+
+def _merge_pl_ytd_column(
+    master_pl: pd.DataFrame,
+    pl_long: pd.DataFrame,
+    index_cols: List[str],
+    ytd_col_name: str,
+    ytd_reporting_fy: int,
+    ltm_year: int,
+    ltm_month: int,
+) -> pd.DataFrame:
+    pl_ytd = (
+        pl_long.loc[
+            _pl_ytd_mask(pl_long, int(ytd_reporting_fy), int(ltm_year), int(ltm_month))
+        ]
+        .groupby(index_cols, as_index=False)["Balance"]
+        .sum()
+        .rename(columns={"Balance": ytd_col_name})
+    )
+    return master_pl.merge(pl_ytd, on=index_cols, how="left")
+
+
+def _merge_bs_ytd_column(
+    master_bs: pd.DataFrame,
+    bs_long: pd.DataFrame,
+    index_cols: List[str],
+    ytd_col_name: str,
+    *,
+    fiscal_start_month: int,
+    ytd_reporting_fy: int,
+    ltm_year: int,
+    ltm_month: int,
+) -> pd.DataFrame:
+    bs_ytd = select_bs_ytd_rows(
+        bs_long,
+        index_cols,
+        fiscal_start_month=fiscal_start_month,
+        ytd_reporting_fy=int(ytd_reporting_fy),
+        ltm_year=int(ltm_year),
+        ltm_month=int(ltm_month),
+    )
+    if bs_ytd.empty:
+        return master_bs
+    bs_ytd_pivot = (
+        bs_ytd.groupby(index_cols, as_index=False)["Balance"]
+        .sum()
+        .rename(columns={"Balance": ytd_col_name})
+    )
+    return master_bs.merge(bs_ytd_pivot, on=index_cols, how="left")
+
+
+def _read_existing_master_df(output_path: str, sheet_name: str) -> pd.DataFrame | None:
+    if not os.path.isfile(output_path):
+        return None
+    try:
+        xl = pd.ExcelFile(output_path, engine="openpyxl")
+        if sheet_name not in xl.sheet_names:
+            return None
+        return pd.read_excel(output_path, sheet_name=sheet_name, engine="openpyxl")
+    except Exception:
+        return None
+
+
+def carry_over_prior_ytd_columns(
+    new_df: pd.DataFrame,
+    existing_df: pd.DataFrame | None,
+    *,
+    index_keys: List[str] | None = None,
+) -> pd.DataFrame:
+    """Keep prior-year YTD values from an existing master when rebuilding Master_* sheets."""
+    if existing_df is None or existing_df.empty or new_df.empty:
+        return new_df
+
+    from databook_periods import is_ytd_period_column
+
+    keys = list(index_keys or ["Entity", "Account"])
+    if not all(k in new_df.columns and k in existing_df.columns for k in keys):
+        return new_df
+
+    ytd_cols = [
+        str(c).strip()
+        for c in existing_df.columns
+        if is_ytd_period_column(str(c))
+    ]
+    if not ytd_cols:
+        return new_df
+
+    carry_cols = [
+        col
+        for col in ytd_cols
+        if col not in new_df.columns or not new_df[col].notna().any()
+    ]
+    if not carry_cols:
+        return new_df
+
+    carry = existing_df[keys + carry_cols].drop_duplicates(subset=keys, keep="first")
+    merged = new_df.merge(carry, on=keys, how="left", suffixes=("", "_carry"))
+
+    out_cols = list(new_df.columns)
+    for col in carry_cols:
+        carry_col = f"{col}_carry"
+        if carry_col in merged.columns:
+            if col in out_cols:
+                base = merged[col]
+                carried = merged[carry_col]
+                merged[col] = carried.where(carried.notna(), base)
+                merged = merged.drop(columns=[carry_col])
+            else:
+                insert_at = len(out_cols)
+                for i, name in enumerate(out_cols):
+                    if is_ytd_period_column(name):
+                        insert_at = i
+                        break
+                out_cols.insert(insert_at, col)
+                merged[col] = merged.pop(carry_col)
+
+    remaining = [c for c in merged.columns if c not in out_cols]
+    return merged.reindex(columns=out_cols + remaining)
+
+
 def build_net_income_bs_rows(
     df: pd.DataFrame,
     period_order: List[str],
@@ -1051,6 +1194,10 @@ def build_net_income_bs_rows(
     ytd_reporting_fy: Optional[int] = None,
     ytd_ltm_year: Optional[int] = None,
     ytd_ltm_month: Optional[int] = None,
+    prior_ytd_col: Optional[str] = None,
+    prior_ytd_reporting_fy: Optional[int] = None,
+    prior_ytd_ltm_year: Optional[int] = None,
+    prior_ytd_ltm_month: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     One BS row per entity: cumulative sum of all PL monthly movements (Soll+/Haben-).
@@ -1133,6 +1280,24 @@ def build_net_income_bs_rows(
                 )
                 row[ytd_col] = float(pl.loc[mask, "Balance"].sum())
 
+        if (
+            prior_ytd_col
+            and prior_ytd_reporting_fy
+            and prior_ytd_ltm_year
+            and prior_ytd_ltm_month
+        ):
+            prior_period = make_period_str(prior_ytd_ltm_year, prior_ytd_ltm_month)
+            if prior_period in row:
+                row[prior_ytd_col] = row[prior_period]
+            else:
+                mask = (pl["Entity"] == entity) & _pl_ytd_mask(
+                    pl,
+                    prior_ytd_reporting_fy,
+                    prior_ytd_ltm_year,
+                    prior_ytd_ltm_month,
+                )
+                row[prior_ytd_col] = float(pl.loc[mask, "Balance"].sum())
+
         rows.append(row)
 
     out = pd.DataFrame(rows)
@@ -1210,9 +1375,25 @@ def build_final_output(
         fy_cols.append(new_name)
 
     ytd_col: Optional[str] = None
+    prior_ytd_col: Optional[str] = None
+    prior_ytd_reporting_fy: Optional[int] = None
+    prior_ytd_ltm_year: Optional[int] = None
+    prior_ytd_ltm_month: Optional[int] = None
     if ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
         ytd_col = f"YTD{str(int(ytd_reporting_fy))[-2:]}A"
+        prior = _prior_ytd_window(
+            int(ytd_reporting_fy), int(ytd_ltm_year), int(ytd_ltm_month), df
+        )
+        if prior is not None:
+            (
+                prior_ytd_col,
+                prior_ytd_reporting_fy,
+                prior_ytd_ltm_year,
+                prior_ytd_ltm_month,
+            ) = prior
     period_cols = list(fy_cols)
+    if prior_ytd_col:
+        period_cols.append(prior_ytd_col)
     if ytd_col:
         period_cols.append(ytd_col)
 
@@ -1252,16 +1433,31 @@ def build_final_output(
         pl_fy_pivot = pl_fy_pivot.rename(columns=fy_rename)
 
     if ytd_col and ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
-        pl_ytd = (
-            pl_long.loc[
-                _pl_ytd_mask(pl_long, int(ytd_reporting_fy), int(ytd_ltm_year), int(ytd_ltm_month))
-            ]
-            .groupby(index_cols_pl, as_index=False)["Balance"]
-            .sum()
-            .rename(columns={"Balance": ytd_col})
-        )
         master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
-        master_pl = master_pl.merge(pl_ytd, on=index_cols_pl, how="left")
+        master_pl = _merge_pl_ytd_column(
+            master_pl,
+            pl_long,
+            index_cols_pl,
+            ytd_col,
+            int(ytd_reporting_fy),
+            int(ytd_ltm_year),
+            int(ytd_ltm_month),
+        )
+        if (
+            prior_ytd_col
+            and prior_ytd_reporting_fy
+            and prior_ytd_ltm_year
+            and prior_ytd_ltm_month
+        ):
+            master_pl = _merge_pl_ytd_column(
+                master_pl,
+                pl_long,
+                index_cols_pl,
+                prior_ytd_col,
+                int(prior_ytd_reporting_fy),
+                int(prior_ytd_ltm_year),
+                int(prior_ytd_ltm_month),
+            )
     else:
         master_pl = pl_pivot.merge(pl_fy_pivot, on=index_cols_pl, how="outer")
 
@@ -1296,21 +1492,32 @@ def build_final_output(
         )
         master_bs = bs_period_pivot.merge(bs_fy_pivot, on=index_cols_bs, how="outer")
         if ytd_col and ytd_reporting_fy and ytd_ltm_year and ytd_ltm_month:
-            bs_ytd = select_bs_ytd_rows(
+            master_bs = _merge_bs_ytd_column(
+                master_bs,
                 bs_long,
                 index_cols_bs,
+                ytd_col,
                 fiscal_start_month=fiscal_start_month,
                 ytd_reporting_fy=int(ytd_reporting_fy),
                 ltm_year=int(ytd_ltm_year),
                 ltm_month=int(ytd_ltm_month),
             )
-            if not bs_ytd.empty:
-                bs_ytd_pivot = (
-                    bs_ytd.groupby(index_cols_bs, as_index=False)["Balance"]
-                    .sum()
-                    .rename(columns={"Balance": ytd_col})
+            if (
+                prior_ytd_col
+                and prior_ytd_reporting_fy
+                and prior_ytd_ltm_year
+                and prior_ytd_ltm_month
+            ):
+                master_bs = _merge_bs_ytd_column(
+                    master_bs,
+                    bs_long,
+                    index_cols_bs,
+                    prior_ytd_col,
+                    fiscal_start_month=fiscal_start_month,
+                    ytd_reporting_fy=int(prior_ytd_reporting_fy),
+                    ltm_year=int(prior_ytd_ltm_year),
+                    ltm_month=int(prior_ytd_ltm_month),
                 )
-                master_bs = master_bs.merge(bs_ytd_pivot, on=index_cols_bs, how="left")
     else:
         master_bs = pd.DataFrame(columns=META_COLS_BS + period_cols + period_order)
 
@@ -1326,6 +1533,10 @@ def build_final_output(
         ytd_reporting_fy=ytd_reporting_fy,
         ytd_ltm_year=ytd_ltm_year,
         ytd_ltm_month=ytd_ltm_month,
+        prior_ytd_col=prior_ytd_col,
+        prior_ytd_reporting_fy=prior_ytd_reporting_fy,
+        prior_ytd_ltm_year=prior_ytd_ltm_year,
+        prior_ytd_ltm_month=prior_ytd_ltm_month,
     )
     if not net_income.empty:
         master_bs = pd.concat([master_bs, net_income], ignore_index=True)
@@ -1474,6 +1685,11 @@ def write_output(
     config: dict,
 ) -> None:
     output_file = output_path
+    existing_bs = _read_existing_master_df(output_file, SHEET_BS)
+    existing_pl = _read_existing_master_df(output_file, SHEET_PL)
+    master_bs = carry_over_prior_ytd_columns(master_bs, existing_bs)
+    master_pl = carry_over_prior_ytd_columns(master_pl, existing_pl)
+
     if os.path.exists(output_file):
         wb = load_workbook(output_file)
         for sn in (SHEET_BS, SHEET_PL):

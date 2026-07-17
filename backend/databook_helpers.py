@@ -464,3 +464,41 @@ def extract_master_entities(master_path: Path | str) -> list[str]:
         return seen
     finally:
         wb.close()
+
+
+def import_master_workbook_sheets(source_path: Path, target_path: Path) -> None:
+    """Replace session master with uploaded workbook (values + formatting, all sheets)."""
+    import shutil
+
+    source_path = source_path.expanduser().resolve()
+    target_path = target_path.expanduser().resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, target_path)
+
+
+def master_import_marker_path(session_id: str) -> Path:
+    return PROJECT_ROOT / "uploads" / session_id / "databook_master_imported.flag"
+
+
+def mark_master_workbook_imported(session_id: str, master_path: Path | str) -> None:
+    """Persist fast-track import so recon steps keep Master_BS/PL untouched."""
+    marker = master_import_marker_path(session_id)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(Path(master_path).expanduser().resolve()), encoding="utf-8")
+
+
+def clear_master_workbook_imported(session_id: str) -> None:
+    marker = master_import_marker_path(session_id)
+    if marker.is_file():
+        marker.unlink()
+
+
+def master_workbook_imported(session_id: str) -> bool:
+    return master_import_marker_path(session_id).is_file()
+
+
+def should_preserve_master_sheets(session_id: str, *, explicit: bool = False) -> bool:
+    """Keep imported master sheets (formulas, YTD, formatting) during recon."""
+    if explicit:
+        return True
+    return master_workbook_imported(session_id)

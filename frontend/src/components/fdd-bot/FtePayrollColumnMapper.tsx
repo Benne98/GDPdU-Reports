@@ -6,6 +6,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Undo2 } from 'lucide-react'
 import { getApiBaseUrl } from '../../lib/api'
+import SourceDataAuditWarning, {
+  type SourceDataAuditResult,
+  hasAuditContent,
+} from './SourceDataAuditWarning'
 
 interface PreviewColumn {
   letter: string
@@ -35,8 +39,12 @@ interface Props {
   sessionId: string
   previewFileId: string
   periodsJson?: string
+  groupColsJson?: string
   sheetName?: string
   headerRow?: number
+  /** Fast Track keeps exactly one grouping choice in this mapper. */
+  fastTrack?: boolean
+  groupingDefault?: string
   disabled?: boolean
   onSubmit: (payload: Record<string, string>) => void | Promise<void>
 }
@@ -45,8 +53,11 @@ export default function FtePayrollColumnMapper({
   sessionId,
   previewFileId,
   periodsJson = '[]',
+  groupColsJson = '[]',
   sheetName = '',
   headerRow = 0,
+  fastTrack = false,
+  groupingDefault = '',
   disabled,
   onSubmit,
 }: Props) {
@@ -60,8 +71,9 @@ export default function FtePayrollColumnMapper({
   const [paySelectionOrder, setPaySelectionOrder] = useState<string[]>([])
   const [phase, setPhase] = useState<'map' | 'payroll'>('map')
   const [submitting, setSubmitting] = useState(false)
-  const [columnWarning, setColumnWarning] = useState<number | null>(null)
+  const [auditResult, setAuditResult] = useState<SourceDataAuditResult | null>(null)
   const [pendingPayload, setPendingPayload] = useState<Record<string, string> | null>(null)
+  const [fastTrackGroup, setFastTrackGroup] = useState(groupingDefault)
   const submittedRef = useRef(false)
 
   const currentRole = SINGLE_ROLES[stepIndex]?.key
@@ -144,9 +156,29 @@ export default function FtePayrollColumnMapper({
     return [{ file_id: previewFileId, sheet_name: sheetName, label: 'Preview' }]
   }, [periodsJson, previewFileId, sheetName])
 
-  const auditInvalidColumns = useCallback(
-    async (payload: Record<string, string>): Promise<number> => {
-      if (!previewFileId.trim()) return 0
+  const groupCols = useMemo(() => {
+    try {
+      const parsed = JSON.parse(groupColsJson || '[]')
+      if (!Array.isArray(parsed)) return []
+      return parsed.map(c => String(c).trim()).filter(Boolean)
+    } catch {
+      return []
+    }
+  }, [groupColsJson])
+
+  useEffect(() => {
+    if (fastTrack && !fastTrackGroup && groupCols[0]) setFastTrackGroup(groupCols[0])
+  }, [fastTrack, fastTrackGroup, groupCols])
+
+  const auditMappedColumns = useCallback(
+    async (payload: Record<string, string>): Promise<SourceDataAuditResult | null> => {
+      if (!previewFileId.trim()) return null
+      let payrollCols: string[] = []
+      try {
+        payrollCols = JSON.parse(payload.fte_payroll_cols_json || '[]') as string[]
+      } catch {
+        payrollCols = []
+      }
       const base = getApiBaseUrl()
       const resp = await fetch(`${base}/api/v1/fdd/fte_payroll/audit-columns`, {
         method: 'POST',
@@ -158,14 +190,15 @@ export default function FtePayrollColumnMapper({
             employment: payload.fte_employment_col,
             months_sum: payload.fte_months_col,
           },
+          payroll_cols: payrollCols,
+          group_cols: fastTrack ? [fastTrackGroup].filter(Boolean) : groupCols,
           header_row: headerRow,
         }),
       })
-      if (!resp.ok) return 0
-      const data = (await resp.json()) as { total_invalid?: number }
-      return Number(data.total_invalid || 0)
+      if (!resp.ok) return null
+      return (await resp.json()) as SourceDataAuditResult
     },
-    [auditPeriods, headerRow, previewFileId, sessionId],
+    [auditPeriods, fastTrack, fastTrackGroup, groupCols, headerRow, previewFileId, sessionId],
   )
 
   useEffect(() => {
@@ -178,20 +211,23 @@ export default function FtePayrollColumnMapper({
         const header = letter ? headerByLetter.get(letter) : ''
         if (header) payload[role.slot] = header
       }
-      const invalid = await auditInvalidColumns(payload)
-      if (!cancelled) {
-        setColumnWarning(invalid > 0 ? invalid : null)
+      const result = await auditMappedColumns(payload)
+      if (!cancelled && result && hasAuditContent(result)) {
+        setAuditResult(result)
+        setPhase('payroll')
+      } else if (!cancelled) {
+        setAuditResult(null)
         setPhase('payroll')
       }
     })()
     return () => {
       cancelled = true
     }
-  }, [singleMapped, phase, assignments, headerByLetter, auditInvalidColumns])
+  }, [singleMapped, phase, assignments, headerByLetter, auditMappedColumns])
 
   useEffect(() => {
     if (phase !== 'map' || singleMapped) return
-    setColumnWarning(null)
+    setAuditResult(null)
   }, [phase, singleMapped, assignments])
 
   const roleForLetter = useCallback(
@@ -262,13 +298,20 @@ export default function FtePayrollColumnMapper({
   }
 
   const finalizeSubmit = async (payload: Record<string, string>) => {
-    setColumnWarning(null)
+    setAuditResult(null)
     setPendingPayload(null)
     await onSubmit(payload)
   }
 
   const handleSubmit = useCallback(async () => {
-    if (!singleMapped || payCols.size === 0 || submitting || disabled || submittedRef.current) return
+    if (
+      !singleMapped ||
+      payCols.size === 0 ||
+      (fastTrack && !fastTrackGroup.trim()) ||
+      submitting ||
+      disabled ||
+      submittedRef.current
+    ) return
     setSubmitting(true)
     try {
       const payload: Record<string, string> = {}
@@ -278,10 +321,14 @@ export default function FtePayrollColumnMapper({
         if (header) payload[role.slot] = header
       }
       payload.fte_payroll_cols_json = JSON.stringify([...payCols])
-      const invalid = await auditInvalidColumns(payload)
+      if (fastTrack) payload.fte_group_col_1 = fastTrackGroup.trim()
+      const result = await auditMappedColumns(payload)
+      const invalid = Number(result?.total_invalid || 0)
+      if (result && hasAuditContent(result)) {
+        setAuditResult(result)
+      }
       if (invalid > 0) {
         submittedRef.current = false
-        setColumnWarning(invalid)
         setPendingPayload(payload)
         return
       }
@@ -298,7 +345,9 @@ export default function FtePayrollColumnMapper({
     headerByLetter,
     onSubmit,
     submitting,
-    auditInvalidColumns,
+    auditMappedColumns,
+    fastTrack,
+    fastTrackGroup,
   ])
 
   const handleContinueDespiteWarning = async () => {
@@ -347,10 +396,29 @@ export default function FtePayrollColumnMapper({
       )}
 
       {phase === 'payroll' && (
-        <p className="text-xs font-semibold text-slate-700">
-          Click every column you want included in the payroll total (e.g. base salary only, or full
-          gross), then click Continue.
-        </p>
+        <>
+          <p className="text-xs font-semibold text-slate-700">
+            Click every column you want included in the payroll total (e.g. base salary only, or full
+            gross), then click Continue.
+          </p>
+          {fastTrack && (
+            <label className="flex max-w-sm flex-col gap-1 text-xs font-semibold text-slate-700">
+              Grouping column
+              <select
+                value={fastTrackGroup}
+                disabled={disabled || submitting}
+                onChange={event => setFastTrackGroup(event.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-normal text-slate-800"
+              >
+                <option value="">Select one column…</option>
+                {preview.columns
+                  .map(column => column.header || column.letter)
+                  .filter(header => !mappedSingleHeaders.has(header) && !payCols.has(header))
+                  .map(header => <option key={header} value={header}>{header}</option>)}
+              </select>
+            </label>
+          )}
+        </>
       )}
 
       {(phase === 'payroll' ? paySelectionOrder.length > 0 : history.length > 0) && (
@@ -435,41 +503,32 @@ export default function FtePayrollColumnMapper({
         </table>
       </div>
 
-      {columnWarning !== null && columnWarning > 0 && (
-        <div
-          className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950"
-          role="alert"
-        >
-          <p className="font-medium">
-            {columnWarning.toLocaleString('en-US')} row{columnWarning === 1 ? '' : 's'} have invalid
-            employment rate or annual working time values across uploaded personnel files.
-          </p>
-          {phase === 'payroll' ? (
-            <>
-              <p className="mt-1 text-amber-900">Do you want to continue anyway?</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={disabled || submitting}
-                  onClick={() => void handleContinueDespiteWarning()}
-                  className="rounded-md bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50"
-                >
-                  Continue anyway
-                </button>
-              </div>
-            </>
-          ) : (
-            <p className="mt-1 text-amber-900">
-              Review the mapped columns or continue to payroll column selection below.
-            </p>
-          )}
-        </div>
+      {auditResult && hasAuditContent(auditResult) && (
+        <SourceDataAuditWarning
+          result={auditResult}
+          summary={
+            Number(auditResult.total_invalid || 0) > 0
+              ? `${Number(auditResult.total_invalid).toLocaleString('en-US')} row${
+                  Number(auditResult.total_invalid) === 1 ? '' : 's'
+                } have invalid employment, working time, or payroll values across uploaded personnel files.`
+              : 'Source data review — see details below.'
+          }
+          blockingCount={phase === 'payroll' ? Number(auditResult.total_invalid || 0) : 0}
+          onContinue={phase === 'payroll' && pendingPayload ? handleContinueDespiteWarning : undefined}
+          submitting={submitting}
+          disabled={disabled}
+        />
       )}
 
       {phase === 'payroll' && (
         <button
           type="button"
-          disabled={disabled || payCols.size === 0 || submitting}
+          disabled={
+            disabled ||
+            payCols.size === 0 ||
+            (fastTrack && !fastTrackGroup.trim()) ||
+            submitting
+          }
           onClick={() => void handleSubmit()}
           className="self-start rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           style={{ background: '#1E40AF' }}

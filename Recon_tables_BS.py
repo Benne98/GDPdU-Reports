@@ -713,16 +713,14 @@ def main():
     bs_row_structure = prepare_bs_row_structure(df_bs)
     individual_entities, has_ic = build_sorted_bs_entities(df_bs, cfg)
 
-    if Path(TARGET_FILE).is_file():
-        wb = load_workbook(TARGET_FILE)
-    else:
-        wb = Workbook()
-        if wb.sheetnames:
-            wb.remove(wb.active)
+    from funktionssammlung import open_report_workbook
+
+    wb = open_report_workbook(cfg, TARGET_FILE)
 
     remove_stale_entity_recon_sheets(wb, individual_entities)
 
-    refresh_master_sheet(wb, df_bs, MASTER_SHEET_BS_OUT)
+    if not bool(cfg.get("preserve_master_sheets")):
+        refresh_master_sheet(wb, df_bs, MASTER_SHEET_BS_OUT)
 
     group_blocks = build_bs_group_blocks(individual_entities, has_ic)
     write_bs_reconciliation_sheet(

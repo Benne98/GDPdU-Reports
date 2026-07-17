@@ -202,6 +202,17 @@ def test_find_recon_block_col_for_period_label_year_suffix_fallback():
     assert find_recon_block_col_for_period_label(ws, AGGREGATED_BLOCK_TITLE, "Jul24A") == 10
 
 
+def test_find_recon_block_col_for_period_label_no_cross_year_fallback():
+    from databook_excel_layout import find_recon_block_col_for_period_label
+
+    wb = Workbook()
+    ws = wb.active
+    _build_minimal_bs_recon_ws(ws)
+    ws.cell(RECON_HEADER_ROW, 10, "Dec23A")
+    ws.cell(RECON_HEADER_ROW, 11, "Dec24A")
+    assert find_recon_block_col_for_period_label(ws, AGGREGATED_BLOCK_TITLE, "Jul25A") is None
+
+
 def test_apply_databook_row_border_band_skips_spacer_cols():
     from openpyxl.styles import Border, Side
 

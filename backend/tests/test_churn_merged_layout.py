@@ -49,13 +49,16 @@ def _mini_df() -> pd.DataFrame:
 
 
 class TestChurnMergedLayout(unittest.TestCase):
-    def test_merged_total_is_last_row(self):
+    def test_merged_total_is_followed_by_reconciliation_rows(self):
         merged = build_merged_horizontal_bridge(_mini_df(), _base_cfg())
         self.assertFalse(merged.empty)
-        self.assertEqual(merged.iloc[-1]["row_type"], "total")
+        self.assertEqual(
+            merged["row_type"].iloc[-3:].tolist(),
+            ["total", "recon", "reported"],
+        )
         total_idx = merged.index[merged["row_type"] == "total"]
         self.assertEqual(len(total_idx), 1)
-        self.assertEqual(total_idx[0], len(merged) - 1)
+        self.assertEqual(total_idx[0], len(merged) - 3)
 
     def test_merged_sort_by_latest_fy(self):
         df = pd.DataFrame({

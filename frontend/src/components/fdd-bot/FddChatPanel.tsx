@@ -3,10 +3,13 @@
  */
 
 import { createPortal } from 'react-dom'
-import { Undo2 } from 'lucide-react'
+import { useState } from 'react'
+import { ListFilter, Undo2 } from 'lucide-react'
 import type { FddBotApi } from './useFddBot'
 import BotConversation from './BotConversation'
 import FddProjectSidebar from './FddProjectSidebar'
+import RowFilterModal from './RowFilterModal'
+import type { FilterRule } from './rowFilterTypes'
 
 const DEFAULT_TOP_OFFSET_PX = 64
 
@@ -27,6 +30,9 @@ function FddChatPanelView({
   topOffsetPx = DEFAULT_TOP_OFFSET_PX,
   bottomOffsetPx = 0,
 }: FddChatPanelProps) {
+  const [salesFilterOpen, setSalesFilterOpen] = useState(false)
+  const [salesFilterRulesJson, setSalesFilterRulesJson] = useState('[]')
+  const [salesFilterHeaders, setSalesFilterHeaders] = useState<string[]>([])
   const {
     loading,
     scriptJobLoading,
@@ -38,6 +44,10 @@ function FddChatPanelView({
     activeProjectId,
     projectName,
     projects,
+    salesFilterContext,
+    submitCard,
+    readTrackerSlots,
+    latestBotCard,
   } = bot
   const busy = loading || scriptJobLoading
 
@@ -45,8 +55,53 @@ function FddChatPanelView({
     return null
   }
 
+  const openSalesFilter = async () => {
+    if (!salesFilterContext) return
+    const slots = await readTrackerSlots()
+    const rulesRaw = slots[`${salesFilterContext}_filter_rules_json`]
+    const headersRaw = slots.headers ?? latestBotCard?.filter_headers ?? latestBotCard?.headers
+    let headers: string[] = []
+    if (Array.isArray(headersRaw)) {
+      headers = headersRaw.map(value => String(value))
+    } else if (typeof headersRaw === 'string') {
+      try {
+        const parsed = JSON.parse(headersRaw)
+        if (Array.isArray(parsed)) headers = parsed.map(value => String(value))
+      } catch {
+        headers = []
+      }
+    }
+    setSalesFilterRulesJson(typeof rulesRaw === 'string' ? rulesRaw : JSON.stringify(rulesRaw ?? []))
+    setSalesFilterHeaders(headers)
+    setSalesFilterOpen(true)
+  }
+
+  const saveSalesFilter = async (rules: FilterRule[]) => {
+    if (!salesFilterContext) return
+    await submitCard(
+      'filter_rules_save',
+      {
+        filter_context: salesFilterContext,
+        filter_rules_json: JSON.stringify(rules),
+      },
+      { skipUserBubble: true },
+    )
+  }
+
   const headerActions = (
     <div className="flex items-center gap-1.5">
+      {salesFilterContext ? (
+        <button
+          type="button"
+          onClick={() => void openSalesFilter()}
+          title="Edit sales row filters for the current revenue analysis"
+          className="mr-1 inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors disabled:opacity-50"
+          style={{ background: 'rgba(255,255,255,0.14)', color: '#FFFFFF' }}
+        >
+          <ListFilter size={14} />
+          Sales row filter
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => void undoLastCard()}
@@ -115,6 +170,15 @@ function FddChatPanelView({
           />
         </div>
       </div>
+
+      <RowFilterModal
+        open={salesFilterOpen}
+        title="Sales row filter"
+        headers={salesFilterHeaders}
+        rulesJson={salesFilterRulesJson}
+        onClose={() => setSalesFilterOpen(false)}
+        onSave={saveSalesFilter}
+      />
     </div>
   )
 

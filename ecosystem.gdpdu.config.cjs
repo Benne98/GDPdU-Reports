@@ -35,7 +35,7 @@ const apps = [
     cwd: path.join(root, 'rasa'),
     env: {
       FASTAPI_BASE_URL: 'http://127.0.0.1:8010',
-      UPLOAD_BASE_DIR: '/Users/mathi/finssentials-wt-mathis/uploads',
+      UPLOAD_BASE_DIR: path.join(root, 'uploads'),
     },
     autorestart: true,
     max_restarts: 20,

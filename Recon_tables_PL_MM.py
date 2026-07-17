@@ -1375,12 +1375,9 @@ def main():
     report_sheet = cfg["paths"]["report_sheet"]
     audit_sheet = cfg["paths"]["audit_master_sheet"]
 
-    if target_path.is_file():
-        wb = load_workbook(target_file)
-    else:
-        wb = Workbook()
-        if wb.sheetnames:
-            wb.remove(wb.active)
+    from funktionssammlung import open_report_workbook
+
+    wb = open_report_workbook(cfg, target_file)
 
     remove_stale_entity_recon_sheets(wb, individual_entities)
 
@@ -1392,7 +1389,8 @@ def main():
             for c_idx, val in enumerate(row, start=1):
                 ws_master.cell(r_idx, c_idx, val)
 
-    refresh_master_sheet(wb, df, audit_sheet)
+    if not bool(cfg.get("preserve_master_sheets")):
+        refresh_master_sheet(wb, df, audit_sheet)
 
     write_pl_reconciliation_sheet(
         wb,

@@ -112,6 +112,26 @@ export interface AdaptiveCardPayload {
   susa_grid_note?: string
   /** databook_susa_column_mapper: session_id, preview_file_id, layout, etc. */
   mapper_meta?: Record<string, unknown>
+  /** Source headers for specialized mapping cards. */
+  headers?: string[]
+  /** Keeps the persistent Fast Track controls visible for this bot context. */
+  fast_track_active?: boolean
+  /** Fast Track card marker used by the Rasa card shell. */
+  fast_track?: boolean
+  /** Dataset/strand currently targeted by Fast Track row filters. */
+  fast_track_dataset?: string
+  /** Opaque dataset context echoed when opening the Fast Track filter editor. */
+  fast_track_filter_context?: Record<string, unknown>
+  /** Specialized-card defaults and immutable upload/date metadata. */
+  defaults?: Record<string, unknown>
+  metadata?: Record<string, unknown>
+  mapper_role?: string
+  /** Row filter modal state for strand-specific filters. */
+  filter_context?: string
+  filter_rules_json?: string
+  filter_rules_display?: string
+  filter_headers?: string[]
+  filter_operators?: { label: string; value: string }[]
   /** Secondary action button (e.g. AP/AR not identifiable) */
   secondary_submit_label?: string
   secondary_submit_id?: string
@@ -147,6 +167,35 @@ interface RasaMessage {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const REVENUE_STRAND_CARD_PREFIXES = [
+  'sheet_name',
+  'file_upload',
+  'reuse_sales_file',
+  'fx_rate',
+  'fx_col_select',
+  'gst_',
+  'pvm_',
+  'top_',
+  'churn_',
+  'bs_',
+]
+
+function inferSalesFilterContext(card: string): string | null {
+  if (card.startsWith('gst_')) return 'gst'
+  if (card.startsWith('pvm_')) return 'pvm'
+  if (card.startsWith('top_')) return 'top'
+  if (card.startsWith('churn_')) return 'churn'
+  if (card.startsWith('bs_')) return 'bs'
+  if (card === 'sheet_name' || card === 'file_upload' || card === 'reuse_sales_file') return 'gst'
+  return null
+}
+
+function isRevenueStrandCard(card: string): boolean {
+  return REVENUE_STRAND_CARD_PREFIXES.some(prefix =>
+    prefix.endsWith('_') ? card.startsWith(prefix) : card === prefix,
+  )
+}
 
 function makeId(): string {
   return Math.random().toString(36).slice(2, 10)
@@ -678,13 +727,13 @@ export function useFddBot() {
     [addMessage, send],
   )
 
-  /** Undo the last card submit only (one step). Tracker is restored to the snapshot before that submit. */
+  /** Undo the last card submit: restore chat + tracker silently; do not emit new bot cards. */
   const undoLastCard = useCallback(async () => {
     const frame = undoStack.current.pop()
     if (!frame) return
     setUndoStackLen(undoStack.current.length)
 
-    const { slots, redoAction, userMessageId } = frame
+    const { slots, userMessageId } = frame
 
     inflightAbort.current?.abort()
     sendGeneration.current += 1
@@ -696,15 +745,10 @@ export function useFddBot() {
         setUndoStackLen(undoStack.current.length)
         return prev
       }
-      let cut = idx
-      return prev.slice(0, cut)
+      return prev.slice(0, idx)
     })
     setSubmittedCardIds(new Set())
 
-    const undoBody = {
-      slots,
-      next_action: redoAction,
-    }
     const controller = new AbortController()
     inflightAbort.current = controller
     const generation = sendGeneration.current
@@ -718,24 +762,16 @@ export function useFddBot() {
         signal: controller.signal,
         body: JSON.stringify({
           sender: senderId.current,
-          message: `/undo_to_checkpoint${JSON.stringify(undoBody)}`,
+          message: `/undo_to_checkpoint${JSON.stringify({
+            slots,
+            next_action: 'action_listen',
+          })}`,
         }),
       })
       if (generation !== sendGeneration.current) return
       if (!resp.ok) throw new Error(`Rasa responded ${resp.status}`)
-      const data: RasaMessage[] = await resp.json()
-      const DEFAULT_FALLBACK_SUB = "didn't quite understand"
-      const hasCustom = data.some(m => m.custom)
-      const filtered = hasCustom
-        ? data.filter(m => !(m.text && m.text.includes(DEFAULT_FALLBACK_SUB)))
-        : data
-      for (const msg of filtered) {
-        if (msg.custom) {
-          addMessage({ role: 'bot', custom: enrichBotCard(msg.custom) })
-        } else if (msg.text) {
-          addMessage({ role: 'bot', text: msg.text })
-        }
-      }
+      // Restore tracker only — the card to re-edit is already visible in trimmed chat history.
+      await resp.json()
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return
       if (generation !== sendGeneration.current) return
@@ -750,7 +786,7 @@ export function useFddBot() {
         setLoading(false)
       }
     }
-  }, [addMessage, enrichBotCard])
+  }, [addMessage])
 
   /** Reset the conversation (clears history and tells Rasa to reset). */
   const reset = useCallback(async () => {
@@ -771,11 +807,13 @@ export function useFddBot() {
   }, [])
 
   const saveActiveProject = useCallback(() => {
+    const now = new Date().toISOString()
     const record: FddProjectRecord = {
       id: activeProjectId,
       name: projectName,
       senderId: senderId.current,
-      updatedAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
       snapshot: buildSnapshot(
         messages,
         datesContextRef.current,
@@ -897,6 +935,13 @@ export function useFddBot() {
     createProject()
   }, [createProject])
 
+  const latestBotCard = [...messages].reverse().find(message => message.role === 'bot' && message.custom)
+    ?.custom
+  const fastTrackEnabled = Boolean(latestBotCard?.fast_track_active ?? latestBotCard?.fast_track)
+  const salesFilterContext = !fastTrackEnabled && latestBotCard && isRevenueStrandCard(latestBotCard.card)
+    ? inferSalesFilterContext(latestBotCard.card)
+    : null
+
   return {
     messages,
     loading,
@@ -920,6 +965,9 @@ export function useFddBot() {
     canUndo: undoStackLen > 0,
     submittedCardIds,
     markCardSubmitted,
+    salesFilterContext,
+    latestBotCard,
+    readTrackerSlots: () => fetchTrackerSlots(senderId.current),
   }
 }
 

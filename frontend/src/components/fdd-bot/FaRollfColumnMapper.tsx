@@ -6,6 +6,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Undo2 } from 'lucide-react'
 import { getApiBaseUrl } from '../../lib/api'
+import SourceDataAuditWarning, {
+  type SourceDataAuditResult,
+  hasAuditContent,
+} from './SourceDataAuditWarning'
 
 interface PreviewColumn {
   letter: string
@@ -36,8 +40,13 @@ const ROLE_COLORS: Record<FaRollfRole, string> = {
 interface Props {
   sessionId: string
   previewFileId: string
+  periodsJson?: string
+  groupColsJson?: string
   sheetName?: string
   headerRow?: number
+  /** Fast Track keeps exactly one grouping choice in this mapper. */
+  fastTrack?: boolean
+  groupingDefault?: string
   disabled?: boolean
   onSubmit: (payload: Record<string, string>) => void | Promise<void>
 }
@@ -45,8 +54,12 @@ interface Props {
 export default function FaRollfColumnMapper({
   sessionId,
   previewFileId,
+  periodsJson = '[]',
+  groupColsJson = '[]',
   sheetName = '',
   headerRow = 0,
+  fastTrack = false,
+  groupingDefault = '',
   disabled,
   onSubmit,
 }: Props) {
@@ -60,6 +73,9 @@ export default function FaRollfColumnMapper({
   const [depSelectionOrder, setDepSelectionOrder] = useState<string[]>([])
   const [phase, setPhase] = useState<'map' | 'depreciation'>('map')
   const [submitting, setSubmitting] = useState(false)
+  const [auditResult, setAuditResult] = useState<SourceDataAuditResult | null>(null)
+  const [pendingPayload, setPendingPayload] = useState<Record<string, string> | null>(null)
+  const [fastTrackGroup, setFastTrackGroup] = useState(groupingDefault)
   const submittedRef = useRef(false)
 
   const currentRole = SINGLE_ROLES[stepIndex]?.key
@@ -121,6 +137,72 @@ export default function FaRollfColumnMapper({
       cancelled = true
     }
   }, [sessionId, previewFileId, sheetName, headerRow])
+
+  const auditPeriods = useMemo(() => {
+    try {
+      const parsed = JSON.parse(periodsJson || '[]') as Array<{
+        file_id?: string
+        sheet_name?: string
+        label?: string
+      }>
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.map(p => ({
+          file_id: String(p.file_id || previewFileId || '').trim(),
+          sheet_name: String(p.sheet_name || sheetName || '').trim(),
+          label: String(p.label || '').trim(),
+        }))
+      }
+    } catch {
+      /* ignore */
+    }
+    return [{ file_id: previewFileId, sheet_name: sheetName, label: 'Preview' }]
+  }, [periodsJson, previewFileId, sheetName])
+
+  const groupCols = useMemo(() => {
+    try {
+      const parsed = JSON.parse(groupColsJson || '[]')
+      if (!Array.isArray(parsed)) return []
+      return parsed.map(c => String(c).trim()).filter(Boolean)
+    } catch {
+      return []
+    }
+  }, [groupColsJson])
+
+  useEffect(() => {
+    if (fastTrack && !fastTrackGroup && groupCols[0]) setFastTrackGroup(groupCols[0])
+  }, [fastTrack, fastTrackGroup, groupCols])
+
+  const auditMappedColumns = useCallback(
+    async (payload: Record<string, string>): Promise<SourceDataAuditResult | null> => {
+      if (!previewFileId.trim()) return null
+      let depCols: string[] = []
+      try {
+        depCols = JSON.parse(payload.fa_depreciation_cols_json || '[]') as string[]
+      } catch {
+        depCols = []
+      }
+      const base = getApiBaseUrl()
+      const resp = await fetch(`${base}/api/v1/fdd/fa_rollf/audit-columns`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          periods: auditPeriods,
+          columns: {
+            opening: payload.fa_opening_col,
+            additions: payload.fa_additions_col,
+            disposals: payload.fa_disposals_col,
+            depreciation_cols: depCols,
+          },
+          group_cols: fastTrack ? [fastTrackGroup].filter(Boolean) : groupCols,
+          header_row: headerRow,
+        }),
+      })
+      if (!resp.ok) return null
+      return (await resp.json()) as SourceDataAuditResult
+    },
+    [auditPeriods, fastTrack, fastTrackGroup, groupCols, headerRow, previewFileId, sessionId],
+  )
 
   useEffect(() => {
     if (singleMapped && phase === 'map') {
@@ -195,9 +277,21 @@ export default function FaRollfColumnMapper({
     })
   }
 
+  const finalizeSubmit = async (payload: Record<string, string>) => {
+    setAuditResult(null)
+    setPendingPayload(null)
+    await onSubmit(payload)
+  }
+
   const handleSubmit = useCallback(async () => {
-    if (!singleMapped || depCols.size === 0 || submitting || disabled || submittedRef.current) return
-    submittedRef.current = true
+    if (
+      !singleMapped ||
+      depCols.size === 0 ||
+      (fastTrack && !fastTrackGroup.trim()) ||
+      submitting ||
+      disabled ||
+      submittedRef.current
+    ) return
     setSubmitting(true)
     try {
       const payload: Record<string, string> = {}
@@ -207,11 +301,45 @@ export default function FaRollfColumnMapper({
         if (header) payload[role.slot] = header
       }
       payload.fa_depreciation_cols_json = JSON.stringify([...depCols])
-      await onSubmit(payload)
+      if (fastTrack) payload.fa_group_col_1 = fastTrackGroup.trim()
+      const result = await auditMappedColumns(payload)
+      const invalid = Number(result?.total_invalid || 0)
+      if (result && hasAuditContent(result)) {
+        setAuditResult(result)
+      }
+      if (invalid > 0) {
+        submittedRef.current = false
+        setPendingPayload(payload)
+        return
+      }
+      submittedRef.current = true
+      await finalizeSubmit(payload)
     } finally {
       setSubmitting(false)
     }
-  }, [singleMapped, depCols, assignments, disabled, headerByLetter, onSubmit, submitting])
+  }, [
+    singleMapped,
+    depCols,
+    assignments,
+    disabled,
+    headerByLetter,
+    onSubmit,
+    submitting,
+    auditMappedColumns,
+    fastTrack,
+    fastTrackGroup,
+  ])
+
+  const handleContinueDespiteWarning = async () => {
+    if (!pendingPayload || submitting || disabled) return
+    setSubmitting(true)
+    submittedRef.current = true
+    try {
+      await finalizeSubmit(pendingPayload)
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   if (loading) {
     return <p className="text-sm text-slate-500">Loading register preview…</p>
@@ -248,10 +376,29 @@ export default function FaRollfColumnMapper({
       )}
 
       {phase === 'depreciation' && (
-        <p className="text-xs font-semibold text-slate-700">
-          Click every depreciation column you want summed (e.g. annual AfA + disposal AfA), then
-          click Continue.
-        </p>
+        <>
+          <p className="text-xs font-semibold text-slate-700">
+            Click every depreciation column you want summed (e.g. annual AfA + disposal AfA), then
+            click Continue.
+          </p>
+          {fastTrack && (
+            <label className="flex max-w-sm flex-col gap-1 text-xs font-semibold text-slate-700">
+              Grouping column
+              <select
+                value={fastTrackGroup}
+                disabled={disabled || submitting}
+                onChange={event => setFastTrackGroup(event.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-normal text-slate-800"
+              >
+                <option value="">Select one column…</option>
+                {preview.columns
+                  .map(column => column.header || column.letter)
+                  .filter(header => !mappedSingleHeaders.has(header) && !depCols.has(header))
+                  .map(header => <option key={header} value={header}>{header}</option>)}
+              </select>
+            </label>
+          )}
+        </>
       )}
 
       {(phase === 'depreciation' ? depSelectionOrder.length > 0 : history.length > 0) && (
@@ -336,10 +483,32 @@ export default function FaRollfColumnMapper({
         </table>
       </div>
 
-      {phase === 'depreciation' && (
+      {auditResult && hasAuditContent(auditResult) && (
+        <SourceDataAuditWarning
+          result={auditResult}
+          summary={
+            Number(auditResult.total_invalid || 0) > 0
+              ? `${Number(auditResult.total_invalid).toLocaleString('en-US')} row${
+                  Number(auditResult.total_invalid) === 1 ? '' : 's'
+                } have invalid fixed-asset column values across uploaded register files.`
+              : 'Source data review — see details below.'
+          }
+          blockingCount={Number(auditResult.total_invalid || 0)}
+          onContinue={pendingPayload ? handleContinueDespiteWarning : undefined}
+          submitting={submitting}
+          disabled={disabled}
+        />
+      )}
+
+      {phase === 'depreciation' && !pendingPayload && (
         <button
           type="button"
-          disabled={disabled || depCols.size === 0 || submitting}
+          disabled={
+            disabled ||
+            depCols.size === 0 ||
+            (fastTrack && !fastTrackGroup.trim()) ||
+            submitting
+          }
           onClick={() => void handleSubmit()}
           className="self-start rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           style={{ background: '#1E40AF' }}

@@ -426,6 +426,7 @@ def discover_l3_l4_pairs_by_bucket(
     bucket_order: list[str],
     normalize_bucket_fn: Callable[[Any], str],
     reported_value: str = DEFAULT_REPORTED_VALUE,
+    exclude_l3_fn: Callable[[Any], bool] | None = None,
 ) -> dict[str, list[tuple[str, str]]]:
     """Group (L3, L4) pairs from master by bucket column, preserving L3 order."""
     rep = reported_mask(master_df, source_col, reported_value)
@@ -440,6 +441,8 @@ def discover_l3_l4_pairs_by_bucket(
     seen: dict[str, set[tuple[str, str]]] = {b: set() for b in bucket_order}
 
     for l3 in l3_order:
+        if exclude_l3_fn and exclude_l3_fn(l3):
+            continue
         l3_rows = work[work["L3"].eq(l3)]
         if l3_rows.empty:
             continue
@@ -761,13 +764,99 @@ def build_working_capital_row_structure(
     return row_structure
 
 
-CF_BUCKET_ORDER = ["TWC", "OWC", "Other", "ND"]
+# Backward-compatible alias — operating buckets only (DL replaces ND in operating CF).
+CF_BUCKET_ORDER = ["TWC", "OWC", "Other", "DL"]
+CF_OPERATING_BUCKET_ORDER = CF_BUCKET_ORDER
+CF_FINANCING_NA_BUCKETS = ["ND", "Equity"]
+CF_EQUITY_L2_LABEL = "Equity"
+NA_BUCKET_ROLLUP: dict[str, tuple[str, ...]] = {"ND": ("ND", "DL")}
+
 CF_BUCKET_TOTAL_LABELS = {
     "TWC": "Δ Trade working capital",
     "OWC": "Δ Other working capital",
     "Other": "Δ Other",
-    "ND": "Δ Debt-like items",
+    "DL": "Δ Debt-like items",
 }
+
+CF_EXCLUDED_L3_CANONICAL = frozenset({"Cash & cash equivalents"})
+_CF_EXCLUDED_L3_ALIASES = frozenset({"cash & cash equivalents"})
+
+
+def is_cf_excluded_l3(l3: Any) -> bool:
+    """True for cash positions that must not appear in cashflow tables (exact match only)."""
+    s = str(l3 or "").strip()
+    if not s:
+        return False
+    key = " ".join(s.lower().split())
+    if key in _CF_EXCLUDED_L3_ALIASES:
+        return True
+    return s in CF_EXCLUDED_L3_CANONICAL
+
+
+def discover_equity_l3_positions(
+    master_df: pd.DataFrame,
+    source_col: str,
+    bucket_col: str,
+    *,
+    normalize_bucket_fn: Callable[[Any], str],
+    reported_value: str = DEFAULT_REPORTED_VALUE,
+) -> list[str]:
+    """L3 lines with NA mapping Equity (not under ND). L2=Equity only as fallback."""
+    rep = reported_mask(master_df, source_col, reported_value)
+    work = master_df.loc[rep].copy()
+    if bucket_col in work.columns:
+        work["_bucket"] = work[bucket_col].apply(normalize_bucket_fn)
+        equity_rows = work[work["_bucket"].eq(CF_EQUITY_L2_LABEL)]
+    else:
+        equity_rows = work.iloc[0:0]
+    if equity_rows.empty and "L2" in work.columns:
+        equity_rows = work[work["L2"].astype(str).str.strip().eq(CF_EQUITY_L2_LABEL)]
+    if equity_rows.empty or "L3" not in equity_rows.columns:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in equity_rows["L3"].tolist():
+        if is_blank_label(raw):
+            continue
+        label = str(raw).strip()
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+    return out
+
+
+def _append_cf_equity_block(
+    row_structure: list[dict],
+    bucket: str,
+    sorted_l3s: list[str],
+) -> None:
+    """Equity L2 as Δ subtotal; underlying L3 lines as indented detail (L4 = L3 in master)."""
+    if not sorted_l3s:
+        return
+    for l3 in sorted_l3s:
+        l3_label = str(l3).strip()
+        row_structure.append(
+            {
+                "type": "detail",
+                "label": l3_label,
+                "NA": bucket,
+                "L2": CF_EQUITY_L2_LABEL,
+                "L3": l3_label,
+                "L4": l3_label,
+            }
+        )
+    row_structure.append(
+        {
+            "type": "subtotal_l3",
+            "label": CF_EQUITY_L2_LABEL,
+            "NA": bucket,
+            "L2": CF_EQUITY_L2_LABEL,
+            "L3": CF_EQUITY_L2_LABEL,
+            "L4": "",
+        }
+    )
 
 
 def build_cf_na_bucket_row_structure(
@@ -782,6 +871,8 @@ def build_cf_na_bucket_row_structure(
     normalize_bucket_fn: Callable[[Any], str],
     reported_value: str = DEFAULT_REPORTED_VALUE,
     na_l3_order: dict[str, list[str]] | None = None,
+    include_bucket_total: bool = True,
+    exclude_l3_fn: Callable[[Any], bool] | None = is_cf_excluded_l3,
 ) -> list[dict]:
     """Cashflow Δ-WC: L4 detail -> L3 subtotal -> NA bucket total per section."""
     period_cols = period_columns_for_sort(master_df, normalize_l4_sort_basis(cfg))
@@ -793,13 +884,38 @@ def build_cf_na_bucket_row_structure(
         bucket_order=bucket_order,
         normalize_bucket_fn=normalize_bucket_fn,
         reported_value=reported_value,
+        exclude_l3_fn=exclude_l3_fn,
     )
 
     row_structure: list[dict] = []
     for bucket in bucket_order:
+        if bucket == CF_EQUITY_L2_LABEL:
+            l3_positions = discover_equity_l3_positions(
+                master_df,
+                source_col,
+                bucket_col,
+                normalize_bucket_fn=normalize_bucket_fn,
+                reported_value=reported_value,
+            )
+            if not l3_positions:
+                continue
+            position_set = {str(x).strip().lower() for x in l3_positions}
+            bucket_l3_order = [
+                l3
+                for l3 in (na_l3_order or {}).get(bucket, [])
+                if str(l3).strip().lower() in position_set
+            ]
+            for l3 in l3_positions:
+                if str(l3).strip() not in bucket_l3_order:
+                    bucket_l3_order.append(l3)
+            _append_cf_equity_block(row_structure, bucket, bucket_l3_order)
+            continue
+
         pairs = pairs_by_bucket.get(bucket, [])
         l3_to_l4: dict[str, list[str]] = {}
         for l3, l4 in pairs:
+            if exclude_l3_fn and exclude_l3_fn(l3):
+                continue
             l3_to_l4.setdefault(l3, [])
             if l4 not in l3_to_l4[l3]:
                 l3_to_l4[l3].append(l4)
@@ -807,7 +923,19 @@ def build_cf_na_bucket_row_structure(
         if not pairs and bucket != "Other":
             continue
 
-        bucket_l3_order = (na_l3_order or {}).get(bucket, [])
+        bucket_l3_order = [
+            l3
+            for l3 in (na_l3_order or {}).get(bucket, [])
+            if not (exclude_l3_fn and exclude_l3_fn(l3))
+        ]
+        seen_l3 = set(bucket_l3_order)
+        for l3 in l3_order:
+            if l3 not in l3_to_l4 or l3 in seen_l3:
+                continue
+            if exclude_l3_fn and exclude_l3_fn(l3):
+                continue
+            bucket_l3_order.append(l3)
+            seen_l3.add(l3)
 
         for l3 in bucket_l3_order:
             l4_list = l3_to_l4.get(l3, [])
@@ -823,16 +951,17 @@ def build_cf_na_bucket_row_structure(
             )
             _append_wc_l3_block(row_structure, bucket, l3, sorted_l4s)
 
-        row_structure.append(
-            {
-                "type": "total_na",
-                "label": bucket_total_labels.get(bucket, bucket),
-                "NA": bucket,
-                "L3": "",
-                "L4": "",
-                "bucket": bucket,
-            }
-        )
+        if include_bucket_total:
+            row_structure.append(
+                {
+                    "type": "total_na",
+                    "label": bucket_total_labels.get(bucket, bucket),
+                    "NA": bucket,
+                    "L3": "",
+                    "L4": "",
+                    "bucket": bucket,
+                }
+            )
 
     return row_structure
 

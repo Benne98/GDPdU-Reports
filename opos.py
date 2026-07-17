@@ -6,6 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -26,6 +27,8 @@ from funktionssammlung import (  # noqa: E402
     build_output_file_path,
     build_sumifs_formula_body,
     ensure_output_writable,
+    escape_excel_sumifs_wildcards,
+    excel_sumifs_criteria_token,
     source_range_ref,
     write_source_df_to_ws,
 )
@@ -43,8 +46,23 @@ from databook_excel_layout import (  # noqa: E402
     bs_recon_aggregated_ref,
     check_row_groups_after_table,
     collapse_check_portfolio,
+    find_bs_recon_row_contains,
     find_recon_block_col_for_period_label,
     paint_check_source_yellow,
+)
+from source_data_audit import (  # noqa: E402
+    ISSUE_EMPTY_GROUPED_AS_NA,
+    ISSUE_MISSING_OR_INVALID,
+    ISSUE_NON_NUMERIC,
+    MISSING_GROUP_LABEL,
+    audit_column_entry,
+    count_missing_series,
+    count_non_numeric_series,
+    finalize_audit_payload,
+    is_blank_group_value,
+    merge_audit_file_result,
+    normalize_group_value,
+    resolve_header_letter,
 )
 
 MONTH_ABBR = {
@@ -53,9 +71,111 @@ MONTH_ABBR = {
 }
 
 DEFAULT_THRESHOLDS = (30, 60, 90, 180)
+DEFAULT_AGING_RANGES: tuple[tuple[int, int], ...] = ((1, 30), (31, 60), (61, 90), (91, 180))
 DEFAULT_SORT_BUCKETS = (
     "overdue_1_30", "overdue_31_60", "overdue_61_90", "overdue_91_180", "overdue_over_180",
 )
+
+
+class AgingRangeValidationError(ValueError):
+    """Invalid user-defined overdue day ranges."""
+
+
+def default_aging_ranges() -> list[tuple[int, int]]:
+    return list(DEFAULT_AGING_RANGES)
+
+
+def _coerce_aging_range_pair(raw) -> tuple[int, int]:
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        lo = int(raw[0])
+        hi = int(raw[1])
+        return lo, hi
+    raise AgingRangeValidationError(f"Each range must be [lo, hi], got {raw!r}")
+
+
+def validate_aging_ranges(raw_ranges) -> list[tuple[int, int]]:
+    """Validate contiguous, non-overlapping overdue ranges starting at day 1."""
+    if not raw_ranges:
+        raise AgingRangeValidationError("At least one overdue bucket range is required.")
+    pairs = [_coerce_aging_range_pair(r) for r in raw_ranges]
+    for lo, hi in pairs:
+        if lo < 1 or hi < 1:
+            raise AgingRangeValidationError("Range bounds must be positive integers.")
+        if lo > hi:
+            raise AgingRangeValidationError(f"Invalid range {lo}-{hi}: start must be <= end.")
+    pairs.sort(key=lambda x: x[0])
+    if pairs[0][0] != 1:
+        raise AgingRangeValidationError("The first overdue bucket must start at day 1.")
+    for i in range(1, len(pairs)):
+        prev_lo, prev_hi = pairs[i - 1]
+        lo, hi = pairs[i]
+        if lo <= prev_hi:
+            raise AgingRangeValidationError(
+                f"Ranges overlap: {prev_lo}-{prev_hi} and {lo}-{hi}."
+            )
+        if lo != prev_hi + 1:
+            raise AgingRangeValidationError(
+                f"Gap between buckets: {prev_lo}-{prev_hi} and {lo}-{hi}."
+            )
+    return pairs
+
+
+def thresholds_to_aging_ranges(thresholds) -> list[tuple[int, int]]:
+    """Convert legacy cumulative thresholds [30,60,90,180] to [(1,30),(31,60),...]."""
+    ends = [int(x) for x in (thresholds or [])]
+    if not ends:
+        return default_aging_ranges()
+    ranges: list[tuple[int, int]] = []
+    start = 1
+    for end in ends:
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def resolve_aging_ranges(cfg: dict | None) -> list[tuple[int, int]]:
+    ab = dict((cfg or {}).get("aging_buckets") or {})
+    raw = ab.get("ranges")
+    if raw:
+        return validate_aging_ranges(raw)
+    thresholds = ab.get("thresholds") or ab.get("boundaries")
+    if thresholds:
+        return thresholds_to_aging_ranges(thresholds)
+    return default_aging_ranges()
+
+
+def bucket_key_for_range(lo: int, hi: int) -> str:
+    return f"overdue_{lo}_{hi}"
+
+
+def bucket_key_for_tail(max_hi: int) -> str:
+    return f"overdue_over_{max_hi}"
+
+
+def bucket_label_for_range(lo: int, hi: int) -> str:
+    return f"{lo}-{hi} days"
+
+
+def bucket_label_for_tail(max_hi: int) -> str:
+    return f">{max_hi} days"
+
+
+def bucket_options_from_ranges(
+    ranges: list[tuple[int, int]], *, include_current: bool = True
+) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    if include_current:
+        out.append(("not_yet_due", "Not yet due"))
+    for lo, hi in ranges:
+        out.append((bucket_key_for_range(lo, hi), bucket_label_for_range(lo, hi)))
+    if ranges:
+        max_hi = ranges[-1][1]
+        out.append((bucket_key_for_tail(max_hi), bucket_label_for_tail(max_hi)))
+    return out
+
+
+def bucket_keys_from_ranges(ranges: list[tuple[int, int]], *, include_current: bool = True) -> list[str]:
+    return [k for k, _ in bucket_options_from_ranges(ranges, include_current=include_current)]
 SORT_METRIC_TOTAL = "__total__"
 
 SIDE_LABELS = {
@@ -256,26 +376,31 @@ def _source_sheet_prefix_for_side(side: str) -> str:
     return f"__SOURCE__{_side_source_prefix(side)}_"
 
 
-INTERNAL_OPOS_COLUMNS = {
-    "partner_id": "__OPOS_PARTNER__",
-    "partner_name": "__OPOS_PARTNER__",
-    "amount": "__OPOS_AMOUNT__",
-    "due_date": "__OPOS_DUE__",
-}
-
-
 def source_sheet_name_for_label(period_label: str, side: str | None = None) -> str:
     if side:
         return f"__SOURCE__{_side_source_prefix(side)}_{period_label}"[:31]
     return f"__SOURCE__{period_label}"[:31]
 
 
-def cfg_with_internal_columns(cfg: dict) -> dict:
-    return {**cfg, "columns": dict(INTERNAL_OPOS_COLUMNS)}
+def _snapshot_column_map(snap: dict, cfg: dict) -> dict[str, str]:
+    """Resolved partner/amount/due headers for one snapshot (original names, not renamed)."""
+    if cfg.get("column_letters"):
+        return _resolve_columns_for_snapshot(snap, cfg)
+    return dict(cfg["columns"])
 
 
-def _opos_processing_cfg(cfg: dict) -> dict:
-    return cfg_with_internal_columns(cfg) if cfg.get("column_letters") else cfg
+def _cfg_for_snapshot(snap: dict, cfg: dict) -> dict:
+    return {**cfg, "columns": _snapshot_column_map(snap, cfg)}
+
+
+def _cfg_for_source_sheet(cfg: dict, source_sheet: str) -> dict:
+    side = str(cfg.get("side") or "debitor").strip().lower()
+    for snap in cfg["snapshots"]:
+        dt = pd.Timestamp(snap["as_of"]).normalize()
+        label = as_of_period_label(dt)
+        if source_sheet_name_for_label(label, side) == source_sheet:
+            return _cfg_for_snapshot(snap, cfg)
+    return cfg
 
 
 def header_at_column_letter(
@@ -343,23 +468,6 @@ def _resolve_columns_for_snapshot(snap: dict, cfg: dict) -> dict[str, str]:
     return dict(cfg["columns"])
 
 
-def _rename_df_to_internal_columns(df: pd.DataFrame, resolved: dict[str, str]) -> pd.DataFrame:
-    out = df.copy()
-    mapping: dict[str, str] = {}
-    pid_src = str(resolved.get("partner_id") or "").strip()
-    if pid_src and pid_src in out.columns:
-        mapping[pid_src] = INTERNAL_OPOS_COLUMNS["partner_id"]
-    amt_src = str(resolved.get("amount") or "").strip()
-    if amt_src and amt_src in out.columns:
-        mapping[amt_src] = INTERNAL_OPOS_COLUMNS["amount"]
-    due_src = str(resolved.get("due_date") or "").strip()
-    if due_src and due_src in out.columns:
-        mapping[due_src] = INTERNAL_OPOS_COLUMNS["due_date"]
-    if mapping:
-        out = out.rename(columns=mapping)
-    return out
-
-
 def _bucket_col_width(bucket_key: str | None) -> float:
     if bucket_key and bucket_key in BUCKET_COL_WIDTH_OVERRIDES:
         return BUCKET_COL_WIDTH_OVERRIDES[bucket_key]
@@ -415,10 +523,26 @@ def normalize_config(raw: dict) -> dict:
     return _normalize_single_side_config(cfg)
 
 
+def _coerce_mapping_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
 def _normalize_combined_config(cfg: dict) -> dict:
-    letters = dict(cfg.get("column_letters") or {})
-    if not letters:
-        raise ValueError("CONFIG column_letters required for combined debitor/kreditor run")
+    letters = _coerce_mapping_dict(cfg.get("column_letters"))
+    columns = _coerce_mapping_dict(cfg.get("columns"))
+    if not letters and not columns:
+        raise ValueError("CONFIG column_letters or columns required for combined debitor/kreditor run")
     base = {
         k: cfg[k]
         for k in (
@@ -428,6 +552,7 @@ def _normalize_combined_config(cfg: dict) -> dict:
             "top_bucket",
             "top_n_subtotal",
             "filters",
+            "aging_buckets",
             "formula_mode",
             "output_file_path",
             "case_id",
@@ -439,7 +564,11 @@ def _normalize_combined_config(cfg: dict) -> dict:
     sides_out: dict[str, dict] = {}
     for side in ("debitor", "kreditor"):
         block = dict((cfg.get("sides") or {}).get(side) or {})
-        side_cfg = {**base, **block, "side": side, "column_letters": letters}
+        side_cfg = {**base, **block, "side": side}
+        if letters:
+            side_cfg["column_letters"] = letters
+        elif columns:
+            side_cfg["columns"] = columns
         sides_out[side] = _normalize_single_side_config(side_cfg)
     out = dict(sides_out["debitor"])
     out["sides"] = sides_out
@@ -449,7 +578,8 @@ def _normalize_combined_config(cfg: dict) -> dict:
 
 def _normalize_single_side_config(cfg: dict) -> dict:
     cfg = dict(cfg or {})
-    letters = cfg.get("column_letters")
+    letters = _coerce_mapping_dict(cfg.get("column_letters"))
+    columns = _coerce_mapping_dict(cfg.get("columns"))
     required = ("partner_id", "partner_name", "amount", "due_date")
     if letters:
         snapshots = _coerce_snapshots(cfg)
@@ -486,6 +616,10 @@ def _normalize_single_side_config(cfg: dict) -> dict:
 
     ab = dict(cfg.get("aging_buckets") or {})
     include_current = bool(ab.get("include_current", True))
+    try:
+        aging_ranges = resolve_aging_ranges({"aging_buckets": ab})
+    except AgingRangeValidationError:
+        aging_ranges = default_aging_ranges()
 
     sort_cfg = dict(cfg.get("sort") or {})
     sort_basis = normalize_sort_basis(sort_cfg.get("basis"))
@@ -498,7 +632,7 @@ def _normalize_single_side_config(cfg: dict) -> dict:
         bucket_keys = [SORT_METRIC_TOTAL]
     elif sort_metric in ("buckets", "bucket") or raw_bucket_keys:
         sort_metric = "buckets"
-        bucket_keys = raw_bucket_keys or list(DEFAULT_SORT_BUCKETS)
+        bucket_keys = raw_bucket_keys or bucket_keys_from_ranges(aging_ranges)
     else:
         sort_metric = "total"
         bucket_keys = [SORT_METRIC_TOTAL]
@@ -508,20 +642,17 @@ def _normalize_single_side_config(cfg: dict) -> dict:
     filters.setdefault("enabled", False)
     filters.setdefault("rules", [])
 
-    column_values = (
-        dict(INTERNAL_OPOS_COLUMNS)
-        if letters
-        else {k: str(cols[k]).strip() for k in required}
-    )
+    column_values = {k: str(cols[k]).strip() for k in required}
     cfg.update(
         {
             "side": side,
             "columns": column_values,
             "snapshots": snapshots,
             "aging_buckets": {
-                "mode": "fixed",
-                "thresholds": DEFAULT_THRESHOLDS,
-                "boundaries": DEFAULT_THRESHOLDS,
+                "mode": "ranges",
+                "ranges": [list(r) for r in aging_ranges],
+                "thresholds": [r[1] for r in aging_ranges],
+                "boundaries": [r[1] for r in aging_ranges],
                 "include_current": include_current,
             },
             "sort": {"basis": sort_basis, "metric": sort_metric, "bucket_keys": bucket_keys},
@@ -546,21 +677,27 @@ def _normalize_single_side_config(cfg: dict) -> dict:
 
 
 def build_aging_bucket_defs(cfg: dict) -> list[AgingBucket]:
-    """Fixed overdue-day buckets (30/60/90/180) — not configurable."""
+    """Build aging buckets from cfg aging_buckets.ranges (always outputs all buckets)."""
     ab = cfg.get("aging_buckets") or {}
     include_current = bool(ab.get("include_current", True))
+    ranges = resolve_aging_ranges(cfg)
     out: list[AgingBucket] = []
     if include_current:
         out.append(AgingBucket("not_yet_due", "Not yet due", 0, 0))
-    specs = [
-        ("overdue_1_30", "1-30 days", 1, 30),
-        ("overdue_31_60", "31-60 days", 31, 60),
-        ("overdue_61_90", "61-90 days", 61, 90),
-        ("overdue_91_180", "91-180 days", 91, 180),
-        ("overdue_over_180", ">180 days", 181, None),
-    ]
-    for key, label, lo, hi in specs:
-        out.append(AgingBucket(key, label, lo, hi))
+    for lo, hi in ranges:
+        out.append(
+            AgingBucket(bucket_key_for_range(lo, hi), bucket_label_for_range(lo, hi), lo, hi)
+        )
+    max_hi = ranges[-1][1]
+    tail_lo = max_hi + 1
+    out.append(
+        AgingBucket(
+            bucket_key_for_tail(max_hi),
+            bucket_label_for_tail(max_hi),
+            tail_lo,
+            None,
+        )
+    )
     return out
 
 
@@ -602,6 +739,8 @@ def _clean_text_series(s: pd.Series) -> pd.Series:
 
 
 def _display_partner_name(pid: str, name: str) -> str:
+    if str(pid).strip() == MISSING_GROUP_LABEL:
+        return MISSING_GROUP_LABEL
     n = str(name or "").strip()
     if not n or n.lower() in ("nan", "none", "<na>"):
         return str(pid)
@@ -610,27 +749,21 @@ def _display_partner_name(pid: str, name: str) -> str:
 
 def build_partner_meta_from_snapshots(cfg: dict) -> dict[str, str]:
     """Partner display names from full snapshot rows (incl. rows without due date)."""
-    processing_cfg = _opos_processing_cfg(cfg)
     meta: dict[str, str] = {}
     for snap in cfg["snapshots"]:
+        snap_cfg = _cfg_for_snapshot(snap, cfg)
+        cols = snap_cfg["columns"]
         df = pd.read_excel(
             snap["file_path"],
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        if cfg.get("column_letters"):
-            resolved = _resolve_columns_for_snapshot(snap, cfg)
-            df = _rename_df_to_internal_columns(df, resolved)
-        d = apply_filters(df.copy(), processing_cfg)
-        ids = _clean_text_series(d[processing_cfg["columns"]["partner_id"]])
-        names = _clean_text_series(d[processing_cfg["columns"]["partner_name"]])
+        d = apply_filters(df.copy(), snap_cfg)
+        ids = _clean_text_series(d[cols["partner_id"]]).map(normalize_group_value)
+        names = _clean_text_series(d[cols["partner_name"]])
         for pid, name in zip(ids, names):
-            if not pid:
-                continue
-            if name and (pid not in meta or meta[pid] == pid):
-                meta[pid] = name
-            elif pid not in meta:
-                meta[pid] = pid
+            if pid not in meta or meta[pid] == pid:
+                meta[pid] = _display_partner_name(pid, name)
     return {pid: _display_partner_name(pid, name) for pid, name in meta.items()}
 
 
@@ -638,32 +771,35 @@ def preprocess_opos_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     cols = cfg["columns"]
     d = apply_filters(df.copy(), cfg)
 
-    d["_partner_id"] = _clean_text_series(d[cols["partner_id"]])
+    d["_partner_id"] = _clean_text_series(d[cols["partner_id"]]).map(normalize_group_value)
     d["_partner_name"] = _clean_text_series(d[cols["partner_name"]])
     d["_amount"] = pd.to_numeric(d[cols["amount"]], errors="coerce").fillna(0.0)
     d["_due_date"] = _parse_date_series(d[cols["due_date"]])
 
-    d = d[
-        d["_partner_id"].notna()
-        & (d["_partner_id"] != "")
-        & d["_due_date"].notna()
-    ]
+    d = d[d["_due_date"].notna()]
     return d
 
 
-def audit_missing_due_date_rows(
+def audit_opos_mapped_columns(
     snapshots: list[dict],
     columns: dict | None = None,
     *,
     column_letters: dict | None = None,
     header_row: int = 0,
 ) -> dict:
-    """Rows with partner id but missing due date — same rule as preprocess_opos_input."""
+    """Audit all mapped OPOS columns with per-file/per-column counts."""
+    files: list[dict] = []
     total_excluded = 0
-    details: list[dict] = []
+    letters = dict(column_letters or {})
+    role_letters = {
+        "partner_id": str(letters.get("partner") or letters.get("partner_id") or "").strip().upper(),
+        "amount": str(letters.get("amount") or "").strip().upper(),
+        "due_date": str(letters.get("due_date") or "").strip().upper(),
+    }
+
     for snap in snapshots:
         fp = str(snap.get("file_path") or "").strip()
-        as_of = str(snap.get("as_of") or "").strip()
+        label = str(snap.get("as_of") or snap.get("label") or Path(fp).name).strip()
         if not fp or not os.path.isfile(fp):
             continue
         sheet = str(snap.get("sheet_name") or "").strip()
@@ -673,20 +809,93 @@ def audit_missing_due_date_rows(
             )
         else:
             col_map = _canonicalize_partner_columns(columns or {})
-        col_map = {k: str(col_map[k]).strip() for k in ("partner_id", "partner_name", "amount", "due_date")}
+        col_map = {
+            k: str(col_map[k]).strip()
+            for k in ("partner_id", "partner_name", "amount", "due_date")
+        }
         if not sheet:
             sheet = resolve_snapshot_sheet_name(fp, col_map["partner_id"], "")
         df = pd.read_excel(fp, sheet_name=sheet, engine="openpyxl")
         tmp_cfg = {"columns": col_map, "filters": {"enabled": False}}
         d = apply_filters(df.copy(), tmp_cfg)
-        ids = _clean_text_series(d[col_map["partner_id"]])
+
+        pid_raw = _clean_text_series(d[col_map["partner_id"]]).map(normalize_group_value)
         due = _parse_date_series(d[col_map["due_date"]])
-        valid_id = ids.notna() & (ids != "")
-        excluded = int((valid_id & due.isna()).sum())
-        if excluded > 0:
-            details.append({"as_of": as_of, "excluded_rows": excluded})
-            total_excluded += excluded
-    return {"total_excluded": total_excluded, "snapshots": details}
+        amount = d[col_map["amount"]]
+
+        empty_partner = int((pid_raw == MISSING_GROUP_LABEL).sum())
+        missing_due = int(due.isna().sum())
+        excluded = missing_due
+        total_excluded += excluded
+
+        col_entries: list[dict] = []
+        for role, header_key in (
+            ("partner_id", "partner_id"),
+            ("partner_name", "partner_name"),
+            ("amount", "amount"),
+            ("due_date", "due_date"),
+        ):
+            header = col_map[header_key]
+            letter = resolve_header_letter(df, header, role=role, letter_map=role_letters)
+            if role == "partner_id":
+                count = empty_partner
+                issue = ISSUE_EMPTY_GROUPED_AS_NA
+            elif role == "due_date":
+                count = missing_due
+                issue = ISSUE_MISSING_OR_INVALID
+            elif role == "amount":
+                count = count_non_numeric_series(amount)
+                issue = ISSUE_NON_NUMERIC
+            else:
+                count = count_missing_series(_clean_text_series(d[col_map["partner_name"]]))
+                issue = ISSUE_MISSING_OR_INVALID
+            entry = audit_column_entry(
+                role=role,
+                header=header,
+                count=count,
+                issue=issue,
+                letter=letter,
+            )
+            if entry:
+                col_entries.append(entry)
+
+        notes: list[str] = []
+        if empty_partner > 0:
+            notes.append(
+                f'{empty_partner} row(s) with empty partner will appear as aggregate position "{MISSING_GROUP_LABEL}".'
+            )
+        if missing_due > 0:
+            notes.append(
+                f"{missing_due} row(s) with missing due date will be excluded from the aging report."
+            )
+
+        merge_audit_file_result(
+            files,
+            label=label,
+            file_path=fp,
+            sheet_name=sheet,
+            columns=col_entries,
+            excluded_rows=excluded,
+            notes=notes,
+        )
+
+    return finalize_audit_payload(files, total_excluded=total_excluded)
+
+
+def audit_missing_due_date_rows(
+    snapshots: list[dict],
+    columns: dict | None = None,
+    *,
+    column_letters: dict | None = None,
+    header_row: int = 0,
+) -> dict:
+    """Backward-compatible alias — returns extended audit payload."""
+    return audit_opos_mapped_columns(
+        snapshots,
+        columns,
+        column_letters=column_letters,
+        header_row=header_row,
+    )
 
 
 def assign_bucket_for_due(
@@ -875,9 +1084,7 @@ def aggregate_opos(
         ]
         sub["_keur"] = sub["_amount"] / 1000.0
         for pid, grp in sub.groupby("_partner_id", dropna=False):
-            pid_s = str(pid).strip()
-            if not pid_s:
-                continue
+            pid_s = normalize_group_value(pid)
             bucket_sums = grp.groupby("_bucket")["_keur"].sum().to_dict()
             row = grid[period.label].setdefault(
                 pid_s, {k: 0.0 for k in bucket_key_list}
@@ -885,7 +1092,10 @@ def aggregate_opos(
             for bk, val in bucket_sums.items():
                 if bk in row:
                     row[bk] = float(row.get(bk, 0.0)) + float(val)
-            partner_meta[pid_s] = pid_s
+            partner_meta[pid_s] = _display_partner_name(
+                pid_s,
+                grp["_partner_name"].iloc[0] if len(grp) else pid_s,
+            )
 
     scores: dict[str, float] = {}
     for pid in partner_meta:
@@ -899,15 +1109,7 @@ def aggregate_opos(
 
 def _partner_display_header(cfg: dict) -> str:
     cols = cfg.get("columns") or {}
-    name = str(cols.get("partner_id") or cols.get("partner_name") or "").strip()
-    if name and not name.startswith("__OPOS_"):
-        return name
-    side = str(cfg.get("side") or "debitor").strip().lower()
-    return SIDE_LABELS.get(side, SIDE_LABELS["debitor"])["partner_header"]
-
-
-def _formula_cfg(cfg: dict) -> dict:
-    return cfg_with_internal_columns(cfg) if cfg.get("column_letters") else cfg
+    return str(cols.get("partner_id") or cols.get("partner_name") or "").strip()
 
 
 def get_opos_excel_layout(cfg: dict) -> dict:
@@ -983,7 +1185,10 @@ def write_opos_formula_key_column(
         for c in range(1, helper_right + 1):
             if c != key_col:
                 ws.cell(row_idx, c).value = None
-        cell = ws.cell(row_idx, key_col, pname)
+        match_key = pname
+        if str(pname or "").strip() != MISSING_GROUP_LABEL:
+            match_key = escape_excel_sumifs_wildcards(pname)
+        cell = ws.cell(row_idx, key_col, match_key)
         cell.font = FONT_MAPPING
         cell.alignment = ALIGN_LEFT
 
@@ -1009,10 +1214,9 @@ def bucket_due_bounds(
     lo_days = int(bucket.min_days)
     hi_days = bucket.max_days
     if hi_days is not None:
-        hi_date = as_of if bucket.key == "overdue_1_30" else as_of - pd.Timedelta(days=lo_days)
+        hi_date = as_of if lo_days == 1 else as_of - pd.Timedelta(days=lo_days)
         return as_of - pd.Timedelta(days=int(hi_days)), hi_date
-    # >180 days overdue → due on or before as_of - 181 days
-    return None, as_of - pd.Timedelta(days=181)
+    return None, as_of - pd.Timedelta(days=lo_days)
 
 
 def _value_col_count(buckets: list[AgingBucket]) -> int:
@@ -1078,7 +1282,6 @@ def enrich_opos_source_df(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def load_snapshot_dataframes(cfg: dict) -> dict[str, pd.DataFrame]:
-    processing_cfg = _opos_processing_cfg(cfg)
     out: dict[str, pd.DataFrame] = {}
     for snap in cfg["snapshots"]:
         dt = pd.Timestamp(snap["as_of"]).normalize()
@@ -1088,10 +1291,8 @@ def load_snapshot_dataframes(cfg: dict) -> dict[str, pd.DataFrame]:
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        if cfg.get("column_letters"):
-            resolved = _resolve_columns_for_snapshot(snap, cfg)
-            df = _rename_df_to_internal_columns(df, resolved)
-        out[label] = preprocess_opos_input(df, processing_cfg)
+        snap_cfg = _cfg_for_snapshot(snap, cfg)
+        out[label] = preprocess_opos_input(df, snap_cfg)
     return out
 
 
@@ -1137,37 +1338,50 @@ def _format_due_date_column(ws, df: pd.DataFrame, cfg: dict) -> None:
 def bootstrap_opos_workbook(
     cfg: dict,
     output_path: str,
+    *,
+    wb=None,
+    save: bool = True,
 ) -> None:
     """Write one __SOURCE__{side}_{label} sheet per snapshot (values only)."""
     side = str(cfg.get("side") or "debitor").strip().lower()
     prefix = _source_sheet_prefix_for_side(side)
-    processing_cfg = _opos_processing_cfg(cfg)
-    if os.path.isfile(output_path):
+    owns_workbook = wb is None
+    if wb is None and os.path.isfile(output_path):
         wb = load_workbook(output_path)
         for sn in list(wb.sheetnames):
             if str(sn).startswith(prefix):
                 del wb[sn]
-    else:
+    elif wb is None:
         wb = Workbook()
         wb.remove(wb.active)
+    else:
+        for sn in list(wb.sheetnames):
+            if str(sn).startswith(prefix):
+                del wb[sn]
     for snap in sorted(cfg["snapshots"], key=lambda s: pd.Timestamp(s["as_of"])):
         dt = pd.Timestamp(snap["as_of"]).normalize()
         label = as_of_period_label(dt)
         title = source_sheet_name_for_label(label, side)
         ws = wb.create_sheet(title)
+        ws.sheet_state = "visible"
         df = pd.read_excel(
             snap["file_path"],
             sheet_name=snap["sheet_name"],
             engine="openpyxl",
         )
-        if cfg.get("column_letters"):
-            resolved = _resolve_columns_for_snapshot(snap, cfg)
-            df = _rename_df_to_internal_columns(df, resolved)
-        snap_cfg = {**processing_cfg, "file_path": snap["file_path"], "sheet_name": snap["sheet_name"]}
-        write_source_df_to_ws(ws, df, snap_cfg)
-        _format_due_date_column(ws, df, processing_cfg)
-    wb.save(output_path)
-    wb.close()
+        snap_cfg = _cfg_for_snapshot(snap, cfg)
+        snap_cfg = {
+            **snap_cfg,
+            "file_path": snap["file_path"],
+            "sheet_name": snap["sheet_name"],
+        }
+        filtered = apply_filters(df.copy(), snap_cfg)
+        write_source_df_to_ws(ws, filtered, snap_cfg)
+        _format_due_date_column(ws, filtered, snap_cfg)
+    if save:
+        wb.save(output_path)
+    if owns_workbook:
+        wb.close()
 
 
 def _partner_has_any_balance(
@@ -1204,6 +1418,17 @@ def _set_cell_formula(cell, formula: str, *, bold: bool = False) -> None:
     cell.alignment = ALIGN_RIGHT
 
 
+def _opos_partner_sumifs_criterion_tokens(
+    partner_id: str | None,
+    partner_row: int | None,
+) -> list[str]:
+    if partner_row is None:
+        return []
+    if str(partner_id or "").strip() == MISSING_GROUP_LABEL:
+        return [excel_sumifs_criteria_token("isblank")]
+    return [f"${col_letter(KEY_COL)}{partner_row}"]
+
+
 def _opos_sumifs_criteria(
     source_sheet: str,
     src_header: dict[str, int],
@@ -1212,39 +1437,54 @@ def _opos_sumifs_criteria(
     bucket: AgingBucket,
     col_idx: int | None,
     partner_row: int | None,
+    *,
+    partner_id: str | None = None,
 ) -> str:
     cols = cfg["columns"]
     amount_rng = source_range_ref(source_sheet, src_header, cols["amount"])
     due_rng = source_range_ref(source_sheet, src_header, cols["due_date"])
 
-    base_pairs: list[tuple[str, str]] = []
-    if partner_row is not None:
-        partner_rng = source_range_ref(source_sheet, src_header, cols["partner_id"])
-        partner_ref = f"${col_letter(KEY_COL)}{partner_row}"
-        base_pairs.append((partner_rng, partner_ref))
-
+    due_pairs: list[tuple[str, str]] = []
     lo_date, hi_date = bucket_due_bounds(bucket, period.date)
     if bucket.key == "not_yet_due":
         if col_idx is not None:
             lo_ref = f"${col_letter(col_idx)}${BUCKET_BOUND_ROW_LO}"
-            base_pairs.append((due_rng, f'">"&{lo_ref}'))
+            due_pairs.append((due_rng, f'">"&{lo_ref}'))
         elif lo_date is not None:
-            base_pairs.append((due_rng, f'">"&{_excel_date_literal(lo_date)}'))
+            due_pairs.append((due_rng, f'">"&{_excel_date_literal(lo_date)}'))
     else:
         if lo_date is not None:
             if col_idx is not None:
                 lo_ref = f"${col_letter(col_idx)}${BUCKET_BOUND_ROW_LO}"
-                base_pairs.append((due_rng, f'">="&{lo_ref}'))
+                due_pairs.append((due_rng, f'">="&{lo_ref}'))
             else:
-                base_pairs.append((due_rng, f'">="&{_excel_date_literal(lo_date)}'))
+                due_pairs.append((due_rng, f'">="&{_excel_date_literal(lo_date)}'))
         if hi_date is not None:
             if col_idx is not None:
                 hi_ref = f"${col_letter(col_idx)}${BUCKET_BOUND_ROW_HI}"
-                base_pairs.append((due_rng, f'"<="&{hi_ref}'))
+                due_pairs.append((due_rng, f'"<="&{hi_ref}'))
             else:
-                base_pairs.append((due_rng, f'"<="&{_excel_date_literal(hi_date)}'))
+                due_pairs.append((due_rng, f'"<="&{_excel_date_literal(hi_date)}'))
 
-    return build_sumifs_formula_body(amount_rng, base_pairs, [[]], divide_by_1000=True)
+    partner_rng = None
+    if partner_row is not None:
+        partner_rng = source_range_ref(source_sheet, src_header, cols["partner_id"])
+    crit_tokens = _opos_partner_sumifs_criterion_tokens(partner_id, partner_row)
+    if not crit_tokens:
+        return build_sumifs_formula_body(amount_rng, due_pairs, [[]], divide_by_1000=True)
+    if len(crit_tokens) == 1:
+        pairs = [(partner_rng, crit_tokens[0])] + due_pairs
+        return build_sumifs_formula_body(amount_rng, pairs, [[]], divide_by_1000=True)
+    bodies = [
+        build_sumifs_formula_body(
+            amount_rng,
+            [(partner_rng, tok)] + due_pairs,
+            [[]],
+            divide_by_1000=True,
+        )
+        for tok in crit_tokens
+    ]
+    return "+".join(f"({body})" for body in bodies)
 
 
 def _opos_sumifs_formula(
@@ -1255,9 +1495,18 @@ def _opos_sumifs_formula(
     bucket: AgingBucket,
     col_idx: int,
     partner_row: int | None,
+    *,
+    partner_id: str | None = None,
 ) -> str:
     body = _opos_sumifs_criteria(
-        source_sheet, src_header, cfg, period, bucket, col_idx, partner_row
+        source_sheet,
+        src_header,
+        cfg,
+        period,
+        bucket,
+        col_idx,
+        partner_row,
+        partner_id=partner_id,
     )
     return f'=IFERROR({body},"")'
 
@@ -1565,11 +1814,20 @@ def _collapse_opos_helper_columns(ws) -> None:
 
 
 def _apply_opos_top_bucket_outlines(ws, top_bucket_rows: list[dict] | None) -> None:
-    for spec in top_bucket_rows or []:
+    """Outline partners under each top-N bucket; collapse from the 3rd bucket (like TOP)."""
+    ws.sheet_properties.outlinePr.summaryBelow = True
+    for i, spec in enumerate(top_bucket_rows or []):
+        collapse = i >= 2
         br = int(spec["row"])
         for pr in spec.get("partner_rows") or []:
-            ws.row_dimensions[int(pr)].outlineLevel = 1
-        ws.row_dimensions[br].outlineLevel = 0
+            rd = ws.row_dimensions[int(pr)]
+            rd.outlineLevel = 1
+            rd.collapsed = False
+            rd.hidden = collapse
+        rd_b = ws.row_dimensions[br]
+        rd_b.outlineLevel = 0
+        rd_b.hidden = False
+        rd_b.collapsed = collapse
 
 
 def apply_opos_sheet_formatting(
@@ -1675,17 +1933,17 @@ def write_detail_sheet(
     use_formulas = bool(cfg.get("formula_mode", True))
     detail_lines = build_opos_detail_lines(partner_order, grid, cfg, periods, buckets)
 
+    company = str(cfg.get("company") or cfg.get("company_name") or "").strip()
     ws.cell(PROJECT_TITLE_ROW, POS_COL, f"Project {cfg['title']}").font = FONT_PROJECT
-    ws.cell(SUBTITLE_ROW, POS_COL, f"{cfg['company']} | {labels['subtitle']}").font = FONT_SUBTITLE
-    ws.cell(
-        TABLE_TITLE_ROW,
-        POS_COL,
-        f"{cfg['company']} | {labels['subtitle']}",
-    ).font = FONT_TITLE
+    ws.cell(SUBTITLE_ROW, POS_COL, labels["subtitle"]).font = FONT_SUBTITLE
+    table_heading = (
+        f"{company} | {labels['subtitle']}" if company else labels["subtitle"]
+    )
+    ws.cell(TABLE_TITLE_ROW, POS_COL, table_heading).font = FONT_TITLE
 
     blocks = build_opos_blocks(periods, buckets, side=cfg.get("side"))
     for block in blocks:
-        _write_block_headers(ws, block, buckets, partner_header=labels["partner_header"])
+        _write_block_headers(ws, block, buckets, partner_header=UNIT_LABEL)
     if use_formulas:
         write_opos_bucket_bound_rows(ws, blocks, buckets)
 
@@ -1828,21 +2086,29 @@ def write_summary_sheet(
     labels = SIDE_LABELS[cfg["side"]]
     use_formulas = bool(cfg.get("formula_mode", True))
 
+    company = str(cfg.get("company") or cfg.get("company_name") or "").strip()
     ws.cell(PROJECT_TITLE_ROW, POS_COL, f"Project {cfg['title']}").font = FONT_PROJECT
-    ws.cell(SUBTITLE_ROW, POS_COL, f"{cfg['company']} | {labels['subtitle']}").font = FONT_SUBTITLE
+    ws.cell(SUBTITLE_ROW, POS_COL, labels["subtitle"]).font = FONT_SUBTITLE
 
     value_start = POS_COL + 1
     last_col = POS_COL + len(periods)
-    title_cell = ws.cell(
-        TABLE_TITLE_ROW,
-        POS_COL,
-        f"{cfg['company']} | {labels['summary_sheet']}",
+    table_heading = (
+        f"{company} | {labels['summary_sheet']}" if company else labels["summary_sheet"]
     )
+    title_cell = ws.cell(TABLE_TITLE_ROW, POS_COL, table_heading)
     title_cell.font = FONT_TITLE
     title_cell.alignment = ALIGN_LEFT
 
-    for cc in range(value_start, last_col + 1):
-        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_HEADER
+    # Row above kEUR: period headers (same pattern as detail block titles).
+    bt_pos = ws.cell(BLOCK_TITLE_ROW, POS_COL, "")
+    bt_pos.fill = FILL_HEADER
+    bt_pos.font = FONT_HEADER
+    for i, period in enumerate(periods):
+        c = value_start + i
+        bc = ws.cell(BLOCK_TITLE_ROW, c, period.label)
+        bc.font = FONT_HEADER
+        bc.fill = FILL_HEADER
+        bc.alignment = ALIGN_RIGHT
 
     hpos = ws.cell(HEADER_ROW, POS_COL, UNIT_LABEL)
     hpos.font = FONT_HEADER
@@ -1850,9 +2116,9 @@ def write_summary_sheet(
     hpos.alignment = ALIGN_LEFT
     hpos.border = THEME.border_header_bottom
 
-    for i, period in enumerate(periods):
+    for i, _period in enumerate(periods):
         c = value_start + i
-        hc = ws.cell(HEADER_ROW, c, period.label)
+        hc = ws.cell(HEADER_ROW, c, "")
         hc.font = FONT_HEADER
         hc.fill = FILL_HEADER
         hc.alignment = ALIGN_RIGHT
@@ -1904,7 +2170,8 @@ def write_summary_sheet(
 
     for cc in range(POS_COL, last_col + 1):
         ws.cell(TABLE_TITLE_ROW, cc).fill = FILL_WHITE
-        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_HEADER if cc >= value_start else FILL_WHITE
+        # D7 (above kEUR) must keep header fill — not only period value columns.
+        ws.cell(BLOCK_TITLE_ROW, cc).fill = FILL_HEADER
         ws.cell(HEADER_ROW, cc).fill = FILL_HEADER
         ws.cell(HEADER_ROW, cc).border = THEME.border_header_bottom
 
@@ -1966,7 +2233,6 @@ def apply_opos_detail_formulas(
     buckets: list[AgingBucket],
     layout: dict,
 ) -> None:
-    fcfg = _formula_cfg(cfg)
     labels = SIDE_LABELS[cfg["side"]]
     ws = wb[labels["detail_sheet"]]
 
@@ -1985,15 +2251,24 @@ def apply_opos_detail_formulas(
             header_maps[source_sheet] = _get_sheet_header_map(wb[source_sheet])
 
     for row_idx in partner_row_pids:
+        pid = partner_row_pids[row_idx]
         for block in blocks:
             period = block["period"]
             source_sheet = block["source_sheet"]
             src_header = header_maps[source_sheet]
+            fcfg = _cfg_for_source_sheet(cfg, source_sheet)
             cc = block["year_startcol"]
             bucket_ccs: list[int] = []
             for b in bucket_cols:
                 formula = _opos_sumifs_formula(
-                    source_sheet, src_header, fcfg, period, b, cc, row_idx
+                    source_sheet,
+                    src_header,
+                    fcfg,
+                    period,
+                    b,
+                    cc,
+                    row_idx,
+                    partner_id=pid,
                 )
                 _set_cell_formula(ws.cell(row_idx, cc), formula)
                 bucket_ccs.append(cc)
@@ -2053,7 +2328,6 @@ def apply_opos_summary_formulas(
     buckets: list[AgingBucket],
     layout: dict,
 ) -> None:
-    fcfg = _formula_cfg(cfg)
     labels = SIDE_LABELS[cfg["side"]]
     ws = wb[labels["summary_sheet"]]
     summary_rows = layout["summary_rows"]
@@ -2073,6 +2347,7 @@ def apply_opos_summary_formulas(
             col_idx = value_start + i
             source_sheet = source_sheet_name_for_label(period.label, cfg.get("side"))
             src_header = header_maps[source_sheet]
+            fcfg = _cfg_for_source_sheet(cfg, source_sheet)
             body = _opos_sumifs_criteria(
                 source_sheet,
                 src_header,
@@ -2120,7 +2395,10 @@ def _opos_bs_recon_row(ws_rec, side: str) -> int | None:
             return rr
         if needle in vs and fallback is None:
             fallback = rr
-    return fallback
+    if fallback is not None:
+        return fallback
+    # Wider search across the sheet (label may sit outside the helper POS col).
+    return find_bs_recon_row_contains(ws_rec, needle)
 
 
 def _opos_bs_recon_reported_formula(wb, side: str, period_label: str) -> str | None:
@@ -2218,56 +2496,126 @@ def _apply_opos_check_section(
         bucket_cols = layout.get("bucket_cols") or []
         for block in layout["blocks"]:
             tot_col = block["year_startcol"] + len(bucket_cols)
+            src_cell = ws.cell(check_source_row, tot_col)
             if not _apply_opos_bs_recon_cell(
-                ws.cell(check_source_row, tot_col),
+                src_cell,
                 wb,
                 side,
                 block["period"].label,
             ):
-                continue
+                src_cell.value = "n/a"
+                src_cell.font = FONT_BASE
             yellow_cols.append(tot_col)
             anchor_cell = ws.cell(anchor_row, tot_col)
             delta_cell = ws.cell(check_delta_row, tot_col)
-            delta_cell.value = f"={anchor_cell.coordinate}-{ws.cell(check_source_row, tot_col).coordinate}"
+            if src_cell.value == "n/a":
+                delta_cell.value = "n/a"
+            else:
+                delta_cell.value = f"={anchor_cell.coordinate}-{src_cell.coordinate}"
             delta_cell.number_format = NUM_FMT
             delta_cell.font = FONT_CHECK_RED
-            ws.conditional_formatting.add(
-                delta_cell.coordinate,
-                CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
-            )
+            if src_cell.value != "n/a":
+                ws.conditional_formatting.add(
+                    delta_cell.coordinate,
+                    CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+                )
     else:
         value_start = POS_COL + 1
         for i, period in enumerate(periods):
             col_idx = value_start + i
-            if not _apply_opos_bs_recon_cell(
-                ws.cell(check_source_row, col_idx),
-                wb,
-                side,
-                period.label,
-            ):
-                continue
+            src_cell = ws.cell(check_source_row, col_idx)
+            if not _apply_opos_bs_recon_cell(src_cell, wb, side, period.label):
+                src_cell.value = "n/a"
+                src_cell.font = FONT_BASE
             yellow_cols.append(col_idx)
             anchor_cell = ws.cell(anchor_row, col_idx)
             delta_cell = ws.cell(check_delta_row, col_idx)
-            delta_cell.value = f"={anchor_cell.coordinate}-{ws.cell(check_source_row, col_idx).coordinate}"
+            if src_cell.value == "n/a":
+                delta_cell.value = "n/a"
+            else:
+                delta_cell.value = (
+                    f"={anchor_cell.coordinate}-{src_cell.coordinate}"
+                )
             delta_cell.number_format = NUM_FMT
             delta_cell.font = FONT_CHECK_RED
-            ws.conditional_formatting.add(
-                delta_cell.coordinate,
-                CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
-            )
+            if src_cell.value != "n/a":
+                ws.conditional_formatting.add(
+                    delta_cell.coordinate,
+                    CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+                )
 
-    if yellow_cols:
-        paint_check_source_yellow(
-            ws,
-            check_source_row,
-            list(range(POS_COL, table_right + 1)),
-        )
+    # Always highlight the Source - BS Reconciliation row (even if some periods are n/a).
+    paint_check_source_yellow(
+        ws,
+        check_source_row,
+        list(range(POS_COL, table_right + 1)),
+    )
 
     collapse_check_portfolio(ws, [check_source_row, check_delta_row])
     ws.sheet_view.showOutlineSymbols = True
     ws.sheet_properties.outlinePr.summaryBelow = True
     ws.sheet_properties.outlinePr.applyStyles = True
+
+
+def apply_opos_detail_summary_crosscheck(
+    wb,
+    cfg: dict,
+    detail_layout: dict,
+    summary_layout: dict,
+) -> None:
+    """Cross-check detail grand-total columns against summary sum row per period."""
+    from openpyxl.formatting.rule import CellIsRule
+
+    labels = SIDE_LABELS[cfg["side"]]
+    if labels["detail_sheet"] not in wb.sheetnames or labels["summary_sheet"] not in wb.sheetnames:
+        return
+
+    detail_ws = wb[labels["detail_sheet"]]
+    summary_name = labels["summary_sheet"].replace("'", "''")
+
+    detail_total_row = detail_layout["footer_rows"]["total"]
+    summary_sum_row = summary_layout["footer_rows"]["sum"]
+    bucket_cols = detail_layout.get("bucket_cols") or []
+    reported_row = detail_layout["footer_rows"]["reported"]
+
+    base_row = reported_row
+    if BS_RECON_SHEET in wb.sheetnames:
+        bs_rows = check_row_groups_after_table(reported_row, [2])
+        base_row = bs_rows[-1]
+
+    ref_row, delta_row = check_row_groups_after_table(base_row, [2])
+
+    detail_ws.cell(ref_row, POS_COL, "Summary (reference)").font = FONT_BASE
+    detail_ws.cell(ref_row, POS_COL).alignment = ALIGN_LEFT
+    detail_ws.cell(delta_row, POS_COL, "Check vs summary").font = FONT_CHECK_RED
+    detail_ws.cell(delta_row, POS_COL).alignment = ALIGN_LEFT
+
+    for i, block in enumerate(detail_layout["blocks"]):
+        tot_col = block["year_startcol"] + len(bucket_cols)
+        summary_col = POS_COL + 1 + i
+        summary_ref = f"'{summary_name}'!{col_letter(summary_col)}{summary_sum_row}"
+        detail_ref = f"{col_letter(tot_col)}{detail_total_row}"
+
+        ref_cell = detail_ws.cell(ref_row, tot_col)
+        ref_cell.value = f"={summary_ref}"
+        ref_cell.number_format = NUM_FMT
+        ref_cell.font = FONT_BASE
+        ref_cell.alignment = ALIGN_RIGHT
+
+        delta_cell = detail_ws.cell(delta_row, tot_col)
+        delta_cell.value = f"={detail_ref}-{summary_ref}"
+        delta_cell.number_format = NUM_FMT
+        delta_cell.font = FONT_CHECK_RED
+        ws_cond = detail_ws.conditional_formatting
+        ws_cond.add(
+            delta_cell.coordinate,
+            CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
+        )
+
+    collapse_check_portfolio(detail_ws, [ref_row, delta_row])
+    detail_ws.sheet_view.showOutlineSymbols = True
+    detail_ws.sheet_properties.outlinePr.summaryBelow = True
+    detail_ws.sheet_properties.outlinePr.applyStyles = True
 
 
 def apply_opos_check_sections(
@@ -2304,7 +2652,7 @@ def _clear_opos_workbook_sheets(wb) -> None:
     clear_opos_workbook_sheets(wb)
 
 
-def run_opos_side(cfg: dict, output_path: str) -> str:
+def run_opos_side(cfg: dict, output_path: str, *, wb=None, save: bool = True) -> str:
     buckets = build_aging_bucket_defs(cfg)
     periods = build_opos_periods(cfg)
     labels = SIDE_LABELS[cfg["side"]]
@@ -2317,10 +2665,15 @@ def run_opos_side(cfg: dict, output_path: str) -> str:
     summary = summary_from_grid(grid, periods, buckets)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    ensure_output_writable(output_path)
+    if save:
+        ensure_output_writable(output_path)
 
-    bootstrap_opos_workbook(cfg, output_path)
-    wb = load_workbook(output_path)
+    owns_workbook = wb is None
+    if wb is None:
+        bootstrap_opos_workbook(cfg, output_path)
+        wb = load_workbook(output_path)
+    else:
+        bootstrap_opos_workbook(cfg, output_path, wb=wb, save=False)
 
     for sn in (labels["detail_sheet"], labels["summary_sheet"]):
         if sn in wb.sheetnames:
@@ -2353,20 +2706,25 @@ def run_opos_side(cfg: dict, output_path: str) -> str:
         if name.startswith("__SOURCE__"):
             wb[name].sheet_state = "visible"
 
-    from databook_workbook import reorder_workbook_sheets
-
-    reorder_workbook_sheets(wb)
     wb.calculation.fullCalcOnLoad = True
-    wb.save(output_path)
-    wb.close()
+    if save:
+        from databook_workbook import reorder_workbook_sheets
+
+        reorder_workbook_sheets(wb)
+        wb.save(output_path)
+    if owns_workbook:
+        wb.close()
     return output_path
 
 
-def run_opos_combined(cfg: dict) -> str:
+def run_opos_combined(cfg: dict, *, wb=None, save: bool = True) -> str:
     output_path = build_output_file_path(cfg)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    ensure_output_writable(output_path)
-    if os.path.isfile(output_path):
+    if save:
+        ensure_output_writable(output_path)
+    if wb is not None:
+        _clear_opos_workbook_sheets(wb)
+    elif os.path.isfile(output_path):
         wb = load_workbook(output_path)
         _clear_opos_workbook_sheets(wb)
         wb.save(output_path)
@@ -2374,15 +2732,15 @@ def run_opos_combined(cfg: dict) -> str:
     for side in ("debitor", "kreditor"):
         side_cfg = dict(cfg["sides"][side])
         side_cfg["column_letters"] = cfg.get("column_letters") or side_cfg.get("column_letters")
-        run_opos_side(side_cfg, output_path)
+        run_opos_side(side_cfg, output_path, wb=wb, save=False if wb is not None else save)
     return output_path
 
 
-def run_opos(cfg: dict) -> str:
+def run_opos(cfg: dict, wb=None, save: bool = True) -> str:
     if cfg.get("sides"):
-        return run_opos_combined(cfg)
+        return run_opos_combined(cfg, wb=wb, save=save)
     output_path = build_output_file_path(cfg)
-    return run_opos_side(cfg, output_path)
+    return run_opos_side(cfg, output_path, wb=wb, save=save)
 
 
 def main():

@@ -123,6 +123,102 @@ slots:
     mappings:
       - type: custom
 
+  # ── Fast Track batch collection ──
+  workflow_mode:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_active:
+    type: bool
+    mappings:
+      - type: custom
+
+  fast_track_active_section:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_filter_context:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_manifest_json:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_output_workbook_path:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_revenue_file_id:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_revenue_sheet_name:
+    type: text
+    mappings:
+      - type: custom
+
+  fast_track_revenue_headers:
+    type: list
+    mappings:
+      - type: custom
+
+  ft_databook_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_databook_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_opos_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_opos_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_fte_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_fte_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_fa_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_fa_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_revenue_filter_rules_json:
+    type: text
+    mappings:
+      - type: custom
+
+  ft_revenue_filter_rules_display:
+    type: text
+    mappings:
+      - type: custom
+
   # ── General Sales Table ──
   gst_invoice_mapping_mode:
     type: text
@@ -427,6 +523,11 @@ slots:
       - type: custom
 
   opos_sort_bucket_keys_json:
+    type: text
+    mappings:
+      - type: custom
+
+  opos_aging_ranges_json:
     type: text
     mappings:
       - type: custom
@@ -1260,6 +1361,20 @@ actions:
   - action_ask_dates_card
   - action_process_main_card
   - action_process_dates_card
+  - action_process_workflow_mode
+  - action_process_fast_track_databook
+  - action_process_fast_track_databook_fs
+  - action_process_fast_track_opos_snapshots
+  - action_process_fast_track_opos_mapper
+  - action_process_fast_track_fte_files
+  - action_process_fast_track_fte_mapper
+  - action_process_fast_track_fa_files
+  - action_process_fast_track_fa_mapper
+  - action_process_fast_track_revenue_upload
+  - action_process_fast_track_revenue_sheet
+  - action_process_fast_track_revenue
+  - action_resume_fast_track_section
+  - action_run_fast_track
   - action_navigate_folders
   - action_process_folder_selection
   - action_upload_file
@@ -1362,17 +1477,9 @@ actions:
   - action_process_strand_post_output
   - action_show_opos_review
   - action_run_opos
-  - action_show_fa_rollf_files
-  - action_process_fa_rollf_files
-  - action_reshow_fa_rollf_columns
-  - action_process_fa_rollf_columns
-  - action_show_fa_rollf_grouping
-  - action_process_fa_rollf_grouping
-  - action_enter_fa_filter_checkpoint
-  - action_process_fa_filter_checkpoint
-  - action_run_fa_rollf
   - action_start_filter
   - action_process_filter_rule
+  - action_save_filter_rules
   - action_finish_filters
   - action_run_databook
   - action_process_databook_susa_format
@@ -1405,6 +1512,7 @@ actions:
   - action_process_databook_master_next_action
   - action_process_databook_sort
   - action_process_next_action
+  - action_process_pdf_report_prompt
 
 # ─── Forms ────────────────────────────────────────────────────────────────────
 

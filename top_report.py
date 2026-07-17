@@ -38,6 +38,7 @@ from funktionssammlung import (  # noqa: E402
     source_range_ref,
     source_column_range_ref,
     add_accrual_col_in_ws,
+    parse_invoice_fy_year,
     _get_sheet_header_map as _get_source_header_map,
 )
 
@@ -50,6 +51,13 @@ _SCRIPTS_DIR = os.path.join(BASE_DIR, "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 from gst_excel_theme import THEME  # noqa: E402
+from revenue_reconciliation import (  # noqa: E402
+    NA_VALUE,
+    RECON_DIFFERENCE_LABEL,
+    canonical_period,
+    sales_basis_labels,
+    write_reconciliation_cells,
+)
 
 
 DROP_INDEX_PRINT_LIMIT = 200
@@ -226,6 +234,8 @@ def normalize_config(cfg: dict) -> dict:
     out.setdefault("apply_fx", False)
     out.setdefault("fx_col", None)
     out.setdefault("formula_mode", True)
+    out["sales_basis"] = sales_basis_labels(out.get("sales_basis")).sales_basis
+    out["total_label"] = sales_basis_labels(out["sales_basis"]).total_label
     cy = int(out["current_year"])
     out.setdefault("first_fy", cy - 3)
     out["first_fy"] = int(out["first_fy"])
@@ -278,7 +288,7 @@ def preprocess_top_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     d.columns = d.columns.astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
     d = apply_filters(d, cfg)
 
-    date_cols = [cfg["invoice_col"]]
+    date_cols = [cfg["invoice_col"]] if cfg["invoice_mapping_mode"] == "date" else []
     if cfg["calc_mode"] == "accrual":
         for c in [cfg.get("start_col"), cfg.get("end_col")]:
             if not c:
@@ -291,6 +301,8 @@ def preprocess_top_input(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         if c not in d.columns:
             raise ValueError(f"Spalte '{c}' fehlt im Input.")
         d[c] = pd.to_datetime(d[c], errors="coerce", dayfirst=True)
+    if cfg["invoice_mapping_mode"] == "year":
+        d["_invoice_fy_year"] = parse_invoice_fy_year(d[cfg["invoice_col"]])
 
     if cfg["value_col"] not in d.columns:
         raise ValueError(f"value_col '{cfg['value_col']}' fehlt im Input.")
@@ -412,7 +424,10 @@ def build_period_definitions(cfg: dict) -> dict:
 
 def aggregate_period(d: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, cfg: dict) -> pd.DataFrame:
     if cfg["calc_mode"] == "invoice":
-        mask = (d[cfg["invoice_col"]] >= start) & (d[cfg["invoice_col"]] <= end)
+        if cfg["invoice_mapping_mode"] == "year":
+            mask = d["_invoice_fy_year"] == int(end.year)
+        else:
+            mask = (d[cfg["invoice_col"]] >= start) & (d[cfg["invoice_col"]] <= end)
         tmp = d.loc[mask, ["top_key", "value"]].copy()
         out = tmp.groupby("top_key", as_index=False)["value"].sum().rename(columns={"value": "amount"})
         return out.fillna(0.0)
@@ -637,6 +652,23 @@ def append_total_row(df: pd.DataFrame, cfg: dict, meta: dict) -> pd.DataFrame:
     return pd.concat([out, pd.DataFrame([total])], ignore_index=True)
 
 
+def append_revenue_reconciliation_rows(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    reported_label = sales_basis_labels((cfg or {}).get("sales_basis")).reported_label
+    rows = []
+    for label, row_type in (
+        (RECON_DIFFERENCE_LABEL, "recon"),
+        (reported_label, "reported"),
+    ):
+        row = {c: "" for c in df.columns}
+        row["kEUR"] = label
+        row["row_type"] = row_type
+        for col in df.columns:
+            if canonical_period(col):
+                row[col] = NA_VALUE
+        rows.append(row)
+    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+
+
 def arrange_columns(df: pd.DataFrame, period_defs: dict, meta: dict, cfg: dict) -> pd.DataFrame:
     out = df.copy()
     FYs = period_defs["FYs"]
@@ -856,6 +888,7 @@ def format_top_report_excel(
 
     col_kEUR = None
     col_abc = None
+    col_rank = None
     col_row_type = None
     money_cols = []
     percent_cols = []
@@ -867,6 +900,8 @@ def format_top_report_excel(
             col_kEUR = c
         elif hv == "ABC":
             col_abc = c
+        elif hv == "Rank":
+            col_rank = c
         elif hv == "row_type":
             col_row_type = c
 
@@ -920,9 +955,7 @@ def format_top_report_excel(
         hdr.border = header_border
 
     subtitle_suffix = str(cfg.get("subtitle_suffix", "")).strip()
-    company_line = str(company_name or "").strip()
-    if subtitle_suffix:
-        company_line = f"{company_line} | {subtitle_suffix}" if company_line else subtitle_suffix
+    company = str(company_name or cfg.get("company") or cfg.get("company_name") or "").strip()
 
     blue_text = THEME.text_brand_title
     title_cell = ws.cell(row=layout["title_row"], column=label_col)
@@ -935,11 +968,14 @@ def format_top_report_excel(
     m = re.match(r"(?is)\s*TOP\s*\((.+)\)\s*$", display_table_name)
     if m:
         display_table_name = m.group(1).strip()
-    table_cell.value = display_table_name
+    table_line = display_table_name or "TOP"
+    if subtitle_suffix:
+        table_line = f"{table_line} ({subtitle_suffix})"
+    table_cell.value = table_line
     table_cell.font = Font(name=THEME.font_name, size=THEME.font_size_subtitle, color=blue_text)
 
     company_cell = ws.cell(row=COMPANY_ROW, column=label_col)
-    company_cell.value = company_line
+    company_cell.value = f"{company} | {display_table_name or 'TOP'}" if company else (display_table_name or "TOP")
     company_cell.font = Font(
         name=THEME.font_name, size=THEME.font_size_company, color=blue_text, bold=True
     )
@@ -962,8 +998,8 @@ def format_top_report_excel(
     for c in percent_cols:
         set_width(c, WIDTHS["percent"])
 
-    # Base font (ohne Perioden-Hilfszeilen — die bleiben rot)
-    for r in range(HEADER_ROW, ws.max_row + 1):
+    # Base font (data rows only — keep header bold/color from THEME.font_header)
+    for r in range(DATA_START_ROW, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             ws.cell(row=r, column=c).font = base_font
 
@@ -1036,6 +1072,7 @@ def format_top_report_excel(
     # Lines above bucket/total and bottom at total
     total_row_idx = None
     bucket_rows: list[int] = []
+    diagonal_cols = [c for c in (col_rank, col_abc, *percent_cols) if c]
     for r in range(DATA_START_ROW, ws.max_row + 1):
         rt = ws.cell(row=r, column=col_row_type).value
         rt_s = str(rt).strip().lower() if isinstance(rt, str) else ""
@@ -1046,12 +1083,26 @@ def format_top_report_excel(
                 cell.fill = fill_subtotal
                 cell.font = bold_font
                 cell.border = border_subtotal_top
+            for c in diagonal_cols:
+                cell = ws.cell(row=r, column=c)
+                # Keep subtotal top border + diagonal slash for empty Rank/ABC/% cells
+                cell.border = Border(
+                    top=THEME.border_subtotal_top.top,
+                    diagonal=Side(style="thin", color=THEME.border_strong),
+                    diagonalDown=True,
+                )
         elif rt_s == "total":
             total_row_idx = r
             for c in range(TABLE_LEFT_COL, TABLE_RIGHT_COL + 1):
                 cell = ws.cell(row=r, column=c)
                 cell.fill = fill_subtotal
                 cell.font = bold_font
+                cell.border = border_subtotal_tb
+        elif rt_s in {"recon", "reported"}:
+            for c in range(TABLE_LEFT_COL, TABLE_RIGHT_COL + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.fill = fill_subtotal if rt_s == "reported" else white_fill
+                cell.font = bold_font if rt_s == "reported" else base_font
                 cell.border = border_subtotal_tb
 
     # Perioden-Hilfszeilen + Schlüsselspalte B (nach Basis-Font, damit Rot erhalten bleibt)
@@ -1085,25 +1136,40 @@ def format_top_report_excel(
             table_bottom_row=TABLE_BOTTOM_ROW,
         )
 
-    # Outline: Detailzeilen oben, Bucket-Summe darunter (summaryBelow)
+    # Outline: first two buckets expanded; further buckets collapsed on open
+    # Row order is leaves… then bucket summary (summaryBelow).
     ws.sheet_properties.outlinePr.summaryBelow = True
-    if total_row_idx is not None:
-        for r in range(DATA_START_ROW, total_row_idx + 1):
-            rt = ws.cell(row=r, column=col_row_type).value
-            rt_s = str(rt).strip().lower() if isinstance(rt, str) else ""
+    if total_row_idx is not None and bucket_rows:
+        for i, br in enumerate(bucket_rows):
+            start = DATA_START_ROW if i == 0 else bucket_rows[i - 1] + 1
+            collapse = i >= 2
+            for r in range(start, br):
+                rt = ws.cell(row=r, column=col_row_type).value
+                rt_s = str(rt).strip().lower() if isinstance(rt, str) else ""
+                rd = ws.row_dimensions[r]
+                if rt_s == "leaf":
+                    rd.outlineLevel = 1
+                    rd.collapsed = False
+                    rd.hidden = collapse
+                else:
+                    rd.outlineLevel = 0
+                    rd.hidden = False
+                    rd.collapsed = False
+            rd_b = ws.row_dimensions[br]
+            rd_b.outlineLevel = 0
+            rd_b.hidden = False
+            rd_b.collapsed = collapse
+        for r in range(bucket_rows[-1] + 1, total_row_idx + 1):
             rd = ws.row_dimensions[r]
-            if rt_s == "bucket":
-                rd.outlineLevel = 0
-                rd.hidden = False
-                rd.collapsed = False
-            elif rt_s == "total":
-                rd.outlineLevel = 0
-                rd.hidden = False
-                rd.collapsed = False
-            elif rt_s == "leaf":
-                rd.outlineLevel = 1
-                rd.hidden = False
-                rd.collapsed = False
+            rd.outlineLevel = 0
+            rd.hidden = False
+            rd.collapsed = False
+    elif total_row_idx is not None:
+        for r in range(DATA_START_ROW, total_row_idx + 1):
+            rd = ws.row_dimensions[r]
+            rd.outlineLevel = 0
+            rd.hidden = False
+            rd.collapsed = False
 
     if cfg.get("formula_mode", True) and source_df is not None and source_sheet_name:
         n_before = _count_sheet_formulas(ws)
@@ -1141,6 +1207,37 @@ def _get_report_header_map(ws, header_row: int) -> dict[str, int]:
             continue
         out[str(v).strip()] = c
     return out
+
+
+def apply_top_reconciliation(wb, report_sheet_name: str, cfg: dict) -> None:
+    labels = sales_basis_labels(cfg.get("sales_basis"))
+    ws = wb[report_sheet_name]
+    layout = get_top_excel_layout(cfg)
+    header_map = _get_report_header_map(ws, layout["header_row"])
+    label_col = layout["label_col"]
+    rows = {
+        str(ws.cell(r, label_col).value or "").strip(): r
+        for r in range(layout["data_start_row"], ws.max_row + 1)
+    }
+    total_row = rows.get(labels.total_label)
+    recon_row = rows.get(RECON_DIFFERENCE_LABEL)
+    reported_row = rows.get(labels.reported_label)
+    if not all((total_row, recon_row, reported_row)):
+        return
+    period_columns = {
+        header: col_idx
+        for header, col_idx in header_map.items()
+        if canonical_period(header)
+    }
+    write_reconciliation_cells(
+        wb,
+        ws,
+        period_columns=period_columns,
+        total_row=total_row,
+        recon_row=recon_row,
+        reported_row=reported_row,
+        sales_basis=labels.sales_basis,
+    )
 
 
 def _col_ref(col_idx: int, row_idx: int, *, abs_col: bool = False, abs_row: bool = False) -> str:
@@ -1366,6 +1463,53 @@ def apply_top_report_formulas(
     wb.calculation.calcMode = "auto"
 
 
+def run_top_report_in_workbook(cfg: dict, wb) -> str:
+    """Fast Track / session mode: write TOP into an already-open workbook."""
+    from funktionssammlung import ensure_source_sheet_in_workbook
+
+    cfg = normalize_config(cfg)
+    df = pd.read_excel(cfg["file_path"], sheet_name=cfg["sheet_name"], engine="openpyxl")
+    d = preprocess_top_input(df, cfg)
+    period_defs = build_period_definitions(cfg)
+    wide = build_wide_table(d, period_defs, cfg)
+    wide = drop_rows_all_zero_periods(wide)
+    with_metrics, meta = add_metrics(wide, period_defs, cfg)
+    with_metrics = drop_rows_all_zero_relevant_values(with_metrics)
+    bucketed = apply_top_buckets_topreport(with_metrics, cfg, meta)
+    final = append_total_row(bucketed, cfg, meta)
+    final = append_revenue_reconciliation_rows(final, cfg)
+    final = arrange_columns(final, period_defs, meta, cfg)
+    if cfg.get("formula_mode", True):
+        final = strip_formula_value_columns(final, meta)
+    else:
+        for c in final.columns:
+            if c in {"kEUR", "Rank", "ABC", "row_type", meta["pct_col"], meta["cum_col"]}:
+                continue
+            if isinstance(c, str) and (
+                c.startswith("FY") or c.startswith("YTD") or c.startswith("LTM") or c.startswith("Δ ")
+            ):
+                final[c] = to_kEUR(final[c])
+
+    source_sheet_name = ensure_source_sheet_in_workbook(wb, cfg, df)
+    target_sheet_name = get_next_sheet_name_from_wb(wb, cfg.get("base_sheet_name", "TOP"))
+    write_export_df_to_sheet(wb, final, target_sheet_name)
+    suffix = str(cfg.get("subtitle_suffix", "")).strip()
+    table_name_for_sheet = suffix if suffix else str(cfg.get("table", "TOP") or "TOP").strip()
+    format_top_report_excel(
+        wb=wb,
+        target_sheet_name=target_sheet_name,
+        project_name=str(cfg.get("title", "")),
+        table_name=table_name_for_sheet,
+        company_name=str(cfg.get("company", "")),
+        cfg=cfg,
+        period_defs=period_defs,
+        source_sheet_name=source_sheet_name,
+        source_df=df,
+    )
+    apply_top_reconciliation(wb, target_sheet_name, cfg)
+    return target_sheet_name
+
+
 def main():
     if len(sys.argv) < 2:
         raise ValueError("Bitte den Pfad zur topconfig.json als Argument übergeben.")
@@ -1389,6 +1533,7 @@ def main():
     with_metrics = drop_rows_all_zero_relevant_values(with_metrics)
     bucketed = apply_top_buckets_topreport(with_metrics, cfg, meta)
     final = append_total_row(bucketed, cfg, meta)
+    final = append_revenue_reconciliation_rows(final, cfg)
     final = arrange_columns(final, period_defs, meta, cfg)
     if cfg.get("formula_mode", True):
         final = strip_formula_value_columns(final, meta)
@@ -1427,6 +1572,7 @@ def main():
         source_sheet_name=source_sheet_name,
         source_df=df,
     )
+    apply_top_reconciliation(wb, target_sheet_name, cfg)
 
     print("Formatierung angewendet.")
 

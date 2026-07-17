@@ -22,6 +22,7 @@ from databook_excel_layout import (  # noqa: E402
     LAYOUT_BS,
     apply_bs_hierarchy_borders,
     check_row_groups_after_table,
+    collapse_bs_l3_groups_on_open,
     collapse_check_outline_rows,
     hide_helper_column_group,
     paint_check_source_yellow,
@@ -40,7 +41,11 @@ from databook_periods import (  # noqa: E402
     ordered_reporting_columns_from_df,
     split_fy_and_ytd,
 )
-from report_row_layout import build_bs_row_structure, l2_l3_order_from_mapping  # noqa: E402
+from report_row_layout import (  # noqa: E402
+    NA_BUCKET_ROLLUP,
+    build_bs_row_structure,
+    l2_l3_order_from_mapping,
+)
 from databook_workbook import BS_RECON_MAPPING_FILE, MASTER_WORKBOOK_STR  # noqa: E402
 from databook_runtime import load_argv_config, path_value  # noqa: E402
 
@@ -51,8 +56,8 @@ _argv_cfg = load_argv_config()
 # ================================================
 DESKTOP_DIR = PROJECT_ROOT / "Desktop"
 
-PROJECT_NAME = "Desktop Test"
-GROUP_NAME = "Group"
+PROJECT_NAME = str(_argv_cfg.get("project_name") or "Desktop Test")
+GROUP_NAME = str(_argv_cfg.get("company_name") or _argv_cfg.get("group_name") or "Group")
 UNIT_LABEL = "kEUR"
 
 INPUT_FILE = path_value(_argv_cfg, "input_file", MASTER_WORKBOOK_STR)
@@ -421,6 +426,40 @@ l3_rng = master_range("L3")
 l4_rng = master_range("L4")
 l5_rng = master_range(l5_col)
 
+
+def _na_bucket_sumifs_body(
+    sum_rng: str,
+    *,
+    src_rng: str | None,
+    rep_crit: str,
+    l2_rng: str,
+    l2_crit: str,
+    l3_rng: str,
+    l3_crit: str,
+    l4_rng: str,
+    l4_crit: str,
+    l5_rng: str,
+    cat: str,
+) -> str:
+    """SUMIFS for one NA bucket column; ND column rolls up DL + ND."""
+    na_values = NA_BUCKET_ROLLUP.get(cat, (cat,))
+
+    def one(na_val: str) -> str:
+        na_crit = f'"{na_val}"'
+        if src_rng is not None:
+            return (
+                f"SUMIFS({sum_rng},{src_rng},{rep_crit},"
+                f"{l2_rng},{l2_crit},{l3_rng},{l3_crit},"
+                f"{l4_rng},{l4_crit},{l5_rng},{na_crit})"
+            )
+        return (
+            f"SUMIFS({sum_rng},{l2_rng},{l2_crit},{l3_rng},{l3_crit},"
+            f"{l4_rng},{l4_crit},{l5_rng},{na_crit})"
+        )
+
+    return "+".join(one(v) for v in na_values)
+
+
 # ================================================
 # TITLES
 # ================================================
@@ -557,6 +596,7 @@ for i, r in enumerate(bs_row_structure):
         ws.row_dimensions[excel_row].hidden = False
 
 LAST_TABLE_ROW = DATA_START_ROW + len(bs_row_structure) - 1
+collapse_bs_l3_groups_on_open(ws, bs_row_structure)
 
 # ================================================
 # VALUES for main blocks (SUMIFS / SUM)
@@ -908,25 +948,20 @@ for r in bs_row_structure:
             sum_rng = master_range(nb["year_col"])
 
             if r["type"] in {"detail", "detail_single"}:
-                if src_rng is not None:
-                    c.value = (
-                        f"=SUMIFS({sum_rng},"
-                        f"{src_rng},{rep_crit},"
-                        f"{l2_rng},{l2_crit},"
-                        f"{l3_rng},{l3_crit},"
-                        f"{l4_rng},{l4_crit},"
-                        f"{l5_rng},{l5_crit}"
-                        f")/1000"
-                    )
-                else:
-                    c.value = (
-                        f"=SUMIFS({sum_rng},"
-                        f"{l2_rng},{l2_crit},"
-                        f"{l3_rng},{l3_crit},"
-                        f"{l4_rng},{l4_crit},"
-                        f"{l5_rng},{l5_crit}"
-                        f")/1000"
-                    )
+                body = _na_bucket_sumifs_body(
+                    sum_rng,
+                    src_rng=src_rng,
+                    rep_crit=rep_crit,
+                    l2_rng=l2_rng,
+                    l2_crit=l2_crit,
+                    l3_rng=l3_rng,
+                    l3_crit=l3_crit,
+                    l4_rng=l4_rng,
+                    l4_crit=l4_crit,
+                    l5_rng=l5_rng,
+                    cat=cat,
+                )
+                c.value = f"=({body})/1000" if "+" in body else f"={body}/1000"
 
             elif r["type"] == "subtotal_l3":
                 idx = r["_idx"]

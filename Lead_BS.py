@@ -23,6 +23,7 @@ from databook_excel_layout import (  # noqa: E402
     FILL_YELLOW,
     apply_subtotal_row_style,
     check_rows_after_table,
+    collapse_bs_l3_groups_on_open,
     collapse_check_outline_rows,
     hide_helper_column_group,
     paint_check_source_yellow,
@@ -62,8 +63,8 @@ SHEET_OUT = "Lead_BS"
 LEAD_IS_SHEET = "Lead_IS"
 BS_BUCKET_SHEET = "BS_Bucket"
 
-PROJECT_NAME = "Desktop Test"
-GROUP_NAME = "Group"
+PROJECT_NAME = str(_argv_cfg.get("project_name") or "Desktop Test")
+GROUP_NAME = str(_argv_cfg.get("company_name") or _argv_cfg.get("group_name") or "Group")
 UNIT_LABEL = "kEUR"
 
 SOURCE_COL_CANDIDATES = ("L5", "L6")
@@ -256,6 +257,8 @@ def normalize_l5_bucket(x: str) -> str:
     s = str(x).strip()
     if s == "":
         return "Other"
+    if s == "DL" or s.startswith("DL"):
+        return "ND"
     if s in L5_ORDER:
         return s
     for b in L5_ORDER:
@@ -653,6 +656,8 @@ for i, r in enumerate(row_structure):
     else:
         for cc in Y_COLS:
             ws.cell(excel_row, cc).fill = FILL_WHITE
+
+collapse_bs_l3_groups_on_open(ws, row_structure)
 
 row_inventory = find_row_by_label_contains(ws, POS_COL, "Inventories")
 row_recv = find_row_by_label_contains(ws, POS_COL, "trade receivables")

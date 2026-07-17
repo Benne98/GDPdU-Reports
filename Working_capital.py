@@ -21,7 +21,6 @@ if str(BACKEND_DIR) not in sys.path:
 from gst_excel_theme import THEME  # noqa: E402
 from databook_excel_layout import (  # noqa: E402
     DIFF_FONT,
-    FILL_YELLOW,
     LAYOUT_NA,
     apply_subtotal_row_style,
     check_row_groups_after_table,
@@ -36,11 +35,11 @@ from databook_excel_layout import (  # noqa: E402
     write_mapping_header_row,
 )
 from databook_periods import (  # noqa: E402
+    bs_bucket_display_label_for_wc_snapshot,
     days_in_month_formula,
-    display_bs_period_labels,
     group_month_columns_by_reporting_fy,
     ordered_month_columns_from_df,
-    ordered_reporting_columns_from_df,
+    wc_snapshot_periods,
     yearly_average_period_label,
 )
 from report_row_layout import (  # noqa: E402
@@ -163,6 +162,7 @@ def resolve_config() -> dict:
         "company_name": str(raw.get("company_name") or "Group").strip(),
         "fy_end_month": int(raw.get("fy_end_month") or 12),
         "fiscal_start_month": raw.get("fiscal_start_month"),
+        "ltm_month": str(raw.get("ltm_month") or "").strip() or None,
     }
 
 
@@ -294,20 +294,6 @@ def _find_row_in_col_any(ws_, col_idx: int, needles: list[str]) -> int | None:
     return None
 
 
-def _wc_nwc_month_refs(
-    nwc_row: int,
-    month_cols: list[str],
-    period_index: dict[str, int],
-    y_cols: list[int],
-) -> list[str]:
-    refs: list[str] = []
-    for mc in month_cols:
-        if mc not in period_index:
-            continue
-        refs.append(f"{col_letter(y_cols[period_index[mc]])}{nwc_row}")
-    return refs
-
-
 def _bs_bucket_bucket_source_formula(
     sheet_name: str,
     bucket_cols: dict[str, int],
@@ -319,20 +305,23 @@ def _bs_bucket_bucket_source_formula(
     return f"='{sheet_name}'!{col}{assets_row}+'{sheet_name}'!{col}{el_row}"
 
 
-def _bs_bucket_nwc_source_formula(
-    sheet_name: str,
-    bucket_cols: dict[str, int],
-    assets_row: int,
-    el_row: int,
+def _master_bs_twc_owc_source_formula(
+    period: str,
+    *,
+    period_rng: dict[str, str],
+    na_rng: str,
+    src_rng: str | None,
+    rep_crit: str | None,
 ) -> str:
-    twc_col = col_letter(bucket_cols["TWC"])
-    owc_col = col_letter(bucket_cols["OWC"])
-    return (
-        f"='{sheet_name}'!{twc_col}{assets_row}"
-        f"+'{sheet_name}'!{twc_col}{el_row}"
-        f"+'{sheet_name}'!{owc_col}{assets_row}"
-        f"+'{sheet_name}'!{owc_col}{el_row}"
-    )
+    pr = period_rng.get(period)
+    if not pr:
+        return ""
+    if rep_crit and src_rng:
+        return (
+            f"=(SUMIFS({pr},{na_rng},\"TWC\",{src_rng},{rep_crit})"
+            f"+SUMIFS({pr},{na_rng},\"OWC\",{src_rng},{rep_crit}))/1000"
+        )
+    return f"=(SUMIFS({pr},{na_rng},\"TWC\")+SUMIFS({pr},{na_rng},\"OWC\"))/1000"
 
 
 def main() -> None:
@@ -343,6 +332,7 @@ def main() -> None:
     project_name = cfg["project_name"]
     group_name = cfg["company_name"]
     fy_end_month = cfg["fy_end_month"]
+    ltm_month = cfg.get("ltm_month")
 
     print("Working_capital —")
     print(f"  input:   {input_file}")
@@ -750,177 +740,156 @@ def main() -> None:
                 f'=IFERROR({col_l}{dso_r}+{col_l}{dio_r}-{col_l}{dpo_r},"n/a")'
             )
 
+    check_source_highlights: list[tuple[int, list[int]]] = []
+
     check_base_row = NS_HELPER_ROW + 2
     (
-        bs_bucket_src_row,
-        bs_bucket_sum_row,
-        bs_bucket_check_row,
+        twc_bs_src_row,
+        twc_bs_check_row,
+        owc_bs_src_row,
+        owc_bs_check_row,
         master_src_row,
-        master_sum_row,
         master_check_row,
-    ) = check_row_groups_after_table(check_base_row, [3, 3])
+    ) = check_row_groups_after_table(check_base_row, [2, 2, 2])
     check_rows_to_collapse = [
-        bs_bucket_src_row,
-        bs_bucket_sum_row,
-        bs_bucket_check_row,
+        twc_bs_src_row,
+        twc_bs_check_row,
+        owc_bs_src_row,
+        owc_bs_check_row,
         master_src_row,
-        master_sum_row,
         master_check_row,
     ]
-    master_periods = ordered_reporting_columns_from_df(df_bs)
-    display_periods = display_bs_period_labels(master_periods, fy_end_month)
-    master_to_display = {
-        master_periods[i]: display_periods[i] for i in range(len(master_periods))
-    }
+    snapshot_periods = wc_snapshot_periods(
+        fy_groups,
+        PERIODS,
+        fy_end_month=fy_end_month,
+        ltm_month=ltm_month,
+    )
 
     from openpyxl.formatting.rule import CellIsRule
 
-    def _style_check_row(cell, *, red: bool = False) -> None:
+    def _style_check_source(cell) -> None:
         cell.number_format = NUM_FMT_INT
         cell.alignment = ALIGN_RIGHT
-        cell.font = FONT_CHECK_RED if red else FONT_BASE
+        cell.font = FONT_BASE
 
     def _style_check_delta(cell) -> None:
-        _style_check_row(cell, red=True)
+        cell.number_format = NUM_FMT_INT
+        cell.alignment = ALIGN_RIGHT
+        cell.font = FONT_CHECK_RED
         ws.conditional_formatting.add(
             cell.coordinate,
             CellIsRule(operator="notEqual", formula=["0"], font=FONT_CHECK_RED),
         )
 
-    if SHEET_BS_BUCKET in wb.sheetnames and nwc_rownum is not None:
+    rep_crit = f'"{REPORTED_FILTER_VALUE}"' if src_rng else None
+    twc_total_row = bucket_total_row.get("TWC")
+    owc_total_row = bucket_total_row.get("OWC")
+
+    if (
+        SHEET_BS_BUCKET in wb.sheetnames
+        and nwc_rownum is not None
+        and twc_total_row is not None
+        and owc_total_row is not None
+    ):
         ws_bs = wb[SHEET_BS_BUCKET]
         period_bucket_cols = detect_period_bucket_cols(ws_bs, PERIODS)
         bs_assets_row = _find_row_in_col_any(ws_bs, POS_COL, ["Total assets"])
         bs_el_row = _find_row_in_col_any(
             ws_bs, POS_COL, ["Total equity & liabilities", "Total equity & liabilities "]
         )
-        owc_total_row = bucket_total_row.get("OWC")
-        twc_total_row = bucket_total_row.get("TWC")
         if (
-            not period_bucket_cols
-            or bs_assets_row is None
-            or bs_el_row is None
-            or owc_total_row is None
-            or twc_total_row is None
+            period_bucket_cols
+            and bs_assets_row is not None
+            and bs_el_row is not None
         ):
-            print("Warnung: BS_Bucket Bucket-Checks übersprungen (Perioden/Total-Zeilen).")
+            ws.cell(twc_bs_src_row, POS_COL, "Source - TWC BS_Bucket").font = FONT_BASE
+            ws.cell(twc_bs_src_row, POS_COL).alignment = ALIGN_LEFT
+            ws.cell(twc_bs_check_row, POS_COL, "Check").font = FONT_CHECK_RED
+            ws.cell(twc_bs_check_row, POS_COL).alignment = ALIGN_LEFT
+            ws.cell(owc_bs_src_row, POS_COL, "Source - OWC BS_Bucket").font = FONT_BASE
+            ws.cell(owc_bs_src_row, POS_COL).alignment = ALIGN_LEFT
+            ws.cell(owc_bs_check_row, POS_COL, "Check").font = FONT_CHECK_RED
+            ws.cell(owc_bs_check_row, POS_COL).alignment = ALIGN_LEFT
+
+            twc_yellow_cols: list[int] = []
+            owc_yellow_cols: list[int] = []
+            for period in snapshot_periods:
+                if period not in period_index:
+                    continue
+                display_period = bs_bucket_display_label_for_wc_snapshot(
+                    period,
+                    PERIODS,
+                    fy_end_month=fy_end_month,
+                    ltm_month=ltm_month,
+                )
+                bucket_map = period_bucket_cols.get(display_period)
+                if bucket_map is None:
+                    continue
+                cc = Y_COLS[period_index[period]]
+                twc_src_cell = ws.cell(twc_bs_src_row, cc)
+                twc_src_cell.value = _bs_bucket_bucket_source_formula(
+                    SHEET_BS_BUCKET, bucket_map, "TWC", bs_assets_row, bs_el_row
+                )
+                _style_check_source(twc_src_cell)
+                twc_yellow_cols.append(cc)
+                twc_table_cell = ws.cell(twc_total_row, cc)
+                twc_delta_cell = ws.cell(twc_bs_check_row, cc)
+                twc_delta_cell.value = f"={twc_table_cell.coordinate}-{twc_src_cell.coordinate}"
+                _style_check_delta(twc_delta_cell)
+
+                owc_src_cell = ws.cell(owc_bs_src_row, cc)
+                owc_src_cell.value = _bs_bucket_bucket_source_formula(
+                    SHEET_BS_BUCKET, bucket_map, "OWC", bs_assets_row, bs_el_row
+                )
+                _style_check_source(owc_src_cell)
+                owc_yellow_cols.append(cc)
+                owc_table_cell = ws.cell(owc_total_row, cc)
+                owc_delta_cell = ws.cell(owc_bs_check_row, cc)
+                owc_delta_cell.value = f"={owc_table_cell.coordinate}-{owc_src_cell.coordinate}"
+                _style_check_delta(owc_delta_cell)
+
+            if twc_yellow_cols:
+                check_source_highlights.append((twc_bs_src_row, [POS_COL, *twc_yellow_cols]))
+            if owc_yellow_cols:
+                check_source_highlights.append((owc_bs_src_row, [POS_COL, *owc_yellow_cols]))
         else:
-            ws.cell(bs_bucket_src_row, POS_COL, "Source - BS_Bucket").font = FONT_BASE
-            ws.cell(bs_bucket_src_row, POS_COL).alignment = ALIGN_LEFT
-            ws.cell(bs_bucket_sum_row, POS_COL, "Sum WC").font = FONT_BASE
-            ws.cell(bs_bucket_sum_row, POS_COL).alignment = ALIGN_LEFT
-            ws.cell(bs_bucket_check_row, POS_COL, "Check").font = FONT_CHECK_RED
-            ws.cell(bs_bucket_check_row, POS_COL).alignment = ALIGN_LEFT
-            bs_yellow_cols: list[int] = []
-            for _fy_end_year, month_cols in fy_groups.items():
-                if len(month_cols) < 2:
-                    continue
-                penultimate_period = month_cols[-2]
-                last_period = month_cols[-1]
-                if penultimate_period not in period_index or last_period not in period_index:
-                    continue
-                pen_display = master_to_display.get(penultimate_period, penultimate_period)
-                last_display = master_to_display.get(last_period, last_period)
-                bucket_map_pen = period_bucket_cols.get(pen_display)
-                bucket_map_last = period_bucket_cols.get(last_display)
-                if bucket_map_pen is None or bucket_map_last is None:
-                    continue
-                owc_cc = Y_COLS[period_index[penultimate_period]]
-                twc_cc = Y_COLS[period_index[last_period]]
-                for bucket, cc, bucket_map, total_row in (
-                    ("OWC", owc_cc, bucket_map_pen, owc_total_row),
-                    ("TWC", twc_cc, bucket_map_last, twc_total_row),
-                ):
-                    src_cell = ws.cell(bs_bucket_src_row, cc)
-                    src_cell.value = _bs_bucket_bucket_source_formula(
-                        SHEET_BS_BUCKET, bucket_map, bucket, bs_assets_row, bs_el_row
-                    )
-                    src_cell.fill = FILL_YELLOW
-                    _style_check_row(src_cell)
-                    bs_yellow_cols.append(cc)
-                    sum_refs = [
-                        f"{col_letter(Y_COLS[period_index[mc]])}{total_row}"
-                        for mc in month_cols
-                        if mc in period_index
-                    ]
-                    sum_cell = ws.cell(bs_bucket_sum_row, cc)
-                    sum_cell.value = f"=SUM({','.join(sum_refs)})" if sum_refs else ""
-                    _style_check_row(sum_cell)
-                    delta_cell = ws.cell(bs_bucket_check_row, cc)
-                    delta_cell.value = f"={sum_cell.coordinate}-{src_cell.coordinate}"
-                    _style_check_delta(delta_cell)
-            if bs_yellow_cols:
-                paint_check_source_yellow(ws, bs_bucket_src_row, [POS_COL, *bs_yellow_cols])
+            print("Warnung: BS_Bucket Bucket-Checks übersprungen (Perioden/Total-Zeilen).")
     else:
-        print(f"Hinweis: Sheet '{SHEET_BS_BUCKET}' fehlt oder NWC-Zeile nicht gefunden — BS_Bucket-Check übersprungen.")
+        print(
+            f"Hinweis: Sheet '{SHEET_BS_BUCKET}' fehlt oder WC-Totals nicht gefunden "
+            "— BS_Bucket-Checks übersprungen."
+        )
 
     if nwc_rownum is not None:
-        ws.cell(master_src_row, POS_COL, "Source - Master_BS").font = FONT_BASE
+        ws.cell(master_src_row, POS_COL, "Source - TWC + OWC Master_BS").font = FONT_BASE
         ws.cell(master_src_row, POS_COL).alignment = ALIGN_LEFT
-        ws.cell(master_sum_row, POS_COL, "Sum WC").font = FONT_BASE
-        ws.cell(master_sum_row, POS_COL).alignment = ALIGN_LEFT
         ws.cell(master_check_row, POS_COL, "Check").font = FONT_CHECK_RED
         ws.cell(master_check_row, POS_COL).alignment = ALIGN_LEFT
         master_yellow_cols: list[int] = []
-        rep_crit = f'"{REPORTED_FILTER_VALUE}"' if src_rng else None
-        for _fy_end_year, month_cols in fy_groups.items():
-            if not month_cols:
+        for period in snapshot_periods:
+            if period not in period_index:
                 continue
-            fy_master_label = yearly_average_period_label(
-                _fy_end_year, month_cols, PERIODS, fy_end_month
+            cc = Y_COLS[period_index[period]]
+            src_formula = _master_bs_twc_owc_source_formula(
+                period,
+                period_rng=period_rng,
+                na_rng=na_rng,
+                src_rng=src_rng,
+                rep_crit=rep_crit,
             )
-            target_period = month_cols[-1]
-            if target_period not in period_index:
-                continue
-            target_cc = Y_COLS[period_index[target_period]]
-            nwc_refs = _wc_nwc_month_refs(nwc_rownum, month_cols, period_index, Y_COLS)
-            if not nwc_refs:
-                continue
-            if fy_master_label in df_bs.columns:
-                sum_rng = master_bs_range(fy_master_label)
-                if rep_crit and src_rng:
-                    src_formula = (
-                        f"=(SUMIFS({sum_rng},{na_rng},\"TWC\",{src_rng},{rep_crit})"
-                        f"+SUMIFS({sum_rng},{na_rng},\"OWC\",{src_rng},{rep_crit}))/1000"
-                    )
-                else:
-                    src_formula = (
-                        f"=(SUMIFS({sum_rng},{na_rng},\"TWC\")"
-                        f"+SUMIFS({sum_rng},{na_rng},\"OWC\"))/1000"
-                    )
-            else:
-                month_parts: list[str] = []
-                for mc in month_cols:
-                    if mc not in period_rng:
-                        continue
-                    pr = period_rng[mc]
-                    if rep_crit and src_rng:
-                        month_parts.append(
-                            f"SUMIFS({pr},{na_rng},\"TWC\",{src_rng},{rep_crit})"
-                            f"+SUMIFS({pr},{na_rng},\"OWC\",{src_rng},{rep_crit})"
-                        )
-                    else:
-                        month_parts.append(
-                            f"SUMIFS({pr},{na_rng},\"TWC\")+SUMIFS({pr},{na_rng},\"OWC\")"
-                        )
-                src_formula = (
-                    f"=({'+'.join(month_parts)})/1000" if month_parts else ""
-                )
             if not src_formula:
                 continue
-            src_cell = ws.cell(master_src_row, target_cc)
+            src_cell = ws.cell(master_src_row, cc)
             src_cell.value = src_formula
-            src_cell.fill = FILL_YELLOW
-            _style_check_row(src_cell)
-            master_yellow_cols.append(target_cc)
-            sum_cell = ws.cell(master_sum_row, target_cc)
-            sum_cell.value = f"=SUM({','.join(nwc_refs)})"
-            _style_check_row(sum_cell)
-            delta_cell = ws.cell(master_check_row, target_cc)
-            delta_cell.value = f"={sum_cell.coordinate}-{src_cell.coordinate}"
+            _style_check_source(src_cell)
+            master_yellow_cols.append(cc)
+            nwc_cell = ws.cell(nwc_rownum, cc)
+            delta_cell = ws.cell(master_check_row, cc)
+            delta_cell.value = f"={nwc_cell.coordinate}-{src_cell.coordinate}"
             _style_check_delta(delta_cell)
         if master_yellow_cols:
-            paint_check_source_yellow(ws, master_src_row, [POS_COL, *master_yellow_cols])
+            check_source_highlights.append((master_src_row, [POS_COL, *master_yellow_cols]))
 
     if check_rows_to_collapse:
         collapse_check_portfolio(ws, check_rows_to_collapse)
@@ -928,7 +897,7 @@ def main() -> None:
     current_row = max(
         NS_HELPER_ROW,
         master_check_row if nwc_rownum else NS_HELPER_ROW,
-        bs_bucket_check_row if nwc_rownum else NS_HELPER_ROW,
+        owc_bs_check_row if nwc_rownum else NS_HELPER_ROW,
     )
 
     ws.sheet_view.showOutlineSymbols = True
@@ -978,6 +947,9 @@ def main() -> None:
         )
 
     hide_helper_column_group(ws, layout)
+
+    for src_row, cols in check_source_highlights:
+        paint_check_source_yellow(ws, src_row, cols)
 
     wb.calculation.fullCalcOnLoad = True
     wb.save(input_file)

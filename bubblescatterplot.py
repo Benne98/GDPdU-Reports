@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import textwrap
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,12 +29,17 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from funktionssammlung import apply_filters, compute_amount, get_period, pick_colors_hardcoded
+from revenue_reconciliation import (
+    RECON_DIFFERENCE_LABEL,
+    sales_basis_labels,
+    write_reconciliation_cells,
+)
 
-# Font — Inter / system sans-serif
-FONT_PROP = fm.FontProperties(family="sans-serif")
-plt.rcParams["font.family"] = "sans-serif"
-plt.rcParams["font.weight"] = "normal"
-plt.rcParams["font.size"] = 7
+# Font — shared Excel/chart theme (no local TTF paths)
+from gst_excel_theme import THEME, apply_matplotlib_theme, matplotlib_font_properties
+
+apply_matplotlib_theme(size=7)
+FONT_PROP = matplotlib_font_properties()
 
 # -----------------------------------------------------------------------------
 # INPUT (Beispiel — Pfade anpassen)
@@ -46,7 +52,7 @@ plt.rcParams["font.size"] = 7
 # -----------------------------------------------------------------------------
 DEFAULT_CONFIG: Dict[str, Any] = {
     "title": "Project Draft",
-    "table": "Top product groups",
+    "table": "Margin analyses",
     "company": "Draft AG",
     "subtitle_suffix": "GP by segment",
     # Time input (as-of immer Monatsende)
@@ -116,9 +122,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "group_mode": "parent_cluster",
             "box_linestyle": "--",
             "box_linewidth": 0.5,
-            "cluster_box_pad_px": 1,
+            "cluster_box_pad_px": 2,
             "cluster_title_gap_px": 2,
-            "cluster_top_pad_px": 1,
+            "cluster_top_pad_px": 2,
+            "cluster_gap_px": 8,
         },
         "show_labels": False,
         "label_wrap": 16,
@@ -142,14 +149,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "row_offset": 4,
         "col_offset": 3,
-        "sheet_name": "BUBBLE",
+        "sheet_name": "Margin analyses",
         "image_anchor_cell": "D6",
         "set_column_widths": True,
         "display_dpi": 180,
         "image_scale": 1.0,
-        "legend_anchor_cell": "D20",
+        "legend_anchor_cell": "D28",
         "legend_scale": 0.5,
-    },
+        "helper_table_row": 42,    },
 }
 
 
@@ -207,6 +214,11 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if out["calc_mode"] not in {"invoice", "accrual"}:
         raise ValueError("CONFIG['calc_mode'] muss 'invoice' oder 'accrual' sein.")
     out["invoice_col"] = str(out["invoice_col"]).strip()
+    out["invoice_mapping_mode"] = str(
+        out.get("invoice_mapping_mode") or "date"
+    ).strip().lower()
+    if out["invoice_mapping_mode"] not in {"date", "year"}:
+        raise ValueError("CONFIG['invoice_mapping_mode'] muss 'date' oder 'year' sein.")
     if out["calc_mode"] == "accrual":
         for key in ("start_col", "end_col"):
             if not str(out.get(key) or "").strip():
@@ -259,9 +271,25 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out["rank_by"] = str(out.get("rank_by", "revenue")).lower()
 
     out.setdefault("title", "")
-    out.setdefault("company", "")
-    out.setdefault("table", "Top product groups")
-    out.setdefault("subtitle_suffix", "")
+    out["company"] = str(
+        out.get("company") or out.get("company_name") or ""
+    ).strip()
+    out.setdefault("table", "Margin analyses")
+    labels = sales_basis_labels(out.get("sales_basis"))
+    out["sales_basis"] = labels.sales_basis
+    plot = dict(out.get("plot") or {})
+    default_x = {"GM (in%)", "GM", "NM (in%)", "NM", ""}
+    default_y = {"GP", "NP", ""}
+    if str(plot.get("x_label") or "").strip() in default_x:
+        plot["x_label"] = f"{labels.margin_abbrev} (in%)"
+    if str(plot.get("y_label") or "").strip() in default_y:
+        plot["y_label"] = labels.profit_abbrev
+    out["plot"] = plot
+    suffix = str(out.get("subtitle_suffix") or "").strip()
+    if suffix in {"", "GP by segment", "NP by segment", "GM by segment", "NM by segment"}:
+        out["subtitle_suffix"] = f"{labels.profit_abbrev} by segment"
+    else:
+        out["subtitle_suffix"] = suffix
 
     grp = out.get("grouping") or {}
     out["grouping"] = grp
@@ -354,12 +382,12 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if e["enabled"]:
         e["row_offset"] = int(e.get("row_offset", 4))
         e["col_offset"] = int(e.get("col_offset", 3))
-        e["sheet_name"] = str(e.get("sheet_name", "BUBBLE"))
+        e["sheet_name"] = str(e.get("sheet_name", "Margin analyses"))
         e["image_anchor_cell"] = str(e.get("image_anchor_cell", "D6"))
         e["set_column_widths"] = bool(e.get("set_column_widths", True))
         e["display_dpi"] = int(e.get("display_dpi", 180))
         e["image_scale"] = float(e.get("image_scale", 1.0))
-        e["legend_anchor_cell"] = str(e.get("legend_anchor_cell", "D20"))
+        e["legend_anchor_cell"] = str(e.get("legend_anchor_cell", "D28"))
         e["legend_scale"] = float(e.get("legend_scale", 0.5))
         if e["legend_scale"] <= 0:
             raise ValueError("excel.legend_scale muss > 0 sein.")
@@ -369,6 +397,18 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def preprocess_input(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     d = df.copy()
+    d.columns = d.columns.astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
+    if cfg["calc_mode"] == "invoice" and cfg["invoice_mapping_mode"] == "date":
+        d[cfg["invoice_col"]] = pd.to_datetime(
+            d[cfg["invoice_col"]], errors="coerce", dayfirst=True
+        )
+    if cfg["calc_mode"] == "accrual":
+        d[cfg["start_col"]] = pd.to_datetime(
+            d[cfg["start_col"]], errors="coerce", dayfirst=True
+        )
+        d[cfg["end_col"]] = pd.to_datetime(
+            d[cfg["end_col"]], errors="coerce", dayfirst=True
+        )
     if cfg.get("apply_fx"):
         fx_col = str(cfg["fx_col"])
         d["fx_rate"] = pd.to_numeric(d[fx_col], errors="coerce").fillna(1.0)
@@ -821,6 +861,14 @@ def save_legend_png(
     box_pad_px = float(leg_cfg.get("cluster_box_pad_px", 2.0))
     title_gap_px = float(leg_cfg.get("cluster_title_gap_px", 6.0))
     top_pad_px = float(leg_cfg.get("cluster_top_pad_px", 2.0))
+    # Gap between consecutive segment boxes (outer edge → outer edge), must stay > 0.
+    cluster_gap_px = float(leg_cfg.get("cluster_gap_px", 3.0))
+    if cluster_gap_px < 1.0:
+        cluster_gap_px = 1.0
+
+    # Explicit size so parent segment titles match child legend labels
+    # (FONT_PROP alone can keep the theme default size).
+    legend_fp = matplotlib_font_properties(size=int(font_size))
 
     def coerce_color(c: Any) -> str:
         if c is None:
@@ -890,7 +938,7 @@ def save_legend_png(
             ncol=int(ncol),
             frameon=False,
             fontsize=int(font_size),
-            prop=FONT_PROP,
+            prop=legend_fp,
             handletextpad=0.35,
             columnspacing=0.8,
             borderaxespad=0.0,
@@ -971,6 +1019,14 @@ def save_legend_png(
             handles, labels = _rows_to_handles_labels(sub)
             blocks.append((p, pcol, handles, labels))
 
+    # Use the figure's effective dpi for px↔inches (Retina often doubles fig.dpi).
+    probe = plt.figure(dpi=dpi)
+    eff_dpi = float(probe.dpi) or float(dpi)
+    plt.close(probe)
+
+    def _px_to_in(px: float) -> float:
+        return float(px) / eff_dpi
+
     def _measure_block(handles: List[Line2D], labels: List[str]) -> Tuple[float, float]:
         tmp = plt.figure(figsize=(1.0, 1.0), dpi=dpi)
         ax_m = tmp.add_subplot(111)
@@ -982,7 +1038,7 @@ def save_legend_png(
             bbox_to_anchor=(0.0, 1.0),
             frameon=False,
             fontsize=int(font_size),
-            prop=FONT_PROP,
+            prop=legend_fp,
             handletextpad=0.35,
             columnspacing=0.6,
             borderaxespad=0.0,
@@ -994,16 +1050,19 @@ def save_legend_png(
         plt.close(tmp)
         return w_m, h_m
 
-    n_blocks = max(1, len(blocks))
-    widths: List[float] = []
-    heights: List[float] = []
+    # Measure each segment legend; store box size (= content + pad). The next box
+    # starts immediately after the previous outer edge + cluster_gap_px.
+    legend_sizes: List[Tuple[float, float]] = []
+    box_widths: List[float] = []
+    box_heights: List[float] = []
     draw_box: List[bool] = []
     show_title: List[bool] = []
 
     for _p, _pcol, handles, labels in blocks:
         w_raw, h_raw = _measure_block(handles, labels)
-        widths.append(w_raw + 2 * box_pad_px)
-        heights.append(h_raw + 2 * box_pad_px)
+        legend_sizes.append((w_raw, h_raw))
+        box_widths.append(w_raw + 2 * box_pad_px)
+        box_heights.append(h_raw + 2 * box_pad_px)
         n_lbl = len(labels)
         if flat_single_column:
             draw_box.append(True)
@@ -1012,27 +1071,38 @@ def save_legend_png(
             draw_box.append(n_lbl > 1)
             show_title.append(n_lbl > 1)
 
-    title_line_px = (font_size + 2) * (dpi / 72.0) + title_gap_px
+    title_line_px = font_size * (eff_dpi / 72.0) + title_gap_px
     title_h = max((title_line_px if st else 0.0) for st in show_title) if show_title else 0.0
-    max_h = max(heights) if heights else 1.0
-    total_h_px = top_pad_px + title_h + max_h + 2.0
-    total_w_px = sum(widths) + 2.0
+    max_h = max(box_heights) if box_heights else 1.0
+    n_blocks = len(blocks)
+    side_margin_px = 1.0
 
-    fig = plt.figure(figsize=(total_w_px / dpi, total_h_px / dpi), dpi=dpi)
+    box_lefts: List[float] = []
+    x_cursor = side_margin_px
+    for i, w_box in enumerate(box_widths):
+        box_lefts.append(x_cursor)
+        x_cursor += w_box + (cluster_gap_px if i < n_blocks - 1 else 0.0)
+    total_w_px = x_cursor + side_margin_px
+    total_h_px = top_pad_px + title_h + max_h + 2.0
+
+    fig = plt.figure(figsize=(_px_to_in(total_w_px), _px_to_in(total_h_px)), dpi=dpi)
     axes_list: List[Any] = []
     legends_data: List[Tuple[Any, Any, str]] = []
-
-    x_cursor_px = 1.0
     y0_px = 1.0
     content_h_px = total_h_px - y0_px
 
     for i, (p, pcol, handles, labels) in enumerate(blocks):
-        w_px = widths[i]
-        left = x_cursor_px / total_w_px
-        width_frac = w_px / total_w_px
-        bottom = y0_px / total_h_px
-        height_frac = content_h_px / total_h_px
-        ax_c = fig.add_axes([left, bottom, width_frac, height_frac])
+        w_legend = legend_sizes[i][0]
+        # Legend sits inside the box; axes left = box left + pad.
+        left_px = box_lefts[i] + box_pad_px
+        ax_c = fig.add_axes(
+            [
+                left_px / total_w_px,
+                y0_px / total_h_px,
+                max(w_legend, 1.0) / total_w_px,
+                content_h_px / total_h_px,
+            ]
+        )
         ax_c.axis("off")
         leg = ax_c.legend(
             handles=handles,
@@ -1041,7 +1111,7 @@ def save_legend_png(
             bbox_to_anchor=(0.0, 1.0),
             frameon=False,
             fontsize=int(font_size),
-            prop=FONT_PROP,
+            prop=legend_fp,
             handletextpad=0.35,
             columnspacing=0.6,
             borderaxespad=0.0,
@@ -1049,39 +1119,54 @@ def save_legend_png(
         )
         axes_list.append(ax_c)
         legends_data.append((leg, p, pcol))
-        x_cursor_px += w_px
 
-    # First draw: measure true legend bboxes in this figure.
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
 
-    # Re-pack axes so the *actual* legend bboxes sit nearly adjacent.
-    # This removes unwanted whitespace even if the initial width estimate was off.
-    tight_pad_px = 1.0
-    x_cursor_px = 1.0
-    for ax_c, (leg, _p, _pcol) in zip(axes_list, legends_data):
+    # Refine with true rendered sizes, then re-place tightly.
+    measured_box_widths: List[float] = []
+    measured_legend_sizes: List[Tuple[float, float]] = []
+    for leg, _p, _pcol in legends_data:
         bb = leg.get_window_extent(renderer=renderer)
-        w_px = float(bb.width) + 2 * box_pad_px
-        left = x_cursor_px / total_w_px
-        width_frac = w_px / total_w_px
-        bottom = y0_px / total_h_px
-        height_frac = content_h_px / total_h_px
-        ax_c.set_position([left, bottom, width_frac, height_frac])
-        x_cursor_px += w_px + tight_pad_px
+        measured_legend_sizes.append((float(bb.width), float(bb.height)))
+        measured_box_widths.append(float(bb.width) + 2 * box_pad_px)
 
-    # Second draw: bboxes reflect the final packed positions.
+    box_lefts = []
+    x_cursor = side_margin_px
+    for i, w_box in enumerate(measured_box_widths):
+        box_lefts.append(x_cursor)
+        x_cursor += w_box + (cluster_gap_px if i < n_blocks - 1 else 0.0)
+    packed_w_px = x_cursor + side_margin_px
+    if packed_w_px > 1.0:
+        fig.set_size_inches(_px_to_in(packed_w_px), _px_to_in(total_h_px), forward=True)
+        total_w_px = packed_w_px
+
+    for i, ax_c in enumerate(axes_list):
+        w_legend = measured_legend_sizes[i][0]
+        left_px = box_lefts[i] + box_pad_px
+        ax_c.set_position(
+            [
+                left_px / total_w_px,
+                y0_px / total_h_px,
+                max(w_legend, 1.0) / total_w_px,
+                content_h_px / total_h_px,
+            ]
+        )
+
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     inv_fig = fig.transFigure.inverted()
 
+    # Stored box extents (display px): content bbox + pad. Slots were packed so
+    # next_left ≈ prev_right + cluster_gap_px; draw around the live content bbox.
     for i, (ax_c, (leg, p, pcol)) in enumerate(zip(axes_list, legends_data)):
         if not draw_box[i]:
             continue
         bb = leg.get_window_extent(renderer=renderer)
-        x0 = bb.x0 - box_pad_px
-        y0 = bb.y0 - box_pad_px
-        x1 = bb.x1 + box_pad_px
-        y1 = bb.y1 + box_pad_px
+        x0 = float(bb.x0) - box_pad_px
+        x1 = float(bb.x1) + box_pad_px
+        y0 = float(bb.y0) - box_pad_px
+        y1 = float(bb.y1) + box_pad_px
 
         (fx0, fy0) = inv_fig.transform((x0, y0))
         (fx1, fy1) = inv_fig.transform((x1, y1))
@@ -1108,9 +1193,8 @@ def save_legend_png(
                 str(p),
                 ha="left",
                 va="bottom",
-                fontsize=int(font_size) + 1,
                 color=coerce_color(pcol),
-                fontproperties=FONT_PROP,
+                fontproperties=legend_fp,
             )
 
     fig.savefig(out_png, dpi=dpi, bbox_inches="tight", pad_inches=pad, transparent=True)
@@ -1141,13 +1225,18 @@ def export_excel_with_images(
     legend_png_path: Optional[str],
     xlsx_path: str,
     period_label: str,
+    *,
+    wb=None,
+    save: bool = True,
+    helper_table: Optional[pd.DataFrame] = None,
+    total_net_sales: float = 0.0,
 ) -> None:
     excel_cfg = cfg.get("excel") or {}
     if excel_cfg.get("enabled") is False:
         return
 
     col_offset = int(excel_cfg.get("col_offset", 3))
-    sheet_name = str(excel_cfg.get("sheet_name", "BUBBLE"))
+    sheet_name = str(excel_cfg.get("sheet_name", "Margin analyses"))
     anchor_cell = str(excel_cfg.get("image_anchor_cell", "D6"))
     set_widths = bool(excel_cfg.get("set_column_widths", True))
     legend_anchor_cell = str(excel_cfg.get("legend_anchor_cell", "D35"))
@@ -1155,11 +1244,16 @@ def export_excel_with_images(
     display_dpi = int(excel_cfg.get("display_dpi", 180))
     image_scale = float(excel_cfg.get("image_scale", 1.0))
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = sheet_name
+    if wb is None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_name
+    else:
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
 
-    font_name = FONT_PROP.get_name() if FONT_PROP.get_name() else "Calibri"
+    font_name = THEME.font_name
     title_font = Font(name=font_name, size=24, color="FF4F2D7F")
     sub_font = Font(name=font_name, size=12, color="FF4F2D7F")
     info_font = Font(name=font_name, size=9, bold=True, color="FF4F2D7F")
@@ -1186,20 +1280,73 @@ def export_excel_with_images(
             ws.cell(row=r, column=c).fill = fill_white
 
     if os.path.exists(plot_png_path):
-        img = XLImage(plot_png_path)
+        img = XLImage(BytesIO(Path(plot_png_path).read_bytes()))
         plot_cfg = cfg.get("plot", {}) or {}
         fig_w, fig_h = plot_cfg.get("figsize", (6.0, 3.2))
         img.width = int(float(fig_w) * display_dpi * image_scale)
         img.height = int(float(fig_h) * display_dpi * image_scale)
         ws.add_image(img, anchor_cell)
+        plot_img_h = img.height
     else:
         ws[anchor_cell] = f"(Plot-Bild nicht gefunden: {plot_png_path})"
+        plot_img_h = 0
 
     if legend_png_path and os.path.exists(legend_png_path):
-        leg = XLImage(legend_png_path)
+        leg = XLImage(BytesIO(Path(legend_png_path).read_bytes()))
         leg.width = int(leg.width * legend_scale)
         leg.height = int(leg.height * legend_scale)
-        ws.add_image(leg, legend_anchor_cell)
+        # Place legend just under the chart (Excel row ≈ 20px), unless an
+        # explicit far-below anchor is configured.
+        plot_row = int("".join(ch for ch in anchor_cell if ch.isdigit()) or "6")
+        plot_col = "".join(ch for ch in anchor_cell if ch.isalpha()) or "D"
+        auto_legend_row = plot_row + max(1, int(np.ceil(float(plot_img_h) / 20.0))) + 2
+        configured_row = int(
+            "".join(ch for ch in str(legend_anchor_cell) if ch.isdigit()) or "0"
+        )
+        legend_row = max(auto_legend_row, configured_row) if configured_row else auto_legend_row
+        ws.add_image(leg, f"{plot_col}{legend_row}")
+
+    if helper_table is not None:
+        labels = sales_basis_labels(cfg.get("sales_basis"))
+        table_row = int(excel_cfg.get("helper_table_row", 55))
+        table_col = int(excel_cfg.get("helper_table_col", 4))
+        headers = [
+            "Group",
+            f"{labels.metric_label} ({period_label})",
+            "Gross profit",
+            "GM",
+            "Bubble size",
+        ]
+        for idx, value in enumerate(headers):
+            cell = ws.cell(table_row, table_col + idx, value)
+            cell.font = Font(name=font_name, size=9, bold=True, color="FFFFFFFF")
+            cell.fill = PatternFill(fill_type="solid", fgColor="FF4F2D7F")
+        for offset, record in enumerate(helper_table.to_dict("records"), start=1):
+            values = [
+                record.get("label") or record.get("__group__"),
+                float(record.get("revenue") or 0.0) / 1000.0,
+                float(record.get("gp") or 0.0) / 1000.0,
+                record.get("gm"),
+                float(record.get("bubblesize") or 0.0) / 1000.0,
+            ]
+            for idx, value in enumerate(values):
+                ws.cell(table_row + offset, table_col + idx, value)
+        total_row = table_row + len(helper_table) + 2
+        recon_row = total_row + 1
+        reported_row = total_row + 2
+        ws.cell(total_row, table_col, labels.total_label)
+        ws.cell(total_row, table_col + 1, float(total_net_sales) / 1000.0)
+        ws.cell(recon_row, table_col, RECON_DIFFERENCE_LABEL)
+        ws.cell(reported_row, table_col, labels.reported_label)
+        write_reconciliation_cells(
+            wb,
+            ws,
+            period_columns={period_label: table_col + 1},
+            total_row=total_row,
+            recon_row=recon_row,
+            reported_row=reported_row,
+            sales_basis=labels.sales_basis,
+        )
 
     if set_widths:
         for c in range(1, 30):
@@ -1215,10 +1362,16 @@ def export_excel_with_images(
         ws.column_dimensions[col_letter].hidden = True
     ws.column_dimensions["D"].collapsed = True
 
-    wb.save(xlsx_path)
+    if save:
+        wb.save(xlsx_path)
 
 
-def run_bubble_chart(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[None, Optional[str]]:
+def run_bubble_chart(
+    df: pd.DataFrame,
+    cfg: Dict[str, Any],
+    wb=None,
+    save: bool = True,
+) -> Tuple[None, Optional[str]]:
     cfg = normalize_config(cfg)
     df = apply_filters(df, cfg)
     d = preprocess_input(df, cfg)
@@ -1267,7 +1420,17 @@ def run_bubble_chart(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[None, Optio
 
     excel_path_out: Optional[str] = None
     if cfg.get("excel", {}).get("enabled", True):
-        export_excel_with_images(cfg, plot_png, legend_path_out, xlsx_path, period_label)
+        export_excel_with_images(
+            cfg,
+            plot_png,
+            legend_path_out,
+            xlsx_path,
+            period_label,
+            wb=wb,
+            save=save,
+            helper_table=g,
+            total_net_sales=float(d["revenue_amt"].sum()),
+        )
         excel_path_out = xlsx_path
 
     if excel_path_out:

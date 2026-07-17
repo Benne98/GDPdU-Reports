@@ -3,9 +3,28 @@ import os
 import pandas as pd
 import numpy as np
 
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from matplotlib.colors import to_rgba
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+
+_SESSION_WORKBOOK: Workbook | None = None
+
+
+@contextmanager
+def session_workbook_context(wb: Workbook):
+    """Bind the Fast Track shared workbook for helpers that would otherwise open disk paths."""
+    global _SESSION_WORKBOOK
+    previous = _SESSION_WORKBOOK
+    _SESSION_WORKBOOK = wb
+    try:
+        yield wb
+    finally:
+        _SESSION_WORKBOOK = previous
+
+
+def get_session_workbook() -> Workbook | None:
+    return _SESSION_WORKBOOK
 
 RGBA = Tuple[float, float, float, float]
 
@@ -68,42 +87,42 @@ def resolve_color_expr(expr: str) -> str:
 # Reihenfolge: Shade-Stufe → Über alle Parents
 FLAT_COLORS_HEX: List[str] = [
 
-    "#4F2D7F@0.0",
+    "#1E3A5F@0.0",
     "#FFC23D@0.0",
     "#FF5149@0.0",
     "#00A4B3@0.0",
     "#CCC4BD@0.0",
     "#7F7F7F@0.5",
 
-    "#4F2D7F@0.8",
+    "#1E3A5F@0.8",
     "#FFC23D@0.6",
     "#FF5149@0.4",
     "#00A4B3@0.4",
     "#F2F0EE@-0.75",
     "#7F7F7F@0.25",
 
-    "#4F2D7F@0.4",
+    "#1E3A5F@0.4",
     "#FFC23D@-0.5",
     "#FF5149@-0.5",
     "#00A4B3@-0.5",
     "#CCC4BD@-0.4",
     "#BFBFBF@-0.25",
 
-    "#4F2D7F@0.6",
+    "#1E3A5F@0.6",
     "#FFC23D@0.4",
     "#FF5149@0.6",
     "#00A4B3@0.8",
     "#CCC4BD@-0.25",
     "#BFBFBF@-0.5",
 
-    "#4F2D7F@-0.5",
+    "#1E3A5F@-0.5",
     "#FFC23D@-0.25",
     "#FF5149@-0.25",
     "#00A4B3@-0.25",
     "#CCC4BD@-0.5",
     "#BFBFBF@-0.35",
 
-    "#4F2D7F@0.2",
+    "#1E3A5F@0.2",
     "#FFC23D@0.2",
     "#FF5149@0.8",
     "#00A4B3@0.6",
@@ -114,8 +133,8 @@ FLAT_COLORS_HEX: List[str] = [
 # 2) FALL: HIERARCHIE (2 group_cols) → bis zu 6 Parents, pro Parent bis zu 6 Children
 # Idee: pro Parent eine "Familie" aus ähnlichen Shades (leicht unterschiedliche tint-Werte)
 HIERARCHY_COLORS_HEX: List[List[str]] = [
-    # Parent 1 — Lila (#4F2D7F)
-    ["#4F2D7F@0.8", "#4F2D7F@0.6", "#4F2D7F@0.5", "#4F2D7F@0.4", "#4F2D7F@0.2", "#4F2D7F@-0.25"],
+    # Parent 1 — Navy (#1E3A5F)
+    ["#1E3A5F@0.8", "#1E3A5F@0.6", "#1E3A5F@0.5", "#1E3A5F@0.4", "#1E3A5F@0.2", "#1E3A5F@-0.25"],
     # Parent 2 — Gelb (#FFC23D)
     ["#FFC23D@0.0", "#FFC23D@0.6", "#FFC23D@0.4", "#FFC23D@0.2", "#FFC23D@-0.25", "#FFC23D@-0.5"],
     # Parent 3 — Rot (#FF5149)
@@ -530,35 +549,20 @@ def recognized_value(          #accrual Logik
     Accrual-Logik: liefert pro Zeile den realisierten Anteil im Zeitraum.
 
     Erwartet in cfg:
-        start_col, end_col, invoice_col
+        start_col, end_col
     und in d:
         'value' (numerisch)
     """
-    I = pd.to_datetime(d[cfg["invoice_col"]], errors="coerce", dayfirst=True)
     S = pd.to_datetime(d[cfg["start_col"]], errors="coerce", dayfirst=True)
     E = pd.to_datetime(d[cfg["end_col"]], errors="coerce", dayfirst=True)
-
-    aktiv_von = np.where(
-        I >= period_start,
-        S,
-        np.where(S > period_start, S, period_start)
-    )
-    aktiv_von = pd.to_datetime(aktiv_von)
-
-    aktiv_bis = pd.to_datetime(
-        np.minimum(E.values.astype("datetime64[ns]"), np.datetime64(period_end))
-    )
-
+    aktiv_von = S.where(S > period_start, period_start)
+    aktiv_bis = E.where(E < period_end, period_end)
     tage_realisiert = days_inclusive(aktiv_von, aktiv_bis)
     contract_days = days_inclusive(S, E).clip(lower=1)
 
     value = pd.to_numeric(d["value"], errors="coerce").fillna(0.0)
-
-    ko1 = (S > period_end) | (I > period_end)
-    ko2 = (I < period_start) & (E < period_start)
-
     out = value * (tage_realisiert / contract_days)
-    out = out.where(~(ko1 | ko2), 0.0)
+    out = out.where((S <= period_end) & (E >= period_start), 0.0)
     return out
 
 
@@ -610,7 +614,12 @@ def get_period(cfg: Dict[str, Any]) -> Tuple[pd.Timestamp, pd.Timestamp, str]:
 
 def compute_amount(d: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, cfg: Dict[str, Any], value_col: str) -> pd.Series:
     if cfg["calc_mode"] == "invoice":
-        mask = (d[cfg["invoice_col"]] >= start) & (d[cfg["invoice_col"]] <= end)
+        if str(cfg.get("invoice_mapping_mode") or "date").lower() == "year":
+            invoice_year = parse_invoice_fy_year(d[cfg["invoice_col"]])
+            mask = invoice_year == int(end.year)
+        else:
+            invoice_dates = pd.to_datetime(d[cfg["invoice_col"]], errors="coerce", dayfirst=True)
+            mask = (invoice_dates >= start) & (invoice_dates <= end)
         amt = pd.to_numeric(d[value_col], errors="coerce").fillna(0.0)
         return amt.where(mask, 0.0)
 
@@ -686,6 +695,31 @@ def _workbook_filename_stem(cfg: dict) -> str:
     return case_id or "Workbook"
 
 
+def revenue_report_col_offset(n_group_cols: int, configured: int | None = None) -> int:
+    """Hidden left band: spacer in A, helper keys, spacer before the visible table."""
+    minimum = max(int(n_group_cols or 0) + 2, 3)
+    if configured in (None, ""):
+        return minimum
+    try:
+        return max(minimum, int(configured))
+    except (TypeError, ValueError):
+        return minimum
+
+
+REVENUE_REPORT_HELPER_START_COL = 2
+
+
+def revenue_report_helper_col(group_index: int) -> int:
+    """1-based Excel column for a SUMIFS key cell (group_index is 0-based)."""
+    return REVENUE_REPORT_HELPER_START_COL + group_index
+
+
+def revenue_report_helper_letter(group_index: int) -> str:
+    from openpyxl.utils import get_column_letter
+
+    return get_column_letter(revenue_report_helper_col(group_index))
+
+
 def build_output_file_path(cfg: dict) -> str:
     output_dir = str(cfg["output_file_path"]).strip()
     stem = _workbook_filename_stem(cfg)
@@ -698,9 +732,12 @@ def build_output_file_path(cfg: dict) -> str:
         safe_suffix = re.sub(r"[^\w\-]+", "_", suffix).strip("_") or "Output"
         return os.path.join(output_dir, f"{stem}_{safe_suffix}.xlsx")
 
+    session_workbook = str(cfg.get("output_workbook_path") or "").strip()
+    if session_workbook:
+        return os.path.abspath(session_workbook)
+
     explicit = str(
-        cfg.get("output_workbook_path")
-        or cfg.get("master_workbook_path")
+        cfg.get("master_workbook_path")
         or cfg.get("db_master_workbook_path")
         or cfg.get("master_pl_path")
         or ""
@@ -790,6 +827,10 @@ def touch_session_workbook(cfg: dict) -> str:
 
 def open_session_workbook(cfg: dict) -> Workbook:
     """Load session master if it exists; otherwise create an empty workbook."""
+    if cfg.get("use_session_workbook"):
+        shared = get_session_workbook()
+        if shared is not None:
+            return shared
     path = build_output_file_path(cfg)
     if os.path.isfile(path):
         return load_workbook(path)
@@ -831,14 +872,32 @@ def replace_workbook_sheet(wb: Workbook, sheet_name: str):
 
 
 def build_source_sheet_name(cfg: dict) -> str:
-    return "__SOURCE__"
+    return "__SOURCE__Sales"
+
+
+def ensure_source_sheet_in_workbook(wb, cfg: dict, source_df: pd.DataFrame | None = None) -> str:
+    """Write or refresh the hidden revenue source sheet on an open workbook."""
+    source_name = build_source_sheet_name(cfg)
+    file_path = str(cfg.get("file_path") or "").strip()
+    sheet_name = str(cfg.get("sheet_name") or "").strip()
+    if source_df is None:
+        if not file_path or not sheet_name:
+            raise ValueError("file_path and sheet_name are required to build the source sheet")
+        source_df = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
+    if source_name in wb.sheetnames:
+        ws = wb[source_name]
+    else:
+        ws = wb.create_sheet(source_name)
+    ws.sheet_state = "visible"
+    refresh_source_sheet_from_df(ws, source_df, cfg)
+    return source_name
 
 
 def _source_date_columns(cfg: dict) -> list[str]:
     """Columns that must be real Excel dates for SUMIFS date criteria."""
     cols: list[str] = []
     inv = str(cfg.get("invoice_col") or "").strip()
-    if inv:
+    if inv and str(cfg.get("invoice_mapping_mode") or "date").lower() != "year":
         cols.append(inv)
     if str(cfg.get("invoice_mapping_mode", "")).strip().lower() == "accrual":
         for key in ("start_col", "end_col"):
@@ -973,6 +1032,12 @@ def ensure_source_sheet_in_output(cfg: dict, output_path: str) -> str:
     gewünschtes Sheet umbenennen auf __SOURCE__ und nach vorne ziehen.
     """
     source_sheet_name = build_source_sheet_name(cfg)
+    if cfg.get("use_session_workbook"):
+        shared = get_session_workbook()
+        if shared is not None:
+            ensure_source_sheet_in_workbook(shared, cfg)
+        return source_sheet_name
+
     input_sheet_name = str(cfg["sheet_name"]).strip()
     file_path = str(cfg["file_path"]).strip()
 
@@ -991,13 +1056,30 @@ def ensure_source_sheet_in_output(cfg: dict, output_path: str) -> str:
         return source_sheet_name
 
     wb = load_workbook(output_path)
-    if source_sheet_name not in wb.sheetnames:
+    try:
+        if source_sheet_name not in wb.sheetnames:
+            raise ValueError(
+                f"Output-Datei existiert bereits, aber Source-Sheet "
+                f"'{source_sheet_name}' fehlt: {output_path}"
+            )
+        return source_sheet_name
+    finally:
         wb.close()
-        raise ValueError(
-            f"Output-Datei existiert bereits, aber Source-Sheet '{source_sheet_name}' fehlt: {output_path}"
-        )
-    wb.close()
-    return source_sheet_name
+
+
+def open_report_workbook(cfg: dict, output_path: str):
+    """Open a report workbook; in session mode the batch adapter supplies the shared wb."""
+    if cfg.get("use_session_workbook"):
+        shared = get_session_workbook()
+        if shared is not None:
+            return shared
+        return load_workbook(output_path)
+    if os.path.isfile(output_path):
+        return load_workbook(output_path)
+    wb = Workbook()
+    if wb.sheetnames:
+        wb.remove(wb.active)
+    return wb
 
 
 def get_next_sheet_name_from_wb(wb, base_sheet_name: str) -> str:
@@ -1083,17 +1165,24 @@ def parse_invoice_fy_year(series: pd.Series) -> pd.Series:
     out = out.mask(~mnum, out).where(~mnum, num.astype("Int64"))
 
     sstr = raw.astype(str).str.strip()
-    mtxt = sstr.str.extract(r"^\D*(\d{4})\D*$", expand=False)
+    mtxt = sstr.str.extract(r"^\D*(\d{2}|\d{4})\D*$", expand=False)
     ytxt = pd.to_numeric(mtxt, errors="coerce").astype("Int64")
+    ytxt = ytxt.where(ytxt >= 100, ytxt + 2000)
     out = ytxt.where(ytxt.notna(), out)
 
-    dt = pd.to_datetime(raw, errors="coerce", dayfirst=True)
+    dt = pd.to_datetime(raw.where(out.isna()), errors="coerce", dayfirst=True)
     ydt = dt.dt.year.astype("Int64")
     out = ydt.where(ydt.notna(), out)
     return out
 
 
 # ─── Excel formula tokens ────────────────────────────────────────────────────
+
+
+def escape_excel_sumifs_wildcards(value) -> str:
+    """Escape ~, *, ? so SUMIFS/COUNTIFS match criterion text literally."""
+    s = str(value)
+    return s.replace("~", "~~").replace("*", "~*").replace("?", "~?")
 
 
 def excel_formula_value_token(value) -> str:

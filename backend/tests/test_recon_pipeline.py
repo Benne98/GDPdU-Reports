@@ -116,10 +116,10 @@ def test_is_entity_recon_sheet_excludes_group_tabs():
     assert is_entity_recon_sheet("PL_Reconciliation") is False
 
 
-def test_reorder_workbook_sheets_entity_recon_left_of_masters():
+def test_reorder_workbook_sheets_entity_recon_in_appendix():
     from openpyxl import Workbook
 
-    from databook_workbook import reorder_workbook_sheets
+    from databook_workbook import reorder_workbook_sheets, section_sheet_name
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -131,27 +131,33 @@ def test_reorder_workbook_sheets_entity_recon_left_of_masters():
     wb.create_sheet("Beta_PL_Reconciliation")
 
     reorder_workbook_sheets(wb)
-    assert wb.sheetnames[:4] == [
+    appendix = section_sheet_name("Appendix")
+    source = section_sheet_name("Source")
+    assert appendix in wb.sheetnames
+    assert source in wb.sheetnames
+    idx = wb.sheetnames.index(appendix)
+    assert wb.sheetnames[idx + 1 : idx + 6] == [
+        "BS_Reconciliation",
         "Alpha_BS_Reconciliation",
         "Alpha_PL_Reconciliation",
         "Beta_BS_Reconciliation",
         "Beta_PL_Reconciliation",
     ]
-    assert wb.sheetnames[4] == "Master_BS"
-    assert wb.sheetnames[5] == "BS_Reconciliation"
+    src_idx = wb.sheetnames.index(source)
+    assert wb.sheetnames[src_idx + 1] == "Master_BS"
 
 
 def test_reorder_workbook_sheets_order():
     from openpyxl import Workbook
 
-    from databook_workbook import reorder_workbook_sheets
+    from databook_workbook import reorder_workbook_sheets, section_sheet_name
 
     wb = Workbook()
     wb.remove(wb.active)
     wb.create_sheet("Cashflow")
     wb.create_sheet("Master_BS")
     wb.create_sheet("__SOURCE__FA_Dec23A")
-    wb.create_sheet("__SOURCE__FY25A")
+    wb.create_sheet("__SOURCE__FTE_FY25A")
     wb.create_sheet("FTE Development")
     wb.create_sheet("__SOURCE__AR_Jul25A")
     wb.create_sheet("BS_Reconciliation")
@@ -160,13 +166,19 @@ def test_reorder_workbook_sheets_order():
 
     reorder_workbook_sheets(wb)
     assert wb.sheetnames == [
-        "Master_BS",
-        "BS_Reconciliation",
-        "Cashflow",
-        "FA roll forward",
+        section_sheet_name("Executive Summary"),
+        section_sheet_name("Earnings"),
         "FTE Development",
+        section_sheet_name("Assets"),
+        "FA roll forward",
         "Trade debtors aging",
+        section_sheet_name("Liquidity"),
+        "Cashflow",
+        section_sheet_name("Appendix"),
+        "BS_Reconciliation",
+        section_sheet_name("Source"),
+        "Master_BS",
         "__SOURCE__AR_Jul25A",
         "__SOURCE__FA_Dec23A",
-        "__SOURCE__FY25A",
+        "__SOURCE__FTE_FY25A",
     ]

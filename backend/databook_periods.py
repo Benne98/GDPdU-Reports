@@ -386,6 +386,49 @@ def display_bs_period_labels(
     return out
 
 
+def wc_snapshot_periods(
+    fy_groups: dict[int, list[str]],
+    all_periods: list[str],
+    *,
+    fy_end_month: int = 12,
+    ltm_month: str | None = None,
+) -> list[str]:
+    """One Stichtag month per reporting FY (FY-end snapshot or LTM month for open YTD)."""
+    out: list[str] = []
+    for fy_end_year, month_cols in fy_groups.items():
+        if not month_cols:
+            continue
+        if is_open_ytd_fy_group(fy_end_year, month_cols, all_periods, fy_end_month):
+            target = display_bs_ytd_snapshot_label(
+                master_ytd_label(fy_end_year), ltm_month, fy_end_month
+            )
+        else:
+            target = display_bs_snapshot_label(master_fy_label(fy_end_year), fy_end_month)
+        out.append(target if target in all_periods else month_cols[-1])
+    return out
+
+
+def bs_bucket_display_label_for_wc_snapshot(
+    month_period: str,
+    all_month_periods: list[str],
+    *,
+    fy_end_month: int = 12,
+    ltm_month: str | None = None,
+) -> str:
+    """Map WC monthly snapshot column to BS_Bucket NA classification period title."""
+    info = parse_period_column_info(month_period, fy_end_month)
+    if info["kind"] != "month":
+        return str(month_period).strip()
+    rfy = int(info["reporting_fy"])
+    fy_groups = group_month_columns_by_reporting_fy(all_month_periods, fy_end_month)
+    month_cols = fy_groups.get(rfy, [])
+    if is_open_ytd_fy_group(rfy, month_cols, all_month_periods, fy_end_month):
+        return display_bs_ytd_snapshot_label(
+            master_ytd_label(rfy), ltm_month, fy_end_month
+        )
+    return display_bs_snapshot_label(master_fy_label(rfy), fy_end_month)
+
+
 def days_in_month_formula(month_header: str, fy_end_month: int = 12) -> str:
     """Excel formula for calendar days in a month column header."""
     info = parse_period_column_info(month_header, fy_end_month)

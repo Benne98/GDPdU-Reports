@@ -82,6 +82,8 @@ SCRIPTS: dict[str, Path] = {
     "fixed_assets_rollf": PROJECT_ROOT / "fixed_assets_rollf.py",
     "opos": PROJECT_ROOT / "opos.py",
     "fte_payroll": PROJECT_ROOT / "FTE_payroll.py",
+    "fast_track": PROJECT_ROOT / "scripts" / "fast_track_batch.py",
+    "fast_track_pdf": PROJECT_ROOT / "scripts" / "fast_track_pdf_report.py",
 }
 
 
@@ -853,12 +855,17 @@ def pick_folder():
 
 @router.get("/download")
 def download_output_file(path: str = Query(..., description="Absolute path to output file")):
-    """Download a generated output workbook (path must be under uploads or an allowed folder)."""
+    """Download a generated output workbook or PDF (path must be under uploads or an allowed folder)."""
     resolved = _resolve_download_path(path)
+    suffix = resolved.suffix.lower()
+    if suffix == ".pdf":
+        media_type = "application/pdf"
+    else:
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     return FileResponse(
         path=str(resolved),
         filename=resolved.name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
     )
 
 
@@ -871,6 +878,23 @@ class RunRequest(BaseModel):
     config: dict
 
 
+class FastTrackRequest(BaseModel):
+    session_id: str
+    manifest: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    output_folder: str = ""
+
+
+class FastTrackPdfRequest(BaseModel):
+    session_id: str
+    workbook_path: str = ""
+    output_folder: str = ""
+    project_name: str = ""
+    company_name: str = ""
+    group_name: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class OposAuditDueDatesRequest(BaseModel):
     session_id: str
     column_letters: dict[str, str] = Field(default_factory=dict)
@@ -881,6 +905,16 @@ class FteAuditColumnsRequest(BaseModel):
     session_id: str
     periods: list[dict[str, Any]] = Field(default_factory=list)
     columns: dict[str, str] = Field(default_factory=dict)
+    payroll_cols: list[str] = Field(default_factory=list)
+    group_cols: list[str] = Field(default_factory=list)
+    header_row: int = 0
+
+
+class FaAuditColumnsRequest(BaseModel):
+    session_id: str
+    periods: list[dict[str, Any]] = Field(default_factory=list)
+    columns: dict[str, Any] = Field(default_factory=dict)
+    group_cols: list[str] = Field(default_factory=list)
     header_row: int = 0
 
 
@@ -1375,6 +1409,343 @@ def run_bubble_async(req: RunRequest):
     return _start_async_script_job(req.session_id, req.file_id, config, "bubble")
 
 
+def _fast_track_section_config(manifest: dict, name: str) -> tuple[dict | None, dict | None]:
+    sections = manifest.get("sections")
+    if not isinstance(sections, dict):
+        return None, None
+    raw = sections.get(name)
+    if not isinstance(raw, dict):
+        return raw, None
+    nested = raw.get("config")
+    return raw, nested if isinstance(nested, dict) else raw
+
+
+def _fast_track_output_filename(manifest: dict, session_id: str) -> str:
+    project = manifest.get("project") if isinstance(manifest.get("project"), dict) else {}
+    for key in ("project_name", "title"):
+        raw = str(project.get(key) or manifest.get(key) or "").strip()
+        if raw:
+            safe = re.sub(r"[^\w\-]+", "_", raw).strip("_")
+            if safe:
+                return f"{safe[:80]}_FastTrack.xlsx"
+    return f"{session_id}_FastTrack.xlsx"
+
+
+def _resolve_fast_track_manifest(req: FastTrackRequest) -> dict:
+    from fast_track_manifest_store import (
+        load_all_fast_track_sections,
+        load_fast_track_manifest,
+        merge_fast_track_manifests,
+        resolve_master_upload_path,
+    )
+
+    manifest = dict(req.manifest or req.config or {})
+    persisted = load_fast_track_manifest(req.session_id, UPLOAD_DIR)
+    manifest = merge_fast_track_manifests(persisted, manifest)
+    sections = dict(manifest.get("sections") or {})
+    for name, cfg in load_all_fast_track_sections(req.session_id, UPLOAD_DIR).items():
+        if name not in ("opos", "fte", "fa", "databook", "revenue"):
+            continue
+        if cfg is False or (isinstance(cfg, dict) and cfg.get("included") is False):
+            continue
+        if isinstance(sections.get(name), dict) and isinstance(cfg, dict):
+            merged = dict(cfg)
+            merged.update(sections[name])
+            sections[name] = merged
+        elif not isinstance(sections.get(name), dict):
+            sections[name] = dict(cfg) if isinstance(cfg, dict) else cfg
+    manifest["sections"] = sections
+    sections = manifest.get("sections")
+    if not isinstance(sections, dict):
+        raise ValueError("manifest.sections must be an object")
+
+    master_path = str(manifest.get("master_path") or manifest.get("input_master_path") or "").strip()
+    master_file_id = str(manifest.get("master_file_id") or "").strip()
+    for section_name in ("databook", "opos", "fte", "fa", "revenue"):
+        _raw, sec_cfg = _fast_track_section_config(manifest, section_name)
+        if not isinstance(sec_cfg, dict):
+            continue
+        master_path = str(
+            sec_cfg.get("master_path")
+            or sec_cfg.get("master_file_path")
+            or master_path
+        ).strip()
+        master_file_id = str(sec_cfg.get("master_file_id") or master_file_id).strip()
+    db_raw, db_cfg = _fast_track_section_config(manifest, "databook")
+    if not master_path and master_file_id:
+        resolved = _file_path_for_id(req.session_id, master_file_id)
+        if not resolved:
+            raise ValueError("Fast Track master_file_id was not found")
+        master_path = str(resolved.resolve())
+    if not master_path:
+        master_path = resolve_master_upload_path(req.session_id, UPLOAD_DIR)
+    if master_path:
+        if not Path(master_path).expanduser().is_file():
+            raise ValueError(f"Fast Track master workbook not found: {master_path}")
+        manifest["master_path"] = str(Path(master_path).expanduser().resolve())
+        if db_cfg is not None:
+            db_cfg["master_path"] = manifest["master_path"]
+
+    from scripts.fast_track_upload_hydration import hydrate_strand_sections_from_uploads
+
+    hydrate_strand_sections_from_uploads(
+        req.session_id,
+        UPLOAD_DIR,
+        sections,
+        dates=manifest.get("dates") if isinstance(manifest.get("dates"), dict) else {},
+    )
+    manifest["sections"] = sections
+
+    for name, normalizer in (
+        ("opos", _normalize_opos_config),
+        ("fte", _normalize_fte_payroll_config),
+        ("fa", _normalize_fa_rollf_config),
+    ):
+        _raw, cfg = _fast_track_section_config(manifest, name)
+        if cfg is None:
+            continue
+        enabled = bool(
+            (_raw or {}).get(
+                "enabled",
+                (_raw or {}).get("selected", (_raw or {}).get("included", True)),
+            )
+        )
+        if enabled:
+            normalized = normalizer(dict(cfg), req.session_id)
+            cfg.clear()
+            cfg.update(normalized)
+
+    _revenue_raw, revenue_cfg = _fast_track_section_config(manifest, "revenue")
+    if revenue_cfg is not None:
+        from scripts.fast_track_batch import _resolve_sheet_name
+
+        bubble = revenue_cfg.get("bubble")
+        target = bubble if isinstance(bubble, dict) else revenue_cfg
+        nested = revenue_cfg.get("config")
+        lookup = dict(nested) if isinstance(nested, dict) else {}
+        lookup.update(revenue_cfg)
+        file_id = str(lookup.get("file_id") or target.get("file_id") or "").strip()
+        file_path = str(lookup.get("file_path") or target.get("file_path") or "").strip()
+        if file_id and not file_path:
+            resolved = _file_path_for_id(req.session_id, file_id)
+            if not resolved:
+                raise ValueError("Revenue file_id was not found")
+            file_path = str(resolved.resolve())
+        if file_path:
+            target["file_path"] = file_path
+            revenue_cfg["file_path"] = file_path
+            if isinstance(nested, dict):
+                nested["file_path"] = file_path
+            resolved_sheet = _resolve_sheet_name(file_path, lookup.get("sheet_name") or target.get("sheet_name"))
+            target["sheet_name"] = resolved_sheet
+            revenue_cfg["sheet_name"] = resolved_sheet
+            if isinstance(nested, dict):
+                nested["sheet_name"] = resolved_sheet
+
+    output_folder = _resolve_output_folder(
+        req.output_folder or str(manifest.get("output_folder") or ""),
+        req.session_id,
+    )
+    default_output = Path(output_folder) / _fast_track_output_filename(manifest, req.session_id)
+    manifest["output_path"] = str(
+        Path(str(manifest.get("output_path") or default_output))
+        .expanduser()
+        .resolve()
+    )
+    manifest["case_id"] = req.session_id
+
+    from scripts.fast_track_batch import validate_manifest
+
+    validate_manifest(manifest)
+    return manifest
+
+
+@router.post("/run/fast-track/async")
+def run_fast_track_async(req: FastTrackRequest):
+    """Run all selected Fast Track sections in one workbook-owning subprocess."""
+    try:
+        manifest = _resolve_fast_track_manifest(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    run_id = _make_run_id("fast_track_")
+    run_d = _run_dir(req.session_id, run_id)
+    config_path = run_d / "manifest.json"
+    config_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    script = SCRIPTS["fast_track"]
+    if not script.is_file():
+        raise HTTPException(status_code=500, detail=f"Fast Track script not found: {script}")
+
+    output_file = str(manifest["output_path"])
+    output_folder = str(Path(output_file).parent)
+    started = datetime.now(timezone.utc).isoformat()
+    _write_run_status(
+        req.session_id,
+        run_id,
+        {
+            "status": "running",
+            "session_id": req.session_id,
+            "run_id": run_id,
+            "script_key": "fast_track",
+            "started_at": started,
+            "output_path": output_folder,
+        },
+    )
+    proc = subprocess.Popen(
+        [_script_python(), str(script), str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(PROJECT_ROOT),
+        env=_script_subprocess_env(),
+    )
+    thread = threading.Thread(
+        target=_monitor_script_job,
+        args=(
+            req.session_id,
+            run_id,
+            proc,
+            script,
+            {"output_path": output_file, "case_id": req.session_id},
+            output_folder,
+            "fast_track",
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "success": True,
+        "status": "running",
+        "session_id": req.session_id,
+        "run_id": run_id,
+        "script_key": "fast_track",
+        "output_path": output_folder,
+    }
+
+
+@router.post("/run/fast-track-pdf/async")
+def run_fast_track_pdf_async(req: FastTrackPdfRequest):
+    """Build a Finssentials PDF report from a completed Fast Track workbook."""
+    workbook = str(req.workbook_path or (req.config or {}).get("workbook_path") or "").strip()
+    output_folder = _resolve_output_folder(
+        req.output_folder or (req.config or {}).get("output_folder") or "",
+        req.session_id,
+    )
+    session_output = str((_session_dir(req.session_id) / "output").resolve())
+
+    if not workbook or not Path(workbook).is_file():
+        search_folders: list[Path] = []
+        for folder in (output_folder, session_output):
+            p = Path(folder)
+            if p.is_dir() and p not in search_folders:
+                search_folders.append(p)
+        candidates: list[Path] = []
+        for folder in search_folders:
+            candidates.extend(folder.glob("*FastTrack*.xlsx"))
+        candidates = sorted(
+            {p.resolve() for p in candidates if p.is_file()},
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise HTTPException(
+                status_code=400,
+                detail="Fast Track workbook not found. Run Fast Track first in this session.",
+            )
+        workbook = str(candidates[0])
+
+    workbook_path = Path(workbook).expanduser().resolve()
+    output_folder = _resolve_output_folder(
+        req.output_folder
+        or (req.config or {}).get("output_folder")
+        or str(workbook_path.parent),
+        req.session_id,
+    )
+    project = str(
+        req.project_name
+        or (req.config or {}).get("project_name")
+        or workbook_path.stem.replace("_FastTrack", "")
+        or "Project"
+    ).strip()
+    company = str(
+        req.company_name
+        or req.group_name
+        or (req.config or {}).get("company_name")
+        or (req.config or {}).get("group_name")
+        or ""
+    ).strip()
+
+    stem = workbook_path.stem
+    if stem.endswith("_FastTrack"):
+        pdf_name = f"{stem}_Report.pdf"
+    else:
+        pdf_name = f"{stem}_FastTrack_Report.pdf"
+    pdf_path = str(Path(output_folder) / pdf_name)
+
+    cfg = {
+        "workbook_path": str(workbook_path),
+        "pdf_output_path": pdf_path,
+        "output_path": pdf_path,
+        "output_folder": output_folder,
+        "project_name": project,
+        "company_name": company,
+        "case_id": req.session_id,
+        "recalc_excel": True,
+    }
+
+    run_id = _make_run_id("fast_track_pdf_")
+    run_d = _run_dir(req.session_id, run_id)
+    config_path = run_d / "config.json"
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    script = SCRIPTS["fast_track_pdf"]
+    if not script.is_file():
+        raise HTTPException(status_code=500, detail=f"PDF report script not found: {script}")
+
+    started = datetime.now(timezone.utc).isoformat()
+    _write_run_status(
+        req.session_id,
+        run_id,
+        {
+            "status": "running",
+            "session_id": req.session_id,
+            "run_id": run_id,
+            "script_key": "fast_track_pdf",
+            "started_at": started,
+            "output_path": output_folder,
+        },
+    )
+    proc = subprocess.Popen(
+        [_script_python(), str(script), str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(PROJECT_ROOT),
+        env=_script_subprocess_env(),
+    )
+    thread = threading.Thread(
+        target=_monitor_script_job,
+        args=(
+            req.session_id,
+            run_id,
+            proc,
+            script,
+            {"output_path": pdf_path, "case_id": req.session_id},
+            output_folder,
+            "fast_track_pdf",
+        ),
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "success": True,
+        "status": "running",
+        "session_id": req.session_id,
+        "run_id": run_id,
+        "script_key": "fast_track_pdf",
+        "output_path": output_folder,
+    }
+
+
 @router.get("/run/status")
 def run_status(
     session_id: str = Query(...),
@@ -1454,6 +1825,33 @@ def _normalize_opos_config(config: dict, session_id: str) -> dict:
     """Resolve snapshot file_ids to paths and infer sheet names."""
     cfg = dict(config)
     partner_col = str((cfg.get("columns") or {}).get("partner_id") or "").strip()
+    raw_snaps = cfg.get("snapshots")
+    if (
+        not cfg.get("sides")
+        and isinstance(raw_snaps, list)
+        and raw_snaps
+        and isinstance(raw_snaps[0], dict)
+        and "debitor" in raw_snaps[0]
+        and "kreditor" in raw_snaps[0]
+    ):
+        sides: dict[str, dict[str, Any]] = {"debitor": {"snapshots": []}, "kreditor": {"snapshots": []}}
+        for item in raw_snaps:
+            if not isinstance(item, dict):
+                continue
+            as_of = str(item.get("as_of") or "").strip()
+            if not as_of:
+                continue
+            for side in ("debitor", "kreditor"):
+                block = item.get(side) if isinstance(item.get(side), dict) else {}
+                sides[side]["snapshots"].append(
+                    {
+                        "as_of": as_of,
+                        "file_id": str(block.get("file_id") or "").strip(),
+                        "file_path": str(block.get("file_path") or "").strip(),
+                        "sheet_name": str(block.get("sheet_name") or "").strip(),
+                    }
+                )
+        cfg["sides"] = sides
     sides = cfg.get("sides")
     if isinstance(sides, dict) and sides:
         for side in ("debitor", "kreditor"):
@@ -1572,8 +1970,8 @@ def _flatten_opos_snapshots_for_audit(
 
 @router.post("/opos/audit-due-dates")
 def opos_audit_due_dates(req: OposAuditDueDatesRequest):
-    """Count OPOS rows with partner id but missing due date (debitor + kreditor)."""
-    from opos import audit_missing_due_date_rows
+    """Audit mapped OPOS columns (due dates, amounts, empty partners as n/a)."""
+    from opos import audit_opos_mapped_columns
 
     letters = dict(req.column_letters or {})
     if not letters:
@@ -1581,7 +1979,7 @@ def opos_audit_due_dates(req: OposAuditDueDatesRequest):
     snaps = _flatten_opos_snapshots_for_audit(req.snapshots, req.session_id)
     if not snaps:
         raise HTTPException(status_code=400, detail="No valid snapshots to audit")
-    return audit_missing_due_date_rows(snaps, column_letters=letters)
+    return audit_opos_mapped_columns(snaps, column_letters=letters)
 
 
 # ─── Fixed Assets Rollforward preview + run ───────────────────────────────────
@@ -1686,7 +2084,64 @@ def fte_audit_columns(req: FteAuditColumnsRequest):
         normalized.append(period)
     if not normalized:
         raise HTTPException(status_code=400, detail="No valid periods to audit")
-    return audit_invalid_fte_columns(normalized, cols, header_row=int(req.header_row or 0))
+    return audit_invalid_fte_columns(
+        normalized,
+        cols,
+        header_row=int(req.header_row or 0),
+        payroll_cols=[str(c).strip() for c in (req.payroll_cols or []) if str(c).strip()],
+        group_cols=[str(c).strip() for c in (req.group_cols or []) if str(c).strip()],
+    )
+
+
+@router.post("/fa_rollf/audit-columns")
+def fa_rollf_audit_columns(req: FaAuditColumnsRequest):
+    """Audit mapped FA rollforward columns per period file."""
+    from fixed_assets_rollf import audit_fa_rollf_mapped_columns
+
+    cols = dict(req.columns or {})
+    if not cols.get("opening") or not cols.get("additions") or not cols.get("disposals"):
+        raise HTTPException(
+            status_code=400,
+            detail="columns.opening, columns.additions, and columns.disposals are required",
+        )
+
+    normalized: list[dict] = []
+    for item in req.periods or []:
+        if not isinstance(item, dict):
+            continue
+        period = dict(item)
+        fid = str(period.get("file_id") or "").strip()
+        fp = str(period.get("file_path") or "").strip()
+        if not fp and fid:
+            resolved = _file_path_for_id(req.session_id, fid)
+            if resolved:
+                fp = str(resolved)
+        if not fp:
+            continue
+        period["file_path"] = fp
+        normalized.append(period)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="No valid periods to audit")
+    dep_cols = cols.get("depreciation_cols")
+    if isinstance(dep_cols, str):
+        try:
+            dep_cols = json.loads(dep_cols)
+        except json.JSONDecodeError:
+            dep_cols = [dep_cols]
+    if not isinstance(dep_cols, list):
+        dep_cols = []
+    audit_cols = {
+        "opening": str(cols.get("opening") or "").strip(),
+        "additions": str(cols.get("additions") or "").strip(),
+        "disposals": str(cols.get("disposals") or "").strip(),
+        "depreciation_cols": [str(c).strip() for c in dep_cols if str(c).strip()],
+    }
+    return audit_fa_rollf_mapped_columns(
+        normalized,
+        audit_cols,
+        header_row=int(req.header_row or 0),
+        group_cols=[str(c).strip() for c in (req.group_cols or []) if str(c).strip()],
+    )
 
 
 @router.get("/fte_payroll/preview")
@@ -1732,6 +2187,10 @@ def run_databook_susa(req: DatabookSusaRequest):
     run_d = _run_dir(req.session_id, run_id)
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
+
+    from databook_helpers import clear_master_workbook_imported
+
+    clear_master_workbook_imported(req.session_id)
 
     groups = list(req.entity_year_files)
     if not groups and req.entity_files:
@@ -2055,6 +2514,7 @@ class DatabookReconCoreRequest(BaseModel):
     company_name: str = "Group"
     entity_order: list[str] = Field(default_factory=list)
     l4_sort_basis: str = "latest_fy"
+    preserve_master_sheets: bool = False
 
 
 class DatabookExtendedTablesRequest(BaseModel):
@@ -2065,6 +2525,7 @@ class DatabookExtendedTablesRequest(BaseModel):
     company_name: str = "Group"
     entity_order: list[str] = Field(default_factory=list)
     l4_sort_basis: str = "latest_fy"
+    preserve_master_sheets: bool = False
 
 
 # ─── Run: Databook — post-SuSa steps ─────────────────────────────────────────
@@ -2072,9 +2533,11 @@ class DatabookExtendedTablesRequest(BaseModel):
 
 @router.post("/run/databook/import-master")
 def run_databook_import_master(req: DatabookImportMasterRequest):
-    import shutil
-
-    from databook_helpers import extract_master_entities
+    from databook_helpers import (
+        extract_master_entities,
+        import_master_workbook_sheets,
+        mark_master_workbook_imported,
+    )
 
     uploaded = _file_path_for_id(req.session_id, req.master_file_id)
     if not uploaded or not uploaded.is_file():
@@ -2082,8 +2545,8 @@ def run_databook_import_master(req: DatabookImportMasterRequest):
 
     output_folder = _resolve_output_folder(req.output_folder, req.session_id)
     master = _databook_master_path(req.session_id, output_folder, project_name=req.project_name)
-    master.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(uploaded, master)
+    import_master_workbook_sheets(uploaded, master)
+    mark_master_workbook_imported(req.session_id, master)
     entities = extract_master_entities(master)
 
     return {
@@ -2348,6 +2811,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
         ensure_pl_mapping_file,
         extract_fs_check_values,
         prepare_master_pl_for_recon,
+        should_preserve_master_sheets,
     )
 
     sess = _session_dir(req.session_id)
@@ -2364,7 +2828,9 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
-    prepare_master_pl_for_recon(master)
+    preserve_master = should_preserve_master_sheets(req.session_id)
+    if not preserve_master:
+        prepare_master_pl_for_recon(master)
     mapping_file = ensure_pl_mapping_file()
     recon_target = master.parent / f"{req.session_id}_recon_pl.xlsx"
 
@@ -2390,6 +2856,7 @@ def run_databook_recon_pl(req: DatabookReconPlRequest):
         "sort_by": "custom",
         "l4_sort_basis": str(req.l4_sort_basis or "latest_fy").strip().lower(),
         "entity_order": list(req.entity_order),
+        "preserve_master_sheets": preserve_master,
         "show_fs_check": bool(req.show_fs_check),
         "fs_check_values": fs_check,
         "display": {"titles": titles},
@@ -2433,6 +2900,7 @@ def run_databook_recon_core(req: DatabookReconCoreRequest):
     from databook_helpers import (
         ensure_pl_mapping_file,
         prepare_master_pl_for_recon,
+        should_preserve_master_sheets,
     )
 
     run_id = _make_run_id("db_recon_core_")
@@ -2447,7 +2915,12 @@ def run_databook_recon_core(req: DatabookReconCoreRequest):
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
-    prepare_master_pl_for_recon(master)
+    preserve_master = should_preserve_master_sheets(
+        req.session_id,
+        explicit=bool(req.preserve_master_sheets),
+    )
+    if not preserve_master:
+        prepare_master_pl_for_recon(master)
     master_str = str(master)
     entity_order = list(req.entity_order)
     l4_sort_basis = str(req.l4_sort_basis or "latest_fy").strip().lower()
@@ -2462,6 +2935,7 @@ def run_databook_recon_core(req: DatabookReconCoreRequest):
         "sort_by": "custom",
         "l4_sort_basis": l4_sort_basis,
         "entity_order": entity_order,
+        "preserve_master_sheets": preserve_master,
         "show_fs_check": True,
         "fs_check_values": {"entities": [], "consolidation": []},
         "display": {"titles": titles},
@@ -2491,6 +2965,7 @@ def run_databook_recon_core(req: DatabookReconCoreRequest):
         "company_name": req.company_name,
         "entity_order": entity_order,
         "l4_sort_basis": l4_sort_basis,
+        "preserve_master_sheets": preserve_master,
         "show_bs_checks": True,
         "display": {"titles": titles},
         "paths": {
@@ -2527,7 +3002,7 @@ def run_databook_extended_tables(req: DatabookExtendedTablesRequest):
     """Run BS bucket, Lead_IS, Lead_BS, Working capital, and Cashflow on session master."""
     from databook_workbook import BS_RECON_MAPPING_FILE, CF_NA_L3_ORDER_FILE, PL_RECON_MAPPING_FILE
 
-    from databook_helpers import prepare_master_pl_for_recon
+    from databook_helpers import prepare_master_pl_for_recon, should_preserve_master_sheets
 
     run_id = _make_run_id("db_ext_tables_")
     run_d = _run_dir(req.session_id, run_id)
@@ -2541,7 +3016,11 @@ def run_databook_extended_tables(req: DatabookExtendedTablesRequest):
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
-    prepare_master_pl_for_recon(master)
+    if not should_preserve_master_sheets(
+        req.session_id,
+        explicit=bool(req.preserve_master_sheets),
+    ):
+        prepare_master_pl_for_recon(master)
     master_str = str(master)
     entity_order = list(req.entity_order)
     l4_sort_basis = str(req.l4_sort_basis or "latest_fy").strip().lower()
@@ -2612,7 +3091,7 @@ def run_databook_extended_tables(req: DatabookExtendedTablesRequest):
 @router.post("/run/databook/recon-pipeline")
 def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
     """Run PL/BS recon, BS bucket, Lead_IS, Lead_BS, Working_capital on session master."""
-    from databook_helpers import prepare_master_pl_for_recon
+    from databook_helpers import prepare_master_pl_for_recon, should_preserve_master_sheets
 
     run_id = _make_run_id("db_recon_pipe_")
     run_d = _run_dir(req.session_id, run_id)
@@ -2626,13 +3105,16 @@ def run_databook_recon_pipeline(req: DatabookReconPipelineRequest):
     if not master.is_file():
         raise HTTPException(status_code=404, detail=f"Master workbook not found: {master}")
 
-    prepare_master_pl_for_recon(master)
+    preserve_master = should_preserve_master_sheets(req.session_id)
+    if not preserve_master:
+        prepare_master_pl_for_recon(master)
     master_str = str(master)
     entity_order = list(req.entity_order)
     base = {
         "project_name": req.project_name,
         "company_name": req.company_name,
         "entity_order": entity_order,
+        "preserve_master_sheets": preserve_master,
         "paths": {"mapping_source": "db", "master_file": master_str},
     }
 

@@ -41,6 +41,7 @@ export default function PlDetailOverlay({
   narrativeContext,
   onClose,
 }: Props) {
+  void narrativeContext
   const load = useStatementLineDetailLoad({
     statement,
     lineCode: bullet.line_code,

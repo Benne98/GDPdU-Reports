@@ -8,7 +8,7 @@
  * On submit, calls onSubmit(cardName, values) which the parent hook posts to Rasa.
  */
 
-import { useState, useRef, useId, useEffect, type DragEvent } from 'react'
+import { useState, useRef, useId, useEffect, type DragEvent, type ReactNode } from 'react'
 import { Upload, ChevronDown, Check, FileSpreadsheet, Download } from 'lucide-react'
 import { getApiBaseUrl } from '../../lib/api'
 import type { AdaptiveCardPayload, AdaptiveCardInput } from './useFddBot'
@@ -18,13 +18,16 @@ import FaRollfColumnMapper from './FaRollfColumnMapper'
 import FtePayrollColumnMapper from './FtePayrollColumnMapper'
 import OposSnapshotsCard from './OposSnapshotsCard'
 import OposDisplayBucketsCard from './OposDisplayBucketsCard'
+import RevenueFastTrackCard, { type RevenueFastTrackValues } from './RevenueFastTrackCard'
+import RowFilterModal, { RowFilterToolbar } from './RowFilterModal'
+import { useRowFilterEditor } from './useRowFilterEditor'
 
 interface Props {
   payload: AdaptiveCardPayload
   onSubmit: (
     cardName: string,
     values: Record<string, unknown>,
-    meta?: { submitLabel?: string },
+    meta?: { submitLabel?: string; skipUserBubble?: boolean },
   ) => void | Promise<void>
   onFileUpload?: (
     file: File,
@@ -203,14 +206,15 @@ function FileAttachmentCard({ payload }: { payload: AdaptiveCardPayload }) {
   const rel = payload.download_url ?? ''
   const href = rel.startsWith('http') ? rel : `${getApiBaseUrl()}${rel}`
   const compact = Boolean(payload.notification)
+  const isPdf = filename.toLowerCase().endsWith('.pdf')
+  const mime = isPdf
+    ? 'application/pdf'
+    : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
   const onDragStart = (e: DragEvent) => {
     if (compact) return
     e.dataTransfer.effectAllowed = 'copy'
-    e.dataTransfer.setData(
-      'DownloadURL',
-      `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:${filename}:${href}`,
-    )
+    e.dataTransfer.setData('DownloadURL', `${mime}:${filename}:${href}`)
     e.dataTransfer.setData('text/uri-list', href)
   }
 
@@ -954,29 +958,70 @@ export default function AdaptiveCard(props: Props) {
   if (props.payload.card === 'databook_susa_column_mapper') {
     return <SusaColumnMapperCard {...props} />
   }
-  if (props.payload.card === 'opos_columns') {
+  if (props.payload.card === 'opos_columns' || props.payload.card === 'fast_track_opos_mapper') {
     return <OposColumnMapperCard {...props} />
   }
-  if (props.payload.card === 'fa_rollf_columns') {
+  if (props.payload.card === 'fa_rollf_columns' || props.payload.card === 'fast_track_fa_mapper') {
     return <FaRollfColumnMapperCard {...props} />
   }
-  if (props.payload.card === 'fte_columns') {
+  if (props.payload.card === 'fte_columns' || props.payload.card === 'fast_track_fte_mapper') {
     return <FtePayrollColumnMapperCard {...props} />
   }
-  if (props.payload.card === 'opos_snapshots') {
+  if (props.payload.card === 'opos_snapshots' || props.payload.card === 'fast_track_opos_snapshots') {
     return <OposSnapshotsCardWrapper {...props} />
   }
   if (props.payload.card === 'opos_display_buckets') {
     return <OposDisplayBucketsCardWrapper {...props} />
   }
+  if (props.payload.card === 'revenue_fast_track') {
+    return <RevenueFastTrackCardWrapper {...props} />
+  }
   return <AdaptiveCardForm {...props} />
 }
 
+function RevenueFastTrackCardWrapper({ payload, onSubmit, disabled }: Props) {
+  const filter = useRowFilterEditor(payload, onSubmit)
+  const handleSubmit = async (values: RevenueFastTrackValues) => {
+    await onSubmit(
+      payload.card,
+      values as unknown as Record<string, unknown>,
+      { submitLabel: payload.submit_label },
+    )
+  }
+  return (
+    <>
+      <RevenueFastTrackCard
+        payload={payload}
+        disabled={disabled}
+        onSubmit={handleSubmit}
+        onOpenFilter={filter.canEdit ? () => filter.setOpen(true) : undefined}
+      />
+      <RowFilterModal
+        open={filter.open}
+        title="Row filter"
+        headers={filter.headers}
+        rulesJson={filter.rulesJson}
+        onClose={() => filter.setOpen(false)}
+        onSave={filter.saveRules}
+      />
+    </>
+  )
+}
+
 function OposDisplayBucketsCardWrapper({ payload, onSubmit, disabled }: Props) {
-  const bucketOptions =
-  (payload as { bucket_options?: { label: string; value: string }[] }).bucket_options ?? []
-  const defaultKeys =
-    (payload as { bucket_defaults?: string[] }).bucket_defaults ?? []
+  const rawDefaults =
+    (payload as { aging_range_defaults?: [number, number][] }).aging_range_defaults ??
+    (payload as { bucket_defaults?: unknown }).bucket_defaults
+  const defaultRanges: { lo: number; hi: number }[] = Array.isArray(rawDefaults)
+    ? rawDefaults
+        .filter((r): r is [number, number] => Array.isArray(r) && r.length >= 2)
+        .map(([lo, hi]) => ({ lo: Number(lo), hi: Number(hi) }))
+    : [
+        { lo: 1, hi: 30 },
+        { lo: 31, hi: 60 },
+        { lo: 61, hi: 90 },
+        { lo: 91, hi: 180 },
+      ]
   const multipleSnapshots = Boolean(
     (payload as { multiple_snapshots?: boolean }).multiple_snapshots,
   )
@@ -985,7 +1030,7 @@ function OposDisplayBucketsCardWrapper({ payload, onSubmit, disabled }: Props) {
   )
 
   const handleSubmit = async (values: {
-    opos_display_bucket_keys: string[]
+    opos_aging_ranges: [number, number][]
     opos_sort_basis?: string
   }) => {
     await onSubmit(payload.card, values)
@@ -996,8 +1041,7 @@ function OposDisplayBucketsCardWrapper({ payload, onSubmit, disabled }: Props) {
       title={payload.title}
       subtitle={payload.subtitle}
       submitLabel={payload.submit_label ?? 'Continue'}
-      bucketOptions={bucketOptions}
-      defaultKeys={defaultKeys}
+      defaultRanges={defaultRanges}
       multipleSnapshots={multipleSnapshots}
       defaultSortBasis={defaultSortBasis}
       disabled={disabled}
@@ -1027,12 +1071,46 @@ function normalizeMapperMeta(value: unknown, fallback: string): string {
   return trimmed || fallback
 }
 
+function MapperCardHeader({
+  title,
+  subtitle,
+  filter,
+}: {
+  title?: string
+  subtitle?: string
+  filter?: ReactNode
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <div>
+        {title ? (
+          <h3 className="text-sm font-semibold" style={{ color: '#1E293B' }}>
+            {title}
+          </h3>
+        ) : null}
+        {subtitle ? <p className="text-xs text-slate-500">{subtitle}</p> : null}
+      </div>
+      {filter ? <div className="self-start">{filter}</div> : null}
+    </div>
+  )
+}
+
 function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const filter = useRowFilterEditor(payload, onSubmit)
   const meta = payload.mapper_meta ?? {}
   const sessionId = String(meta.session_id ?? '')
   const previewFileId = String(meta.preview_file_id ?? '')
   const sheetName = String(meta.sheet_name ?? '')
   const headerRow = Number(meta.header_row ?? 0)
+  const periodsJson = String(meta.fa_periods_json ?? meta.periods_json ?? '[]')
+  const groupColsJson = String(meta.fa_group_cols_json ?? '[]')
+  const fastTrack = Boolean(
+    payload.fast_track ||
+    meta.fast_track ||
+    meta.inline_grouping ||
+    Number(meta.grouping_fields) === 1,
+  )
+  const groupingDefault = String(meta.fa_group_col_1 ?? '')
 
   const handleMapping = async (mapping: Record<string, string>) => {
     await onSubmit(payload.card, mapping)
@@ -1043,30 +1121,54 @@ function FaRollfColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       className="rounded-xl p-4 flex flex-col gap-3 relative"
       style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
     >
-      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
-        {payload.title}
-      </h3>
-      {payload.subtitle && (
-        <p className="text-xs text-slate-500">{payload.subtitle}</p>
-      )}
+      <MapperCardHeader
+        title={payload.title}
+        subtitle={payload.subtitle}
+        filter={
+          filter.canEdit ? (
+            <RowFilterToolbar onOpen={() => filter.setOpen(true)} disabled={disabled} />
+          ) : null
+        }
+      />
       <FaRollfColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
+        periodsJson={periodsJson}
+        groupColsJson={groupColsJson}
         sheetName={sheetName}
         headerRow={headerRow}
+        fastTrack={fastTrack}
+        groupingDefault={groupingDefault}
         disabled={disabled}
         onSubmit={handleMapping}
+      />
+      <RowFilterModal
+        open={filter.open}
+        headers={filter.headers}
+        rulesJson={filter.rulesJson}
+        onClose={() => filter.setOpen(false)}
+        onSave={filter.saveRules}
       />
     </div>
   )
 }
 
 function FtePayrollColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const filter = useRowFilterEditor(payload, onSubmit)
   const meta = payload.mapper_meta ?? {}
   const sessionId = String(meta.session_id ?? '')
   const previewFileId = String(meta.preview_file_id ?? '')
   const sheetName = String(meta.sheet_name ?? '')
   const headerRow = Number(meta.header_row ?? 0)
+  const periodsJson = String(meta.fte_periods_json ?? meta.periods_json ?? '[]')
+  const groupColsJson = String(meta.fte_group_cols_json ?? '[]')
+  const fastTrack = Boolean(
+    payload.fast_track ||
+    meta.fast_track ||
+    meta.inline_grouping ||
+    Number(meta.grouping_fields) === 1,
+  )
+  const groupingDefault = String(meta.fte_group_col_1 ?? '')
 
   const handleMapping = async (mapping: Record<string, string>) => {
     await onSubmit(payload.card, mapping)
@@ -1077,25 +1179,40 @@ function FtePayrollColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       className="rounded-xl p-4 flex flex-col gap-3 relative"
       style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
     >
-      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
-        {payload.title}
-      </h3>
-      {payload.subtitle && (
-        <p className="text-xs text-slate-500">{payload.subtitle}</p>
-      )}
+      <MapperCardHeader
+        title={payload.title}
+        subtitle={payload.subtitle}
+        filter={
+          filter.canEdit ? (
+            <RowFilterToolbar onOpen={() => filter.setOpen(true)} disabled={disabled} />
+          ) : null
+        }
+      />
       <FtePayrollColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
+        periodsJson={periodsJson}
+        groupColsJson={groupColsJson}
         sheetName={sheetName}
         headerRow={headerRow}
+        fastTrack={fastTrack}
+        groupingDefault={groupingDefault}
         disabled={disabled}
         onSubmit={handleMapping}
+      />
+      <RowFilterModal
+        open={filter.open}
+        headers={filter.headers}
+        rulesJson={filter.rulesJson}
+        onClose={() => filter.setOpen(false)}
+        onSave={filter.saveRules}
       />
     </div>
   )
 }
 
 function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
+  const filter = useRowFilterEditor(payload, onSubmit)
   const meta = payload.mapper_meta ?? {}
   const sessionId = String(meta.session_id ?? '')
   const previewFileId = String(meta.preview_file_id ?? '')
@@ -1116,12 +1233,15 @@ function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       className="rounded-xl p-4 flex flex-col gap-3 relative"
       style={{ background: '#FFFFFF', border: '1px solid #E2E8F0' }}
     >
-      <h3 className="text-sm font-semibold pr-8" style={{ color: '#1E293B' }}>
-        {payload.title}
-      </h3>
-      {payload.subtitle && (
-        <p className="text-xs text-slate-500">{payload.subtitle}</p>
-      )}
+      <MapperCardHeader
+        title={payload.title}
+        subtitle={payload.subtitle}
+        filter={
+          filter.canEdit ? (
+            <RowFilterToolbar onOpen={() => filter.setOpen(true)} disabled={disabled} />
+          ) : null
+        }
+      />
       <OposColumnMapper
         sessionId={sessionId}
         previewFileId={previewFileId}
@@ -1131,6 +1251,13 @@ function OposColumnMapperCard({ payload, onSubmit, disabled }: Props) {
         disabled={disabled}
         onSubmit={handleMapping}
         onReupload={handleReupload}
+      />
+      <RowFilterModal
+        open={filter.open}
+        headers={filter.headers}
+        rulesJson={filter.rulesJson}
+        onClose={() => filter.setOpen(false)}
+        onSave={filter.saveRules}
       />
     </div>
   )
@@ -1169,6 +1296,13 @@ function SusaColumnMapperCard({ payload, onSubmit, disabled }: Props) {
       />
     </div>
   )
+}
+
+function fastTrackSubmitFlags(payload: Props['payload']): Record<string, boolean> {
+  const flags: Record<string, boolean> = {}
+  if (payload.fast_track) flags.fast_track = true
+  if (payload.fast_track_active) flags.fast_track_active = true
+  return flags
 }
 
 function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) {
@@ -1374,6 +1508,15 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
       ) {
         setSusaGridError('Please upload at least one file in the grid before continuing.')
         return
+      }
+
+      Object.assign(out, fastTrackSubmitFlags(payload))
+
+      if (payload.card === 'pdf_report_prompt') {
+        const metaPath = String(payload.metadata?.workbook_path ?? '').trim()
+        if (metaPath) {
+          out.workbook_path = metaPath
+        }
       }
 
       await Promise.resolve(
@@ -1717,7 +1860,10 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
                   setSubmitting(true)
                   try {
                     await Promise.resolve(
-                      onSubmit(payload.card, { [payload.secondary_submit_id!]: true }),
+                      onSubmit(payload.card, {
+                        [payload.secondary_submit_id!]: true,
+                        ...fastTrackSubmitFlags(payload),
+                      }),
                     )
                   } finally {
                     setSubmitting(false)
@@ -1736,7 +1882,10 @@ function AdaptiveCardForm({ payload, onSubmit, onFileUpload, disabled }: Props) 
                   setSubmitting(true)
                   try {
                     await Promise.resolve(
-                      onSubmit(payload.card, { [payload.secondary_submit_id!]: true }),
+                      onSubmit(payload.card, {
+                        [payload.secondary_submit_id!]: true,
+                        ...fastTrackSubmitFlags(payload),
+                      }),
                     )
                   } finally {
                     setSubmitting(false)

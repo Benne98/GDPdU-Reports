@@ -50,13 +50,20 @@ def test_opos_bs_recon_reported_formula_missing_sheet():
     assert _opos_bs_recon_reported_formula(wb, "debitor", "Dec24A") is None
 
 
-def test_opos_bs_recon_reported_formula_fy_end_period_fallback():
+def test_opos_bs_recon_reported_formula_same_year_suffix():
     wb = Workbook()
     _seed_bs_recon(wb, header_label="Jul24A")
     formula = _opos_bs_recon_reported_formula(wb, "debitor", "Dec24A")
     assert formula == "='BS_Reconciliation'!J12"
     ws = wb["BS_Reconciliation"]
     assert find_recon_block_col_for_period_label(ws, AGGREGATED_BLOCK_TITLE, "Dec24A") == 10
+
+
+def test_opos_bs_recon_reported_formula_no_cross_year_fallback():
+    """Jul25A must not invent Dec24A — leave n/a when the snapshot year is missing."""
+    wb = Workbook()
+    _seed_bs_recon(wb, header_label="Dec24A")
+    assert _opos_bs_recon_reported_formula(wb, "debitor", "Jul25A") is None
 
 
 def test_apply_opos_summary_check_section_writes_formulas():

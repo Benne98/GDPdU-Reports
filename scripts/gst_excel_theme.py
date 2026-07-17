@@ -108,6 +108,40 @@ class GstExcelTheme:
 
 THEME = GstExcelTheme()
 
+
+def matplotlib_font_properties(
+    *,
+    size: float | int | None = None,
+    weight: str | float | None = None,
+    family: str | None = None,
+):
+    """Matplotlib FontProperties from the shared Excel/chart theme (no local TTF paths)."""
+    import matplotlib.font_manager as fm
+
+    props: dict = {"family": family or THEME.font_name}
+    if size is not None:
+        props["size"] = size
+    if weight is not None:
+        props["weight"] = weight
+    return fm.FontProperties(**props)
+
+
+def apply_matplotlib_theme(
+    *,
+    size: float | int | None = None,
+    weight: str | float = "normal",
+) -> None:
+    """Apply THEME.font_name to matplotlib rcParams (portable; no font files required)."""
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.family"] = THEME.font_name
+    plt.rcParams["font.sans-serif"] = [THEME.font_name, "Arial", "DejaVu Sans", "sans-serif"]
+    if size is not None:
+        plt.rcParams["font.size"] = size
+    plt.rcParams["font.weight"] = weight
+    plt.rcParams["axes.labelweight"] = weight
+    plt.rcParams["text.antialiased"] = True
+
 SCHEMA_ROWS = [
     ("Header row", "Background", "F8FAFC", THEME.header_bg),
     ("Header row", "Text", "475569 (all period columns)", THEME.text_header),
