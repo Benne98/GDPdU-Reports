@@ -3,6 +3,8 @@
   "private": true,
   "description": "GDPdU Reports dev stack (PM2)",
   "scripts": {
+    "setup": "bash scripts/setup-gdpdu-stack.sh",
+    "train": "bash scripts/setup-gdpdu-stack.sh --force-train --no-start",
     "stack:start": "npx pm2 start ecosystem.gdpdu.config.cjs",
     "stack:stop": "npx pm2 stop gdpdu-api gdpdu-rasa-actions gdpdu-rasa gdpdu-vite",
     "stack:restart": "npx pm2 restart gdpdu-api gdpdu-rasa-actions gdpdu-rasa gdpdu-vite",

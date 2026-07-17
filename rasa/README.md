@@ -5,23 +5,53 @@ Replaces the legacy Copilot Studio / Power Automate setup.
 
 ## Prerequisites
 
-- Python 3.10
-- Rasa 3.6.x (see `requirements.txt`)
+- Python 3.10+
+- Node.js + npm
+- Rasa 3.6.x (installed by the setup script from `requirements.txt`)
 
-## Installation
+## Colleague setup (recommended)
+
+From the **repo root** (not `rasa/`):
+
+```bash
+npm run setup
+```
+
+That script:
+
+1. installs npm deps (pm2 + frontend if needed)
+2. creates/updates `backend/.venv` and `rasa/.venv`
+3. trains the Rasa model when missing or outdated
+4. starts the GDPdU PM2 stack (API 8010, Rasa 5005/5055, UI 5176)
+
+Useful variants:
+
+```bash
+npm run train                 # only retrain Rasa
+./scripts/setup-gdpdu-stack.sh --force-train   # retrain + restart stack
+./scripts/setup-gdpdu-stack.sh --no-start      # setup + train, do not start
+```
+
+UI: http://127.0.0.1:5176
+
+## Manual installation
 
 ```bash
 cd rasa
+python3.10 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Training
+## Manual training
 
 ```bash
+cd rasa
+source .venv/bin/activate
 rasa train
 ```
 
-## Running
+## Manual running (without PM2)
 
 Three processes are required (open three terminals):
 
